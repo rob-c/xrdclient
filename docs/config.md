@@ -51,6 +51,7 @@ minute at a time. Both take `0` to wait forever.
 | `data_streams` | `1` | `XRD_SUBSTREAMSPERCHANNEL` |
 | `data_stream_timeout` | 2 s | `XRD_SUBSTREAMTIMEOUT` |
 | `max_read_size` | 1 GiB | `XRD_MAXREADSIZE` |
+| `cache_dir` | `~/.cache/xrd` | `XRD_CACHE` |
 
 `parallel_chunks` is how many connections one large copy is spread over, a
 span of the file each; `1` keeps the single stream. See
@@ -78,6 +79,12 @@ first file pays the timeout, and every later file on the same connection goes
 straight to the split that works.
 From the command line the field is `xrd-cp --streams N`, where `0` asks for
 the control link alone.
+`cache_dir` is where [`xrd.ml.download`](ml.md#keeping-a-local-copy) puts a
+dataset it has pulled. Naming a directory does not turn caching on: nothing is
+written there until a caller asks for it with `download(...)` or
+`load(..., cache=True)`, because streaming the file is the ordinary case and a
+copy on disk is the exception you opt into.
+
 `max_read_size` is the ceiling on a read that never said how much it wanted -
 `read()` with no argument, `read_bytes()`, `read_text()` - so that a file
 bigger than memory raises [`TooLargeError`](errors.md#too-much-at-once)

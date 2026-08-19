@@ -263,6 +263,16 @@ class Config:
     #: Where :func:`xrd.ml.load` resolves bare dataset names: a URL or local
     #: directory holding the ``index.json`` an ``xrd-datasets build`` wrote.
     catalogue: str | None = field(default_factory=lambda: os.environ.get("XRD_CATALOGUE"))
+    #: Where :func:`xrd.ml.download` keeps a file it has already pulled, so
+    #: that a second run reads the local copy instead of the network. Having a
+    #: directory here does not turn caching on - nothing is written until a
+    #: caller asks for it - it only says where it would go.
+    cache_dir: str = field(
+        default_factory=lambda: os.environ.get("XRD_CACHE")
+        or os.path.join(
+            os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "xrd"
+        )
+    )
 
     def check_whole_read(self, size: int, path: str | None = None) -> None:
         """Refuse a read of ``size`` bytes that nobody put a number on.

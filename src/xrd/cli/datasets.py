@@ -253,6 +253,20 @@ def _verify(args: argparse.Namespace, config: Config) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _root_url(base: str, given: str | None) -> str:
+    """Where the same directory answers to ``root://``.
+
+    A site nearly always serves both planes off one host, so the default is
+    that host with the scheme swapped; ``--root-url`` is for the deployment
+    where the native protocol lives somewhere else, behind its own name or
+    port.
+    """
+    if given:
+        return given.rstrip("/")
+    host = base.split("://", 1)[-1].split("/", 1)[0]
+    return f"root://{host}"
+
+
 def _site(args: argparse.Namespace, config: Config) -> int:
     out = Path(args.directory)
     index = json.loads((out / "index.json").read_text())
@@ -260,8 +274,10 @@ def _site(args: argparse.Namespace, config: Config) -> int:
     values = {
         "title": args.title,
         "base_url": base,
+        "root_url": _root_url(base, args.root_url),
         "built": index["built"],
         "count": str(len(index["datasets"])),
+        "plural": "" if len(index["datasets"]) == 1 else "s",
         # ``</`` would end the page's own script block early if a title ever
         # contained it; JSON does not need the slash, so it goes.
         "payload": json.dumps(index["datasets"]).replace("</", "<\\/"),
@@ -300,11 +316,22 @@ _PAGE = """\
            border-bottom: 1px solid var(--line); vertical-align: top; }
   td.n { text-align: right; white-space: nowrap; }
   .muted { opacity: 0.65; font-size: 0.85rem; }
+  .lede { font-size: 1.05rem; }
+  h2 { font-size: 1.15rem; margin-top: 2rem; }
+  .ways td { vertical-align: top; }
+  .ways td:first-child { white-space: nowrap; font-weight: 600; }
+  .ways pre { margin: 0.4rem 0 0; }
 </style>
 <body>
 <h1>$title</h1>
-<p>$count datasets, converted to ROOT files and served as they are.
-Stream one straight into a training loop:</p>
+<p class="lede">$count dataset$plural, converted to ROOT files and streamed over
+<b>XRootD</b> &mdash; the high-performance data-access protocol built in
+high-energy physics, and the one the OSG and the WLCG move petabytes of
+physics data over every day, across hundreds of sites worldwide. This is that
+machinery pointed at machine-learning data: the same protocol, the same
+client, the same wide-area performance.</p>
+
+<p>Stream one straight into a training loop. Nothing is downloaded first:</p>
 <pre>pip install xrd
 export XRD_CATALOGUE=$base_url
 
@@ -313,10 +340,36 @@ import xrd.ml
 data = xrd.ml.load("mnist")
 for images, labels in data.train.batches(256):
     ...'</pre>
-<p class="muted">Each file carries its licence and source in its
-<code>about</code> key; the same is recorded in
-<a href="index.json">index.json</a>, which is how the name lookup above
-works. Built $built.</p>
+
+<p>A minibatch is a read of the baskets it needs and nothing else, so the loop
+starts at the first batch rather than at the end of a download, and a dataset
+larger than the machine is not a problem. Reading the same data over and over,
+or from further away than you would like? <code>xrd.ml.load("mnist",
+cache=True)</code> pulls the file once into <code>~/.cache/xrd</code>, checks
+it against this catalogue, and reads from your own disk ever after.</p>
+
+<h2>Three ways to the same bytes</h2>
+<table class="ways">
+<tbody>
+<tr><td><code>root://</code></td>
+    <td>The native protocol: parallel, resumable, vector reads, checksums on
+    the wire. Public and read-only.
+    <pre>xrd.ml.load("$root_url//mnist.root")</pre></td></tr>
+<tr><td><code>https://</code></td>
+    <td>Range requests, for anything that speaks HTTP &mdash; a browser, a
+    notebook, <code>curl</code>, a batch node behind a proxy.
+    <pre>xrd.ml.load("$base_url/mnist.root")</pre></td></tr>
+<tr><td>browser</td>
+    <td>Every name in the table below is a link. Click one and you have the
+    file; nothing here needs a login, an account or a token.</td></tr>
+</tbody>
+</table>
+
+<p class="muted">Served by <a href="https://github.com/rob-c/PyXRootDClient"
+>PyXRootDClient</a> against a BriX-Cache endpoint, read-only on every plane.
+Each file carries its licence and source in its <code>about</code> key; the
+same is recorded in <a href="index.json">index.json</a>, which is how the name
+lookup above works. Built $built.</p>
 <input id="q" type="search" placeholder="filter by name, title or licence"
        aria-label="filter">
 <table>
@@ -460,10 +513,14 @@ WantedBy=multi-user.target
 _README = """\
 # $title
 
-$count machine-learning datasets, converted to ROOT files by
+$count machine-learning dataset$plural, converted to ROOT files by
 `xrd-datasets build`, indexed in `index.json`, and checksummed in
 `MANIFEST`. Every file says what it is and what its licence is in its own
 `about` key, so it keeps saying so wherever it is copied.
+
+They are served over XRootD, the data-access protocol high-energy physics
+built for globally distributed analysis and runs across the OSG and the
+WLCG. Training data streams the same way the physics does.
 
 ## Use it
 
@@ -473,7 +530,18 @@ $count machine-learning datasets, converted to ROOT files by
     python -c 'import xrd.ml; print(xrd.ml.load("iris"))'
 
 Any dataset name in the table on the site works; `index.json` is the
-catalogue that resolves it.
+catalogue that resolves it. A whole URL works too, on either plane:
+
+    xrd.ml.load("$root_url//iris.root")     # native, streamed
+    xrd.ml.load("$base_url/iris.root")      # HTTP ranges
+
+Nothing is downloaded: a minibatch reads the baskets it needs. To keep a
+local copy anyway - the same data read many times, or a slow link -
+
+    xrd.ml.load("iris", cache=True)
+
+pulls it once into `~/.cache/xrd`, checks it against this catalogue, and
+reads from disk after that.
 
 ## Serve it
 
@@ -562,6 +630,11 @@ def _parser() -> argparse.ArgumentParser:
     site.add_argument("directory", help="a directory that build wrote")
     site.add_argument(
         "--base-url", metavar="URL", help="where this directory will be served from"
+    )
+    site.add_argument(
+        "--root-url",
+        metavar="URL",
+        help="the public root:// endpoint (default: the base URL's host)",
     )
     site.add_argument(
         "--title", default="Open datasets, as ROOT files", help="what the page calls itself"

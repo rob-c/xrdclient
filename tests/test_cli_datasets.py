@@ -236,6 +236,43 @@ def test_site_writes_the_page_and_every_serving_config(registry, mirror, out, ca
     assert "index.html" in output
 
 
+def test_the_page_advertises_the_protocol_and_where_it_answers(registry, mirror, out, capsys):
+    """A visitor should be able to tell what this is served over, and why."""
+    built(out, mirror, capsys)
+    run(["site", str(out), "--base-url", "https://data.example.org"], capsys)
+    page = (out / "index.html").read_text()
+    assert "XRootD" in page and "WLCG" in page and "OSG" in page
+    assert "root://data.example.org//mnist.root" in page  # the native plane
+    assert "https://data.example.org/mnist.root" in page  # and the HTTP one
+    assert "cache=True" in page  # and the local copy, for those who want one
+
+
+def test_the_root_endpoint_can_live_somewhere_else(registry, mirror, out, capsys):
+    built(out, mirror, capsys)
+    run(
+        [
+            "site",
+            str(out),
+            "--base-url",
+            "https://data.example.org",
+            "--root-url",
+            "root://xrootd.example.org:1094/",
+        ],
+        capsys,
+    )
+    page = (out / "index.html").read_text()
+    assert "root://xrootd.example.org:1094//mnist.root" in page
+    assert "root://data.example.org" not in page
+
+
+def test_the_readme_says_both_planes_and_the_cache(registry, mirror, out, capsys):
+    built(out, mirror, capsys)
+    run(["site", str(out), "--base-url", "https://data.example.org"], capsys)
+    readme = (out / "README.md").read_text()
+    assert "root://data.example.org//iris.root" in readme
+    assert 'load("iris", cache=True)' in readme
+
+
 def test_site_json_lists_what_it_wrote(registry, mirror, out, capsys):
     built(out, mirror, capsys)
     code, output, _ = run(["site", str(out), "--json"], capsys)

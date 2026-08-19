@@ -22,7 +22,7 @@ import types
 import pytest
 
 import xrd
-from xrd.ml import Column, Dataset, _pool, load
+from xrd.ml import Column, Dataset, _pool, download, load
 from xrd.root import Histogram, create, open_root
 
 DATA = pathlib.Path(__file__).parent / "data"
@@ -547,3 +547,150 @@ def test_a_file_that_exists_is_never_shadowed_by_the_catalogue(digits, monkeypat
     monkeypatch.chdir(plain.parent)
     with load("digits") as data:  # no catalogue set, and none needed
         assert len(data) == 18
+
+
+# ---------------------------------------------------------------------------
+# Pulling a dataset once, and reading it from disk after
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def served(digits):
+    """A one-dataset catalogue over HTTP, with the index a build would write."""
+    from xrd.crypto import checksum_file
+    from xrd.testing import FakeDAVServer
+
+    raw = pathlib.Path(digits).read_bytes()
+    entry = {
+        "name": "digits",
+        "file": "digits.root",
+        "bytes": len(raw),
+        "adler32": checksum_file("adler32", [raw]),
+    }
+    index = json.dumps({"format": 1, "datasets": [entry]})
+    files = {"/d/index.json": index.encode(), "/d/digits.root": raw}
+    with FakeDAVServer(files=files) as server:
+        yield types.SimpleNamespace(url=f"{server.url}d", raw=raw, entry=entry)
+
+
+def test_a_dataset_is_pulled_to_the_cache_and_named_after_itself(served, tmp_path):
+    where = download("digits", into=tmp_path, config=xrd.Config(catalogue=served.url))
+    assert where.parent == tmp_path
+    assert where.name.endswith("-digits.root")
+    assert where.read_bytes() == served.raw
+
+
+def test_a_dataset_pulled_once_is_read_without_the_server(served, tmp_path):
+    """The point of the cache: the second run does not need the network at all."""
+    config = xrd.Config(catalogue=served.url)
+    first = download("digits", into=tmp_path, config=config)
+    with load(first) as data:
+        assert len(data) == 18
+    # The catalogue is gone; only the copy on disk can answer now.
+    again = download(str(served.url) + "/digits.root", into=tmp_path)
+    assert again.read_bytes() == served.raw
+
+
+def test_the_cache_directory_is_where_the_config_says(served, tmp_path):
+    config = xrd.Config(catalogue=served.url, cache_dir=str(tmp_path / "c"))
+    where = download("digits", config=config)
+    assert where.parent == tmp_path / "c" / "datasets"
+
+
+def test_a_file_already_here_is_its_own_cache(digits, tmp_path):
+    """Nothing is copied for a path that is local already."""
+    cache = tmp_path / "cache"
+    assert download(digits, into=cache) == pathlib.Path(digits)
+    assert not cache.exists()
+
+
+def test_two_catalogues_offering_one_name_do_not_land_on_each_other():
+    from xrd.ml import _cache_name
+
+    a = _cache_name("https://one.example.org/mnist.root")
+    b = _cache_name("https://two.example.org/mnist.root")
+    assert (a.endswith("-mnist.root"), b.endswith("-mnist.root"), a == b) == (True, True, False)
+
+
+def test_a_source_with_no_file_name_left_in_it_still_names_a_file():
+    from xrd.ml import _cache_name
+
+    assert _cache_name("/").endswith("-dataset.root")
+
+
+def test_a_second_pull_of_what_is_there_transfers_nothing(served, tmp_path, monkeypatch):
+    config = xrd.Config(catalogue=served.url)
+    download("digits", into=tmp_path, config=config)
+
+    def refuse(*args, **options):
+        raise AssertionError("the cached copy should have been enough")
+
+    # ``xrd.copy`` the name is the function; the module it shadows is the one
+    # ``download`` imports from, so that is the one to take the copy out of.
+    monkeypatch.setattr(sys.modules["xrd.copy"], "copy", refuse)
+    assert download("digits", into=tmp_path, config=config).read_bytes() == served.raw
+
+
+def test_refresh_pulls_over_what_is_already_there(served, tmp_path):
+    config = xrd.Config(catalogue=served.url)
+    where = download("digits", into=tmp_path, config=config)
+    where.write_bytes(b"not the dataset any more")
+    assert download("digits", into=tmp_path, config=config, refresh=True).read_bytes() == served.raw
+
+
+def test_a_copy_of_the_wrong_length_is_refused_and_not_kept(served, tmp_path, monkeypatch):
+    """The catalogue said how big it is, so a short file is a failed pull."""
+    monkeypatch.setattr(
+        "xrd.ml._agrees",
+        lambda part, entry, source: (_ for _ in ()).throw(ValueError("truncated")),
+    )
+    with pytest.raises(ValueError, match="truncated"):
+        download("digits", into=tmp_path, config=xrd.Config(catalogue=served.url))
+    assert list(tmp_path.glob("*.part")) == []
+
+
+def test_a_length_the_catalogue_disagrees_with_is_named(served, tmp_path):
+    from xrd.ml import _agrees
+
+    part = tmp_path / "short.root"
+    part.write_bytes(b"nowhere near")
+    with pytest.raises(ValueError, match="bytes long, and its catalogue says"):
+        _agrees(part, served.entry, "digits")
+
+
+def test_a_checksum_the_catalogue_disagrees_with_is_named(served, tmp_path):
+    from xrd.ml import _agrees
+
+    part = tmp_path / "wrong.root"
+    part.write_bytes(b"x" * served.entry["bytes"])
+    with pytest.raises(ValueError, match="adler32"):
+        _agrees(part, served.entry, "digits")
+
+
+def test_a_url_nobody_catalogued_is_taken_as_it_arrives(served, tmp_path):
+    """With no entry there is nothing to hold the bytes to but the copy itself."""
+    from xrd.ml import _agrees
+
+    part = tmp_path / "loose.root"
+    part.write_bytes(b"whatever this is")
+    _agrees(part, {}, "https://host/loose.root")
+
+
+def test_load_can_do_the_pull_itself(served, tmp_path):
+    config = xrd.Config(catalogue=served.url, cache_dir=str(tmp_path))
+    with load("digits", cache=True, config=config) as data:
+        assert len(data) == 18
+    assert (tmp_path / "datasets").is_dir()
+
+
+def test_load_takes_a_directory_to_cache_into(served, tmp_path):
+    config = xrd.Config(catalogue=served.url)
+    with load("digits", cache=tmp_path, config=config) as data:
+        assert len(data) == 18
+    assert list(tmp_path.glob("*-digits.root"))
+
+
+def test_caching_a_file_that_is_already_open_is_a_mistake_worth_naming(digits):
+    with open(digits, "rb") as handle:
+        with pytest.raises(ValueError, match="not an already-open file"):
+            load(handle, cache=True)

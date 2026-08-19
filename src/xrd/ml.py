@@ -34,10 +34,12 @@ from __future__ import annotations
 
 import array
 import dataclasses
+import hashlib
 import json
 import math
 import os
 from collections.abc import Iterator, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from .root import open_root
@@ -46,13 +48,14 @@ from .root.interp import Numeric
 # ``_torch`` is the import of PyTorch with the refusal that says what to
 # install; there is one of those in this library and this module wants it too.
 from .root.ml import _torch, mixed, numeric
+from .url import parse
 
 if TYPE_CHECKING:
     from .config import Config
     from .root.file import ROOTFile
     from .root.tree import TTree
 
-__all__ = ["load", "Dataset", "Split", "Column"]
+__all__ = ["load", "download", "Dataset", "Split", "Column"]
 
 #: Tree-name prefixes that mean "this part of the data", in the order they
 #: belong in a summary: a dataset is trained on the first and scored on the
@@ -130,6 +133,7 @@ def load(
     answer: str | None = None,
     scale: bool = True,
     step: int | None = None,
+    cache: bool | str | os.PathLike[str] = False,
     config: Config | None = None,
 ) -> Dataset:
     """Open a dataset, wherever it is.
@@ -148,11 +152,27 @@ def load(
     names - see :class:`Dataset` - and ``inputs`` and ``answer`` say so
     outright when a file's names are its own.
 
+    ``cache=True`` pulls the file to :attr:`~xrd.Config.cache_dir` first and
+    opens it from there, so the network is paid once and every run afterwards
+    is a local read - see :func:`download`, of which this is the shorthand.
+    Pass a directory instead of ``True`` to say where. It is off by default
+    because streaming is the point: a training loop reads the baskets it wants
+    and never the whole file, so a cache only earns its keep when the same
+    dataset is read over and over, or read where the network is worse than the
+    disk.
+
     The dataset holds the file open. Use it in a ``with`` block, or let it go
     and it closes itself.
     """
-    if isinstance(source, str) and _is_name(source):
-        source = _from_catalogue(source, config)
+    if cache is not False:
+        if not isinstance(source, str):
+            raise ValueError(
+                "cache= pulls a file to a local copy, so it needs somewhere to "
+                "pull from: a name or a URL, not an already-open file"
+            )
+        source = str(download(source, into=None if cache is True else cache, config=config))
+    elif isinstance(source, str) and _is_name(source):
+        source = _from_catalogue(source, config)[0]
     handle = open_root(source, config=config)
     try:
         return Dataset(
@@ -178,8 +198,13 @@ def _is_name(source: str) -> bool:
     )
 
 
-def _from_catalogue(name: str, config: Config | None) -> str:
-    """The URL behind ``name``, according to the catalogue's ``index.json``."""
+def _from_catalogue(name: str, config: Config | None) -> tuple[str, dict[str, Any]]:
+    """The URL behind ``name`` and its index entry, from the catalogue.
+
+    The entry comes back with the URL because it carries the size and the
+    checksum of what should arrive, which is what makes a pulled copy
+    checkable rather than merely present.
+    """
     from .config import Config as _Config
     from .root.datasets import fetch
 
@@ -194,12 +219,114 @@ def _from_catalogue(name: str, config: Config | None) -> str:
     index = json.loads(fetch(f"{base}/index.json", config=config))
     for entry in index["datasets"]:
         if entry["name"] == name:
-            return f"{base}/{entry['file']}"
+            return f"{base}/{entry['file']}", entry
     names = sorted(entry["name"] for entry in index["datasets"])
     held = ", ".join(names[:8]) + (f", and {len(names) - 8} more" if len(names) > 8 else "")
     raise ValueError(
         f"the catalogue at {where} has {held or 'nothing in it'}, and no {name!r}"
     )
+
+
+def download(
+    source: str,
+    *,
+    into: str | os.PathLike[str] | None = None,
+    refresh: bool = False,
+    config: Config | None = None,
+) -> Path:
+    """Pull a dataset once and hand back the path it now lives at.
+
+        >>> path = download("mnist")                               # doctest: +SKIP
+        >>> data = load(path)                                      # doctest: +SKIP
+
+    ``source`` is what :func:`load` takes: a catalogue name, or a URL of any
+    scheme this library speaks. The file lands under
+    :attr:`~xrd.Config.cache_dir` - ``$XRD_CACHE``, or
+    ``~/.cache/xrd/datasets`` - unless ``into`` names somewhere else, and a
+    second call with the same source transfers nothing and returns the same
+    path. Anything already on this machine is its own cache: a local path
+    comes straight back, uncopied.
+
+    The pull goes to a ``.part`` beside the target and is renamed onto it only
+    once the bytes are all there and the catalogue's checksum agrees, so an
+    interrupted or corrupted transfer leaves nothing that a later run would
+    mistake for the dataset. That check is why a cache hit is cheap: the file
+    is re-checked for length, but nothing that was renamed into place was ever
+    unverified, so its digest is not recomputed on every open. ``refresh=True``
+    pulls again over whatever is there.
+
+    This is the download that :func:`load` exists to avoid, and it is worth
+    reaching for when the same data is read many times over, or from somewhere
+    the network is slower than the disk. For a single pass, streaming is
+    faster to start and reads less.
+    """
+    from .config import Config as _Config
+
+    settings = config or _Config()
+    entry: dict[str, Any] = {}
+    if _is_name(source):
+        source, entry = _from_catalogue(source, settings)
+    if parse(source).is_local:
+        return Path(source)
+    where = Path(into) if into is not None else Path(settings.cache_dir) / "datasets"
+    target = where / _cache_name(source)
+    if not refresh and _cached(target, entry):
+        return target
+    where.mkdir(parents=True, exist_ok=True)
+    part = target.with_name(target.name + ".part")
+    from .copy import copy
+
+    copy(source, str(part), config=settings)
+    try:
+        _agrees(part, entry, source)
+    except BaseException:
+        part.unlink(missing_ok=True)  # a bad copy is not left where a run could find it
+        raise
+    os.replace(part, target)
+    return target
+
+
+def _cache_name(url: str) -> str:
+    """A file name that belongs to this URL and to no other.
+
+    The name of the file is kept so that a cache directory can be read by a
+    person, and a digest of the whole URL goes in front of it so that two
+    catalogues offering their own ``mnist.root`` cannot land on one another.
+    """
+    stem = url.rstrip("/").rsplit("/", 1)[-1] or "dataset.root"
+    return f"{hashlib.sha256(url.encode()).hexdigest()[:12]}-{stem}"
+
+
+def _cached(target: Path, entry: dict[str, Any]) -> bool:
+    """Whether ``target`` is already the file the entry describes."""
+    if not target.exists():
+        return False
+    return "bytes" not in entry or target.stat().st_size == entry["bytes"]
+
+
+def _agrees(part: Path, entry: dict[str, Any], source: str) -> None:
+    """Raise unless the pulled bytes are what the catalogue said they would be.
+
+    A URL nobody catalogued arrives with nothing to check it against, and the
+    copy's own verification is all there is; a name out of a catalogue can be
+    held to the size and digest that catalogue published.
+    """
+    size = part.stat().st_size
+    if "bytes" in entry and size != entry["bytes"]:
+        raise ValueError(
+            f"{source} arrived {size} bytes long, and its catalogue says "
+            f"{entry['bytes']}"
+        )
+    if "adler32" in entry:
+        from .crypto import checksum_file
+
+        with part.open("rb") as handle:
+            got = checksum_file("adler32", iter(lambda: handle.read(1 << 20), b""))
+        if got != entry["adler32"]:
+            raise ValueError(
+                f"{source} arrived with adler32 {got}, and its catalogue says "
+                f"{entry['adler32']}"
+            )
 
 
 class Dataset:

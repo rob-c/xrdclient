@@ -20,6 +20,14 @@ streams minibatches straight off your server, with nothing downloaded first
 and nothing installed but this library. This page is how to build that
 directory, keep it honest, and put it on the web.
 
+The protocol underneath is XRootD — the one high-energy physics built for
+globally distributed analysis, and the one the OSG and the WLCG move petabytes
+a day over, between hundreds of sites. That is the point of serving training
+data this way: wide-area reads that were designed for exactly this shape of
+access, a file read in pieces from far away, by many clients at once. The
+generated page says so to every visitor, and names the two planes the data
+answers on.
+
 ## Build it
 
 ```console
@@ -79,11 +87,19 @@ $ xrd-datasets site /srv/datasets --base-url https://data.example.org
 wrote index.html, nginx.conf, brix.conf, xrd-datasets.service, README.md in /srv/datasets
 ```
 
+`--base-url` is where the directory answers to HTTP. The native endpoint is
+taken to be the same host — `root://data.example.org` — which is what a single
+BriX-Cache box serving both planes gives you; `--root-url` says otherwise when
+`root://` lives behind its own name or port.
+
 Everything lands next to the files, so *the directory is the deploy*:
 
 - `index.html` — a browsable, searchable page with the whole index embedded;
   it works served or opened from disk, and shows every visitor the two lines
-  of setup at the top of this page.
+  of setup at the top of this page. It also says what it is served over and
+  by what, gives the `root://` and `https://` URL for a file side by side, and
+  makes every dataset name a link, so a browser is a first-class way in and
+  nothing needs a login, an account or a token.
 - `nginx.conf` — static hosting for any stock nginx: drop it in
   `conf.d/`, and range requests (which `xrd.ml` reads by) come from nginx
   itself.
@@ -112,6 +128,18 @@ xrd.ml.load("mnist")                                        # via XRD_CATALOGUE
 xrd.ml.load("root://data.example.org//mnist.root")          # the native protocol
 xrd.ml.load("https://data.example.org/mnist.root")          # plain HTTP ranges
 ```
+
+Nothing there is downloaded — the loop reads the baskets each batch needs. For
+a set read many times over, or read from further away than you would like, one
+more word keeps a local copy:
+
+```python
+xrd.ml.load("mnist", cache=True)     # pulled once, checked against the index
+```
+
+The pull is verified against the size and `adler32` this site published, so a
+cached file is one the catalogue vouches for rather than merely one that
+arrived. See [Keeping a local copy](ml.md#keeping-a-local-copy).
 
 See [Machine learning](ml.md) for what happens next, and
 [Training playbooks](playbooks.md) for serving a directory ad hoc, with no

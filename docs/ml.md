@@ -223,6 +223,37 @@ as one, so a real path or URL is never shadowed by a catalogue entry. The
 catalogue can also be set per call with `Config(catalogue=...)`, and can be a
 local directory as easily as a URL.
 
+## Keeping a local copy
+
+Streaming is the default because it is usually the faster answer: a minibatch
+is a read of the baskets it needs, so the first batch arrives without waiting
+for the last byte of the file, and a dataset bigger than the machine is not a
+problem. But a copy on disk wins when the same data is read over and over — a
+hyperparameter sweep, an epoch loop on a small set — or when the link is worse
+than the disk.
+
+```python
+data = xrd.ml.load("mnist", cache=True)      # pull once, then read locally
+```
+
+```python
+path = xrd.ml.download("mnist")              # or take the file itself
+```
+
+`download` returns the path the file now lives at, under `cache_dir`
+(`$XRD_CACHE`, or `~/.cache/xrd/datasets`) unless `into=` says otherwise. A
+second call for the same source transfers nothing; a local path is its own
+cache and comes straight back, uncopied. Pass a whole directory to `cache=`
+instead of `True` to put one dataset somewhere of its own.
+
+The pull lands in a `.part` file and is renamed onto the target only once the
+bytes are all there and the catalogue's size and `adler32` agree, so an
+interrupted or corrupted transfer never leaves something a later run would
+mistake for the dataset. That is also why a cache hit is cheap: the length is
+checked, but nothing that reached its final name was ever unverified, so the
+digest is not recomputed on every open. `refresh=True` pulls again over
+whatever is there.
+
 ## When to go a layer down
 
 [`xrd.root.ml`](root.md#into-pytorch-and-tensorflow) is the expert layer, and
