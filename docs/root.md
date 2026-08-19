@@ -940,7 +940,7 @@ datasets.convert("iris", "iris.root")
 | `child_mortality_igme` | 13,980 country-years of child deaths per hundred live births, as the UN counts them | CC BY 4.0 | 145 kB |
 | `adult_literacy` | 1,833 country-years and the share of adults who could read and write | CC BY 4.0 | 20 kB |
 | `human_development_index` | 6,604 country-years scored on health, schooling and income together | CC BY 4.0 | 42 kB |
-| `sea_level` | 563 monthly readings of how far the sea has risen since 1880, in millimetres | CC BY 4.0 | 15 kB |
+| `sea_level` | 563 quarterly readings of how far the sea has risen since 1880, in millimetres | CC BY 4.0 | 15 kB |
 | `abortion_and_crime` | 19,584 state-years used to ask whether legal abortion cut crime | MIT | 320 kB |
 | `adult_services` | 1,787 sessions sold by escorts and what each one was paid for | MIT | 39 kB |
 | `affair_counts` | 601 married people and how many affairs each admitted to | GPL-2 | 12 kB |
@@ -1109,7 +1109,7 @@ datasets.convert("iris", "iris.root")
 | `hydro_electricity_share` | 7,777 country-years and the share of electricity taken from falling water | CC BY 4.0 | 70 kB |
 | `electricity_per_person` | 7,071 country-years of electricity generated for every person living there | CC BY 4.0 | 64 kB |
 | `electricity_demand` | 6,378 country-years of electricity asked for, in terawatt-hours | CC BY 4.0 | 42 kB |
-| `fossil_fuel_energy` | 6,405 country-years of energy taken from fossil fuels, in terawatt-hours | CC BY 4.0 | 59 kB |
+| `fossil_fuel_energy` | 11,989 country-years of energy taken from fossil fuels, in terawatt-hours | CC BY 4.0 | 116 kB |
 | `electricity_carbon_intensity` | 6,332 country-years and the carbon a kilowatt-hour of electricity cost | CC BY 4.0 | 46 kB |
 | `coal_production` | 17,032 country-years of coal dug up, counted in terawatt-hours | CC BY 4.0 | 118 kB |
 | `oil_production` | 17,992 country-years of oil pumped, counted in terawatt-hours | CC BY 4.0 | 116 kB |

@@ -2313,11 +2313,13 @@ def test_the_country_year_charts_all_read_the_csv_owid_serves():
 
 
 def test_every_chart_but_the_sea_measures_a_country_a_year_at_a_time():
-    days = [name for name in CHARTS if ("day", "date") in DATASETS[name].fields]
-    assert days == ["sea_level"]
-    assert DATASETS["sea_level"].dates == "%Y-%m-%d"
+    yearly = [name for name in CHARTS if ("year", "i") in DATASETS[name].fields]
+    assert sorted(set(CHARTS) - set(yearly)) == ["sea_level"]
+    # The sea is read every quarter, and OWID writes a quarter as ``1880-Q2``,
+    # which no date format parses - so the column keeps the text it is given
+    # rather than being turned into a day nobody measured.
+    assert ("quarter", "text") in DATASETS["sea_level"].fields
     assert DATASETS["sea_level"].fields[-1] == ("sea_level_mm", "target")
-    assert all(("year", "i") in DATASETS[name].fields for name in CHARTS if name not in days)
 
 
 def test_the_charts_that_carry_a_region_or_a_note_keep_it_beside_the_measure():
@@ -2549,8 +2551,8 @@ def test_every_chart_on_the_second_shelf_but_the_ice_counts_by_the_year():
 
 def test_a_chart_that_carries_more_than_one_measure_predicts_the_named_one():
     late = [name for name in CHARTS_TWO if DATASETS[name].fields[-1][1] != "target"]
-    assert late == ["electricity_carbon_intensity", "temperature_anomaly",
-                    "sea_surface_temperature", "forest_cover", "maternal_mortality"]
+    assert late == ["temperature_anomaly", "sea_surface_temperature",
+                    "forest_cover", "maternal_mortality"]
     assert DATASETS["temperature_anomaly"].fields[3:] == (
         ("anomaly_c", "target"), ("anomaly_low", "d"), ("anomaly_high", "d"))
     assert DATASETS["sea_surface_temperature"].fields[3:] == (
@@ -2558,7 +2560,9 @@ def test_a_chart_that_carries_more_than_one_measure_predicts_the_named_one():
     assert DATASETS["maternal_mortality"].fields[3:] == (
         ("deaths_per_100k", "target"), ("region", "text"), ("note", "text"))
     assert DATASETS["forest_cover"].fields[-1] == ("note", "text")
-    assert DATASETS["electricity_carbon_intensity"].fields[-1] == ("region", "text")
+    # The carbon-intensity chart used to carry a region beside the measure and
+    # no longer does: OWID reshaped it to the four columns it has now.
+    assert DATASETS["electricity_carbon_intensity"].fields[-1] == ("grams_per_kwh", "target")
 
 
 def test_a_chart_from_the_second_shelf_writes_every_country_year_into_one_tree():

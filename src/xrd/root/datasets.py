@@ -5565,8 +5565,11 @@ _HUMAN_DEVELOPMENT_INDEX_FIELDS: tuple[tuple[str, str], ...] = (
     ("hdi", "target"), ("region", "text"),
 )
 
+#: The readings are quarterly and the file says so in its own terms - ``1880-Q2``
+#: - which is not a date any format string parses, so the quarter is kept as the
+#: text it is rather than invented into a day.
 _SEA_LEVEL_FIELDS: tuple[tuple[str, str], ...] = (
-    ("entity", "text"), ("code", "text"), ("day", "date"),
+    ("entity", "text"), ("code", "text"), ("quarter", "text"),
     ("church_and_white", "d"), ("uhslc", "d"), ("sea_level_mm", "target"),
 )
 
@@ -7094,7 +7097,7 @@ _FOSSIL_FUEL_ENERGY_FIELDS: tuple[tuple[str, str], ...] = (
 
 _ELECTRICITY_CARBON_INTENSITY_FIELDS: tuple[tuple[str, str], ...] = (
     ("entity", "text"), ("code", "text"), ("year", "i"),
-    ("grams_per_kwh", "target"), ("region", "text"),
+    ("grams_per_kwh", "target"),
 )
 
 _COAL_PRODUCTION_FIELDS: tuple[tuple[str, str], ...] = (
@@ -13272,13 +13275,13 @@ DATASETS: dict[str, Images | CIFAR | Audio | Matrix | Table] = {
     "sea_level": Table(
         name="sea_level",
         label="Global Sea Level",
-        title="563 monthly readings of how far the sea has risen since 1880, in millimetres",
+        title="563 quarterly readings of how far the sea has risen since 1880, in millimetres",
         licence="CC BY 4.0",
         source="https://ourworldindata.org/grapher/sea-level",
         classes=(),
         url="https://ourworldindata.org/grapher/sea-level.csv?v=1&csvType=full&useColumnShortNames=true",
         header=True,
-        text_size=8,
+        text_size=16,
         fields=_SEA_LEVEL_FIELDS,
     ),
     "abortion_and_crime": Table(
@@ -15743,13 +15746,13 @@ DATASETS: dict[str, Images | CIFAR | Audio | Matrix | Table] = {
     "fossil_fuel_energy": Table(
         name="fossil_fuel_energy",
         label="Fossil Fuel Consumption",
-        title="6,405 country-years of energy taken from fossil fuels, in terawatt-hours",
+        title="11,989 country-years of energy taken from fossil fuels, in terawatt-hours",
         licence="CC BY 4.0",
         source="https://ourworldindata.org/grapher/fossil-fuel-primary-energy",
         classes=(),
         url="https://ourworldindata.org/grapher/fossil-fuel-primary-energy.csv?v=1&csvType=full&useColumnShortNames=true",
         header=True,
-        text_size=30,
+        text_size=48,
         fields=_FOSSIL_FUEL_ENERGY_FIELDS,
     ),
     "electricity_carbon_intensity": Table(
@@ -15761,7 +15764,7 @@ DATASETS: dict[str, Images | CIFAR | Audio | Matrix | Table] = {
         classes=(),
         url="https://ourworldindata.org/grapher/carbon-intensity-electricity.csv?v=1&csvType=full&useColumnShortNames=true",
         header=True,
-        text_size=35,
+        text_size=48,
         fields=_ELECTRICITY_CARBON_INTENSITY_FIELDS,
     ),
     "coal_production": Table(
