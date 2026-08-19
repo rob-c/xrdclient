@@ -18,6 +18,7 @@ one moment where at-most-once is the only safe answer.
 from __future__ import annotations
 
 import struct
+import time
 
 import pytest
 
@@ -26,6 +27,7 @@ from xrd.client.file import File
 from xrd.config import Config
 from xrd.errors import ChecksumMismatchError, TransientError, WaitLimitError
 from xrd.errors import ConnectionError as XrdConnectionError
+from xrd.errors import TimeoutError as XrdTimeoutError
 from xrd.flags import OpenFlags
 from xrd.proto import constants as c
 from xrd.proto import machine as m
@@ -143,10 +145,14 @@ def test_a_write_is_not_replayed_over_a_reconnect(server):
     server.add_file("/data/w.root", b"")
     handle = File(server.url.with_path("/data/w.root"), IMPATIENT)
     handle.open(OpenFlags.UPDATE)
-    with handle:
-        vanish_once(server, c.kXR_write)
-        with pytest.raises((TransientError, XrdConnectionError)):
-            handle.write(b"payload", 0)
+    vanish_once(server, c.kXR_write)
+    with pytest.raises((TransientError, XrdConnectionError)):
+        handle.write(b"payload", 0)
+    # The handle was opened for writing and its server has gone, so the close
+    # cannot commit the file either - and a writer's close says so rather
+    # than letting the caller believe the write landed.
+    with pytest.raises((TransientError, XrdConnectionError)):
+        handle.close()
     assert server.seen.count(c.kXR_write) == 1
 
 
@@ -322,6 +328,96 @@ def test_an_absurd_wait_is_capped_rather_than_obeyed():
     waiting = [e for e in machine.events() if isinstance(e, m.Waiting)]
     assert waiting[0].seconds == 0.25
     assert waiting[0].resend
+
+
+# ---------------------------------------------------------------------------
+# The stall deadline: a peer that is neither answering nor gone
+# ---------------------------------------------------------------------------
+
+#: Long enough that nothing healthy trips it, short enough to test with.
+IMPATIENT_STALL = IMPATIENT.evolve(stall_deadline=0.5, request_timeout=30.0)
+
+
+def test_a_server_that_goes_quiet_is_given_up_on(server):
+    """No reply at all: the socket is open, the peer is running, nothing is
+    coming. Only an absolute deadline ends this."""
+
+    def silence(conn, sid, params, body):
+        return iter(())
+
+    server.handlers[c.kXR_stat] = silence
+    with Session.connect(server.url, config=IMPATIENT_STALL) as session:
+        started = time.monotonic()
+        with pytest.raises(XrdTimeoutError, match="stall deadline"):
+            session.execute(r.Stat("/data/a.root"), path="/data/a.root")
+        assert time.monotonic() - started < IMPATIENT_STALL.request_timeout
+
+
+def test_a_server_that_dribbles_is_given_up_on_too(server):
+    """The case a per-read timeout cannot catch: every read succeeds, and the
+    operation still never finishes."""
+
+    def dribble(conn, sid, params, body):
+        # A header promising far more than will ever arrive, then one byte at
+        # a time: every read returns something, so no read ever times out.
+        yield frame(sid, c.kXR_ok, b"\x00" * 4096)[:8]
+        for _ in range(4096):
+            time.sleep(0.05)
+            yield b"\x00"
+
+    server.handlers[c.kXR_stat] = dribble
+    with Session.connect(server.url, config=IMPATIENT_STALL) as session:
+        with pytest.raises(XrdTimeoutError, match="stall deadline"):
+            session.execute(r.Stat("/data/a.root"), path="/data/a.root")
+
+
+def test_a_wait_restarts_the_deadline_rather_than_spending_it(server):
+    """A server that says "not yet" is not stalling, so the delay it asked
+    for must not be charged against the cutoff it would otherwise trip."""
+
+    def slow(conn, sid, params, body):
+        yield frame(sid, c.kXR_wait, struct.pack(">i", 1) + b"staging\x00")
+        yield frame(sid, c.kXR_ok, conn._stat_line("/data/a.root"))
+
+    server.handlers[c.kXR_stat] = slow
+    with Session.connect(server.url, config=IMPATIENT_STALL) as session:
+        # The whole operation outlasts the deadline; the wait is why.
+        assert session.execute(r.Stat("/data/a.root"), path="/data/a.root").data
+
+
+def test_a_deferred_reply_extends_the_deadline_without_a_resend(server):
+    """``kXR_waitresp`` is "the answer is coming later" - the deadline has to
+    cover the delay the server named, and nothing is sent again."""
+
+    def deferred(conn, sid, params, body):
+        yield frame(sid, c.kXR_waitresp, struct.pack(">i", 1))
+        time.sleep(0.8)  # past the bare deadline, inside the extended one
+        yield frame(sid, c.kXR_ok, conn._stat_line("/data/a.root"))
+
+    server.handlers[c.kXR_stat] = deferred
+    with Session.connect(server.url, config=IMPATIENT_STALL) as session:
+        assert session.execute(r.Stat("/data/a.root"), path="/data/a.root").data
+    assert server.seen.count(c.kXR_stat) == 1
+
+
+def test_the_parking_a_server_asks_for_is_bounded_in_total(server):
+    """Each wait restarts the deadline, so without this a server could park a
+    caller forever one honest delay at a time."""
+
+    def parked(conn, sid, params, body):
+        yield frame(sid, c.kXR_wait, struct.pack(">i", 10) + b"come back\x00")
+
+    server.handlers[c.kXR_stat] = parked
+    with Session.connect(server.url, config=IMPATIENT_STALL.evolve(wait_budget=0.5)) as session:
+        with pytest.raises(WaitLimitError, match="budget for one operation"):
+            session.execute(r.Stat("/data/a.root"), path="/data/a.root")
+
+
+def test_the_deadline_can_be_turned_off(server):
+    """A caller who would rather wait forever than lose a transfer."""
+    with Session.connect(server.url, config=IMPATIENT.evolve(stall_deadline=0)) as session:
+        assert session._armed() is None
+        assert session.execute(r.Stat("/data/a.root"), path="/data/a.root").data
 
 
 # ---------------------------------------------------------------------------

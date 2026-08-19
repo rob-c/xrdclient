@@ -209,7 +209,7 @@ def test_a_read_answered_with_more_than_was_asked_for_is_refused(hostile):
     handle = File(client.url.with_path("/data/a.root"), client.config, router=client._router)
     handle.open(OpenFlags.READ)
     try:
-        with pytest.raises(ProtocolError, match="answered a 8 byte read"):
+        with pytest.raises(ProtocolError, match="more than the 8 bytes it asked for"):
             handle.read(8)
     finally:
         handle.close()
@@ -223,7 +223,7 @@ def test_a_paged_read_answered_with_more_than_was_asked_for_is_refused(hostile, 
     handle = File(client.url.with_path("/data/a.root"), client.config, router=client._router)
     handle.open(OpenFlags.READ)
     try:
-        with pytest.raises(ProtocolError, match="paged read"):
+        with pytest.raises(ProtocolError, match="more than the 68 bytes it asked for"):
             handle.pgread(64, 0)
     finally:
         handle.close()
@@ -259,15 +259,18 @@ def test_a_vector_read_segment_longer_than_asked_for_is_refused(hostile, server)
     from xrd.flags import OpenFlags
 
     def too_generous(conn, sid, params, body):
+        # One segment, four times the length asked for - and still inside what
+        # the two ranges together allow, so the per-segment check is the only
+        # thing standing between the caller and the wrong bytes.
         fhandle = body[:4]
-        yield frame(sid, c.kXR_ok, _readv_body(fhandle, [(0, b"x" * 99)]))
+        yield frame(sid, c.kXR_ok, _readv_body(fhandle, [(0, b"x" * 20)]))
 
     client = hostile(c.kXR_readv, too_generous)
     handle = File(client.url.with_path("/data/a.root"), client.config, router=client._router)
     handle.open(OpenFlags.READ)
     try:
-        with pytest.raises(ProtocolError, match="99 bytes"):
-            handle.readv([(0, 5)])
+        with pytest.raises(ProtocolError, match="20 bytes"):
+            handle.readv([(0, 5), (6, 5)])
     finally:
         handle.close()
 

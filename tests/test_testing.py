@@ -235,16 +235,18 @@ def test_an_unsupported_query_is_refused():
             fs._router.execute(r.Query(c.kXR_Qopaquf, "/"))
 
 
-def test_a_corrupt_pgwrite_is_rejected():
-    from xrd.errors import ChecksumMismatchError
+def test_a_corrupt_pgwrite_is_reported_page_by_page():
+    """Stock stores what it was sent and names the pages whose CRC did not
+    survive the trip, so the client can resend those and only those."""
     from xrd.proto import requests as r
+    from xrd.proto.responses import parse_pgwrite_cse
 
     with FakeServer() as srv:
         handle = xrd.File(srv.url / "corrupt.bin")
         handle.open(xrd.OpenFlags.UPDATE | xrd.OpenFlags.NEW | xrd.OpenFlags.MAKEPATH)
         payload = struct.pack(">I", 0xDEADBEEF) + b"bad page"
-        with pytest.raises(ChecksumMismatchError):
-            handle._router.execute(r.PgWrite(handle.handle, 0, payload))
+        result = handle._router.execute(r.PgWrite(handle.handle, 0, payload))
+        assert parse_pgwrite_cse(result.data) == (0,)
         handle.close()
 
 

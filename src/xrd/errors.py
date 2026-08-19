@@ -21,9 +21,11 @@ __all__ = [
     "CredentialError",
     "TokenExpiredError",
     "ServerError",
+    "TLSRequiredError",
     "RedirectLimitError",
     "WaitLimitError",
     "ChecksumMismatchError",
+    "PageIntegrityError",
     "TooLargeError",
     "raise_for_status",
 ]
@@ -119,6 +121,29 @@ class ChecksumMismatchError(XRootDError):
 
     def __reduce__(self) -> tuple:  # type: ignore[type-arg]
         return _rebuild, (type(self), (self.algorithm, self.expected, self.actual), {})
+
+
+class PageIntegrityError(XRootDError):
+    """A ``kXR_pgwrite`` page kept arriving corrupt, past the retry budget.
+
+    Not a :class:`ChecksumMismatchError`: nothing was computed here and found
+    wanting. The server checksummed the page as it arrived, said it did not
+    match what was sent with it, and went on saying so after the page had
+    been retransmitted - so the wire, not the data, is what is broken.
+    """
+
+    def __init__(self, offset: int, retries: int, *, path: str | None = None) -> None:
+        self.offset = offset
+        self.retries = retries
+        self.path = path
+        where = f" of {path}" if path else ""
+        super().__init__(
+            f"the page at offset {offset}{where} was still corrupt on arrival after "
+            f"{retries} retransmissions"
+        )
+
+    def __reduce__(self) -> tuple:  # type: ignore[type-arg]
+        return _rebuild, (type(self), (self.offset, self.retries), {"path": self.path})
 
 
 class TooLargeError(XRootDError):
@@ -225,6 +250,33 @@ class ServerTimeoutError(ServerError, TimeoutError):
         return self._describe()
 
 
+class TLSRequiredError(ServerError, builtins.PermissionError):
+    """A server refusing to do this in the clear.
+
+    A plain :class:`PermissionError` says "you may not"; this one says "not
+    like *this*" - the operation is fine, the connection is not, and retrying
+    over TLS is the whole fix. ``except PermissionError`` still catches it.
+    """
+
+    errno = _errno.EACCES
+
+    def __init__(self, code: int, message: str, *, path: str | None = None) -> None:
+        self.code = code
+        self.message = message
+        self.path = path
+        builtins.PermissionError.__init__(self, _errno.EACCES, message, path)
+        self.args = (_errno.EACCES, message)
+
+    def _describe(self) -> str:
+        return (
+            ServerError._describe(self)
+            + " - the server wants TLS for this operation; connect with roots:// (or davs://)"
+        )
+
+    def __str__(self) -> str:
+        return self._describe()
+
+
 # kXR_* server error codes (src/protocols/root/protocol/opcodes.h).
 kXR_ArgInvalid = 3000
 kXR_ArgMissing = 3001
@@ -285,7 +337,7 @@ _CODE_CLASSES: dict[int, type[ServerError]] = {
     kXR_overQuota: QuotaError,
     kXR_NotAuthorized: PermissionError_,
     kXR_AuthFailed: PermissionError_,
-    kXR_TLSRequired: PermissionError_,
+    kXR_TLSRequired: TLSRequiredError,
     kXR_SigVerErr: PermissionError_,
     kXR_DecryptErr: PermissionError_,
     kXR_BadPayload: InvalidArgumentError,

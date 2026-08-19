@@ -230,6 +230,9 @@ CLONE_ITEM_LEN = 32
 # ---- kXR_sigver ----
 kXR_SHA256_sig = 0x01
 kXR_nodata_sig = 0x01
+#: ``secopt`` bit in the protocol security block: a write's payload joins its
+#: signature instead of travelling unsigned.
+kXR_secOData = 0x01
 kXR_secNone = 0
 kXR_secCompatible = 1
 kXR_secStandard = 2
@@ -242,6 +245,11 @@ kXR_pgUnitSZ = kXR_pgPageSZ + 4
 kXR_pgMaxEpr = 128
 kXR_pgRetry = 0x01
 kXR_pgValid = 0x02
+#: ``cseCRC[4] dlFirst[2] dlLast[2]`` in front of a ``kXR_pgwrite`` reply's
+#: list of corrupt-page offsets.
+PGW_CSE_HDRLEN = 8
+#: How many times one page may be retransmitted before the write is a loss.
+PGW_MAX_RETRY = 3
 kXR_FinalResult = 0x00
 kXR_PartialResult = 0x01
 #: crc32c[4] streamID[2] requestid[1] resptype[1] reserved[4] dlen[4]

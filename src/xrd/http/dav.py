@@ -492,13 +492,15 @@ class HTTPFileSystem(FileSystem):
 
     def _mkcol(self, target: XRootDURL, *, exist_ok: bool) -> None:
         # RFC 4918: MKCOL answers 405 when the collection is already there,
-        # which is "exists", not "the server cannot do this".
+        # which is "exists", not "the server cannot do this". A plain
+        # resource on the name answers 405 too, and ``exist_ok`` does not
+        # forgive that - what exists must be a collection.
         try:
             self.client.request(
                 "MKCOL", target, expect=(201,), errors={405: kXR_ItExists}
             )
         except FileExistsError:
-            if not exist_ok:
+            if not exist_ok or not self.isdir(target.path):
                 raise
 
     def makedirs(self, path: str, mode: int | str = 0o755, exist_ok: bool = False) -> None:
@@ -629,6 +631,7 @@ class HTTPFileSystem(FileSystem):
         self,
         path: str,
         *,
+        create: bool = False,
         refresh: bool = False,
         no_wait: bool = False,
         add_peers: bool = False,
@@ -687,7 +690,7 @@ class HTTPFileSystem(FileSystem):
     def protocol(self) -> ProtocolInfo:
         raise self._unsupported("protocol handshake")
 
-    def deep_locate(self, path: str) -> list[LocationInfo]:
+    def deep_locate(self, path: str, *, create: bool = False) -> list[LocationInfo]:
         raise self._unsupported("locate")
 
     def evict(self, paths: Sequence[str]) -> str:

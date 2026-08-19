@@ -133,7 +133,7 @@ class XRootDFileSystem(AbstractFileSystem):
 
     def ls(self, path: str, detail: bool = True, **kwargs: Any) -> list[Any]:
         filesystem, target = self._target(path)
-        listing = [
+        listing: list[Any] = [
             self._info_of(entry.stat or StatInfo(), posixpath.join(target, entry.name))
             for entry in filesystem.scandir(target)
         ]

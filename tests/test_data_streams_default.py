@@ -131,16 +131,30 @@ def _fast_multistream() -> Config:
     )
 
 
+def _mute_config_queries(server):
+    """Leave the arrival question unanswerable, so the trial decides.
+
+    The session first *asks* whether arrivals are served (``kXR_Qconfig
+    brix.substreams``), and the fake answers - so the tests about the
+    trial-and-timeout fallback need a server whose answer is an error,
+    which settles nothing.
+    """
+
+    def refuse(conn, sid, params, body):
+        yield error(sid, 3006, "queries not served here")
+
+    server.handlers[c.kXR_query] = refuse
+
+
 def test_a_default_open_binds_a_stream(server):
     with xrd.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
         assert fh._data_paths, "open did not bind an automatic data stream"
 
 
 def test_a_multistream_read_is_byte_exact_via_the_standard_split(server):
-    # The fake server is push-only, so the request that arrived on the data
-    # socket is never answered - but the standard split is what this server
-    # does serve, so the read stays on a data path rather than giving up on
-    # one, and the bytes are the bytes either way.
+    # The fake server is push-only and says so when asked, so the read stays
+    # on a data path via the standard split rather than giving up on one, and
+    # the bytes are the bytes either way.
     with xrd.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
         assert fh.read() == b"hello world"
         assert fh._router.session.arrives_on_path is False
@@ -148,10 +162,32 @@ def test_a_multistream_read_is_byte_exact_via_the_standard_split(server):
         assert fh._data_paths, "the file gave up a data path it could have kept"
 
 
+def test_a_stock_server_answers_the_question_and_keeps_its_path(server):
+    # The server disclaims arrival routing when asked, so no request is ever
+    # abandoned on the data socket and the socket never has to be sacrificed.
+    with xrd.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
+        first = list(fh._data_paths)
+        assert fh.read() == b"hello world"
+        assert fh._router.session.arrives_on_path is False
+        assert fh._data_paths == first, "the ask should have spared the socket"
+
+
+def test_a_server_that_advertises_but_will_not_serve_falls_back(server):
+    # The advertisement is taken at its word, and the word is checked: the
+    # trial that follows fails, the socket goes, and the read is byte-exact
+    # via the standard split on a replacement path.
+    server.config_values["brix.substreams"] = "rw"
+    with xrd.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
+        assert fh.read() == b"hello world"
+        assert fh._router.session.arrives_on_path is False
+
+
 def test_the_stream_left_waiting_is_released_with_the_socket(server):
-    # The request that went down the abandoned socket may still be answered
-    # there, so the socket goes; what it was carrying must not be left in
-    # flight for the rest of the session, and its id is free to use again.
+    # With no answer to the question, the trial decides. The request that
+    # went down the abandoned socket may still be answered there, so the
+    # socket goes; what it was carrying must not be left in flight for the
+    # rest of the session, and its id is free to use again.
+    _mute_config_queries(server)
     with xrd.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
         first = list(fh._data_paths)
         assert fh.read() == b"hello world"
@@ -246,6 +282,7 @@ def test_a_file_that_cannot_rebind_finishes_on_the_control_link(server, monkeypa
     from xrd.errors import XRootDError
     from xrd.session.sync import Session
 
+    _mute_config_queries(server)
     real = Session.bind_data_path
     bound = []
 

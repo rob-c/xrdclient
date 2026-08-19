@@ -172,6 +172,22 @@ class Config:
     retry_backoff: float = field(default_factory=lambda: _env_float("XRD_STREAMERRORWINDOW", 0.5))
     redirect_limit: int = field(default_factory=lambda: _env_int("XRD_REDIRECTLIMIT", 16))
     wait_cap: float = 600.0
+    #: Ceiling on one whole logical operation, from the request going out to
+    #: its last byte coming back. :attr:`request_timeout` bounds a single
+    #: read from the socket, which is not the same thing: a peer that sends
+    #: one byte per timeout window keeps a request alive forever, and one
+    #: that stops talking after the header keeps it alive with no bytes at
+    #: all. Neither looks like a dead connection, so the cutoff has to be
+    #: absolute. A ``kXR_wait`` or ``kXR_waitresp`` restarts it - a server
+    #: saying "staging from tape" is not stalling, and
+    #: :attr:`wait_budget` bounds that parking instead. ``0`` waits forever.
+    stall_deadline: float = field(
+        default_factory=lambda: _env_float("XRD_STALLDEADLINE", 1800.0)
+    )
+    #: Ceiling on the *cumulative* delay one operation may be asked to park
+    #: for. A single wait is already clamped by :attr:`wait_cap`; this is what
+    #: stops a server answering every resend with another one.
+    wait_budget: float = field(default_factory=lambda: _env_float("XRD_WAITBUDGET", 1800.0))
     keepalive_interval: float = 60.0
 
     # -- transfer tuning ----------------------------------------------
@@ -220,6 +236,11 @@ class Config:
     auth_order: Sequence[str] = ("gsi", "ztn", "krb5", "sss", "unix", "host")
     verify_tls: bool = True
     require_tls: bool = False
+    #: Send a bearer token over a connection that is not encrypted. Off, as it
+    #: is in the stock client, ``ztn`` simply is not attempted on cleartext -
+    #: a token on the wire is a token for whoever reads the wire. Turn it on
+    #: (or set ``$XRD_ZTNCLEARTEXT``) only on a network you trust end to end.
+    ztn_cleartext: bool = field(default_factory=lambda: bool(_env_flag("XRD_ZTNCLEARTEXT")))
     #: Ask for missing credentials rather than failing. ``None`` - the default,
     #: overridable with ``$XRD_PROMPT`` - means "only if somebody is there",
     #: which is a terminal on both stdin and stderr. See :mod:`xrd.auth.prompt`.
@@ -235,6 +256,13 @@ class Config:
     recover_handles: bool = True
     verify_checksums: bool = True
     preferred_checksum: str = "adler32"
+    #: Give S3 directories a presence: ``mkdir`` writes a zero-length
+    #: ``dir/`` marker object, ``stat`` believes one, listings hide them.
+    #: Off - the default - directories remain the fiction every prefix is.
+    s3_folder_markers: bool = False
+    #: Where :func:`xrd.ml.load` resolves bare dataset names: a URL or local
+    #: directory holding the ``index.json`` an ``xrd-datasets build`` wrote.
+    catalogue: str | None = field(default_factory=lambda: os.environ.get("XRD_CATALOGUE"))
 
     def check_whole_read(self, size: int, path: str | None = None) -> None:
         """Refuse a read of ``size`` bytes that nobody put a number on.

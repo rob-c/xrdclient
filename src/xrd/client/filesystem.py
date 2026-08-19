@@ -429,7 +429,9 @@ class FileSystem:
                 r.Mkdir(target, permissions(mode), mkpath=parents), path=target
             )
         except FileExistsError:
-            if not exist_ok:
+            # ``exist_ok`` forgives an existing *directory*, as pathlib does;
+            # a file squatting on the name is still an error.
+            if not exist_ok or not self.isdir(path):
                 raise
 
     def makedirs(self, path: str, mode: int | str = 0o755, exist_ok: bool = False) -> None:
@@ -693,6 +695,7 @@ class FileSystem:
         self,
         path: str,
         *,
+        create: bool = False,
         refresh: bool = False,
         no_wait: bool = False,
         add_peers: bool = False,
@@ -706,6 +709,12 @@ class FileSystem:
         whatever it can say now instead of waiting for a file to come back
         from tape. The rarer options are still there as words or bits:
         ``flags="add_peers refresh"``.
+
+        ``create=True`` asks where the file *would* go instead of where it is:
+        the redirector picks a server with room for it, and a path that does
+        not exist yet is the expected case rather than an error. It is the
+        question a writer has to ask before it can place anything, and the
+        only way to get an answer for a file that is not there.
         """
         target = self._abs(path)
         options = locate_flags(
@@ -715,13 +724,16 @@ class FileSystem:
             prefer_name=prefer_name,
             flags=flags,
         )
-        res = self._router.execute(r.Locate(target, int(options)), path=target)
+        # The ``*`` goes on the wire and nowhere else: it is a mode, not part
+        # of the name, and an error about it should still name the file.
+        wire = f"*{target}" if create else target
+        res = self._router.execute(r.Locate(wire, int(options)), path=target)
         return rp.parse_locate(res.data)
 
-    def deep_locate(self, path: str) -> list[LocationInfo]:
+    def deep_locate(self, path: str, *, create: bool = False) -> list[LocationInfo]:
         """Locate, resolving managers down to the servers behind them."""
         seen: dict[str, LocationInfo] = {}
-        pending = list(self.locate(path))
+        pending = list(self.locate(path, create=create))
         while pending:
             loc = pending.pop()
             known = seen.get(loc.address)
@@ -736,7 +748,7 @@ class FileSystem:
             if loc.is_manager:
                 child = FileSystem(self.url.evolve(host=loc.host, port=loc.port), self.config)
                 try:
-                    pending.extend(child.locate(path))
+                    pending.extend(child.locate(path, create=create))
                 except OSError:
                     pass
                 finally:

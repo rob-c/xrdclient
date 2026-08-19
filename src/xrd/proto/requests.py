@@ -561,6 +561,9 @@ class Read(Request):
         # the request from ``dlen`` and reject a body they did not ask for.
         return Writer().u8(self.pathid).zeros(7).bytes() if self.pathid else b""
 
+    def reply_cap(self) -> int:
+        return self.length
+
     def __repr__(self) -> str:
         return f"Read(offset={self.offset}, length={self.length})"
 
@@ -630,6 +633,11 @@ class ReadV(Request):
         for fhandle, offset, length in self.chunks:
             w.padded(fhandle, 4).i32(length).i64(offset)
         return w.bytes()
+
+    def reply_cap(self) -> int:
+        # Every chunk comes back behind its own ``read_list`` descriptor.
+        wanted = sum(length for _, _, length in self.chunks)
+        return c.READ_LIST_ENTRY_LEN * len(self.chunks) + wanted
 
     def __repr__(self) -> str:
         return f"ReadV(chunks={len(self.chunks)})"
@@ -726,6 +734,12 @@ class PgRead(Request):
             return b""
         return Writer().u8(self.pathid).u8(self.reqflags).zeros(2).bytes()
 
+    def reply_cap(self) -> int:
+        # A CRC in front of every page, and an unaligned read straddles one
+        # page more than its length alone accounts for.
+        pages = -(-(self.offset % c.kXR_pgPageSZ + self.length) // c.kXR_pgPageSZ)
+        return self.length + (c.kXR_pgUnitSZ - c.kXR_pgPageSZ) * pages
+
     def __repr__(self) -> str:
         return f"PgRead(offset={self.offset}, length={self.length})"
 
@@ -756,6 +770,13 @@ class PgWrite(Request):
 
     def path_data(self) -> bytes:
         return self.data if self.pathid else b""
+
+    def reply_cap(self) -> int:
+        # Nothing comes back but the offsets of the pages that arrived
+        # corrupt, and at worst that is all of them. An unaligned first page
+        # is shorter than a unit, so it can be one more than the division.
+        pages = -(-len(self.data) // c.kXR_pgUnitSZ) + 1
+        return c.PGW_CSE_HDRLEN + 8 * pages
 
     def __repr__(self) -> str:
         return f"PgWrite(offset={self.offset}, len={len(self.data)})"

@@ -132,6 +132,24 @@ def test_a_server_timeout_is_caught_by_the_same_except_as_a_client_one():
     assert str(info.value) == "kXR_ReqTimedOut: took too long [/a]"
 
 
+def test_tls_required_names_the_fix():
+    """"Permission denied" would send someone to chmod; the real fix is one
+    scheme change, so the message says which."""
+    with pytest.raises(PermissionError) as info:
+        e.raise_for_status(e.kXR_TLSRequired, "TLS required", path="/store/f")
+    assert isinstance(info.value, e.TLSRequiredError)
+    assert info.value.errno == errno.EACCES
+    assert "roots://" in str(info.value)
+    assert str(info.value).startswith("kXR_TLSRequired: TLS required [/store/f]")
+
+
+def test_tls_required_survives_pickling():
+    back = pickle.loads(pickle.dumps(e.TLSRequiredError(e.kXR_TLSRequired, "TLS", path="/p")))
+    assert isinstance(back, PermissionError)
+    assert (back.code, back.path, back.errno) == (e.kXR_TLSRequired, "/p", errno.EACCES)
+    assert str(back).startswith("kXR_TLSRequired")
+
+
 def test_every_error_code_the_protocol_defines_has_a_name():
     """``kXR_ArgInvalid`` (3000) through ``kXR_TimerExpired`` (3035), the last
     before XProtocol.hh's kXR_ERRFENCE - a gap here prints as a number."""

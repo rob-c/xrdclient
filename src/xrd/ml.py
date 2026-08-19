@@ -34,7 +34,9 @@ from __future__ import annotations
 
 import array
 import dataclasses
+import json
 import math
+import os
 from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
@@ -133,15 +135,24 @@ def load(
     """Open a dataset, wherever it is.
 
         >>> data = load("root://host//store/mnist.root")           # doctest: +SKIP
+        >>> data = load("mnist")                                   # doctest: +SKIP
 
     ``source`` is a URL of any scheme this library speaks, a local path, or an
-    open binary file. The columns to learn from and the one to learn are
-    worked out from their names - see :class:`Dataset` - and ``inputs`` and
-    ``answer`` say so outright when a file's names are its own.
+    open binary file. A bare name - no scheme, no slash, no file where one
+    would be - is looked up in the catalogue named by
+    :attr:`~xrd.Config.catalogue` (usually the ``XRD_CATALOGUE`` environment
+    variable), which is the ``index.json`` an ``xrd-datasets`` site serves;
+    that is how the second line above finds the same file as the first.
+
+    The columns to learn from and the one to learn are worked out from their
+    names - see :class:`Dataset` - and ``inputs`` and ``answer`` say so
+    outright when a file's names are its own.
 
     The dataset holds the file open. Use it in a ``with`` block, or let it go
     and it closes itself.
     """
+    if isinstance(source, str) and _is_name(source):
+        source = _from_catalogue(source, config)
     handle = open_root(source, config=config)
     try:
         return Dataset(
@@ -150,6 +161,45 @@ def load(
     except BaseException:
         handle.close()  # a file whose rows make no dataset should not stay open
         raise
+
+
+def _is_name(source: str) -> bool:
+    """Whether ``source`` is a catalogue name rather than somewhere to look.
+
+    Anything that could plausibly be a place - a scheme, a slash, a ``.root``
+    suffix, or a file that actually exists here - is treated as one, so no
+    file anyone can already open is ever shadowed by a catalogue entry.
+    """
+    return (
+        "://" not in source
+        and "/" not in source
+        and not source.endswith(".root")
+        and not os.path.exists(source)
+    )
+
+
+def _from_catalogue(name: str, config: Config | None) -> str:
+    """The URL behind ``name``, according to the catalogue's ``index.json``."""
+    from .config import Config as _Config
+    from .root.datasets import fetch
+
+    where = (config or _Config()).catalogue
+    if not where:
+        raise ValueError(
+            f"{name!r} is not a path or a URL, and no catalogue is set to look "
+            "it up in - point XRD_CATALOGUE (or Config.catalogue) at a "
+            "datasets site, or give the whole URL"
+        )
+    base = where.rstrip("/")
+    index = json.loads(fetch(f"{base}/index.json", config=config))
+    for entry in index["datasets"]:
+        if entry["name"] == name:
+            return f"{base}/{entry['file']}"
+    names = sorted(entry["name"] for entry in index["datasets"])
+    held = ", ".join(names[:8]) + (f", and {len(names) - 8} more" if len(names) > 8 else "")
+    raise ValueError(
+        f"the catalogue at {where} has {held or 'nothing in it'}, and no {name!r}"
+    )
 
 
 class Dataset:

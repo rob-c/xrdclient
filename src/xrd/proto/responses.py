@@ -8,6 +8,7 @@ header itself is handled by :mod:`xrd.proto.frames`; status dispatch is the
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 
 from .._compat import SLOTS
@@ -34,7 +35,7 @@ __all__ = [
     "parse_dirlist", "parse_locate", "parse_open", "parse_checksum",
     "parse_checkpoint", "parse_readlink", "parse_space", "parse_prepare_status",
     "parse_error", "parse_redirect", "parse_wait", "parse_waitresp", "parse_attn",
-    "parse_status", "parse_readv", "parse_fattr", "parse_fattr_tree",
+    "parse_status", "parse_pgwrite_cse", "parse_readv", "parse_fattr", "parse_fattr_tree",
 ]
 
 
@@ -70,14 +71,27 @@ class RedirectInfo:
         return f"{scheme}://{self.host}:{abs(self.port)}/"
 
 
+#: What closes the target field of a ``kXR_redirect``.
+_TARGET_END = re.compile(r"[\x00\r\n]")
+
+
 def parse_redirect(data: bytes) -> RedirectInfo:
+    """Decode a ``kXR_redirect`` body: a port, a host, and an opaque token.
+
+    The target field ends at the first NUL, CR or LF - a redirector that
+    closes it with a line ending is naming a host, not a host plus
+    whitespace - and the token's own leading separators are dropped: EOS
+    hands its open capability over as ``?&cap.sym=...``, where the ``&`` is
+    a separator and not part of the token. Keeping it would put an empty
+    parameter into the URL the next request is built from.
+    """
     r = Reader(data, "kXR_redirect")
     port = r.i32()
-    target = r.rest().split(b"\x00", 1)[0].decode("utf-8", "replace")
+    target = _TARGET_END.split(r.rest().decode("utf-8", "replace"), 1)[0]
     host, sep, token = target.partition("?")
     if not host:
         raise ProtocolError("kXR_redirect names no host to redirect to")
-    return RedirectInfo(host, port, token if sep else "")
+    return RedirectInfo(host, port, token.lstrip("?&") if sep else "")
 
 
 @dataclass(frozen=True, **SLOTS)
@@ -152,6 +166,26 @@ def parse_status(data: bytes) -> StatusInfo:
     r.skip(4)
     dlen = r.i32()
     return StatusInfo(crc, streamid, requestid, resptype, dlen, r.rest())
+
+
+def parse_pgwrite_cse(data: bytes) -> tuple[int, ...]:
+    """Corrupt-page file offsets from a ``kXR_pgwrite`` reply's trailer.
+
+    The trailer is an 8-byte header - ``cseCRC[4] dlFirst[2] dlLast[2]`` -
+    followed by one big-endian ``int64`` file offset per page whose CRC-32C
+    did not match on arrival. The server has kept the rest of the write;
+    only the pages named here need retransmitting, with ``kXR_pgRetry``.
+
+    An empty trailer means every page arrived intact.
+    """
+    if len(data) < c.PGW_CSE_HDRLEN or (len(data) - c.PGW_CSE_HDRLEN) % 8:
+        raise ProtocolError(
+            f"kXR_pgwrite answered with a {len(data)} byte checksum-error trailer, "
+            f"which is not {c.PGW_CSE_HDRLEN} bytes of header and whole 8-byte offsets"
+        )
+    r = Reader(data, "kXR_pgwrite.cse")
+    r.skip(c.PGW_CSE_HDRLEN)
+    return tuple(r.i64() for _ in range((len(data) - c.PGW_CSE_HDRLEN) // 8))
 
 
 # --------------------------------------------------------------------------

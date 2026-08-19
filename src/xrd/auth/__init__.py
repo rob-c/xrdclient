@@ -94,12 +94,20 @@ def select(
     username: str = "",
     host: str = "",
     rejected: dict[str, str] | None = None,
+    tls: bool | None = None,
 ) -> Iterator[Credential]:
     """Yield usable credentials, most preferred first.
 
     Iteration is lazy: building a GSI proxy costs a file read and a parse, so
     it only happens if the mechanisms ahead of it were rejected. Pass a dict
     as ``rejected`` to collect why each skipped mechanism was unusable.
+
+    ``tls`` is whether the connection these credentials will travel on is
+    encrypted. On a cleartext one - ``tls=False`` - the ``ztn`` rung is
+    skipped, because a bearer token is a password to anyone who can read the
+    wire; that is what the stock client does, and
+    :attr:`~xrd.config.Config.ztn_cleartext` opts a lab rig back in. ``None``
+    means the caller cannot say, and nothing is withheld.
 
     If the whole ladder comes up empty and ``config`` allows prompting, one
     last pass asks a person for the missing material - a proxy path, a token
@@ -111,6 +119,15 @@ def select(
     order = [n for n in config.auth_order if n in by_name]
     order += [o.name for o in offers if o.name not in order]
     why = {} if rejected is None else rejected
+
+    if tls is False and not config.ztn_cleartext and "ztn" in by_name:
+        del by_name["ztn"]
+        order.remove("ztn")
+        why["ztn"] = (
+            "not offered on a cleartext connection - a bearer token is "
+            "replayable by anyone on the path; use roots:// (or xroots://), "
+            "or set ztn_cleartext=True on a rig you trust end to end"
+        )
 
     found = False
     for name in order:

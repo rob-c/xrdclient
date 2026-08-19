@@ -279,8 +279,8 @@ def test_a_session_key_installs_a_signer():
     machine.submit(r.Write(b"HDL0", 0, b"data"))
     out = machine.data_to_send()
     assert struct.unpack(">H", out[2:4])[0] == c.kXR_sigver
-    assert len(out) == (24 + 32) + (24 + 4)  # signature frame, then the request
-    assert struct.unpack(">H", out[58:60])[0] == c.kXR_write
+    assert len(out) == (24 + 48) + (24 + 4)  # signature frame, then the request
+    assert struct.unpack(">H", out[74:76])[0] == c.kXR_write
 
 
 def test_an_unsigned_session_sends_one_frame_per_request():
@@ -564,6 +564,82 @@ def test_the_status_trailer_is_reassembled_across_receives():
     for i in range(0, len(raw), 5):
         machine.receive_data(raw[i : i + 5])
     assert only(machine, m.Completed).data == b"abcdef"
+
+
+# --------------------------------------------------------------------------
+# How much of an answer is too much
+#
+# A request that says how many bytes it wants has said how big its answer may
+# be. Anything past that is a server that has lost track of what it is doing,
+# or one that would like the client to run out of memory; either way the only
+# safe thing is to stop accumulating and fail the stream.
+# --------------------------------------------------------------------------
+
+
+def test_an_answer_of_the_size_that_was_asked_for_is_kept():
+    machine = ready()
+    sid = machine.submit(r.Read(b"HDL0", 0, 4))
+    machine.receive_data(ok(sid, b"abcd"))
+    assert only(machine, m.Completed).data == b"abcd"
+
+
+def test_an_answer_longer_than_the_read_is_refused():
+    machine = ready()
+    sid = machine.submit(r.Read(b"HDL0", 0, 4))
+    machine.receive_data(ok(sid, b"abcde"))
+    assert "more than the 4 bytes" in str(only(machine, m.Failed).error)
+    assert machine.in_flight == 0
+
+
+def test_chunks_that_add_up_to_more_than_was_asked_for_are_refused():
+    """The case that costs memory: every frame is small, the total is not."""
+    machine = ready()
+    sid = machine.submit(r.Read(b"HDL0", 0, 4))
+    machine.receive_data(frame(sid, c.kXR_oksofar, b"abc"))
+    assert kinds(drain(machine)) == ["Chunk"]
+    machine.receive_data(frame(sid, c.kXR_oksofar, b"def"))
+    assert "more than the 4 bytes" in str(only(machine, m.Failed).error)
+    assert machine.in_flight == 0
+
+
+def test_a_vector_read_is_capped_by_what_all_its_ranges_come_to():
+    machine = ready()
+    sid = machine.submit(r.ReadV([(b"HDL0", 0, 8), (b"HDL0", 64, 8)]))
+    machine.receive_data(ok(sid, b"x" * (2 * c.READ_LIST_ENTRY_LEN + 17)))
+    assert "more than the 48 bytes" in str(only(machine, m.Failed).error)
+
+
+def test_a_paged_read_is_capped_with_its_checksums_counted_in():
+    machine = ready()
+    sid = machine.submit(r.PgRead(b"HDL0", 0, 8))
+    machine.receive_data(status_frame(sid, c.kXR_pgread, c.kXR_FinalResult, b"x" * 13))
+    assert "more than the 12 bytes" in str(only(machine, m.Failed).error)
+
+
+def test_a_paged_write_is_capped_by_the_pages_it_could_be_asked_to_resend():
+    machine = ready()
+    sid = machine.submit(r.PgWrite(b"HDL0", 0, b"x" * c.kXR_pgUnitSZ))
+    machine.receive_data(status_frame(sid, c.kXR_pgwrite, c.kXR_FinalResult, b"x" * 25))
+    assert "more than the 24 bytes" in str(only(machine, m.Failed).error)
+
+
+def test_a_reply_whose_size_nobody_declared_is_not_capped():
+    """A dirlist is as long as the directory is. There is nothing to check it
+    against, and a limit invented here would break the large ones."""
+    machine = ready()
+    sid = machine.submit(r.Dirlist("/data"))
+    machine.receive_data(frame(sid, c.kXR_oksofar, b"a\n" * 5000))
+    machine.receive_data(ok(sid, b"z\n"))
+    assert len(only(machine, m.Completed).data) == 10002
+
+
+def test_an_error_body_is_never_truncated():
+    """The cap is about memory, not about conformance: a long refusal still
+    arrives whole, because the reason is all it carries."""
+    machine = ready()
+    sid = machine.submit(r.Read(b"HDL0", 0, 4), path="/data/a.root")
+    machine.receive_data(error(sid, 3011, "x" * 400))
+    assert "x" * 400 in str(only(machine, m.Failed).error)
 
 
 # --------------------------------------------------------------------------

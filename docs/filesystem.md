@@ -156,6 +156,7 @@ fs.checksum("/store/f.root")            # ChecksumInfo(algorithm, value)
 fs.locate("/store/f.root")              # which servers hold it
 fs.locate("/store/f.root", refresh=True)  # ignore whatever the redirector cached
 fs.locate("/store/run7", flags="for_dirlist")     # about to list it
+fs.locate("/store/new.root", create=True)  # where it would go, before it exists
 fs.deep_locate("/store/f.root")         # follow managers to the data servers
 fs.prepare(["/store/a.root", "/store/b.root"])   # stage from tape
 fs.prepare(["/store/a.root"], notify=True)       # and mail me when it lands

@@ -64,6 +64,18 @@ class Request:
         """
         return b""
 
+    def reply_cap(self) -> int:
+        """Most bytes the answer to this request may add up to; 0 for no cap.
+
+        A request that names how much it wants back - a read, a readv - knows
+        the size of its own answer, so a server that keeps sending past it is
+        either broken or hostile. Either way the client stops buying memory
+        for it. Requests whose reply has no size known in advance (a dirlist,
+        a query) are uncapped, and an error body is never capped at all: it is
+        small, and truncating it would cost the reason for the failure.
+        """
+        return 0
+
     def trailer(self) -> bytes:
         """Bytes streamed after the frame that ``dlen`` does not count.
 

@@ -1,8 +1,9 @@
 # Command line
 
-Two commands, `xrd-fs` and `xrd-cp`. Both take whole URLs, both understand
-`--json`, and both use the same three exit codes: `0` success, `1` a runtime
-failure, `2` a usage error.
+Three commands: `xrd-fs` and `xrd-cp` take whole URLs, and `xrd-datasets`
+builds a directory of ML datasets worth serving. All understand `--json`,
+and all use the same three exit codes: `0` success, `1` a runtime failure,
+`2` a usage error.
 
 Common options on every subcommand:
 
@@ -109,6 +110,8 @@ $ xrd-cp -f /tmp/f.root root://host//store/f.root      # overwrite what is there
 $ xrd-cp --verify -a crc32c /tmp/f.root root://host//store/f.root
 $ xrd-cp --chunk-size 8M --progress root://host//store/big.root /scratch/
 $ xrd-cp --in-flight 4 root://host//store/big.root /scratch/   # deeper read-ahead
+$ xrd-cp --stripes 8 root://host//store/big.root /scratch/      # eight spans at once
+$ xrd-cp --streams 2 root://host//store/big.root /scratch/      # two links per span
 $ xrd-cp -r --exclude '*.log' /tmp/results root://host//store/results
 $ xrd-cp -r --include '*.root' --sync size /tmp/results root://host//store/results
 $ xrd-cp -r --delete /tmp/results root://host//store/results
@@ -159,6 +162,21 @@ needs `-r`, since without a tree there is nothing to run in parallel.
 directory is copied *into*, so a second run of `cp -r tree /dest` writes
 `/dest/tree/tree`. Give the target a trailing slash to say "into this" every
 time, which is what makes `--sync` and `--delete` idempotent.
+
+## `xrd-datasets`
+
+```console
+$ xrd-datasets list
+$ xrd-datasets build /srv/datasets --only "mnist*" --only iris --jobs 4
+$ xrd-datasets verify /srv/datasets
+$ xrd-datasets site /srv/datasets --base-url https://data.example.org
+```
+
+`build` converts datasets to ROOT files and writes the `index.json` that
+makes the directory a catalogue; `verify` reopens every file and checks it
+against that index; `site` adds the browsable page and ready-to-serve nginx,
+BriX and systemd configuration. The whole story, including what the licences
+allow, is in [A datasets site](datasets-site.md).
 
 ## Scripting with `--json`
 

@@ -19,7 +19,10 @@ from .._log import get_logger
 from ..config import Config
 from ..errors import ConnectionError as XrdConnectionError
 from ..errors import ProtocolError, WaitLimitError, XRootDError
+from ..errors import TimeoutError as XrdTimeoutError
+from ..proto import constants as c
 from ..proto import machine as m
+from ..proto import requests as r
 from ..proto import responses as rp
 from ..proto.frames import Request
 from ..transport.base import Transport
@@ -31,6 +34,9 @@ __all__ = ["Session", "Result", "RedirectRequired"]
 _log = get_logger(__name__)
 
 _RECV = 1 << 18
+
+#: Grace added to a kXR_waitresp delay before the deferred reply is overdue.
+_WAITRESP_GRACE = 30.0
 
 
 class RedirectRequired(XRootDError):
@@ -168,9 +174,10 @@ class Session:
     def arrives_on_path(self) -> bool | None:
         """Whether this server serves a request that arrived on a data path.
 
-        ``None`` until one has been tried, then what happened. A server that
-        does not is asked once per connection rather than once per file: the
-        answer is a property of the server, and finding it out costs a whole
+        ``None`` until the question has been settled, then the answer. It is
+        settled once per connection: first by asking outright - a gateway
+        that routes by arrival says so in ``kXR_Qconfig`` - and only when the
+        server has no opinion by trying one and seeing, which costs a whole
         :attr:`~xrd.Config.data_stream_timeout`.
         """
         return self._arrives_on_path
@@ -270,7 +277,9 @@ class Session:
         honoured only while that path is actually bound and while this server
         has not already declined one; a redirect or a reconnect that dropped
         the path silently falls back to the control link, so the caller never
-        has to unwind its own routing on recovery.
+        has to unwind its own routing on recovery. The first such request
+        asks the server outright - see :meth:`_ask_arrival_routing` - so a
+        server with an answer never costs the trial-and-timeout.
         """
         with self._lock:
             if self.closed:
@@ -279,6 +288,8 @@ class Session:
                 raise ValueError(
                     f"data path {request.pathid} is not bound to {self.endpoint}"
                 )
+            if arrive_on_path and self._arrives_on_path is None and request.pathid:
+                self._ask_arrival_routing()
             on_path = (
                 arrive_on_path
                 and self._arrives_on_path is not False
@@ -307,13 +318,53 @@ class Session:
             self._arrives_on_path = True
             return result
 
+    def _ask_arrival_routing(self) -> None:
+        """Settle :attr:`arrives_on_path` by asking, when the server will say.
+
+        A gateway that serves requests arriving on a data path advertises it
+        as a ``kXR_Qconfig`` value (``brix.substreams``); a stock daemon
+        echoes the key back or answers nothing, which is the convention for
+        "never heard of it". Either answer costs one round trip on the
+        control link where trying and failing would cost a whole
+        :attr:`~xrd.Config.data_stream_timeout`. A query that itself fails
+        settles nothing - the behavioural probe is still there.
+        """
+        try:
+            sid = self._m.submit(r.Query(c.kXR_Qconfig, "brix.substreams"))
+            answer = self._await(sid, None).data
+        except XRootDError:
+            return
+        value = answer.rstrip(b"\x00").strip().decode("utf-8", "replace")
+        self._arrives_on_path = bool(value) and value != "brix.substreams"
+        _log.debug(
+            "%s %s arrival routing (brix.substreams=%r)",
+            self.endpoint,
+            "advertises" if self._arrives_on_path else "disclaims",
+            value,
+        )
+
+    def _armed(self, seconds: float = 0.0) -> float | None:
+        """A fresh stall deadline, or ``None`` when there is not to be one.
+
+        ``seconds`` is a delay the server has asked for: the deadline never
+        comes in sooner than that plus a grace, so a server that says "in ten
+        minutes" is not cut off at a shorter deadline for saying so.
+        """
+        limit = self.config.stall_deadline
+        if limit <= 0:
+            return None
+        return time.monotonic() + max(limit, seconds + _WAITRESP_GRACE if seconds else 0.0)
+
     def _await(
         self, sid: int, on_chunk: Callable[[bytes], None] | None, pathid: int = 0
     ) -> Result:
         waits = 0
+        parked = 0.0
         streamed = 0
+        # Absolute, over the whole logical operation: see Config.stall_deadline.
+        deadline = self._armed()
         while True:
-            for event in self._events_for(sid, pathid):
+            for event in self._events_for(sid, pathid, deadline):
                 if isinstance(event, m.Completed):
                     # The machine's Completed carries the whole body; hand the
                     # streaming caller only the tail it has not seen yet.
@@ -330,19 +381,36 @@ class Session:
                     self._m.release(sid)
                     raise RedirectRequired(event.target)
                 elif isinstance(event, m.Waiting):
-                    if event.resend:
-                        waits += 1
-                        if waits > self.config.redirect_limit:
-                            raise WaitLimitError(
-                                f"server kept asking to wait for "
-                                f"{type(event.request).__name__}",
-                                attempts=waits,
-                            )
-                        _log.debug("server asked to wait %.1fs: %s", event.seconds, event.message)
-                        time.sleep(event.seconds)
-                        self._m.resume(sid)
-                        self._flush()
-                        streamed = 0  # the body starts over on the resend
+                    # Parking is not stalling, so the deadline restarts - but
+                    # the delays are summed, because a server that answers
+                    # every resend with another wait is stalling after all.
+                    parked += event.seconds
+                    if parked > self.config.wait_budget:
+                        raise WaitLimitError(
+                            f"{type(event.request).__name__} was parked for "
+                            f"{parked:.0f}s, over the {self.config.wait_budget:.0f}s "
+                            f"budget for one operation",
+                            attempts=waits,
+                        )
+                    if not event.resend:
+                        # "The answer is coming later": nothing is re-sent, a
+                        # deferral is not a retry, but the deadline has to
+                        # cover the delay the server named.
+                        deadline = self._armed(event.seconds)
+                        continue
+                    waits += 1
+                    if waits > self.config.redirect_limit:
+                        raise WaitLimitError(
+                            f"server kept asking to wait for "
+                            f"{type(event.request).__name__}",
+                            attempts=waits,
+                        )
+                    _log.debug("server asked to wait %.1fs: %s", event.seconds, event.message)
+                    time.sleep(event.seconds)
+                    self._m.resume(sid)
+                    self._flush()
+                    streamed = 0  # the body starts over on the resend
+                    deadline = self._armed()
 
     # ------------------------------------------------------------------
     # I/O pump
@@ -357,26 +425,55 @@ class Session:
             if queued:
                 transport.send(queued)
 
-    def _pump(self, pathid: int = 0) -> list[m.Event]:
+    def _receive(self, pathid: int, deadline: float | None) -> bytes:
+        """Read once from ``pathid``'s link, never past ``deadline``."""
+        transport = self._paths[pathid] if pathid else self._t
+        resting = self.config.data_stream_timeout if pathid else self.config.request_timeout
+        if deadline is None:
+            return transport.receive(_RECV)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise XrdTimeoutError(self._stalled())
+        if left >= resting:
+            # The socket's own timeout already comes in first; leave it be,
+            # so a data path keeps the short one its fallback depends on.
+            return transport.receive(_RECV)
+        transport.settimeout(left)
+        try:
+            return transport.receive(_RECV)
+        except XrdTimeoutError as exc:
+            raise XrdTimeoutError(self._stalled()) from exc
+        finally:
+            transport.settimeout(resting)
+
+    def _stalled(self) -> str:
+        return (
+            f"{self.endpoint} did not finish answering within the "
+            f"{self.config.stall_deadline:.0f}s stall deadline"
+        )
+
+    def _pump(self, pathid: int = 0, deadline: float | None = None) -> list[m.Event]:
         """One send/receive turn; returns whatever events it produced."""
         self._flush()
-        transport = self._paths[pathid] if pathid else self._t
-        self._m.receive_data(transport.receive(_RECV), pathid=pathid)
+        self._m.receive_data(self._receive(pathid, deadline), pathid=pathid)
         return list(self._m.events())
 
-    def _events_for(self, sid: int, pathid: int = 0) -> list[m.Event]:
+    def _events_for(
+        self, sid: int, pathid: int = 0, deadline: float | None = None
+    ) -> list[m.Event]:
         """Block until at least one event for ``sid`` is available.
 
         ``pathid`` says which link the answer is expected on: a read that
         named a data path is answered there, and waiting on the control link
-        for it would wait forever.
+        for it would wait forever. ``deadline`` is the whole operation's, so
+        a peer that dribbles cannot renew it one byte at a time.
         """
         queued = self._inbox.pop(sid, None)
         if queued:
             return queued
         while True:
             mine: list[m.Event] = []
-            for event in self._pump(pathid):
+            for event in self._pump(pathid, deadline):
                 target = getattr(event, "streamid", None)
                 if target == sid:
                     mine.append(event)

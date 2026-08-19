@@ -215,6 +215,8 @@ class _Pending:
     path: str = ""
     pathid: int = 0
     path_bytes: bytes = b""
+    #: Most bytes this reply may accumulate; 0 for no limit.
+    cap: int = 0
 
 
 @dataclass(**SLOTS)
@@ -371,8 +373,9 @@ class SessionMachine:
         if self.signer is not None:
             signed = self.signer.sign(frame)
             if signed is not None:
-                seqno, mac = signed
-                frame = encode(r.Sigver(request.opcode, seqno, mac), sid) + frame
+                seqno, signature, nodata = signed
+                sigver = r.Sigver(request.opcode, seqno, signature, nodata=nodata)
+                frame = encode(sigver, sid) + frame
         data = request.path_data()
         # Arrival routing (BriX and any server that keys a sub-stream on which
         # connection a request *arrived* on): the whole frame goes down the
@@ -381,7 +384,12 @@ class SessionMachine:
         # link, payload on the data socket - is what runs otherwise.
         if arrive_on_path and request.pathid:
             self._pending[sid] = _Pending(
-                request, frame, path=path, pathid=request.pathid, path_bytes=data
+                request,
+                frame,
+                path=path,
+                pathid=request.pathid,
+                path_bytes=data,
+                cap=request.reply_cap(),
             )
             buf = self._out_path.setdefault(request.pathid, bytearray())
             buf.extend(frame)
@@ -389,7 +397,12 @@ class SessionMachine:
                 buf.extend(data)
             return
         self._pending[sid] = _Pending(
-            request, frame, path=path, pathid=request.pathid, path_bytes=data
+            request,
+            frame,
+            path=path,
+            pathid=request.pathid,
+            path_bytes=data,
+            cap=request.reply_cap(),
         )
         self._out += frame
         if data:
@@ -613,6 +626,7 @@ class SessionMachine:
                 username=self.username,
                 host=self.host,
                 rejected=self._auth_rejected,
+                tls=self.tls_active,
             )
         for cred in self._credentials:
             try:
@@ -652,6 +666,7 @@ class SessionMachine:
                 key,
                 self.protocol_info.security_level,
                 self.protocol_info.security_overrides,
+                secodata=bool(self.protocol_info.security_options & c.kXR_secOData),
             )
         self._events.append(Ready(self.session_id, self.mechanism))
 
@@ -668,6 +683,8 @@ class SessionMachine:
         status = header.status
 
         if status == c.kXR_ok:
+            if not self._within_cap(sid, pending, len(body)):
+                return
             if pending.buffer:
                 # Extend and freeze, rather than concatenating and freezing:
                 # the latter copies the whole accumulated response twice.
@@ -679,6 +696,8 @@ class SessionMachine:
             self._events.append(Completed(sid, pending.request, data, pending.status))
 
         elif status == c.kXR_oksofar:
+            if not self._within_cap(sid, pending, len(body)):
+                return
             pending.buffer += body
             self._events.append(Chunk(sid, pending.request, body))
 
@@ -723,9 +742,34 @@ class SessionMachine:
                 )
             )
 
+    def _within_cap(self, sid: int, pending: _Pending, extra: int) -> bool:
+        """Whether ``extra`` more bytes still fit the reply's declared size.
+
+        Over it, the stream is finished off with an error: the request said
+        how much it wanted, so the surplus can only be a server that has lost
+        track of the answer, and buffering it is how a client is talked into
+        exhausting its own memory.
+        """
+        if not pending.cap or len(pending.buffer) + extra <= pending.cap:
+            return True
+        self.release(sid)
+        self._events.append(
+            Failed(
+                sid,
+                pending.request,
+                ProtocolError(
+                    f"{pending.request!r} was answered with more than the "
+                    f"{pending.cap} bytes it asked for"
+                ),
+            )
+        )
+        return False
+
     def _on_status_data(self, sid: int, data: bytes) -> None:
         pending = self._pending.get(sid)
         if pending is None or pending.status is None:
+            return
+        if not self._within_cap(sid, pending, len(data)):
             return
         info = pending.status
         if info.is_final:

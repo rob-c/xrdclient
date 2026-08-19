@@ -87,4 +87,8 @@ def test_the_open_overloads_say_what_comes_back(tmp_path: pathlib.Path) -> None:
         cwd=pathlib.Path(__file__).resolve().parent.parent,
     )
     revealed = [line for line in result.stdout.splitlines() if "Revealed type" in line]
-    assert [line.split("note: ")[-1] for line in revealed] == EXPECTED, result.stdout
+    # mypy has changed whether it spells these "bytes" or "builtins.bytes"
+    # within the range the dev extra allows, and the promise is the type,
+    # not the spelling.
+    found = [line.split("note: ")[-1].replace("builtins.", "") for line in revealed]
+    assert found == EXPECTED, result.stdout

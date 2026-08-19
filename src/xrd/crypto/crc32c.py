@@ -10,7 +10,7 @@ five times faster than the naive per-byte loop.
 
 from __future__ import annotations
 
-__all__ = ["crc32c", "pack_pages", "unpack_pages", "IS_ACCELERATED"]
+__all__ = ["crc32c", "pack_pages", "unpack_pages", "page_span", "IS_ACCELERATED"]
 
 _POLY = 0x82F63B78
 _MASK = 0xFFFFFFFF
@@ -79,6 +79,16 @@ except ImportError:  # pragma: no cover - the common path
 # --------------------------------------------------------------------------
 
 PAGE_SIZE = 4096
+
+
+def page_span(offset: int, remaining: int) -> int:
+    """How much of the page at file ``offset`` is still in ``remaining`` bytes.
+
+    Pages are aligned to the file, not to the buffer, so the page a
+    retransmission has to resend runs from ``offset`` to the next 4 KiB
+    boundary - or to the end of the data, whichever comes first.
+    """
+    return min(remaining, PAGE_SIZE - offset % PAGE_SIZE)
 
 
 def pack_pages(data: bytes, offset: int = 0) -> bytes:

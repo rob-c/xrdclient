@@ -14,9 +14,10 @@ from contextlib import contextmanager
 
 from .._log import get_logger
 from ..config import Config
-from ..crypto.crc32c import pack_pages, unpack_pages
+from ..crypto.crc32c import pack_pages, page_span, unpack_pages
 from ..errors import (
     ChecksumMismatchError,
+    PageIntegrityError,
     ProtocolError,
     ServerError,
     TransientError,
@@ -331,14 +332,21 @@ class File:
 
         A handle that was never opened still owns a connection, so the
         release happens either way.
+
+        On a reader, a connection that has already gone is not an error -
+        closing is what releases it, and there is nothing left to lose. On a
+        writer it is: the close is the point at which the server commits the
+        file, and a caller told the write succeeded when the server never
+        heard the close would go on to trust a file that may be short. That
+        failure is raised, not logged.
         """
         handle, self._handle = self._handle, None
         try:
             if handle is not None:
                 self._router.execute(r.Close(handle))
         except TransientError as exc:
-            # The connection is already gone, which is what a close is for.
-            # Raising here would mask whatever the ``with`` body was doing.
+            if self._flags & _WRITING:
+                raise
             _log.debug("close of %s found the connection gone: %s", self.url, exc)
         finally:
             if self._owns_router:
@@ -349,8 +357,16 @@ class File:
             self.open()
         return self
 
-    def __exit__(self, *exc: object) -> None:
-        self.close()
+    def __exit__(self, exc_type: object, *_: object) -> None:
+        # A failing close is worth raising, but not over the top of the
+        # exception that is already on its way out of the ``with`` body:
+        # that one is the reason the block is unwinding.
+        try:
+            self.close()
+        except Exception:
+            if exc_type is None:
+                raise
+            _log.debug("close of %s failed while unwinding", self.url, exc_info=True)
 
     def __repr__(self) -> str:
         state = "open" if self.is_open else "closed"
@@ -423,13 +439,10 @@ class File:
         return b"".join(parts)
 
     def _read_one(self, offset: int, length: int) -> bytes:
-        data = self._bulk(lambda handle, pid: r.Read(handle, offset, length, pid)).data
-        if len(data) > length:
-            raise ProtocolError(
-                f"the server answered a {length} byte read at offset {offset} with "
-                f"{len(data)} bytes"
-            )
-        return data
+        # A reply longer than the read is refused by the session machine,
+        # which caps what it will accumulate from the request itself; there
+        # is nothing left to check by the time the bytes get here.
+        return self._bulk(lambda handle, pid: r.Read(handle, offset, length, pid)).data
 
     def pread(self, size: int, offset: int) -> bytes:
         """:func:`os.pread` order of arguments."""
@@ -469,11 +482,6 @@ class File:
         result = self._execute(
             lambda handle: r.PgRead(handle, offset, size, pathid=self._pathid)
         )
-        if len(result.data) > _packed_length(size, offset):
-            raise ProtocolError(
-                f"the server answered a {size} byte paged read at offset {offset} with "
-                f"{len(result.data)} bytes of pages and checksums"
-            )
         if not verify:
             data, _ = unpack_pages(result.data, offset)
             return PageResult(data, offset)
@@ -618,15 +626,41 @@ class File:
     def pgwrite(self, data: bytes, offset: int = 0) -> int:
         """``kXR_pgwrite`` - write with a CRC-32C per 4 KiB page.
 
-        The server verifies each page and rejects the request outright if one
-        fails, which turns a silent corruption into a loud one.
+        The server verifies each page as it arrives and stores the write
+        either way, answering with a checksum-error trailer that names the
+        pages whose CRC did not survive the wire. Each of those is
+        retransmitted here with ``kXR_pgRetry`` until the server takes it or
+        the retry budget runs out, which fails the write rather than leaving
+        a page of corruption behind.
         """
         if not data:
             return 0
-        payload = pack_pages(data, offset)
-        self._submit(r.PgWrite(self.handle, offset, payload, pathid=self._pathid))
+        corrupt = self._pgwrite_once(data, offset)
+        for page_offset in corrupt:
+            self._pgwrite_retry(data, offset, page_offset)
         self._invalidate(offset + len(data))
         return len(data)
+
+    def _pgwrite_once(self, data: bytes, offset: int, *, retry: bool = False) -> tuple[int, ...]:
+        """One ``kXR_pgwrite``, returning the offsets the server found corrupt."""
+        result = self._submit(
+            r.PgWrite(self.handle, offset, pack_pages(data, offset), retry, self._pathid)
+        )
+        return rp.parse_pgwrite_cse(result.data) if result.data else ()
+
+    def _pgwrite_retry(self, data: bytes, base: int, page_offset: int) -> None:
+        """Resend one page until the server has it intact, or give up loudly."""
+        start = page_offset - base
+        if not 0 <= start < len(data):
+            raise ProtocolError(
+                f"kXR_pgwrite reported a corrupt page at offset {page_offset}, which is "
+                f"outside the {len(data)} bytes written at offset {base}"
+            )
+        page = data[start : start + page_span(page_offset, len(data) - start)]
+        for _ in range(c.PGW_MAX_RETRY):
+            if not self._pgwrite_once(page, page_offset, retry=True):
+                return
+        raise PageIntegrityError(page_offset, c.PGW_MAX_RETRY, path=self.url.path)
 
     def truncate(self, size: int = 0) -> int:
         """``kXR_truncate`` on the open handle."""
@@ -765,16 +799,6 @@ def _write_for(at: int, body: bytes) -> Callable[[bytes, int], Request]:
     to the next chunk, so the chunk it was made for is captured here.
     """
     return lambda handle, pid: r.Write(handle, at, body, pid)
-
-
-def _packed_length(size: int, offset: int) -> int:
-    """How long a ``kXR_pgread`` reply of ``size`` bytes may be, CRCs included."""
-    if size <= 0:
-        return 0
-    page = c.kXR_pgPageSZ
-    head = page - offset % page          # short first unit when unaligned
-    rest = max(size - head, 0)
-    return size + 4 * (1 + -(-rest // page))
 
 
 def _segment_for(wanted: ReadRange, answers: list[bytes] | None) -> bytes:

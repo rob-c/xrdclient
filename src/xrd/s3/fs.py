@@ -305,25 +305,74 @@ class S3FileSystem(HTTPFileSystem):
     def mkdir(
         self, path: str, mode: int | str = 0o755, *, parents: bool = False, exist_ok: bool = False
     ) -> None:
-        """Nothing, successfully.
+        """Nothing, successfully - unless folder markers are turned on.
 
-        A prefix exists exactly when a key under it does, so there is nothing
-        to create and nothing that could already be there. Writing the
-        zero-length ``dir/`` marker some consoles show would create an object
-        every other reader would then have to learn to ignore.
+        A prefix exists exactly when a key under it does, so by default there
+        is nothing to create and nothing that could already be there. Writing
+        the zero-length ``dir/`` marker some consoles show would create an
+        object every other reader would then have to learn to ignore.
+
+        :attr:`~xrd.config.Config.s3_folder_markers` opts into exactly that,
+        for a gateway that treats the marker as a directory: the marker is
+        written, an empty directory then exists, and ``mkdir`` gets its POSIX
+        meaning back - a name already taken, by an object or (without
+        ``exist_ok``) by a directory, is refused. Listings hide the markers
+        either way. ``parents`` never matters here: every prefix above the
+        marker is a valid place for it.
         """
+        if self.config.s3_folder_markers:
+            self._write_marker(path, exist_ok=exist_ok)
 
     def makedirs(self, path: str, mode: int | str = 0o755, exist_ok: bool = False) -> None:
-        """Nothing, successfully - see :meth:`mkdir`."""
+        """Nothing, successfully - or the leaf's marker, see :meth:`mkdir`.
+
+        One marker is enough: a prefix exists whenever a key lives under it,
+        and the leaf's marker is under every ancestor.
+        """
+        if self.config.s3_folder_markers:
+            self._write_marker(path, exist_ok=exist_ok)
+
+    def _write_marker(self, path: str, *, exist_ok: bool) -> None:
+        """The zero-length ``dir/`` object that makes an empty prefix exist."""
+        key = self._key(path)
+        if not key:
+            return  # the bucket root is a directory already
+        try:
+            self._stat_object(key)
+        except NotFoundError:
+            pass
+        else:
+            raise ExistsError(
+                kXR_ItExists, "an object already has this name", path=self._abs(path)
+            )
+        if not exist_ok and self._has_children(key):
+            raise ExistsError(kXR_ItExists, "directory exists", path=self._abs(path))
+        self.client.request(
+            "PUT",
+            self._marker_url(key),
+            body=b"",
+            headers={"Content-Length": "0"},
+            expect=(200,),
+        )
+
+    def _marker_url(self, key: str) -> XRootDURL:
+        """Where the marker lives: the key with the slash S3 lets a key keep."""
+        base = self._bucket_url()
+        return base.evolve(path=f"{base.path.rstrip('/')}/{key}/")
 
     def rmdir(self, path: str) -> None:
         """Refuse a prefix that still has keys under it; otherwise nothing.
 
         The emptiness check is the half of ``rmdir`` S3 can honour, and it is
-        the half that stops a caller deleting a tree by accident.
+        the half that stops a caller deleting a tree by accident. With folder
+        markers on, the empty directory's marker goes too, which is the other
+        half.
         """
         if self.listdir(path):
             raise BusyError(kXR_FileLocked, "directory not empty", path=self._abs(path))
+        key = self._key(path)
+        if self.config.s3_folder_markers and key:
+            self.client.request("DELETE", self._marker_url(key), expect=(200, 202, 204))
 
     def remove(self, path: str) -> None:
         """``DELETE`` the object.

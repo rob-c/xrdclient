@@ -240,13 +240,15 @@ def test_a_write_handle_is_never_silently_re_opened(broken, patient):
     """Re-opening a writer would lose data, or worse, re-truncate the file."""
     handle = File(broken.url.with_path("/data/new.root"), patient)
     handle.open(OpenFlags.NEW | OpenFlags.WRITE)
-    try:
-        assert not handle.recoverable
-        handle.write(b"first", 0)
-        broken.cut()
-        with pytest.raises(TransientError):
-            handle.write(b"second", 5)
-    finally:
+    assert not handle.recoverable
+    handle.write(b"first", 0)
+    broken.cut()
+    with pytest.raises(TransientError):
+        handle.write(b"second", 5)
+    # The server that would have committed the file has gone, so the close
+    # cannot succeed either - and a writer's close says so rather than
+    # letting the caller believe the bytes landed.
+    with pytest.raises(TransientError):
         handle.close()
 
 

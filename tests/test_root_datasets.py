@@ -36,6 +36,7 @@ from xrd.root.datasets import (
     read_arff,
     read_table,
     read_xlsx,
+    redistributable,
 )
 from xrd.root.writer import create
 
@@ -701,6 +702,37 @@ def test_describe_can_be_asked_about_one_dataset():
 def test_a_dataset_nobody_has_is_refused_by_name():
     with pytest.raises(ValueError, match=r"the datasets here are mnist.*not 'imagenet'"):
         describe("imagenet")
+
+
+@pytest.mark.parametrize(
+    "licence",
+    ["CC0", "CC BY 4.0", "CC BY-SA 3.0", "MIT", "Apache-2.0", "BSD-3-Clause",
+     "GPL-2 or later", "LGPL-2 or later", "Artistic-2.0", "Unlicense"],
+)
+def test_a_licence_that_permits_passing_the_file_on_says_so(licence):
+    assert redistributable(licence)
+
+
+@pytest.mark.parametrize(
+    "licence",
+    ["CC BY-NC 4.0", "CC BY-ND 4.0", "no formal licence; the authors ask to be cited"],
+)
+def test_a_licence_that_withholds_redistribution_says_so(licence):
+    assert not redistributable(licence)
+
+
+def test_a_licence_nobody_here_has_read_is_not_taken_on_trust():
+    assert not redistributable("see the terms of use on our website")
+
+
+def test_a_work_of_the_us_government_is_free_to_share():
+    assert redistributable("public domain")
+    assert redistributable(DATASETS["emnist"].licence)
+
+
+def test_only_the_cifar_sets_are_kept_back_from_a_mirror():
+    held = sorted(name for name, spec in DATASETS.items() if not redistributable(spec.licence))
+    assert held == ["cifar10", "cifar100"]
 
 
 # --- CIFAR ------------------------------------------------------------------

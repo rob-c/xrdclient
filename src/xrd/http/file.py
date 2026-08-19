@@ -16,7 +16,14 @@ from typing import IO, TYPE_CHECKING, Any, BinaryIO, Literal, TextIO, overload
 
 from .._log import get_logger
 from ..config import Config
-from ..errors import ExistsError, ProtocolError, UnsupportedError, kXR_ItExists, kXR_Unsupported
+from ..errors import (
+    ExistsError,
+    ProtocolError,
+    TransientError,
+    UnsupportedError,
+    kXR_ItExists,
+    kXR_Unsupported,
+)
 from ..io.raw import OpenBinaryMode, OpenTextMode
 from ..url import XRootDURL, parse
 from .client import HTTPClient, check_status, request_target
@@ -143,7 +150,21 @@ class HTTPRawIO(io.RawIOBase):
     def readinto(self, buffer: WriteableBuffer) -> int:
         if not self._readable:
             raise io.UnsupportedOperation("not readable")
-        count = self._stream().readinto(buffer)
+        stream = self._stream()
+        count = stream.readinto(buffer)
+        if not count and memoryview(buffer).nbytes:
+            # End of stream. If the response declared a length it has not
+            # delivered, this is a dropped connection, not the end of the
+            # file - and returning 0 here would hand the caller a silently
+            # short read.
+            short = stream.length
+            self._drop_stream()
+            if short:
+                raise TransientError(
+                    f"connection closed {short} bytes short of the declared "
+                    f"Content-Length reading {self.url.path}",
+                    committed=self._pos,
+                )
         self._pos += count
         return count
 

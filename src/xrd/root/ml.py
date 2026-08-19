@@ -365,7 +365,7 @@ def mixed(
     trees = list(trees)
     if not trees:
         raise ValueError("mixed() needs a tree to read: it was given none")
-    ranges = [(0, len(tree)) for tree in trees] if spans is None else [tuple(s) for s in spans]
+    ranges = [(0, len(tree)) for tree in trees] if spans is None else [(s[0], s[1]) for s in spans]
     if len(ranges) != len(trees):
         raise ValueError(
             f"mixed() was given {len(trees)} trees and {len(ranges)} spans; "

@@ -450,7 +450,9 @@ def test_a_token_supplied_by_hand_authenticates_and_stays_out_of_the_log(nowhere
     with caplog.at_level("DEBUG", logger="xrd"):
         (cred,) = auth.select("&P=ztn", config, host="dav.example.org")
     assert isinstance(cred, TokenCredential)
-    assert cred.initial() == b"ztn\x00eyJhbGciOi.payload.signature"
+    # A ``TokenResp``, not a bare token: the id, the header, then the token.
+    assert cred.initial().startswith(b"ztn\x00")
+    assert cred.initial().endswith(b"eyJhbGciOi.payload.signature\x00")
     assert "payload.signature" not in caplog.text
     assert "payload.signature" not in repr(cred)
 

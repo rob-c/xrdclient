@@ -7,16 +7,23 @@ against a value from the standard that defines it.
 from __future__ import annotations
 
 import hashlib
-import hmac
 import zlib
 
 import pytest
 
+from xrd.crypto.aes import BLOCK_SIZE, cbc_encrypt
 from xrd.crypto.blowfish import Blowfish, _pi_fraction_words
 from xrd.crypto.checksum import algorithms, checksum_bytes, checksum_file, new
-from xrd.crypto.crc32c import PAGE_SIZE, _crc32c_py, crc32c, pack_pages, unpack_pages
+from xrd.crypto.crc32c import (
+    PAGE_SIZE,
+    _crc32c_py,
+    crc32c,
+    pack_pages,
+    page_span,
+    unpack_pages,
+)
 from xrd.crypto.crc64 import crc64, crc64nvme
-from xrd.crypto.sigver import Signer, is_signed, sigver_hmac
+from xrd.crypto.sigver import Signer, is_signed, sigver_hash, sigver_sign, sigver_verify
 from xrd.proto import constants as c
 from xrd.proto import requests as r
 from xrd.proto.frames import encode
@@ -88,6 +95,13 @@ def test_an_unaligned_start_offset_makes_a_short_first_page():
     packed = pack_pages(data, offset)
     back, corrupt = unpack_pages(packed, offset)
     assert back == data and corrupt == ()
+
+
+def test_page_span_stops_at_the_file_page_boundary():
+    assert page_span(0, 10_000) == PAGE_SIZE
+    assert page_span(100, 10_000) == PAGE_SIZE - 100  # a short first page
+    assert page_span(PAGE_SIZE, 10) == 10  # ...and a short last one
+    assert page_span(PAGE_SIZE - 1, 10_000) == 1
 
 
 def test_a_flipped_bit_is_reported_by_offset():
@@ -279,12 +293,55 @@ def test_checksums_accept_memoryviews():
 # --------------------------------------------------------------------------
 
 
-def test_sigver_hmac_is_sha256_over_seqno_header_payload():
+def test_sigver_hash_is_sha256_over_seqno_header_payload():
+    header, payload = b"h" * 24, b"body"
+    expected = hashlib.sha256((1).to_bytes(8, "big") + header + payload).digest()
+    assert sigver_hash(1, header, payload) == expected
+
+
+def test_sigver_hash_drops_the_payload_when_nodata():
+    header = b"h" * 24
+    assert sigver_hash(7, header, b"payload", nodata=True) == sigver_hash(7, header, b"")
+
+
+def test_sigver_sign_is_the_hash_encrypted_under_a_zero_iv():
     key, header, payload = b"k" * 32, b"h" * 24, b"body"
-    expected = hmac.new(
-        key, (1).to_bytes(8, "big") + header + payload, hashlib.sha256
-    ).digest()
-    assert sigver_hmac(key, 1, header, payload) == expected
+    signature = sigver_sign(key, 1, header, payload)
+    assert signature == cbc_encrypt(key, sigver_hash(1, header, payload))
+    # PKCS#7 rounds the 32-byte hash up to three blocks.
+    assert len(signature) == 48
+
+
+def test_sigver_sign_prepends_a_given_iv():
+    key, header, iv = b"k" * 32, b"h" * 24, bytes(range(16))
+    signature = sigver_sign(key, 1, header, b"", iv=iv)
+    assert signature[:BLOCK_SIZE] == iv
+    assert signature[BLOCK_SIZE:] == cbc_encrypt(key, sigver_hash(1, header, b""), iv)
+
+
+def test_sigver_verify_accepts_what_sigver_sign_produced():
+    key, header, payload = b"k" * 32, b"h" * 24, b"body"
+    signature = sigver_sign(key, 3, header, payload)
+    assert sigver_verify(key, signature, 3, header, payload) is True
+
+
+def test_sigver_verify_accepts_an_embedded_iv():
+    key, header = b"k" * 32, b"h" * 24
+    signature = sigver_sign(key, 3, header, b"x", iv=bytes(range(16)))
+    assert sigver_verify(key, signature, 3, header, b"x", embedded_iv=True) is True
+
+
+def test_sigver_verify_rejects_tampered_material():
+    key, header = b"k" * 32, b"h" * 24
+    signature = sigver_sign(key, 3, header, b"body")
+    assert sigver_verify(key, signature, 3, header, b"different") is False
+    assert sigver_verify(key, signature, 4, header, b"body") is False
+
+
+def test_sigver_verify_rejects_what_will_not_even_decrypt():
+    key = b"k" * 32
+    assert sigver_verify(key, b"x" * 17, 1, b"h" * 24, b"") is False
+    assert sigver_verify(key, b"short", 1, b"h" * 24, b"", embedded_iv=True) is False
 
 
 @pytest.mark.parametrize("level", [c.kXR_secNone, c.kXR_secCompatible])
@@ -304,6 +361,13 @@ def test_an_override_can_force_or_exempt_one_opcode():
     """The kXR_protocol security block overrides the level, either way."""
     assert is_signed(c.kXR_write, c.kXR_secStandard, {c.kXR_write: c.kXR_secNone}) is False
     assert is_signed(c.kXR_read, c.kXR_secStandard, {c.kXR_read: c.kXR_secStandard}) is True
+    # An override for some other opcode changes nothing for this one.
+    assert is_signed(c.kXR_write, c.kXR_secStandard, {c.kXR_read: c.kXR_secNone}) is True
+
+
+def test_a_level_from_the_future_signs_the_standard_set():
+    assert is_signed(c.kXR_write, 9) is True
+    assert is_signed(c.kXR_read, 9) is False
 
 
 def test_signer_increments_the_sequence_number():
@@ -322,9 +386,47 @@ def test_signer_leaves_unsigned_requests_alone():
 def test_signer_covers_the_header_and_the_payload():
     key = b"k" * 32
     signer = Signer(key, c.kXR_secStandard, {})
+    frame = encode(r.Rm("/store/f.root"), 5)
+    seqno, signature, nodata = signer.sign(frame)
+    assert nodata is False
+    assert signature == sigver_sign(key, seqno, frame[:24], frame[24:])
+
+
+def test_a_write_travels_outside_its_own_signature():
+    """No ``kXR_secOData``: the data of a write is not hashed, and the frame
+    says so, so the server hashes the same bytes the client did."""
+    key = b"k" * 32
+    signer = Signer(key, c.kXR_secStandard, {})
     frame = encode(r.Write(b"HDL0", 0, b"payload"), 5)
-    seqno, mac = signer.sign(frame)
-    assert mac == sigver_hmac(key, seqno, frame[:24], frame[24:])
+    seqno, signature, nodata = signer.sign(frame)
+    assert nodata is True
+    assert signature == sigver_sign(key, seqno, frame[:24], b"", nodata=True)
+
+
+def test_secodata_pulls_the_payload_back_into_the_signature():
+    key = b"k" * 32
+    signer = Signer(key, c.kXR_secStandard, {}, secodata=True)
+    frame = encode(r.Write(b"HDL0", 0, b"payload"), 5)
+    seqno, signature, nodata = signer.sign(frame)
+    assert nodata is False
+    assert signature == sigver_sign(key, seqno, frame[:24], frame[24:])
+
+
+def test_an_embedded_iv_signer_draws_a_fresh_iv_per_signature():
+    key = b"k" * 32
+    signer = Signer(key, c.kXR_secStandard, {}, embedded_iv=True)
+    frame = encode(r.Rm("/store/f.root"), 5)
+    seqno, signature, _ = signer.sign(frame)
+    assert len(signature) == BLOCK_SIZE + 48
+    assert sigver_verify(key, signature, seqno, frame[:24], frame[24:], embedded_iv=True)
+
+
+def test_the_signature_covers_only_what_dlen_declares():
+    """Bytes appended after the request are the next request, not payload."""
+    key = b"k" * 32
+    frame = encode(r.Rm("/store/f.root"), 5)
+    seqno, signature, _ = Signer(key, c.kXR_secStandard, {}).sign(frame + b"trailing")
+    assert signature == sigver_sign(key, seqno, frame[:24], frame[24:])
 
 
 def test_signer_repr_hides_the_session_key():

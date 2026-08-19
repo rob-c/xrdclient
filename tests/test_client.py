@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import struct
 import time
 
 import pytest
@@ -18,12 +19,14 @@ from xrd.client.filesystem import FileSystem
 from xrd.errors import (
     ChecksumMismatchError,
     InvalidArgumentError,
+    PageIntegrityError,
     ProtocolError,
+    TransientError,
     UnsupportedError,
 )
 from xrd.flags import Access, DirListFlags, OpenFlags, StatInfoFlags
 from xrd.proto import constants as c
-from xrd.testing import FakeServer, error, frame
+from xrd.testing import FakeServer, error, frame, pgwrite_cse
 from xrd.types import CloneRange, ReadRange, WriteChunk
 
 
@@ -275,6 +278,15 @@ def test_mkdir_on_an_existing_directory_raises_unless_allowed(fs):
     fs.mkdir("/data", exist_ok=True)
 
 
+def test_exist_ok_does_not_forgive_a_file_on_the_name(fs):
+    # ``os.makedirs(..., exist_ok=True)`` raises when the leaf is a file, and
+    # so does this: the promise is "a directory exists here", not "something".
+    with pytest.raises(FileExistsError):
+        fs.mkdir("/data/a.root", exist_ok=True)
+    with pytest.raises(FileExistsError):
+        fs.makedirs("/data/a.root", exist_ok=True)
+
+
 def test_makedirs_creates_the_whole_chain(fs, server):
     fs.makedirs("/a/b/c")
     assert {"/a", "/a/b", "/a/b/c"} <= server.dirs
@@ -472,6 +484,19 @@ def test_prepare_is_asked_for_in_words(fs, server):
 def test_locate_is_asked_for_in_words(fs, server):
     locations = fs.locate("/data/a.root", refresh=True, no_wait=True)
     assert locations[0].address == f"{server.address[0]}:{server.address[1]}"
+
+
+def test_a_create_locate_answers_for_a_file_that_is_not_there_yet(fs, server):
+    """Where a new file would go - the question a writer has to ask, and the
+    one a plain locate answers with ENOENT."""
+    locations = fs.locate("/data/new.root", create=True)
+    assert locations[0].address == f"{server.address[0]}:{server.address[1]}"
+    assert (c.kXR_locate, "*/data/new.root") in server.arguments
+
+
+def test_a_deep_create_locate_asks_the_same_question_of_every_tier(fs, server):
+    assert [loc.type for loc in fs.deep_locate("/data/new.root", create=True)] == ["S"]
+    assert (c.kXR_locate, "*/data/new.root") in server.arguments
 
 
 def test_a_query_names_its_code(fs):
@@ -682,6 +707,43 @@ def test_opening_twice_is_refused(fs):
     with handle:
         with pytest.raises(ValueError, match="already open"):
             handle.open()
+
+
+def test_a_writers_close_fails_loudly_when_the_server_is_gone(server, config):
+    """The close is where a written file is committed; a lost one is a loss."""
+    handle = File(server.url.with_path("/data/w.bin"), config)
+    handle.open(OpenFlags.UPDATE | OpenFlags.NEW, Access.OWNER_WRITE)
+    handle.write(b"payload", 0)
+    server.disconnect()
+    with pytest.raises(TransientError):
+        handle.close()
+
+
+def test_a_readers_close_forgives_a_server_that_is_gone(server, config):
+    """Nothing is committed on a read, so a close with nothing to close is
+    the outcome the caller wanted anyway."""
+    handle = File(server.url.with_path("/data/a.root"), config)
+    handle.open(OpenFlags.READ)
+    server.disconnect()
+    handle.close()
+    assert not handle.is_open
+
+
+def test_a_failing_close_does_not_mask_the_bodys_exception(server, config):
+    handle = File(server.url.with_path("/data/w2.bin"), config)
+    handle.open(OpenFlags.UPDATE | OpenFlags.NEW, Access.OWNER_WRITE)
+    with pytest.raises(ZeroDivisionError):
+        with handle:
+            server.disconnect()
+            raise ZeroDivisionError("what the body was really doing")
+
+
+def test_a_failing_close_surfaces_from_the_with_statement(server, config):
+    handle = File(server.url.with_path("/data/w3.bin"), config)
+    handle.open(OpenFlags.UPDATE | OpenFlags.NEW, Access.OWNER_WRITE)
+    with pytest.raises(TransientError):
+        with handle:
+            server.disconnect()
 
 
 def test_close_is_idempotent(fs):
@@ -911,6 +973,60 @@ def test_a_clone_that_fails_for_any_other_reason_is_left_alone(source, opened, s
 def test_pgwrite_checksums_each_page(opened, server):
     assert opened.pgwrite(b"payload") == 7
     assert server.contents("/data/w.bin") == b"payload"
+
+
+def test_a_page_the_server_says_arrived_corrupt_is_sent_again(opened, server):
+    """The server keeps the write and names the bad page; the client resends
+    just that page, with kXR_pgRetry."""
+    server.pgwrite_corrupt[4096] = 1
+    assert opened.pgwrite(b"a" * 4096 + b"b" * 4096) == 8192
+    assert server.contents("/data/w.bin") == b"a" * 4096 + b"b" * 4096
+    retries = [req for req in server.pgwrites if req[2] & c.kXR_pgRetry]
+    assert [(off, length) for off, length, _ in retries] == [(4096, 4096)]
+
+
+def test_only_the_pages_named_are_sent_again(opened, server):
+    """A short last page is resent at its own length, not a whole 4 KiB."""
+    server.pgwrite_corrupt[8192] = 1
+    opened.pgwrite(b"z" * 8195)
+    retries = [req for req in server.pgwrites if req[2] & c.kXR_pgRetry]
+    assert [(off, length) for off, length, _ in retries] == [(8192, 3)]
+
+
+def test_a_page_that_stays_corrupt_fails_the_write(opened, server):
+    server.pgwrite_corrupt[0] = 99
+    with pytest.raises(PageIntegrityError, match="offset 0"):
+        opened.pgwrite(b"payload")
+    assert len([req for req in server.pgwrites if req[2] & c.kXR_pgRetry]) == c.PGW_MAX_RETRY
+
+
+def test_a_pgwrite_retry_that_starts_from_an_unaligned_offset(opened, server):
+    """Pages are aligned to the file, so a write starting mid-page has a short
+    first page, and the retry has to resend exactly that."""
+    server.pgwrite_corrupt[100] = 1
+    opened.pgwrite(b"q" * 5000, 100)
+    retries = [req for req in server.pgwrites if req[2] & c.kXR_pgRetry]
+    assert [(off, length) for off, length, _ in retries] == [(100, 3996)]
+
+
+def test_a_corrupt_page_outside_the_request_is_a_protocol_error(opened, server):
+    def _lies(conn, sid, params, body):
+        yield pgwrite_cse(sid, [1 << 40])
+
+    server.handlers[c.kXR_pgwrite] = _lies
+    with pytest.raises(ProtocolError, match="outside the"):
+        opened.pgwrite(b"payload")
+
+
+def test_a_malformed_checksum_error_trailer_is_refused(opened, server):
+    def _ragged(conn, sid, params, body):
+        status = struct.pack(">IHBB", 0, sid, c.kXR_pgwrite - c.kXR_1stRequest, 0)
+        status += bytes(4) + struct.pack(">iq", 11, 0)
+        yield frame(sid, c.kXR_status, status) + b"x" * 11
+
+    server.handlers[c.kXR_pgwrite] = _ragged
+    with pytest.raises(ProtocolError, match="checksum-error trailer"):
+        opened.pgwrite(b"payload")
 
 
 def test_truncate_on_the_handle_shortens_the_file(opened, server):

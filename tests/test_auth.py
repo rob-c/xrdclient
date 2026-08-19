@@ -119,7 +119,27 @@ def test_token_expiry_reads_the_exp_claim():
 
 def test_a_live_token_produces_the_ztn_blob():
     token = jwt(int(time.time()) + 3600)
-    assert TokenCredential(token).initial() == b"ztn\x00" + token.encode()
+    blob = TokenCredential(token).initial()
+    assert blob == (
+        b"ztn\x00\x00T\x00\x00"
+        + struct.pack(">H", len(token) + 1)
+        + token.encode()
+        + b"\x00"
+    )
+
+
+def test_the_ztn_blob_is_what_stock_reads():
+    """The fields ``XrdSecProtocolztn::Authenticate`` actually looks at."""
+    blob = TokenCredential("opaque").initial()
+    assert blob[:4] == b"ztn\x00"  # id[4], doubling as the credtype
+    assert blob[4] == 0  # ver
+    assert blob[5] == ord("T")  # opr = IsTkn, not a token character
+    assert blob[6:8] == b"\x00\x00"  # rsvd
+    (length,) = struct.unpack(">H", blob[8:10])
+    assert length == len("opaque") + 1  # the trailing NUL counts
+    assert blob[10 : 10 + length - 1] == b"opaque"
+    assert blob[10 + length - 1] == 0  # stock insists on this NUL
+    assert len(blob) == 10 + length
 
 
 def test_an_expired_token_fails_before_the_round_trip():
@@ -128,7 +148,7 @@ def test_an_expired_token_fails_before_the_round_trip():
 
 
 def test_an_opaque_token_is_sent_as_is():
-    assert TokenCredential("opaque").initial() == b"ztn\x00opaque"
+    assert TokenCredential("opaque").initial().endswith(b"opaque\x00")
 
 
 def test_token_repr_hides_the_token():
@@ -168,6 +188,54 @@ def test_ztn_is_unavailable_without_a_token(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     monkeypatch.setattr("os.getuid", lambda: 999999)
     assert TokenCredential.available(Offer("ztn"), Config(), username="", host="h") is None
+
+
+def test_a_token_bigger_than_the_server_takes_is_refused_before_the_wire():
+    """The offer's ``<expiry>:<maxtsz>:`` names a size the server will refuse."""
+    config = Config(token="x" * 65)
+    with pytest.raises(CredentialError, match=r"65 bytes and h accepts at most 64"):
+        TokenCredential.available(Offer("ztn", "0:64:"), config, username="", host="h")
+
+
+def test_a_token_within_the_stated_size_is_used():
+    cred = TokenCredential.available(
+        Offer("ztn", "0:4096:"), Config(token="tok"), username="", host="h"
+    )
+    assert cred is not None and cred.token == "tok"
+
+
+def test_a_token_without_the_life_the_server_wants_is_refused():
+    config = Config(token=jwt(int(time.time()) + 30))
+    with pytest.raises(CredentialError, match=r"wants 300s of life"):
+        TokenCredential.available(Offer("ztn", "300:4096:"), config, username="", host="h")
+
+
+def test_a_lifetime_requirement_cannot_read_an_opaque_token():
+    """No ``exp`` claim, nothing to hold against it - the server decides."""
+    cred = TokenCredential.available(
+        Offer("ztn", "300:4096:"), Config(token="opaque"), username="", host="h"
+    )
+    assert cred is not None
+
+
+def test_legacy_ztn_parameters_are_no_requirement_at_all():
+    for params in ("", "ver:1", "v:10000"):
+        cred = TokenCredential.available(
+            Offer("ztn", params), Config(token="x" * 5000), username="", host="h"
+        )
+        assert cred is not None
+
+
+def test_select_reports_the_oversized_token_and_moves_on():
+    rejected: dict[str, str] = {}
+    names = [
+        c.name
+        for c in auth.select(
+            "&P=ztn,0:8:&P=host", Config(token="x" * 9), username="b", rejected=rejected
+        )
+    ]
+    assert names == ["host"]
+    assert "accepts at most 8" in rejected["ztn"]
 
 
 # --------------------------------------------------------------------------
@@ -469,6 +537,38 @@ def test_a_mechanism_that_raises_does_not_mask_the_rest(monkeypatch):
 def test_select_accepts_offers_as_well_as_a_trailer():
     names = [c.name for c in auth.select([Offer("host")], Config())]
     assert names == ["host"]
+
+
+def test_a_bearer_token_is_withheld_from_a_cleartext_connection(monkeypatch):
+    """Stock behaviour: ztn over cleartext is a replayable credential, so the
+    rung is skipped and the rejection says which scheme fixes it."""
+    monkeypatch.setenv("BEARER_TOKEN", "t0ken")
+    rejected: dict[str, str] = {}
+    names = [
+        c.name
+        for c in auth.select("&P=ztn&P=host", Config(), username="b", rejected=rejected, tls=False)
+    ]
+    assert names == ["host"]
+    assert "cleartext" in rejected["ztn"] and "roots://" in rejected["ztn"]
+
+
+def test_a_bearer_token_travels_when_the_connection_is_encrypted(monkeypatch):
+    monkeypatch.setenv("BEARER_TOKEN", "t0ken")
+    names = [c.name for c in auth.select("&P=ztn", Config(), username="b", tls=True)]
+    assert names == ["ztn"]
+
+
+def test_ztn_cleartext_opts_back_in(monkeypatch):
+    monkeypatch.setenv("BEARER_TOKEN", "t0ken")
+    config = Config(ztn_cleartext=True)
+    names = [c.name for c in auth.select("&P=ztn", config, username="b", tls=False)]
+    assert names == ["ztn"]
+
+
+def test_a_caller_who_cannot_say_withholds_nothing(monkeypatch):
+    monkeypatch.setenv("BEARER_TOKEN", "t0ken")
+    names = [c.name for c in auth.select("&P=ztn", Config(), username="b")]
+    assert names == ["ztn"]
 
 
 def test_select_is_lazy():

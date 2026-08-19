@@ -86,7 +86,7 @@ except ImportError:  # pragma: no cover - before 3.14, where zstandard fills in
         from zstandard import ZstdCompressor
 
         def _zstd_pack(block: bytes, level: int) -> bytes:
-            return ZstdCompressor(level=level).compress(block)
+            return bytes(ZstdCompressor(level=level).compress(block))
 
     except ImportError:
 

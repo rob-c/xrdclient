@@ -27,6 +27,7 @@ from ..errors import (
 )
 from ..errors import (
     RedirectLimitError,
+    TransientError,
     kXR_ArgInvalid,
     kXR_FileLocked,
     kXR_ItExists,
@@ -285,10 +286,22 @@ class HTTPClient:
         expect: tuple[int, ...] = (),
         errors: dict[int, int] | None = None,
     ) -> Response:
-        """Issue a request and read the whole response."""
+        """Issue a request and read the whole response.
+
+        A body that ends before its declared ``Content-Length`` is a dropped
+        connection, not a shorter answer, and is raised as the
+        :class:`~xrd.errors.TransientError` it is rather than returned as if
+        the server had said less. (A body over :data:`MAX_BODY` is truncated
+        deliberately, which is different: nothing was lost on the wire.)
+        """
         response = self.open(method, url, body=body, headers=headers, expect=expect, errors=errors)
         try:
             payload = b"" if method == "HEAD" else response.read(MAX_BODY)
+            if method != "HEAD" and len(payload) < MAX_BODY and response.length:
+                raise TransientError(
+                    f"connection closed {response.length} bytes short of the "
+                    f"declared Content-Length for {method} {url}"
+                )
         finally:
             response.close()
         return Response(response.status, response.reason, response.msg, payload, str(url))

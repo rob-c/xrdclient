@@ -32,6 +32,7 @@ Exception
     │       └── TokenExpiredError
     ├── RedirectLimitError
     ├── ChecksumMismatchError
+    ├── PageIntegrityError            a page kept arriving corrupt on a pgwrite
     ├── TooLargeError                 a whole-file read that would not fit
     ├── ROOTError                     reading a ROOT file (xrd.root)
     │   ├── FormatError               these bytes are not the format they claim
@@ -40,6 +41,7 @@ Exception
         ├── NotFoundError             + FileNotFoundError   ENOENT
         ├── ExistsError               + FileExistsError     EEXIST
         ├── PermissionError           + PermissionError     EACCES
+        ├── TLSRequiredError          + PermissionError     EACCES
         ├── IsADirectoryError         + IsADirectoryError   EISDIR
         ├── NotADirectoryError        + NotADirectoryError  ENOTDIR
         ├── NoSpaceError              + OSError             ENOSPC
@@ -55,6 +57,10 @@ Exception
 
 Catch broadly with `xrd.XRootDError`, or narrowly with the builtin you already
 know.
+
+`TLSRequiredError` is a server refusing to do this in the clear (`kXR_error`
+3028): its message names the fix, which is to connect with `roots://` (or
+`davs://`) rather than to try again.
 
 ## What a `ServerError` carries
 

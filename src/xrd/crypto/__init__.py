@@ -16,11 +16,11 @@ from __future__ import annotations
 from .aes import AES, cbc_decrypt, cbc_encrypt
 from .blowfish import Blowfish
 from .checksum import Checksum, algorithms, checksum_bytes, checksum_file, new
-from .crc32c import IS_ACCELERATED, crc32c, pack_pages, unpack_pages
+from .crc32c import IS_ACCELERATED, crc32c, pack_pages, page_span, unpack_pages
 from .crc64 import crc64, crc64nvme
 from .der import DERError
 from .rsa import RSAPrivateKey, RSAPublicKey, load_private_key, load_public_key, pem_blocks
-from .sigver import Signer, is_signed, sigver_hmac
+from .sigver import Signer, is_signed, sigver_hash, sigver_sign, sigver_verify
 from .x509 import Certificate, Name, ProxyCredential, load_certificates, load_proxy
 
 __all__ = [
@@ -50,7 +50,10 @@ __all__ = [
     "is_signed",
     "new",
     "pack_pages",
-    "sigver_hmac",
+    "page_span",
+    "sigver_hash",
+    "sigver_sign",
+    "sigver_verify",
     "unpack_pages",
     "IS_ACCELERATED",
 ]

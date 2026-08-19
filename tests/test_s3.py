@@ -402,6 +402,81 @@ def test_a_prefix_can_be_removed_only_once_nothing_is_under_it(fs):
     fs.rmdir("/nothing-is-here")
 
 
+# ---------------------------------------------------------------------------
+# Folder markers: the opt-in that makes an empty directory a thing
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def marker_fs(bucket):
+    """The same bucket, with folder markers opted in."""
+    with S3FileSystem(
+        bucket.url,
+        Config(s3_folder_markers=True),
+        credentials=CREDENTIALS,
+        endpoint=bucket.endpoint,
+    ) as filesystem:
+        yield filesystem
+
+
+def test_a_marker_makes_an_empty_directory_exist(bucket, marker_fs):
+    marker_fs.mkdir("/incoming")
+    assert bucket.contents("incoming/") == b""
+    assert marker_fs.isdir("/incoming")
+    assert marker_fs.stat("/incoming").is_dir()
+
+
+def test_listings_hide_the_markers(marker_fs):
+    marker_fs.mkdir("/incoming")
+    assert marker_fs.listdir("/incoming") == []
+    assert "incoming" in marker_fs.listdir("/")
+
+
+def test_mkdir_refuses_a_name_an_object_holds(marker_fs):
+    with pytest.raises(ExistsError, match="object"):
+        marker_fs.mkdir("/top.txt")
+    with pytest.raises(ExistsError, match="object"):
+        marker_fs.makedirs("/top.txt", exist_ok=True)
+
+
+def test_mkdir_without_exist_ok_refuses_a_directory_that_exists(marker_fs):
+    marker_fs.mkdir("/incoming")
+    with pytest.raises(ExistsError, match="exists"):
+        marker_fs.mkdir("/incoming")
+    marker_fs.mkdir("/incoming", exist_ok=True)
+
+
+def test_makedirs_needs_only_the_leaf_marker(bucket, marker_fs):
+    marker_fs.makedirs("/a/b/c")
+    assert list(bucket.objects) == [*OBJECTS, "a/b/c/"]
+    assert marker_fs.isdir("/a") and marker_fs.isdir("/a/b")
+
+
+def test_the_bucket_root_needs_no_marker(bucket, marker_fs):
+    marker_fs.mkdir("/")
+    assert not any(m == "PUT" for m, _p, _q in bucket.seen)
+
+
+def test_rmdir_takes_the_marker_with_it(bucket, marker_fs):
+    marker_fs.mkdir("/incoming")
+    marker_fs.rmdir("/incoming")
+    assert "incoming/" not in bucket.objects
+    assert not marker_fs.exists("/incoming")
+
+
+def test_rmdir_still_refuses_a_prefix_with_keys_under_it(marker_fs):
+    with pytest.raises(BusyError, match="not empty"):
+        marker_fs.rmdir("/runs")
+
+
+def test_rmdir_of_the_root_deletes_nothing(bucket, marker_fs):
+    # An empty bucket's root: nothing listed, no marker to delete.
+    for key in list(bucket.objects):
+        del bucket.objects[key]
+    marker_fs.rmdir("/")
+    assert not any(m == "DELETE" for m, _p, _q in bucket.seen)
+
+
 def test_removing_a_key_twice_is_not_an_error_because_s3_cannot_tell(bucket, fs):
     fs.remove("/top.txt")
     assert "top.txt" not in bucket.objects

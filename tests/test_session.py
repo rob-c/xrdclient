@@ -168,6 +168,15 @@ def test_the_router_follows_a_redirect_to_the_new_endpoint(config):
         assert c.kXR_stat in target.seen
 
 
+def test_an_eos_capability_reaches_the_target_as_one_parameter(config):
+    """``?&cap.sym=...`` must not arrive as a path with an empty parameter."""
+    with FakeServer(files={"/f": b"hi"}) as target, FakeServer() as front:
+        front.redirects[c.kXR_stat] = (*target.address, "&cap.sym=abc")
+        with Router(front.url, config) as router:
+            router.execute(r.Stat("/f"), path="/f")
+    assert (c.kXR_stat, "/f?cap.sym=abc") in target.arguments
+
+
 def test_the_redirect_token_is_folded_into_the_path():
     request = r.Stat("/data/a.root")
     _retarget(request, "xrd.k=1")
@@ -253,7 +262,7 @@ def test_repr_says_whether_it_is_connected(server, config):
 def scripted(session, *batches):
     """Replace the session's I/O turn with a fixed script of event batches."""
     turns = iter(batches)
-    session._pump = lambda pathid=0: next(turns)
+    session._pump = lambda pathid=0, deadline=None: next(turns)
 
 
 def test_events_for_another_stream_are_kept_until_that_stream_asks(server, config):

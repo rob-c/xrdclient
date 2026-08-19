@@ -73,6 +73,18 @@ def _parser() -> argparse.ArgumentParser:
         help="chunks read ahead while the last is written (default 2, 1 for neither)",
     )
     parser.add_argument(
+        "--stripes",
+        type=int,
+        metavar="N",
+        help="connections to move one file over, a span each (default 4, 1 for one)",
+    )
+    parser.add_argument(
+        "--streams",
+        type=int,
+        metavar="N",
+        help="extra connections each file's data rides on (default 1, 0 for none)",
+    )
+    parser.add_argument(
         "-p",
         "--progress",
         action="store_true",
@@ -211,6 +223,11 @@ def _misuse(args: argparse.Namespace) -> str | None:
         return "--parallel is how many files to copy at once, so at least one"
     if args.in_flight is not None and args.in_flight < 1:
         return "--in-flight is how many chunks to hold at once, so at least one"
+    if args.stripes is not None and args.stripes < 1:
+        return "--stripes is how many connections to move one file over, so at least one"
+    if args.streams is not None and args.streams < 0:
+        # Nought is a real answer here: it asks for the control link alone.
+        return "--streams is how many extra connections a file's data gets, so not negative"
     if args.tpc and (args.dry_run or args.remove_source):
         return "--tpc hands the transfer to the servers; --dry-run and --remove-source cannot"
     if args.resume and (args.tpc or args.no_clobber):
@@ -229,6 +246,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = config_from(args)
     if args.in_flight is not None:
         config = config.evolve(in_flight=args.in_flight)
+    if args.stripes is not None:
+        config = config.evolve(parallel_chunks=args.stripes)
+    if args.streams is not None:
+        config = config.evolve(data_streams=args.streams)
     sources = [parse(s) for s in args.source]
     dest = parse(args.dest)
     show = args.progress if args.progress is not None else (sys.stderr.isatty() and not args.quiet)

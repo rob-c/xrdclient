@@ -50,6 +50,9 @@ class MemoryTransport(Transport):
     def start_tls(self, hostname: str, config: Config) -> None:
         self.tls_started = True
 
+    def settimeout(self, timeout: float | None) -> None:
+        """Nothing to bound: a receive here returns whatever is queued."""
+
     def close(self) -> None:
         self._closed = True
 

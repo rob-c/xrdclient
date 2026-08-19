@@ -172,6 +172,12 @@ def test_locate_names_the_servers(url, capsys):
     assert json.loads(payload)[0]["address"]
 
 
+def test_locate_can_ask_where_a_new_file_would_go(url, capsys):
+    code, out, _ = run(["locate", "--create", url + "data/new.root"], capsys)
+    assert code == 0
+    assert out.strip()
+
+
 def test_ping_times_the_round_trip(url, capsys):
     code, out, _ = run(["ping", url], capsys)
     assert code == 0
@@ -903,6 +909,64 @@ def test_the_in_flight_window_reaches_the_copy(url, tmp_path, capsys, monkeypatc
 def test_the_window_is_a_count_of_chunks_so_zero_is_a_usage_error(url, tmp_path, capsys):
     code = cp_cli.main(["--in-flight", "0", url + "data/a.root", str(tmp_path / "f")])
     assert (code, "at least one" in capsys.readouterr().err) == (2, True)
+
+
+def test_the_stripe_count_reaches_the_copy(url, tmp_path, capsys, monkeypatch):
+    """The engine has always been able to move one file over several
+    connections; this is the flag that asks it to."""
+    seen = []
+    real = cp_cli.copy
+
+    def spy(*args, config, **options):
+        seen.append(config.parallel_chunks)
+        return real(*args, config=config, **options)
+
+    monkeypatch.setattr(cp_cli, "copy", spy)
+    target = tmp_path / "f"
+    assert cp_cli.main(["--stripes", "3", "-q", url + "data/a.root", str(target)]) == 0
+    assert (seen, target.read_bytes()) == ([3], BODY)
+
+
+def test_stripes_are_a_count_of_connections_so_zero_is_a_usage_error(url, tmp_path, capsys):
+    code = cp_cli.main(["--stripes", "0", url + "data/a.root", str(tmp_path / "f")])
+    assert (code, "at least one" in capsys.readouterr().err) == (2, True)
+
+
+def test_the_stream_count_reaches_the_copy(url, tmp_path, capsys, monkeypatch):
+    """Stripes and streams are different questions: one is how many spans of
+    the file move at once, the other how many connections each one rides."""
+    seen = []
+    real = cp_cli.copy
+
+    def spy(*args, config, **options):
+        seen.append(config.data_streams)
+        return real(*args, config=config, **options)
+
+    monkeypatch.setattr(cp_cli, "copy", spy)
+    target = tmp_path / "f"
+    assert cp_cli.main(["--streams", "3", "-q", url + "data/a.root", str(target)]) == 0
+    assert (seen, target.read_bytes()) == ([3], BODY)
+
+
+def test_no_extra_streams_is_a_request_rather_than_a_mistake(url, tmp_path, monkeypatch):
+    """Unlike the counts above, nought means something here - the control link
+    on its own - so it has to reach the copy instead of being refused."""
+    seen = []
+    real = cp_cli.copy
+
+    def spy(*args, config, **options):
+        seen.append(config.data_streams)
+        return real(*args, config=config, **options)
+
+    monkeypatch.setattr(cp_cli, "copy", spy)
+    target = tmp_path / "f"
+    assert cp_cli.main(["--streams", "0", "-q", url + "data/a.root", str(target)]) == 0
+    assert (seen, target.read_bytes()) == ([0], BODY)
+
+
+def test_a_negative_stream_count_is_a_usage_error(url, tmp_path, capsys):
+    code = cp_cli.main(["--streams", "-1", url + "data/a.root", str(tmp_path / "f")])
+    assert (code, "not negative" in capsys.readouterr().err) == (2, True)
 
 
 def test_continue_carries_on_from_a_partial_download(url, tmp_path, capsys):

@@ -33,6 +33,7 @@ docs = ["mkdocs>=1.6", "mkdocs-material>=9.5", "mkdocstrings[python]>=0.25"]
 
 [project.scripts]
 xrd-cp = "xrd.cli.cp:main"
+xrd-datasets = "xrd.cli.datasets:main"
 xrd-fs = "xrd.cli.fs:main"
 
 [project.entry-points."fsspec.specs"]

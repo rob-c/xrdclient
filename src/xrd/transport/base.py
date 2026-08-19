@@ -58,4 +58,12 @@ class Transport(ABC):
         """Upgrade the live connection in place."""
 
     @abstractmethod
+    def settimeout(self, timeout: float | None) -> None:
+        """Bound how long one :meth:`receive` may block, in seconds.
+
+        The session layer sets this on whichever link it is about to read
+        from, to hold a deadline that is shorter than the transport's own.
+        """
+
+    @abstractmethod
     def close(self) -> None: ...

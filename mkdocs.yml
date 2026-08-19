@@ -42,6 +42,7 @@ nav:
       - ROOT files: root.md
       - Machine learning: ml.md
       - Training playbooks: playbooks.md
+      - A datasets site: datasets-site.md
       - fsspec: fsspec.md
       - Command line: cli.md
       - Safety: safety.md

@@ -206,6 +206,23 @@ each with what it is licensed under. See
 and [Training playbooks](playbooks.md) for making one and serving it on a port
 you can bind with no daemon and no login.
 
+## Loading by name
+
+```bash
+export XRD_CATALOGUE=https://data.example.org
+```
+
+```python
+data = xrd.ml.load("mnist")
+```
+
+A bare name — no scheme, no slash, no file of that name here — is looked up
+in the catalogue: the `index.json` a [datasets site](datasets-site.md)
+serves, which maps names to files. Anything that could be a place is treated
+as one, so a real path or URL is never shadowed by a catalogue entry. The
+catalogue can also be set per call with `Config(catalogue=...)`, and can be a
+local directory as easily as a URL.
+
 ## When to go a layer down
 
 [`xrd.root.ml`](root.md#into-pytorch-and-tensorflow) is the expert layer, and

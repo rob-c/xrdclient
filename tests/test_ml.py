@@ -14,6 +14,7 @@ no framework at all, which is the point of that half of the API.
 from __future__ import annotations
 
 import gc
+import json
 import pathlib
 import sys
 import types
@@ -491,3 +492,58 @@ def test_the_module_is_one_attribute_away(monkeypatch):
     """``xrd.ml`` resolves lazily, so nobody pays for the ROOT reader."""
     monkeypatch.delattr(xrd, "ml", raising=False)
     assert xrd.ml is sys.modules["xrd.ml"]
+
+
+# ---------------------------------------------------------------------------
+# Loading by name
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def catalogue(digits, tmp_path):
+    """A directory the shape ``xrd-datasets build`` leaves behind."""
+    index = {"format": 1, "datasets": [{"name": "digits", "file": "digits.root"}]}
+    (tmp_path / "index.json").write_text(json.dumps(index))
+    return str(tmp_path)
+
+
+def test_a_bare_name_is_found_in_the_catalogue(catalogue):
+    with load("digits", config=xrd.Config(catalogue=catalogue)) as data:
+        assert len(data) == 18
+
+
+def test_the_catalogue_can_come_from_the_environment(catalogue, monkeypatch):
+    monkeypatch.setenv("XRD_CATALOGUE", catalogue)
+    with load("digits") as data:
+        assert len(data) == 18
+
+
+def test_a_catalogue_is_read_over_http(digits):
+    from xrd.testing import FakeDAVServer
+
+    index = json.dumps({"format": 1, "datasets": [{"name": "digits", "file": "digits.root"}]})
+    files = {"/d/index.json": index.encode(), "/d/digits.root": pathlib.Path(digits).read_bytes()}
+    with FakeDAVServer(files=files) as server:
+        with load("digits", config=xrd.Config(catalogue=f"{server.url}d")) as data:
+            assert len(data) == 18
+
+
+def test_a_name_with_no_catalogue_set_says_how_to_set_one(monkeypatch):
+    monkeypatch.delenv("XRD_CATALOGUE", raising=False)
+    with pytest.raises(ValueError, match="XRD_CATALOGUE"):
+        load("digits")
+
+
+def test_a_name_the_catalogue_has_not_got_names_what_it_has(catalogue):
+    with pytest.raises(ValueError, match=r"has digits, and no 'mnist'"):
+        load("mnist", config=xrd.Config(catalogue=catalogue))
+
+
+def test_a_file_that_exists_is_never_shadowed_by_the_catalogue(digits, monkeypatch):
+    """A bare name that names a real file here is that file, catalogue or not."""
+    monkeypatch.delenv("XRD_CATALOGUE", raising=False)
+    here = pathlib.Path(digits)
+    plain = here.rename(here.with_name("digits"))
+    monkeypatch.chdir(plain.parent)
+    with load("digits") as data:  # no catalogue set, and none needed
+        assert len(data) == 18

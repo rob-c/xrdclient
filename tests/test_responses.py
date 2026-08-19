@@ -28,9 +28,43 @@ def test_parse_redirect_without_a_token():
     assert info.token == ""
 
 
+def test_parse_redirect_ends_the_host_at_a_line_ending():
+    """A redirector that terminates the field with CRLF names a host."""
+    for ending in (b"\r\n", b"\n", b"\r", b"\x00"):
+        info = rp.parse_redirect(struct.pack(">i", 1094) + b"newhost" + ending + b"junk")
+        assert info.host == "newhost"
+
+
+def test_parse_redirect_drops_the_tokens_own_separator():
+    """EOS hands its open capability over as ``?&cap.sym=...``."""
+    body = struct.pack(">i", 1095) + b"eos.example.org?&cap.sym=abc&cap.msg=def\x00"
+    info = rp.parse_redirect(body)
+    assert info.token == "cap.sym=abc&cap.msg=def"
+
+
+def test_parse_redirect_of_a_token_that_is_only_separators():
+    info = rp.parse_redirect(struct.pack(">i", 1094) + b"h?&\x00")
+    assert info.token == ""
+
+
 def test_a_negative_redirect_port_means_tls():
     info = rp.parse_redirect(struct.pack(">i", -1094) + b"h\x00")
     assert info.url == "roots://h:1094/"
+
+
+def test_parse_pgwrite_cse_lists_the_corrupt_pages():
+    trailer = struct.pack(">IHH", 0, 4096, 4096) + struct.pack(">qq", 0, 8192)
+    assert rp.parse_pgwrite_cse(trailer) == (0, 8192)
+
+
+def test_a_header_only_cse_trailer_names_no_page():
+    assert rp.parse_pgwrite_cse(struct.pack(">IHH", 0, 4096, 4096)) == ()
+
+
+@pytest.mark.parametrize("size", [1, 7, 12, 20])
+def test_a_ragged_cse_trailer_is_refused(size):
+    with pytest.raises(ProtocolError, match="checksum-error trailer"):
+        rp.parse_pgwrite_cse(b"x" * size)
 
 
 def test_parse_wait_carries_the_delay_and_the_reason():

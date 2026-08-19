@@ -50,9 +50,14 @@ def arguments(srv, opcode=None):
 
 
 def carried(srv):
-    """Every request that named a path carried the token."""
-    assert srv.arguments, "no requests were recorded"
-    return all(TOKEN in arg for arg in arguments(srv))
+    """Every request that named a path carried the token.
+
+    Not every request names one - the sub-stream probe is a ``kXR_Qconfig``
+    for ``brix.substreams``, and CGI has nowhere to live on a config key.
+    """
+    named = [arg for arg in arguments(srv) if arg.startswith("/")]
+    assert named, "no requests named a path"
+    return all(TOKEN in arg for arg in named)
 
 
 # ---------------------------------------------------------------------------

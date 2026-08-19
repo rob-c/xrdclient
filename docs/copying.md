@@ -132,6 +132,11 @@ xrd.copy(src, dst, config=xrd.Config(parallel_chunks=8))   # eight spans
 xrd.copy(src, dst, config=xrd.Config(parallel_chunks=1))   # one stream
 ```
 
+From the command line that is `xrd-cp --stripes 8`. Its neighbour
+`--streams` answers a different question — not how many spans of the file
+move at once, but how many `kXR_bind` sub-streams each one rides; see
+[`data_streams`](config.md) for what that binds and when it falls back.
+
 It happens by itself, and only where it can pay. The target must be one that
 takes a write at an offset, so a local path or `root://` but never an HTTP
 `PUT`; the source must answer how long it is; and the file must be long enough
@@ -301,6 +306,8 @@ $ xrd-cp -r --sync size --delete /tmp/results root://host//store/results/
 $ xrd-cp -r --dry-run --exclude '*.log' /tmp/results root://host//store/results/
 $ xrd-cp --remove-source /tmp/f.root root://host//store/f.root
 $ xrd-cp -c root://host//store/big.root /scratch/big.root   # carry on
+$ xrd-cp --stripes 8 root://host//store/big.root /scratch/   # eight spans at once
+$ xrd-cp --streams 2 root://host//store/big.root /scratch/   # two links per span
 ```
 
 See [the command line](cli.md#xrd-cp) for the flag table, including why a

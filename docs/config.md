@@ -27,7 +27,17 @@ production. `evolve` returns a new one.
 | `retry_backoff` | `0.5` | `XRD_STREAMERRORWINDOW` | first backoff, then doubling |
 | `redirect_limit` | `16` | `XRD_REDIRECTLIMIT` | redirects before giving up |
 | `wait_cap` | `600.0` | | ceiling on a server-requested wait |
+| `stall_deadline` | `1800.0` | `XRD_STALLDEADLINE` | one whole operation, first byte to last |
+| `wait_budget` | `1800.0` | `XRD_WAITBUDGET` | total parking one operation may be asked for |
 | `keepalive_interval` | `60.0` | | seconds between `kXR_ping`s |
+
+`request_timeout` bounds a single read from the socket and `stall_deadline`
+bounds the operation those reads add up to: a server that dribbles a byte at a
+time, or that says "still working" forever, never trips the first and is
+exactly what the second is for. A `kXR_wait` restarts the deadline — a delay
+the server declared is not a stall — but the delays are added up against
+`wait_budget`, so a redirector cannot park a caller indefinitely one polite
+minute at a time. Both take `0` to wait forever.
 
 ## Transfers
 
@@ -66,6 +76,8 @@ because a server that serves the op answers at once. Which of the two a server
 wants is a property of the server, so it is asked **once per connection**: the
 first file pays the timeout, and every later file on the same connection goes
 straight to the split that works.
+From the command line the field is `xrd-cp --streams N`, where `0` asks for
+the control link alone.
 `max_read_size` is the ceiling on a read that never said how much it wanted -
 `read()` with no argument, `read_bytes()`, `read_text()` - so that a file
 bigger than memory raises [`TooLargeError`](errors.md#too-much-at-once)
@@ -124,10 +136,15 @@ believes in. `pool_size = 0` turns pooling off entirely.
 | `auth_order` | `("gsi", "ztn", "krb5", "sss", "unix", "host")` | |
 | `verify_tls` | `True` | |
 | `require_tls` | `False` | |
+| `ztn_cleartext` | `False` | `XRD_ZTNCLEARTEXT` |
 | `prompt` | `None` (ask only at a terminal) | `XRD_PROMPT` |
 | `prompter` | `None` (ask on the terminal) | |
 
 See [Authentication](auth.md) for what each mechanism looks for.
+
+`ztn_cleartext` opts back into offering a bearer token on a connection that
+is not TLS, which the client otherwise refuses to do - a token sent in the
+clear is a token anyone on the path can replay. Prefer `roots://`.
 
 ## Behaviour
 
@@ -136,6 +153,8 @@ See [Authentication](auth.md) for what each mechanism looks for.
 | `recover_handles` | `True` | silently re-open a read-only file whose data server vanished mid-read |
 | `verify_checksums` | `True` | compare checksums after a copy |
 | `preferred_checksum` | `"adler32"` | algorithm asked for first |
+| `s3_folder_markers` | `False` | make `mkdir` on S3 write a zero-length `dir/` marker object |
+| `catalogue` | `None` (`$XRD_CATALOGUE`) | where `xrd.ml.load("name")` looks a bare name up |
 
 `recover_handles=False` turns a lost data server into a `TransientError` at the
 call that hit it, which is what you want when your job would rather fail than

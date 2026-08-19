@@ -43,7 +43,7 @@ from ..proto import constants as c
 from ..proto.buffer import Reader, Writer
 from ..url import XRootDURL, parse
 
-__all__ = ["FakeServer", "frame", "error", "from_directory", "main"]
+__all__ = ["FakeServer", "frame", "error", "pgwrite_cse", "from_directory", "main"]
 
 #: Requests whose body is payload rather than a path, so nothing about them
 #: belongs in :attr:`FakeServer.arguments`. The read side is here for the same
@@ -77,6 +77,29 @@ def frame(streamid: int, status: int, body: bytes = b"") -> bytes:
 def error(streamid: int, code: int, message: str) -> bytes:
     """A ``kXR_error`` frame carrying a server error code and its text."""
     return frame(streamid, c.kXR_error, struct.pack(">i", code) + message.encode() + b"\x00")
+
+
+def pgwrite_cse(streamid: int, corrupt: Sequence[int]) -> bytes:
+    """A ``kXR_pgwrite`` reply naming the pages that arrived corrupt.
+
+    A ``kXR_status`` frame whose trailer is ``cseCRC[4] dlFirst[2] dlLast[2]``
+    and then one big-endian ``int64`` file offset per bad page.
+    ``dlFirst``/``dlLast`` say how much of the first and last page the request
+    covered - a whole page each here, which is what a write of whole pages
+    means. Public for the same reason :func:`frame` is.
+    """
+    trailer = struct.pack(">IHH", 0, c.kXR_pgPageSZ, c.kXR_pgPageSZ) + b"".join(
+        struct.pack(">q", off) for off in corrupt
+    )
+    status = (
+        struct.pack(">I", 0)
+        + struct.pack(">H", streamid)
+        + bytes([c.kXR_pgwrite - c.kXR_1stRequest, c.kXR_FinalResult])
+        + bytes(4)
+        + struct.pack(">i", len(trailer))
+        + struct.pack(">q", 0)
+    )
+    return frame(streamid, c.kXR_status, status) + trailer
 
 
 _frame = frame
@@ -184,6 +207,10 @@ class FakeServer:
         #: the CGI left on - which is how a test checks that opaque data
         #: reached the operation it was meant for.
         self.arguments: list[tuple[int, str]] = []
+        #: ``(offset, length, reqflags)`` of every ``kXR_pgwrite``, in order.
+        #: The flags are what tell a retransmission (``kXR_pgRetry``) from a
+        #: first attempt.
+        self.pgwrites: list[tuple[int, int, int]] = []
         #: ``opcode -> (host, port, token)``, consumed once each.
         self.redirects: dict[int, tuple[str, int, str]] = {}
         #: ``opcode -> count`` of ``kXR_wait`` replies to send first.
@@ -192,6 +219,11 @@ class FakeServer:
         self.chunk_reads = 0
         #: Rounds of ``kXR_authmore`` to demand before accepting a credential.
         self.auth_rounds = 0
+        #: ``file offset -> count`` of ``kXR_pgwrite`` pages to report as having
+        #: arrived with a broken CRC, consumed once per report. The data is
+        #: stored regardless, as a real server stores it; what the client is
+        #: being made to do is come back for the page with ``kXR_pgRetry``.
+        self.pgwrite_corrupt: dict[int, int] = {}
         #: ``opcode -> handler`` overrides, tried before the built-in ones.
         #: A handler takes ``(connection, streamid, params, body)`` and yields
         #: raw frames, so it can answer with anything at all - including
@@ -829,14 +861,28 @@ def _h_pgread(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterat
 
 
 def _h_pgwrite(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    from ..crypto.crc32c import unpack_pages
+    from ..crypto.crc32c import page_span, unpack_pages
 
     offset = struct.unpack(">q", params[4:12])[0]
     data, corrupt = unpack_pages(body, offset)
-    if corrupt:
-        yield _error(sid, 3019, f"checksum error on pages {list(corrupt)}")
-        return
+    conn.s.pgwrites.append((offset, len(data), params[13]))
+    # A real server stores what it was sent and reports the pages whose CRC
+    # did not survive; it does not throw the whole request away. The client
+    # is expected to come back for those pages with kXR_pgRetry.
     _splice(conn._file(conn._path(params, b"", at=slice(0, 4))), offset, data)
+
+    injected = []
+    at = offset
+    while at < offset + len(data):
+        if conn.s.pgwrite_corrupt.get(at, 0):
+            conn.s.pgwrite_corrupt[at] -= 1
+            injected.append(at)
+        at += page_span(at, offset + len(data) - at)
+    corrupt = tuple(sorted({*corrupt, *injected}))
+
+    if corrupt:
+        yield pgwrite_cse(sid, corrupt)
+        return
     yield _frame(sid, c.kXR_ok)
 
 
@@ -955,6 +1001,19 @@ def _two_paths(params: bytes, body: bytes) -> tuple[str, str]:
     return _clean(text[:split]), _clean(text[split + 1 :])
 
 
+def _config_value(conn: _Connection, name: str) -> str:
+    """One ``kXR_Qconfig`` answer. ``brix.substreams`` tracks whether this
+    server actually serves arrivals, so the advertisement and the behaviour
+    cannot drift apart in a test; ``config_values`` still overrides it, for
+    the test about a server that lies."""
+    value = conn.s.config_values.get(name)
+    if value is not None:
+        return value
+    if name == "brix.substreams" and conn.s.serves_arrivals:
+        return "rw"
+    return ""
+
+
 def _h_query(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
     infotype = struct.unpack(">H", params[:2])[0]
     args = body.split(b"\x00", 1)[0].decode("utf-8", "replace")
@@ -968,7 +1027,7 @@ def _h_query(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterato
         yield _frame(sid, c.kXR_ok, f"{algorithm} {value}".encode() + b"\x00")
     elif infotype == c.kXR_Qconfig:
         names = args.split("\n")
-        values = [conn.s.config_values.get(n, "") for n in names]
+        values = [_config_value(conn, n) for n in names]
         yield _frame(sid, c.kXR_ok, "\n".join(values).encode() + b"\x00")
     elif infotype == c.kXR_Qckscan:
         conn.s.cancelled_checksums.append(_clean(args))
@@ -1007,8 +1066,12 @@ def _h_query(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterato
 
 
 def _h_locate(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    path = _clean(body.split(b"\x00", 1)[0].decode())
-    if path not in conn.s.files and path not in conn.s.dirs:
+    asked = body.split(b"\x00", 1)[0].decode()
+    # A ``*`` in front is create mode: the question is where the file could
+    # go, so one that is not there yet is the normal case, not a miss.
+    create = asked.startswith("*")
+    path = _clean(asked[1:] if create else asked)
+    if not create and path not in conn.s.files and path not in conn.s.dirs:
         raise _NotFound(path)
     host, port = conn.s.address
     yield _frame(sid, c.kXR_ok, f"Sw{host}:{port}".encode() + b"\x00")

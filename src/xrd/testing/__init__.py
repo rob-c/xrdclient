@@ -21,7 +21,7 @@ from __future__ import annotations
 from .faults import FaultProxy
 from .http import FakeDAVServer
 from .s3 import FakeS3Server
-from .server import FakeServer, error, frame, from_directory
+from .server import FakeServer, error, frame, from_directory, pgwrite_cse
 
 __all__ = [
     "FakeServer",
@@ -31,4 +31,5 @@ __all__ = [
     "frame",
     "error",
     "from_directory",
+    "pgwrite_cse",
 ]

@@ -497,6 +497,7 @@ class AsyncFileSystem:
         self,
         path: str,
         *,
+        create: bool = False,
         refresh: bool = False,
         no_wait: bool = False,
         add_peers: bool = False,
@@ -507,6 +508,7 @@ class AsyncFileSystem:
             functools.partial(
                 self._sync.locate,
                 path,
+                create=create,
                 refresh=refresh,
                 no_wait=no_wait,
                 add_peers=add_peers,
@@ -515,8 +517,8 @@ class AsyncFileSystem:
             )
         )
 
-    async def deep_locate(self, path: str) -> list[LocationInfo]:
-        return await _run(self._sync.deep_locate, path)
+    async def deep_locate(self, path: str, *, create: bool = False) -> list[LocationInfo]:
+        return await _run(functools.partial(self._sync.deep_locate, path, create=create))
 
     async def prepare(
         self,

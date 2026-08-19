@@ -450,7 +450,11 @@ def _df(args: argparse.Namespace, endpoints: Endpoints) -> int:
 
 def _locate(args: argparse.Namespace, endpoints: Endpoints) -> int:
     filesystem, path = endpoints.at(args.url)
-    places = filesystem.deep_locate(path) if args.deep else filesystem.locate(path)
+    places = (
+        filesystem.deep_locate(path, create=args.create)
+        if args.deep
+        else filesystem.locate(path, create=args.create)
+    )
     if args.json:
         print(dumps(places))
         return OK
@@ -642,6 +646,11 @@ def _parser() -> argparse.ArgumentParser:
     locate = command("locate", _locate, "which servers hold a path")
     locate.add_argument("url")
     locate.add_argument("--deep", action="store_true", help="follow managers down to the data")
+    locate.add_argument(
+        "--create",
+        action="store_true",
+        help="where the file would go, rather than where it is",
+    )
 
     ping = command("ping", _ping, "is the endpoint answering")
     ping.add_argument("url")

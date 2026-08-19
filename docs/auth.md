@@ -56,7 +56,9 @@ Config(token=os.environ["MY_TOKEN"])
 A JWT's `exp` claim is read - without verifying the signature, which is the
 server's job - so an expired token fails immediately with
 `TokenExpiredError` and the expiry time in the message. Opaque tokens are
-sent as-is.
+sent as-is: the token goes on the wire inside the `TokenResp` that
+`XrdSecProtocolztn` expects, so stock reads it as a token rather than as a
+response code it does not recognise.
 
 Carry tokens over TLS. `roots://`, `xroots://` and `davs://` are TLS by
 scheme; `Config(require_tls=True)` refuses a server that will not upgrade.

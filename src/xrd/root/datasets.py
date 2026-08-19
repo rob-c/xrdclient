@@ -71,6 +71,7 @@ __all__ = [
     "read_idx",
     "read_table",
     "read_xlsx",
+    "redistributable",
 ]
 
 #: How many bytes of a column gather before a basket goes out. Images get a
@@ -16132,6 +16133,38 @@ def _spec(name: str) -> Images | CIFAR | Audio | Matrix | Table:
     if spec is None:
         raise ValueError(f"the datasets here are {', '.join(DATASETS)}, not {name!r}")
     return spec
+
+
+#: Licence families under which a converted file may be passed on, matched at
+#: the front of the statement. Copyleft is here on purpose: the GPL and its
+#: relatives permit redistribution, they just oblige the licence to travel
+#: with the data - and every file converted here carries its licence in its
+#: ``about`` key, so it does.
+_SHAREABLE = ("cc0", "cc by", "mit", "apache", "bsd", "gpl", "lgpl", "artistic", "unlicense")
+
+
+def redistributable(licence: str) -> bool:
+    """Whether a file converted under ``licence`` may be served to others.
+
+        >>> redistributable("CC BY 4.0")
+        True
+        >>> redistributable("no formal licence; the tech report asks to be cited")
+        False
+
+    This answers the one question a public mirror has to ask - may this be
+    passed on at all - and nothing subtler: attribution, share-alike and
+    copyleft obligations still apply, and they are met by the licence
+    statement every converted file carries. A ``NoDerivatives`` or
+    ``NonCommercial`` clause, or no licence at all, is a no; so is anything
+    this function has not read, because "nobody said you could not" is not a
+    licence.
+    """
+    text = licence.lower()
+    if "no formal licence" in text or "-nc" in text or "-nd" in text:
+        return False
+    if text.startswith(_SHAREABLE):
+        return True
+    return "public domain" in text or "us federal government" in text
 
 
 def describe(name: str | None = None) -> str:

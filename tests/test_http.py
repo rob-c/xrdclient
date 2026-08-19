@@ -18,6 +18,7 @@ from xrd.errors import (
     NotFoundError,
     ProtocolError,
     RedirectLimitError,
+    TransientError,
     UnsupportedError,
 )
 from xrd.errors import (
@@ -207,6 +208,34 @@ def test_a_server_that_ignores_ranges_still_gives_the_right_bytes(dav):
         assert fh.read() == b"world"
 
 
+def test_a_body_cut_short_of_its_promise_is_an_error_not_a_download(dav):
+    """A connection dropped mid-body must not pass for a complete transfer."""
+    dav.truncate_at = 5
+    with HTTPClient(Config()) as client:
+        with pytest.raises(TransientError, match="short of the declared Content-Length"):
+            client.request("GET", dav.url / "d/a.root")
+
+
+def test_a_streaming_read_cut_short_names_the_bytes_it_kept(dav):
+    dav.truncate_at = 5
+    with open_http(dav.url / "d/a.root", "rb") as fh:
+        assert fh.read(5) == b"hello"
+        with pytest.raises(TransientError, match="short of the declared Content-Length") as caught:
+            fh.read()
+    assert caught.value.committed == 5
+
+
+def test_a_cut_stream_recovers_with_a_ranged_get(dav):
+    dav.truncate_at = 5
+    with open_http(dav.url / "d/a.root", "rb") as fh:
+        assert fh.read(5) == b"hello"
+        with pytest.raises(TransientError):
+            fh.read()
+        dav.truncate_at = None
+        assert fh.read() == b" world"
+    assert ("GET", "/d/a.root") in dav.seen
+
+
 def test_text_mode_iterates_lines(dav):
     dav.add_file("/d/lines.txt", b"one\ntwo\n")
     with xrd.open(dav.url / "d/lines.txt", "r") as fh:
@@ -313,6 +342,15 @@ def test_mkdir_is_mkcol_with_pathlib_semantics(fs, dav):
     assert "/d/deep/er/still" in dav.dirs
     with pytest.raises(FileNotFoundError):
         fs.mkdir("/d/absent/child")
+
+
+def test_exist_ok_does_not_forgive_a_resource_on_the_name(fs):
+    # MKCOL answers 405 for a collection *and* for a plain resource already
+    # on the name; only the former is what ``exist_ok`` promises to forgive.
+    with pytest.raises(FileExistsError):
+        fs.mkdir("/d/a.root", exist_ok=True)
+    with pytest.raises(FileExistsError):
+        fs.makedirs("/d/a.root", exist_ok=True)
 
 
 def test_remove_rename_and_touch(fs, dav):

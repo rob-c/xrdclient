@@ -90,6 +90,9 @@ class FakeDAVServer:
         self.no_dav = False
         #: Answer a ranged ``GET`` with the whole body, as some caches do.
         self.ignore_ranges = False
+        #: Promise the full ``Content-Length`` on a ``GET`` but send only
+        #: this many bytes and drop the connection - a server dying mid-reply.
+        self.truncate_at: int | None = None
         #: Answer ``Want-Digest`` at all.
         self.digests = True
         #: What a macaroon request mints.
@@ -246,6 +249,12 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header(name, value)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        cut = self.fake.truncate_at if self.command == "GET" else None
+        if cut is not None and cut < len(body):
+            self.wfile.write(body[:cut])
+            self.wfile.flush()
+            self.close_connection = True
+            return
         if body and self.command != "HEAD":
             self.wfile.write(body)
 
