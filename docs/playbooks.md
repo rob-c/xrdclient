@@ -1,12 +1,12 @@
 # Training playbooks
 
-Four programs in `examples/`, each learning something off a `root://` URL and
-none of them holding the file: MNIST twice — once in the short words of
-[`xrd.ml`](ml.md) and once written out longhand — an autoencoder that squeezes
-CIFAR-10 photographs through sixty-four numbers, and a small convolutional net
-on Fashion-MNIST. They are short on purpose — sixty lines apiece, no framework
-of ours between PyTorch and the data — and they run on a laptop in under a
-minute each.
+Five programs live in `examples/`. Four learn from a `root://` URL without
+holding the file: MNIST twice — once in the short words of [`xrd.ml`](ml.md)
+and once written out longhand — an autoencoder that squeezes CIFAR-10
+photographs through sixty-four numbers, and a small convolutional net on
+Fashion-MNIST. The fifth inspects one JARVIS crystal entry as raw and
+normalized 2D images. They are short on purpose, and each keeps remote access
+visible rather than hiding it behind setup code.
 
 The point they make is the one worth checking before trusting a client with a
 dataset that does not fit anywhere: every minibatch is a read of one basket
@@ -31,7 +31,7 @@ Each becomes one file of twenty trees: `train_0` … `train_9` and `test_0` …
 `test_9` for MNIST, and the class names themselves — `train_airplane`,
 `train_cat` — for the other two. See
 [the datasets everyone teaches with](root.md#the-datasets-everyone-teaches-with)
-for the five hundred and eighty-eight sets this can write, and what each of
+for the 1,422 sets a public mirror can write, and what each of
 them is licensed under.
 
 ## Serving them
@@ -51,6 +51,27 @@ That server authorises everyone and reads its files into memory, which is fine
 for a demonstration on loopback and wrong for anything else; see
 [Testing](testing.md#sharing-a-directory-over-root) before pointing it at a
 network.
+
+## Inspecting a JARVIS crystal projection
+
+`examples/jarvis_2d_visualize.py` reads one selected entry and one `xy`, `xz`
+or `yz` projection from a JARVIS-DFT ROOT file. It does not require PyTorch or
+download the rest of a hosted dataset:
+
+```console
+$ python3 examples/jarvis_2d_visualize.py \
+    root://127.0.0.1:21094//jarvis_dft2d_formation_energy.root \
+    --tree train --entry 12 --plane xz --normalization minmax \
+    --output crystal.png
+<Image2D 32x32 from 'train'/'projection' entry=12, plane='xz', normalization='minmax'>
+id=JVASP-... formula=... target=...
+saved crystal.png
+```
+
+Without `--output` it opens the side-by-side Matplotlib figure. A local path,
+HTTPS URL or catalogue name works in place of the `root://` URL. See
+[Raw and normalized 2D crystal images](ml.md#raw-and-normalized-2d-crystal-images)
+for rectangular branches, custom layers and direct NumPy/PyTorch conversion.
 
 ## MNIST, in the words a beginner has
 
@@ -131,8 +152,8 @@ The whole of the reading is these four lines:
 ```python
 trees = [handle[name] for name in handle.trees() if name.startswith("train_")]
 train = DataLoader(
-    mixed(trees, ["image", "label"], step=512, batch=256, device=device),
-    batch_size=None)
+    mixed(trees, ["image", "label"], step=512, batch=256, device=device), batch_size=None
+)
 ```
 
 `mixed` is there because the file keeps one tree per class: read them in turn

@@ -23,9 +23,11 @@ jobs:
           python-version: "3.12"
       - run: pip install -e ".[dev,fsspec]"
       - name: ruff
-        run: ruff check src tests benchmarks
+        run: ruff check src tests benchmarks tools
       - name: mypy --strict
         run: mypy
+      - name: maintainability burn-down (must reach zero)
+        run: python tools/maintainability.py check
 
   test:
     runs-on: ${{ matrix.os }}

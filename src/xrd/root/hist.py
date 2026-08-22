@@ -29,9 +29,17 @@ LINE = {"fLineColor": 1, "fLineStyle": 1, "fLineWidth": 1}
 FILL = {"fFillColor": 0, "fFillStyle": 1001}
 MARKER = {"fMarkerColor": 1, "fMarkerStyle": 1, "fMarkerSize": 1.0}
 AXIS_STYLE = {
-    "fNdivisions": 510, "fAxisColor": 1, "fLabelColor": 1, "fLabelFont": 42,
-    "fLabelOffset": 0.005, "fLabelSize": 0.035, "fTickLength": 0.03,
-    "fTitleOffset": 1.0, "fTitleSize": 0.035, "fTitleColor": 1, "fTitleFont": 42,
+    "fNdivisions": 510,
+    "fAxisColor": 1,
+    "fLabelColor": 1,
+    "fLabelFont": 42,
+    "fLabelOffset": 0.005,
+    "fLabelSize": 0.035,
+    "fTickLength": 0.03,
+    "fTitleOffset": 1.0,
+    "fTitleSize": 0.035,
+    "fTitleColor": 1,
+    "fTitleFont": 42,
 }
 
 
@@ -40,11 +48,17 @@ def _axis(name: str, nbins: int, low: float, high: float, edges: list[float]) ->
     return {
         "TNamed": {"fName": name, "fTitle": ""},
         "TAttAxis": dict(AXIS_STYLE),
-        "fNbins": nbins, "fXmin": low, "fXmax": high,
+        "fNbins": nbins,
+        "fXmin": low,
+        "fXmax": high,
         "fXbins": array.array("d", edges),
-        "fFirst": 0, "fLast": 0, "fBits2": 0,
-        "fTimeDisplay": False, "fTimeFormat": "",
-        "fLabels": None, "fModLabs": None,
+        "fFirst": 0,
+        "fLast": 0,
+        "fBits2": 0,
+        "fTimeDisplay": False,
+        "fTimeFormat": "",
+        "fLabels": None,
+        "fModLabs": None,
     }
 
 
@@ -245,49 +259,17 @@ class Histogram:
         fills the histogram represents, taken to be the sum of the values
         unless said otherwise.
         """
-        edges = [float(edge) for edge in edges]
-        if len(edges) < 2:
-            raise ValueError("a histogram needs at least two edges to have a bin")
-        if any(second <= first for first, second in zip(edges, edges[1:])):
-            raise ValueError("edges must increase: each bin has to be wider than nothing")
+        edges = _validated_edges(edges)
         nbins = len(edges) - 1
         values = _flowed(values, nbins, "values")
-        if errors is not None:
-            errors = _flowed(errors, nbins, "errors")
-        low, high = edges[0], edges[-1]
-        width = (high - low) / nbins
-        even = [low + width * step for step in range(nbins)] + [high]
-        stored = [] if edges == even else edges
+        errors = _optional_errors(errors, nbins)
+        low, high, stored = _axis_geometry(edges, nbins)
         inner = values[1:-1]
         centers = [(edges[step] + edges[step + 1]) / 2 for step in range(nbins)]
         weights = errors[1:-1] if errors is not None else None
-        core = {
-            "TNamed": {"fName": str(name), "fTitle": str(title)},
-            "TAttLine": dict(LINE), "TAttFill": dict(FILL), "TAttMarker": dict(MARKER),
-            "fNcells": nbins + 2,
-            "fXaxis": _axis("xaxis", nbins, low, high, stored),
-            "fYaxis": _axis("yaxis", 1, 0.0, 1.0, []),
-            "fZaxis": _axis("zaxis", 1, 0.0, 1.0, []),
-            "fBarOffset": 0, "fBarWidth": 1000,
-            "fEntries": float(entries) if entries is not None else math.fsum(values),
-            "fTsumw": math.fsum(inner),
-            "fTsumw2": (
-                math.fsum(error * error for error in weights)
-                if weights is not None
-                else math.fsum(inner)
-            ),
-            "fTsumwx": math.fsum(v * c for v, c in zip_strict(inner, centers)),
-            "fTsumwx2": math.fsum(v * c * c for v, c in zip_strict(inner, centers)),
-            "fMaximum": -1111.0, "fMinimum": -1111.0, "fNormFactor": 0.0,
-            "fContour": array.array("d"),
-            "fSumw2": array.array(
-                "d", [error * error for error in errors] if errors is not None else []
-            ),
-            "fOption": "",
-            "fFunctions": [],
-            "fBufferSize": 0, "fBuffer": array.array("d"),
-            "fBinStatErrOpt": 0,
-        }
+        core = _histogram_core(
+            name, title, nbins, low, high, stored, values, inner, centers, errors, weights, entries
+        )
         return cls("TH1D", {"TH1": core, "TArrayD": array.array("d", values)})
 
     def plot(self, ax: Any = None, **options: Any) -> Any:
@@ -323,21 +305,9 @@ class Histogram:
         which have no flat picture.
         """
         if len(self.axes) == 1:
-            values = self.values()
-            edges = self.edges()
-            top = max((value for value in values if value > 0), default=0.0)
-            return "\n".join(
-                f"[{edges[step]:g}, {edges[step + 1]:g})".rjust(24)
-                + f" {bar(value / top if top else 0.0, width):<{width}} {value:g}"
-                for step, value in enumerate(values)
-            )
+            return _text_1d(self, width)
         if len(self.axes) == 2:
-            rows = self.values()
-            top = max((value for row in rows for value in row if value > 0), default=0.0)
-            return "\n".join(
-                "".join(shade(row[step] / top if top else 0.0) for row in rows)
-                for step in reversed(range(len(self.axes[1])))
-            )
+            return _text_2d(self)
         raise missing_picture("histogram", len(self.axes))
 
     def __repr__(self) -> str:
@@ -355,4 +325,93 @@ def _flowed(values: Any, nbins: int, what: str) -> list[float]:
     raise ValueError(
         f"{len(given)} {what} for {nbins} bins: give one per bin, or two "
         f"more counting the flow at each end"
+    )
+
+
+def _validated_edges(edges: Any) -> list[float]:
+    made = [float(edge) for edge in edges]
+    if len(made) < 2:
+        raise ValueError("a histogram needs at least two edges to have a bin")
+    if any(second <= first for first, second in zip(made, made[1:])):
+        raise ValueError("edges must increase: each bin has to be wider than nothing")
+    return made
+
+
+def _optional_errors(errors: Any, nbins: int) -> list[float] | None:
+    return _flowed(errors, nbins, "errors") if errors is not None else None
+
+
+def _axis_geometry(edges: list[float], nbins: int) -> tuple[float, float, list[float]]:
+    low, high = edges[0], edges[-1]
+    width = (high - low) / nbins
+    even = [low + width * step for step in range(nbins)] + [high]
+    return low, high, [] if edges == even else edges
+
+
+def _histogram_core(
+    name: str,
+    title: str,
+    nbins: int,
+    low: float,
+    high: float,
+    stored: list[float],
+    values: list[float],
+    inner: list[float],
+    centers: list[float],
+    errors: list[float] | None,
+    weights: list[float] | None,
+    entries: float | None,
+) -> dict[str, Any]:
+    sumw2 = (
+        math.fsum(error * error for error in weights) if weights is not None else math.fsum(inner)
+    )
+    error_squares = [error * error for error in errors] if errors is not None else []
+    return {
+        "TNamed": {"fName": str(name), "fTitle": str(title)},
+        "TAttLine": dict(LINE),
+        "TAttFill": dict(FILL),
+        "TAttMarker": dict(MARKER),
+        "fNcells": nbins + 2,
+        "fXaxis": _axis("xaxis", nbins, low, high, stored),
+        "fYaxis": _axis("yaxis", 1, 0.0, 1.0, []),
+        "fZaxis": _axis("zaxis", 1, 0.0, 1.0, []),
+        "fBarOffset": 0,
+        "fBarWidth": 1000,
+        "fEntries": float(entries) if entries is not None else math.fsum(values),
+        "fTsumw": math.fsum(inner),
+        "fTsumw2": sumw2,
+        "fTsumwx": math.fsum(value * center for value, center in zip_strict(inner, centers)),
+        "fTsumwx2": math.fsum(
+            value * center * center for value, center in zip_strict(inner, centers)
+        ),
+        "fMaximum": -1111.0,
+        "fMinimum": -1111.0,
+        "fNormFactor": 0.0,
+        "fContour": array.array("d"),
+        "fSumw2": array.array("d", error_squares),
+        "fOption": "",
+        "fFunctions": [],
+        "fBufferSize": 0,
+        "fBuffer": array.array("d"),
+        "fBinStatErrOpt": 0,
+    }
+
+
+def _text_1d(histogram: Histogram, width: int) -> str:
+    values = histogram.values()
+    edges = histogram.edges()
+    top = max((value for value in values if value > 0), default=0.0)
+    return "\n".join(
+        f"[{edges[step]:g}, {edges[step + 1]:g})".rjust(24)
+        + f" {bar(value / top if top else 0.0, width):<{width}} {value:g}"
+        for step, value in enumerate(values)
+    )
+
+
+def _text_2d(histogram: Histogram) -> str:
+    rows = histogram.values()
+    top = max((value for row in rows for value in row if value > 0), default=0.0)
+    return "\n".join(
+        "".join(shade(row[step] / top if top else 0.0) for row in rows)
+        for step in reversed(range(len(histogram.axes[1])))
     )

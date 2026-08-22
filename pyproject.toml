@@ -28,7 +28,25 @@ dependencies = []
 krb5 = ["gssapi>=1.8"]
 fsspec = ["fsspec>=2024.2.0"]
 plot = ["matplotlib>=3.5"]
-dev = ["pytest>=8", "pytest-timeout", "pytest-xdist", "pytest-cov", "mypy>=1.10", "ruff>=0.5"]
+datasets = [
+  "h5py>=3.8",
+  "igor2>=0.5.12",
+  "imagecodecs>=2023.3",
+  "numpy>=1.23",
+  "Pillow>=9",
+  "pyarrow>=10",
+  "tifffile>=2023.4",
+]
+dev = [
+  "complexipy>=6,<7",
+  "mypy>=1.10",
+  "pytest>=8",
+  "pytest-cov",
+  "pytest-timeout",
+  "pytest-xdist",
+  "radon>=6,<7",
+  "ruff>=0.5",
+]
 docs = ["mkdocs>=1.6", "mkdocs-material>=9.5", "mkdocstrings[python]>=0.25"]
 
 [project.scripts]
@@ -103,7 +121,7 @@ mypy_path = "src"
 # through narrow, guarded imports, so untyped is the honest description of
 # them rather than a hole in our own checking.
 [[tool.mypy.overrides]]
-module = ["gssapi.*", "google_crc32c.*", "fsspec.*", "zstandard.*", "tensorflow.*"]
+module = ["gssapi.*", "google_crc32c.*", "fsspec.*", "igor2.*", "zstandard.*", "tensorflow.*"]
 ignore_missing_imports = true
 
 # matplotlib drags numpy in, whose stubs use syntax newer than the floor this

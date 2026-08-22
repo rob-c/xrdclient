@@ -155,16 +155,7 @@ class Basket:
             nevsize = -nevsize
             buf.skip_record()
         nevbuf, last = buf.i32(), buf.i32()
-        flag = buf.u8()
-        offsets: list[int] = []
-        if flag >= 80:
-            flag -= 80  # the offsets were dropped, to be worked out from the size
-        elif flag % 10 == 1 and nevbuf:
-            offsets = buf.i32s(buf.i32())
-            if 20 < flag < 40:  # the top byte of each is a displacement, not a place
-                offsets = [at & 0xFFFFFF for at in offsets]
-            if flag > 40:
-                buf.i32s(buf.i32())  # the displacements, into a tree of objects
+        flag, offsets = _inline_offsets(buf, buf.u8(), nevbuf)
         if flag != 1 and flag <= 10:
             return None
         size = last if version > 1 else buf.i32()
@@ -180,6 +171,19 @@ class Basket:
         """Where the entry after this one begins, for a row of unknown length."""
         boundary = self.offsets[entry + 1] if entry + 1 < self.nevbuf else self.last
         return boundary - self.keylen
+
+
+def _inline_offsets(buf: Buffer, flag: int, entries: int) -> tuple[int, list[int]]:
+    if flag >= 80:
+        return flag - 80, []  # offsets dropped; derive them from entry size
+    if flag % 10 != 1 or not entries:
+        return flag, []
+    offsets = buf.i32s(buf.i32())
+    if 20 < flag < 40:  # the top byte is a displacement, not a place
+        offsets = [at & 0xFFFFFF for at in offsets]
+    if flag > 40:
+        buf.i32s(buf.i32())  # displacements into a tree of objects
+    return flag, offsets
 
 
 class Branch:
@@ -456,8 +460,21 @@ class TTree:
         """
         from .objects import LeafRecord
 
-        labels = []
         many = len(record.leaves) > 1
+        labels = self._add_leaves(record, source, many)
+        split = record.branches and not record.basket_seek and not many
+        if not split:
+            self._add_children(record, source)
+            return labels
+        leaf = record.leaves[0] if record.leaves else LeafRecord("TLeafElement")
+        group = Group(record.name, record, leaf, source, self.branches)
+        self.branches[record.name] = group  # in place, where its own leaf was
+        self.unreadable.pop(record.name, None)
+        self._add_group_children(record, source, group)
+        return [record.name]
+
+    def _add_leaves(self, record: BranchRecord, source: Source, many: bool) -> list[str]:
+        labels = []
         for leaf in record.leaves:
             label = f"{record.name}.{leaf.name}" if many else record.name
             column = build(record, leaf, source)
@@ -465,20 +482,17 @@ class TTree:
             if isinstance(column, Refused):
                 self.unreadable[label] = column.reason
             labels.append(label)
-        split = record.branches and not record.basket_seek and not many
-        if not split:
-            for child in record.branches:
-                self._add(child, source)
-            return labels
-        leaf = record.leaves[0] if record.leaves else LeafRecord("TLeafElement")
-        group = Group(record.name, record, leaf, source, self.branches)
-        self.branches[record.name] = group  # in place, where its own leaf was
-        self.unreadable.pop(record.name, None)
+        return labels
+
+    def _add_children(self, record: BranchRecord, source: Source) -> None:
+        for child in record.branches:
+            self._add(child, source)
+
+    def _add_group_children(self, record: BranchRecord, source: Source, group: Group) -> None:
         prefix = f"{record.name}."
         for child in record.branches:
             for label in self._add(child, source):
                 group.members[label.removeprefix(prefix)] = label
-        return [record.name]
 
     def __repr__(self) -> str:
         return (
@@ -500,8 +514,7 @@ class TTree:
             return self.branches[name]
         except KeyError:
             raise KeyError(
-                f"{name!r} is not a branch of {self.name!r}; there is "
-                + ", ".join(self.branches)
+                f"{name!r} is not a branch of {self.name!r}; there is " + ", ".join(self.branches)
             ) from None
 
     def keys(self) -> list[str]:
@@ -534,9 +547,9 @@ class TTree:
     def show(self) -> str:
         """A one-line-per-column summary, for looking before leaping.
 
-            >>> print(tree.show())                 # doctest: +SKIP
-            pt        float32   variable
-            nmuon     int32
+        >>> print(tree.show())                 # doctest: +SKIP
+        pt        float32   variable
+        nmuon     int32
         """
         lines = []
         for name, branch in self.branches.items():

@@ -97,9 +97,7 @@ def key_bytes(
     keylen = 18 + (16 if big else 8) + len(tail)
     seeks = struct.pack(">qq" if big else ">ii", seek_key, 0)
     version = 1004 if big else 4
-    head = struct.pack(
-        ">iHiIhh", keylen + len(payload), version, len(payload), datime, keylen, 1
-    )
+    head = struct.pack(">iHiIhh", keylen + len(payload), version, len(payload), datime, keylen, 1)
     return head + seeks + tail + payload
 
 
@@ -110,7 +108,14 @@ def wide_file(*, seek_keys_broken: bool = False) -> bytes:
     inner = key_bytes("TH1F", "h", "a histogram", seek_key=seek_keys + 100, big=True)
     keys = key_bytes("TDirectory", "f", big=True, seek_key=seek_keys) + struct.pack(">i", 1) + inner
     directory = struct.pack(
-        ">HIIiiqqq", 1005, 0, 0, len(keys), nbytes_name, begin, 0,
+        ">HIIiiqqq",
+        1005,
+        0,
+        0,
+        len(keys),
+        nbytes_name,
+        begin,
+        0,
         0 if seek_keys_broken else seek_keys,
     )
     header = struct.pack(">4sii", b"root", 1000004, begin) + struct.pack(
@@ -297,9 +302,11 @@ def test_a_null_or_repeated_object_is_read_from_the_map_not_the_stream():
 
 def test_a_new_class_is_read_and_remembered_for_the_next_reference():
     body = b"Thing\x00" + b"\x07"
-    stream = struct.pack(">I", BYTE_COUNT_MASK | (4 + len(body))) + struct.pack(
-        ">I", NEW_CLASS_TAG
-    ) + body
+    stream = (
+        struct.pack(">I", BYTE_COUNT_MASK | (4 + len(body)))
+        + struct.pack(">I", NEW_CLASS_TAG)
+        + body
+    )
     buf = Buffer(stream)
     assert buf.any({"Thing": lambda b: b.u8()}) == 7
     assert buf.refs[4 + MAP_OFFSET] == "Thing"
@@ -313,9 +320,12 @@ def test_a_class_reference_that_points_nowhere_is_a_format_error():
 
 def test_an_unknown_class_is_stepped_over_and_named():
     body = b"TH1F\x00" + b"junk"
-    stream = struct.pack(">I", BYTE_COUNT_MASK | (4 + len(body))) + struct.pack(
-        ">I", NEW_CLASS_TAG
-    ) + body + b"after"
+    stream = (
+        struct.pack(">I", BYTE_COUNT_MASK | (4 + len(body)))
+        + struct.pack(">I", NEW_CLASS_TAG)
+        + body
+        + b"after"
+    )
     buf = Buffer(stream)
     assert buf.any({}) == "TH1F"
     assert buf.take(5) == b"after"
@@ -645,21 +655,29 @@ GAUSS_W2 = [7.26, 79.86, 597.74, 1879.13, 3443.66, 3449.71, 1928.74, 594.11, 111
 def test_a_histogram_is_its_bins_its_edges_and_its_axes():
     with opened("gauss-h1") as root:
         hist = root["h1d"]
-        assert repr(hist) == "<TH1D 'h1d' of 10 bins, 10004 entries>"
-        assert (hist.name, hist.title, hist.classname) == ("h1d", "h1d", "TH1D")
-        assert (hist.shape, len(hist), hist.entries) == ((10,), 10, 10004.0)
-        assert [round(value, 4) for value in hist.values()] == GAUSS
-        assert [round(value, 4) for value in hist.errors()] == [
-            round(math.sqrt(w2), 4) for w2 in GAUSS_W2
-        ]
-        # The two ROOT keeps at the ends are what the bins fell out of.
-        assert list(hist.values(flow=True))[:1] == [2.0]
-        assert round(hist.sum(flow=True) - hist.sum(), 4) == 6.0
-        assert round(hist.sum(flow=True), 4) == 11006.0
-        assert len(hist.edges()) == 11
-        assert hist.edges()[0] == -4.0 and hist.edges()[-1] == 4.0
-        assert hist.axes[0].centers()[0] == -3.6
-        assert repr(hist.axes[0]) == "<Axis 'xaxis' of 10 bins from -4 to 4>"
+        _assert_histogram_identity(hist)
+        _assert_histogram_bins(hist)
+
+
+def _assert_histogram_identity(hist):
+    assert repr(hist) == "<TH1D 'h1d' of 10 bins, 10004 entries>"
+    assert (hist.name, hist.title, hist.classname) == ("h1d", "h1d", "TH1D")
+    assert (hist.shape, len(hist), hist.entries) == ((10,), 10, 10004.0)
+    assert [round(value, 4) for value in hist.values()] == GAUSS
+    assert [round(value, 4) for value in hist.errors()] == [
+        round(math.sqrt(w2), 4) for w2 in GAUSS_W2
+    ]
+
+
+def _assert_histogram_bins(hist):
+    # The two ROOT keeps at the ends are what the bins fell out of.
+    assert list(hist.values(flow=True))[:1] == [2.0]
+    assert round(hist.sum(flow=True) - hist.sum(), 4) == 6.0
+    assert round(hist.sum(flow=True), 4) == 11006.0
+    assert len(hist.edges()) == 11
+    assert hist.edges()[0] == -4.0 and hist.edges()[-1] == 4.0
+    assert hist.axes[0].centers()[0] == -3.6
+    assert repr(hist.axes[0]) == "<Axis 'xaxis' of 10 bins from -4 to 4>"
 
 
 def test_a_histogram_binned_unevenly_keeps_every_edge_it_was_written_with():
@@ -745,25 +763,28 @@ def test_a_histogram_without_its_bins_or_its_axes_is_not_one():
 
 def test_a_graph_is_its_points_and_the_bars_round_them():
     with opened("graphs") as root:
-        plain = root["tg"]
-        assert repr(plain) == "<TGraph 'tg' of 4 points>"
-        assert (plain.name, plain.title) == ("tg", "graph without errors")
-        assert (len(plain), plain[0], plain[-1]) == (4, (1.0, 2.0), (4.0, 8.0))
-        assert plain.points() == [(1.0, 2.0), (2.0, 4.0), (3.0, 6.0), (4.0, 8.0)]
-        assert list(plain.x) == [1.0, 2.0, 3.0, 4.0]
-        assert (plain.xerr, plain.yerr) == (None, None)
+        _assert_plain_graph(root["tg"])
+        _assert_graph_errors(root["tge"], root["tgae"])
 
-        # The same bar both sides of the point, written once.
-        even = root["tge"]
-        assert even.yerr[0] == even.yerr[1]
-        assert [round(bar, 4) for bar in even.yerr[0]] == [0.2, 0.4, 0.6, 0.8]
-        assert even.members["TGraph"]["fNpoints"] == 4
 
-        uneven = root["tgae"]
-        below, above = uneven.yerr
-        assert [round(bar, 4) for bar in below] == [0.3, 0.6, 0.9, 1.2]
-        assert [round(bar, 4) for bar in above] == [0.4, 0.8, 1.2, 1.6]
-        assert [round(bar, 4) for bar in uneven.xerr[1]] == [0.2, 0.4, 0.6, 0.8]
+def _assert_plain_graph(plain):
+    assert repr(plain) == "<TGraph 'tg' of 4 points>"
+    assert (plain.name, plain.title) == ("tg", "graph without errors")
+    assert (len(plain), plain[0], plain[-1]) == (4, (1.0, 2.0), (4.0, 8.0))
+    assert plain.points() == [(1.0, 2.0), (2.0, 4.0), (3.0, 6.0), (4.0, 8.0)]
+    assert list(plain.x) == [1.0, 2.0, 3.0, 4.0]
+    assert (plain.xerr, plain.yerr) == (None, None)
+
+
+def _assert_graph_errors(even, uneven):
+    # The same bar both sides of the point, written once.
+    assert even.yerr[0] == even.yerr[1]
+    assert [round(bar, 4) for bar in even.yerr[0]] == [0.2, 0.4, 0.6, 0.8]
+    assert even.members["TGraph"]["fNpoints"] == 4
+    below, above = uneven.yerr
+    assert [round(bar, 4) for bar in below] == [0.3, 0.6, 0.9, 1.2]
+    assert [round(bar, 4) for bar in above] == [0.4, 0.8, 1.2, 1.6]
+    assert [round(bar, 4) for bar in uneven.xerr[1]] == [0.2, 0.4, 0.6, 0.8]
 
 
 def test_a_graph_without_its_points_is_not_one():
@@ -1079,18 +1100,26 @@ def test_a_variable_length_column_keeps_its_rows(flat):
 
 
 def test_a_tree_describes_itself_before_anything_is_read(simple):
+    _assert_tree_description(simple)
+    _assert_branch_description(simple["two"])
+    with pytest.raises(KeyError, match="there is one, two, three"):
+        simple["four"]
+
+
+def _assert_tree_description(simple):
     assert repr(simple) == "<TTree 'tree' with 3 branches and 4 entries>"
     assert simple.keys() == ["one", "two", "three"]
     assert simple.readable() == ["one", "two", "three"]
     assert list(simple) == simple.keys()
     assert "one" in simple and "four" not in simple
     assert simple.show().splitlines()[0].startswith("one")
-    assert repr(simple["two"]) == "<Branch 'two' of float32>"
-    assert simple["two"].title == "two"
-    assert len(simple["two"]) == 4
-    assert simple["two"].num_baskets == 1
-    with pytest.raises(KeyError, match="there is one, two, three"):
-        simple["four"]
+
+
+def _assert_branch_description(branch):
+    assert repr(branch) == "<Branch 'two' of float32>"
+    assert branch.title == "two"
+    assert len(branch) == 4
+    assert branch.num_baskets == 1
 
 
 def test_a_tree_reads_several_columns_over_the_same_entries(simple):

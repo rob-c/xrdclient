@@ -40,6 +40,10 @@ class XRootDURL:
     username: str = ""
     password: str = ""
     query: dict[str, str] = field(default_factory=dict)
+    # HTTP signatures cover the escaped query bytes, not merely their decoded
+    # values.  Keep those bytes for a URL parsed from text; callers that edit
+    # ``query`` deliberately fall back to the ordinary canonical rendering.
+    _raw_query: str = field(default="", repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "scheme", self.scheme.lower())
@@ -89,6 +93,8 @@ class XRootDURL:
 
     def evolve(self, **changes: object) -> XRootDURL:
         """A copy with ``changes`` applied."""
+        if "query" in changes and "_raw_query" not in changes:
+            changes["_raw_query"] = ""
         return replace(self, **changes)  # type: ignore[arg-type]
 
     def with_path(self, path: str) -> XRootDURL:
@@ -104,10 +110,10 @@ class XRootDURL:
     def with_query(self, **params: str) -> XRootDURL:
         merged = dict(self.query)
         merged.update({k: v for k, v in params.items() if v is not None})
-        return replace(self, query=merged)
+        return replace(self, query=merged, _raw_query="")
 
     def without_query(self) -> XRootDURL:
-        return replace(self, query={})
+        return replace(self, query={}, _raw_query="")
 
     # -- formatting ----------------------------------------------------
 
@@ -177,38 +183,18 @@ def parse(url: str | os.PathLike[str] | XRootDURL) -> XRootDURL:
         return url
     text = os.fspath(url)
     if "://" not in text:
-        return XRootDURL(scheme="file", host="", port=0, path=os.path.abspath(text))
+        return _file_url(os.path.abspath(text))
 
     scheme, rest = text.split("://", 1)
     scheme = scheme.lower()
     if scheme == "file":
-        return XRootDURL(scheme="file", host="", port=0, path=rest or "/")
+        return _file_url(rest or "/")
 
     authority, sep, tail = rest.partition("/")
-    userinfo, _, hostport = authority.rpartition("@")
-    username = password = ""
-    if userinfo:
-        u, _, p = userinfo.partition(":")
-        username = urllib.parse.unquote(u)
-        password = urllib.parse.unquote(p)
-
-    if hostport.startswith("["):
-        host, _, port_s = hostport[1:].partition("]")
-        port_s = port_s.lstrip(":")
-    else:
-        host, _, port_s = hostport.partition(":")
-
-    default_port = 443 if scheme in ("https", "davs", "webdav", "s3") else (
-        80 if scheme in ("http", "dav") else DEFAULT_PORT
-    )
-    try:
-        port = int(port_s) if port_s else default_port
-    except ValueError as exc:
-        raise ValueError(f"invalid port in URL {text!r}") from exc
-
-    path_and_cgi = (sep + tail) if sep else "/"
-    path_s, _, cgi = path_and_cgi.partition("?")
-    query = dict(urllib.parse.parse_qsl(cgi, keep_blank_values=True)) if cgi else {}
+    username, password, hostport = _authority(authority)
+    host, port_s = _host_port(hostport)
+    port = _port(port_s, scheme, text)
+    path_s, cgi, query = _path_query(sep, tail)
 
     return XRootDURL(
         scheme=scheme,
@@ -218,4 +204,47 @@ def parse(url: str | os.PathLike[str] | XRootDURL) -> XRootDURL:
         username=username,
         password=password,
         query=query,
+        _raw_query=cgi,
     )
+
+
+def _file_url(path: str) -> XRootDURL:
+    return XRootDURL(scheme="file", host="", port=0, path=path)
+
+
+def _authority(authority: str) -> tuple[str, str, str]:
+    userinfo, marker, hostport = authority.rpartition("@")
+    if not marker:
+        return "", "", authority
+    user, _, password = userinfo.partition(":")
+    return urllib.parse.unquote(user), urllib.parse.unquote(password), hostport
+
+
+def _host_port(hostport: str) -> tuple[str, str]:
+    if hostport.startswith("["):
+        host, _, port = hostport[1:].partition("]")
+        return host, port.lstrip(":")
+    host, _, port = hostport.partition(":")
+    return host, port
+
+
+def _default_port(scheme: str) -> int:
+    if scheme in ("https", "davs", "webdav", "s3"):
+        return 443
+    if scheme in ("http", "dav"):
+        return 80
+    return DEFAULT_PORT
+
+
+def _port(value: str, scheme: str, text: str) -> int:
+    try:
+        return int(value) if value else _default_port(scheme)
+    except ValueError as exc:
+        raise ValueError(f"invalid port in URL {text!r}") from exc
+
+
+def _path_query(separator: str, tail: str) -> tuple[str, str, dict[str, str]]:
+    path_and_cgi = (separator + tail) if separator else "/"
+    path, _, cgi = path_and_cgi.partition("?")
+    query = dict(urllib.parse.parse_qsl(cgi, keep_blank_values=True)) if cgi else {}
+    return path, cgi, query

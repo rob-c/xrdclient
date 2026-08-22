@@ -23,16 +23,26 @@ _PRIMS = [
     ("int32", "i", 4, ("int", "Int_t", "int32_t")),
     ("uint32", "I", 4, ("unsigned", "unsigned int", "UInt_t", "uint32_t")),
     ("int64", "q", 8, ("long", "long int", "long long", "long long int", "Long_t", "Long64_t")),
-    ("uint64", "Q", 8, ("unsigned long", "unsigned long int", "unsigned long long",
-                        "unsigned long long int", "ULong_t", "ULong64_t")),
+    (
+        "uint64",
+        "Q",
+        8,
+        (
+            "unsigned long",
+            "unsigned long int",
+            "unsigned long long",
+            "unsigned long long int",
+            "ULong_t",
+            "ULong64_t",
+        ),
+    ),
     ("float32", "f", 4, ("float", "Float_t")),
     ("float64", "d", 8, ("double", "Double_t")),
 ]
 
 #: Containers whose contents are simply one value after another. ``RVec`` is
 #: the vector ``RDataFrame`` hands out, and is written exactly like one.
-SEQUENCES = ("vector", "list", "forward_list", "deque", "set", "multiset", "unordered_set",
-             "RVec")
+SEQUENCES = ("vector", "list", "forward_list", "deque", "set", "multiset", "unordered_set", "RVec")
 
 #: Containers of pairs. ``multimap`` is missing on purpose: a Python dict
 #: would silently drop the duplicate keys that are the point of one.
@@ -107,9 +117,7 @@ class Pair:
 
 
 _BY_NAME = {
-    alias: (typename, code, size)
-    for typename, code, size, aliases in _PRIMS
-    for alias in aliases
+    alias: (typename, code, size) for typename, code, size, aliases in _PRIMS for alias in aliases
 }
 _STRINGS = {"string": True, "basic_string<char>": True, "TString": False}
 
@@ -127,47 +135,70 @@ def _split(text: str) -> tuple[str, str] | None:
 def parse(name: str) -> object | None:
     """The type a C++ name describes, or ``None`` if this reader has no idea.
 
-        >>> parse("vector<float>")
-        <Seq of <Prim float32>>
+    >>> parse("vector<float>")
+    <Seq of <Prim float32>>
     """
     text = name.replace("std::", "").strip().rstrip("*&").strip()  # a pointer holds the same
     text = text.replace("ROOT::VecOps::", "")
+    direct, value = _direct(text)
+    if direct:
+        return value
+    return _template(text)
+
+
+def _direct(text: str) -> tuple[bool, object | None]:
     if text in _STRINGS:
-        return Str(_STRINGS[text])
+        return True, Str(_STRINGS[text])
     found = _BY_NAME.get(text)
     if found is not None:
-        return Prim(*found)
+        return True, Prim(*found)
+    return False, None
+
+
+def _template(text: str) -> object | None:
     head, angle, rest = text.partition("<")
     if not angle or not rest.endswith(">"):
         return None
     inside = rest[:-1]
     if head in SEQUENCES:
-        item = parse(inside)
-        return None if item is None else Seq(item)
+        return _sequence(inside)
     if head == "bitset" and inside.strip().isdigit():
         # A byte a bit, lowest bit first, and the count is in the file as well,
         # so the width in the name is not needed to read one.
         return Seq(Prim(*_BY_NAME["bool"]))
     if head in MAPPINGS:
-        halves = _split(inside)
-        if halves is None:
-            return None
-        key, value = parse(halves[0]), parse(halves[1])
-        return None if key is None or value is None else Mapping(key, value)
+        return _mapping(inside)
     if head == "pair":
-        halves = _split(inside)
-        if halves is None:
-            return None
-        first, second = parse(halves[0]), parse(halves[1])
-        return None if first is None or second is None else Pair(first, second)
+        return _pair(inside)
     return None
+
+
+def _sequence(inside: str) -> Seq | None:
+    item = parse(inside)
+    return None if item is None else Seq(item)
+
+
+def _mapping(inside: str) -> Mapping | None:
+    halves = _split(inside)
+    if halves is None:
+        return None
+    key, value = parse(halves[0]), parse(halves[1])
+    return None if key is None or value is None else Mapping(key, value)
+
+
+def _pair(inside: str) -> Pair | None:
+    halves = _split(inside)
+    if halves is None:
+        return None
+    first, second = parse(halves[0]), parse(halves[1])
+    return None if first is None or second is None else Pair(first, second)
 
 
 def py_name(node: object) -> str:
     """What the values look like once they are Python.
 
-        >>> py_name(parse("map<string,vector<int> >"))
-        'dict[str, list[int32]]'
+    >>> py_name(parse("map<string,vector<int> >"))
+    'dict[str, list[int32]]'
     """
     if isinstance(node, Prim):
         return node.typename

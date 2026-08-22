@@ -61,6 +61,14 @@ class Result:
         return self.data
 
 
+@dataclass(**SLOTS)
+class _AwaitState:
+    waits: int
+    parked: float
+    streamed: int
+    deadline: float | None
+
+
 class Session:
     """An authenticated connection to one XRootD server."""
 
@@ -230,9 +238,7 @@ class Session:
                 bringup._bringup()
                 pathid = machine.pathid
                 if pathid in self._paths:
-                    raise ProtocolError(
-                        f"{self.endpoint} handed out path id {pathid} twice"
-                    )
+                    raise ProtocolError(f"{self.endpoint} handed out path id {pathid} twice")
             except BaseException:
                 transport.close()
                 raise
@@ -282,41 +288,53 @@ class Session:
         server with an answer never costs the trial-and-timeout.
         """
         with self._lock:
-            if self.closed:
-                raise XrdConnectionError(f"session to {self.endpoint} is closed")
-            if request.pathid and request.pathid not in self._paths:
-                raise ValueError(
-                    f"data path {request.pathid} is not bound to {self.endpoint}"
-                )
-            if arrive_on_path and self._arrives_on_path is None and request.pathid:
-                self._ask_arrival_routing()
-            on_path = (
-                arrive_on_path
-                and self._arrives_on_path is not False
-                and bool(request.pathid)
-                and request.pathid in self._paths
-            )
+            self._validate_execute(request)
+            on_path = self._use_arrival_path(request, arrive_on_path)
             sid = self._m.submit(request, path=path, arrive_on_path=on_path)
-            if on_path:
-                answers_on = request.pathid
-            else:
-                answers_on = request.pathid if request.reply_on_path else 0
+            answers_on = self._answer_path(request, on_path)
             if not on_path:
                 return self._await(sid, on_chunk, answers_on)
-            try:
-                result = self._await(sid, on_chunk, answers_on)
-            except Exception:
-                # This server does not answer where it was asked. Remember it
-                # for the whole connection - the next file would otherwise pay
-                # the same timeout to learn the same thing - and let the socket
-                # go, because the answer to the request just abandoned may
-                # still arrive on it and would be read as the answer to
-                # whatever is asked next.
-                self._arrives_on_path = False
-                self._close_path(request.pathid)
-                raise
-            self._arrives_on_path = True
-            return result
+            return self._await_arrival(sid, on_chunk, answers_on, request.pathid)
+
+    def _validate_execute(self, request: Request) -> None:
+        if self.closed:
+            raise XrdConnectionError(f"session to {self.endpoint} is closed")
+        if request.pathid and request.pathid not in self._paths:
+            raise ValueError(f"data path {request.pathid} is not bound to {self.endpoint}")
+
+    def _use_arrival_path(self, request: Request, requested: bool) -> bool:
+        if requested and self._arrives_on_path is None and request.pathid:
+            self._ask_arrival_routing()
+        return (
+            requested
+            and self._arrives_on_path is not False
+            and bool(request.pathid)
+            and request.pathid in self._paths
+        )
+
+    @staticmethod
+    def _answer_path(request: Request, arrival: bool) -> int:
+        if arrival:
+            return request.pathid
+        return request.pathid if request.reply_on_path else 0
+
+    def _await_arrival(
+        self,
+        sid: int,
+        on_chunk: Callable[[bytes], None] | None,
+        answers_on: int,
+        pathid: int,
+    ) -> Result:
+        try:
+            result = self._await(sid, on_chunk, answers_on)
+        except Exception:
+            # The abandoned answer may still arrive on this link, so the path
+            # cannot safely carry a later request.
+            self._arrives_on_path = False
+            self._close_path(pathid)
+            raise
+        self._arrives_on_path = True
+        return result
 
     def _ask_arrival_routing(self) -> None:
         """Settle :attr:`arrives_on_path` by asking, when the server will say.
@@ -355,62 +373,64 @@ class Session:
             return None
         return time.monotonic() + max(limit, seconds + _WAITRESP_GRACE if seconds else 0.0)
 
-    def _await(
-        self, sid: int, on_chunk: Callable[[bytes], None] | None, pathid: int = 0
-    ) -> Result:
-        waits = 0
-        parked = 0.0
-        streamed = 0
+    def _await(self, sid: int, on_chunk: Callable[[bytes], None] | None, pathid: int = 0) -> Result:
         # Absolute, over the whole logical operation: see Config.stall_deadline.
-        deadline = self._armed()
+        state = _AwaitState(0, 0.0, 0, self._armed())
         while True:
-            for event in self._events_for(sid, pathid, deadline):
-                if isinstance(event, m.Completed):
-                    # The machine's Completed carries the whole body; hand the
-                    # streaming caller only the tail it has not seen yet.
-                    if on_chunk is not None and len(event.data) > streamed:
-                        on_chunk(event.data[streamed:])
-                    return Result(event.data, event.status)
-                if isinstance(event, m.Failed):
-                    raise event.error
-                if isinstance(event, m.Chunk):
-                    if on_chunk is not None:
-                        on_chunk(event.data)
-                    streamed += len(event.data)
-                elif isinstance(event, m.Redirected):
-                    self._m.release(sid)
-                    raise RedirectRequired(event.target)
-                elif isinstance(event, m.Waiting):
-                    # Parking is not stalling, so the deadline restarts - but
-                    # the delays are summed, because a server that answers
-                    # every resend with another wait is stalling after all.
-                    parked += event.seconds
-                    if parked > self.config.wait_budget:
-                        raise WaitLimitError(
-                            f"{type(event.request).__name__} was parked for "
-                            f"{parked:.0f}s, over the {self.config.wait_budget:.0f}s "
-                            f"budget for one operation",
-                            attempts=waits,
-                        )
-                    if not event.resend:
-                        # "The answer is coming later": nothing is re-sent, a
-                        # deferral is not a retry, but the deadline has to
-                        # cover the delay the server named.
-                        deadline = self._armed(event.seconds)
-                        continue
-                    waits += 1
-                    if waits > self.config.redirect_limit:
-                        raise WaitLimitError(
-                            f"server kept asking to wait for "
-                            f"{type(event.request).__name__}",
-                            attempts=waits,
-                        )
-                    _log.debug("server asked to wait %.1fs: %s", event.seconds, event.message)
-                    time.sleep(event.seconds)
-                    self._m.resume(sid)
-                    self._flush()
-                    streamed = 0  # the body starts over on the resend
-                    deadline = self._armed()
+            for event in self._events_for(sid, pathid, state.deadline):
+                result = self._consume_event(event, sid, on_chunk, state)
+                if result is not None:
+                    return result
+
+    def _consume_event(
+        self,
+        event: m.Event,
+        sid: int,
+        on_chunk: Callable[[bytes], None] | None,
+        state: _AwaitState,
+    ) -> Result | None:
+        if isinstance(event, m.Completed):
+            # Completed carries the whole body; stream only its unseen tail.
+            if on_chunk is not None and len(event.data) > state.streamed:
+                on_chunk(event.data[state.streamed :])
+            return Result(event.data, event.status)
+        if isinstance(event, m.Failed):
+            raise event.error
+        if isinstance(event, m.Chunk):
+            if on_chunk is not None:
+                on_chunk(event.data)
+            state.streamed += len(event.data)
+        elif isinstance(event, m.Redirected):
+            self._m.release(sid)
+            raise RedirectRequired(event.target)
+        elif isinstance(event, m.Waiting):
+            self._wait_event(event, sid, state)
+        return None
+
+    def _wait_event(self, event: m.Waiting, sid: int, state: _AwaitState) -> None:
+        # Parking is not stalling, but repeated delays share one budget.
+        state.parked += event.seconds
+        if state.parked > self.config.wait_budget:
+            raise WaitLimitError(
+                f"{type(event.request).__name__} was parked for {state.parked:.0f}s, "
+                f"over the {self.config.wait_budget:.0f}s budget for one operation",
+                attempts=state.waits,
+            )
+        if not event.resend:
+            state.deadline = self._armed(event.seconds)
+            return
+        state.waits += 1
+        if state.waits > self.config.redirect_limit:
+            raise WaitLimitError(
+                f"server kept asking to wait for {type(event.request).__name__}",
+                attempts=state.waits,
+            )
+        _log.debug("server asked to wait %.1fs: %s", event.seconds, event.message)
+        time.sleep(event.seconds)
+        self._m.resume(sid)
+        self._flush()
+        state.streamed = 0  # the body starts over on the resend
+        state.deadline = self._armed()
 
     # ------------------------------------------------------------------
     # I/O pump
@@ -474,21 +494,24 @@ class Session:
         while True:
             mine: list[m.Event] = []
             for event in self._pump(pathid, deadline):
-                target = getattr(event, "streamid", None)
-                if target == sid:
-                    mine.append(event)
-                elif isinstance(event, m.Attention):
-                    self._notices.append(event.info)
-                elif isinstance(event, m.PathLost):
-                    self._close_path(event.pathid)
-                elif isinstance(event, m.Disconnected):
-                    raise XrdConnectionError(f"connection lost: {event.reason}")
-                elif isinstance(event, m.Failed) and target is None:
-                    raise event.error
-                elif target is not None:
-                    self._inbox.setdefault(target, []).append(event)
+                self._route_event(event, sid, mine)
             if mine:
                 return mine
+
+    def _route_event(self, event: m.Event, sid: int, mine: list[m.Event]) -> None:
+        target = getattr(event, "streamid", None)
+        if target == sid:
+            mine.append(event)
+        elif isinstance(event, m.Attention):
+            self._notices.append(event.info)
+        elif isinstance(event, m.PathLost):
+            self._close_path(event.pathid)
+        elif isinstance(event, m.Disconnected):
+            raise XrdConnectionError(f"connection lost: {event.reason}")
+        elif isinstance(event, m.Failed) and target is None:
+            raise event.error
+        elif target is not None:
+            self._inbox.setdefault(target, []).append(event)
 
     # ------------------------------------------------------------------
     # Teardown

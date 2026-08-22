@@ -124,9 +124,23 @@ class _Column:
     """One branch being filled: how its values pack, and its bytes so far."""
 
     __slots__ = (
-        "name", "typecode", "length", "classname", "letter", "itemsize", "unsigned",
-        "form", "size", "basket_size", "buffer", "pending", "seeks", "sizes",
-        "starts", "tot_bytes", "zip_bytes",
+        "name",
+        "typecode",
+        "length",
+        "classname",
+        "letter",
+        "itemsize",
+        "unsigned",
+        "form",
+        "size",
+        "basket_size",
+        "buffer",
+        "pending",
+        "seeks",
+        "sizes",
+        "starts",
+        "tot_bytes",
+        "zip_bytes",
     )
 
     def __init__(self, name: str, typecode: str, length: int, basket_size: int) -> None:
@@ -292,6 +306,15 @@ def _branch(buf: WBuffer, column: _Column, entries: int, compress: int) -> int:
     return place
 
 
+def _row_trouble(missing: list[str], unknown: list[str]) -> list[str]:
+    trouble = []
+    if missing:
+        trouble.append(f"nothing for {', '.join(missing)}")
+    if unknown:
+        trouble.append(f"{', '.join(unknown)}, which is not a column")
+    return trouble
+
+
 class WritableTree:
     """A tree being written: named columns, then one entry at a time.
 
@@ -390,31 +413,37 @@ class WritableTree:
     def extend(self, rows: Iterable[Mapping[str, Any]]) -> None:
         """Add every entry in ``rows``, each a mapping of column to value.
 
-            >>> tree.extend([{"energy": 1.0}, {"energy": 2.0}])   # doctest: +SKIP
+        >>> tree.extend([{"energy": 1.0}, {"energy": 2.0}])   # doctest: +SKIP
         """
         for row in rows:
             self._row(row)
 
     def _row(self, row: Mapping[str, Any]) -> None:
         """One entry: packed in full before any of it is kept."""
+        self._require_open()
+        self._require_columns(row)
+        packed = [(column, column.pack(row[name])) for name, column in self._columns.items()]
+        self._store_row(packed)
+
+    def _require_open(self) -> None:
         if self._file.closed:
             raise ValueError(
                 f"the file this tree is in is closed; {self.name!r} holds the "
                 f"{self._entries} entries it was given"
             )
+
+    def _require_columns(self, row: Mapping[str, Any]) -> None:
         missing = [name for name in self._columns if name not in row]
         unknown = [str(name) for name in row if name not in self._columns]
-        if missing or unknown:
-            trouble = []
-            if missing:
-                trouble.append(f"nothing for {', '.join(missing)}")
-            if unknown:
-                trouble.append(f"{', '.join(unknown)}, which is not a column")
-            raise ValueError(
-                f"this entry of {self.name!r} has {' and '.join(trouble)}; its columns "
-                f"are {', '.join(self._columns)}, and every entry needs all of them"
-            )
-        packed = [(column, column.pack(row[name])) for name, column in self._columns.items()]
+        if not missing and not unknown:
+            return
+        trouble = _row_trouble(missing, unknown)
+        raise ValueError(
+            f"this entry of {self.name!r} has {' and '.join(trouble)}; its columns "
+            f"are {', '.join(self._columns)}, and every entry needs all of them"
+        )
+
+    def _store_row(self, packed: list[tuple[_Column, bytes]]) -> None:
         for column, raw in packed:
             column.buffer += raw
             column.pending += 1

@@ -111,39 +111,41 @@ def _lz4(src: bytes, size: int) -> bytes:
         while pos < end:
             token = src[pos]
             pos += 1
-            literals = token >> 4
-            if literals == 15:
-                while (more := src[pos]) == 255:
-                    literals += 255
-                    pos += 1
-                literals += more
-                pos += 1
+            literals, pos = _lz4_length(src, pos, token >> 4)
             out += src[pos : pos + literals]
             pos += literals
             if pos >= end:
                 break  # the last sequence is literals only
             offset = src[pos] | (src[pos + 1] << 8)
             pos += 2
-            match = (token & 0xF) + 4
-            if token & 0xF == 15:
-                while (more := src[pos]) == 255:
-                    match += 255
-                    pos += 1
-                match += more
-                pos += 1
-            start = len(out) - offset
-            if start < 0:
-                raise FormatError(f"an LZ4 match points {-start} bytes before the block")
-            if offset >= match:
-                out += out[start : start + match]
-            else:
-                for index in range(start, start + match):
-                    out.append(out[index])
+            match, pos = _lz4_length(src, pos, token & 0xF, base=4)
+            _lz4_match(out, offset, match)
     except IndexError:
         raise FormatError("an LZ4 block ends in the middle of a sequence") from None
     if len(out) != size:
         raise FormatError(f"an LZ4 block gave {len(out)} bytes where {size} were promised")
     return bytes(out)
+
+
+def _lz4_length(src: bytes, pos: int, nibble: int, *, base: int = 0) -> tuple[int, int]:
+    length = nibble + base
+    if nibble != 15:
+        return length, pos
+    while (more := src[pos]) == 255:
+        length += 255
+        pos += 1
+    return length + more, pos + 1
+
+
+def _lz4_match(out: bytearray, offset: int, length: int) -> None:
+    start = len(out) - offset
+    if start < 0:
+        raise FormatError(f"an LZ4 match points {-start} bytes before the block")
+    if offset >= length:
+        out += out[start : start + length]
+        return
+    for index in range(start, start + length):
+        out.append(out[index])
 
 
 #: The five prime constants XXH64 is built from, straight from its definition.
@@ -307,9 +309,7 @@ def decompress(data: bytes, size: int) -> bytes:
     pos = 0
     while len(out) < size:
         if pos + HEADER > len(data):
-            raise FormatError(
-                f"the compressed object ran out after {len(out)} of {size} bytes"
-            )
+            raise FormatError(f"the compressed object ran out after {len(out)} of {size} bytes")
         tag = data[pos : pos + 2]
         packed = int.from_bytes(data[pos + 3 : pos + 6], "little")
         unpacked = int.from_bytes(data[pos + 6 : pos + 9], "little")

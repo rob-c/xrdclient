@@ -86,14 +86,17 @@ def test_every_donor_histogram_survives_a_round_trip():
             originals = {name: donor[name] for name in names}
         with read_back(written(**originals)) as back:
             for name, hist in originals.items():
-                again = back[name]
-                assert again.classname == hist.classname
-                assert again.title == hist.title
-                assert again.entries == hist.entries
-                assert list(again.values(flow=True)) == list(hist.values(flow=True))
-                assert list(again.errors(flow=True)) == list(hist.errors(flow=True))
-                for axis in range(len(hist.shape)):
-                    assert list(again.edges(axis)) == list(hist.edges(axis))
+                _assert_histogram_round_trip(back[name], hist)
+
+
+def _assert_histogram_round_trip(again, hist):
+    assert again.classname == hist.classname
+    assert again.title == hist.title
+    assert again.entries == hist.entries
+    assert list(again.values(flow=True)) == list(hist.values(flow=True))
+    assert list(again.errors(flow=True)) == list(hist.errors(flow=True))
+    for axis in range(len(hist.shape)):
+        assert list(again.edges(axis)) == list(hist.edges(axis))
 
 
 def test_every_donor_graph_survives_a_round_trip():
@@ -123,8 +126,12 @@ def test_a_written_file_describes_its_classes_exactly_as_the_donors_do():
         for name, member in members.items():
             other = theirs[classname][name]
             assert (
-                member.name, member.title, member.stype,
-                member.typename, member.length, member.count,
+                member.name,
+                member.title,
+                member.stype,
+                member.typename,
+                member.length,
+                member.count,
             ) == (other.name, other.title, other.stype, other.typename, other.length, other.count)
 
 
@@ -240,9 +247,7 @@ def test_even_edges_are_stored_the_compact_way_and_uneven_ones_kept_whole():
 
 
 def test_a_new_histogram_takes_flow_bins_errors_and_entries_when_given():
-    hist = Histogram.new(
-        "h", [0, 1, 2], [9, 5, 7, 3], errors=[1, 0.5, 0.25, 2], entries=40
-    )
+    hist = Histogram.new("h", [0, 1, 2], [9, 5, 7, 3], errors=[1, 0.5, 0.25, 2], entries=40)
     assert hist.entries == 40.0
     with read_back(written(h=hist)) as back:
         again = back["h"]
@@ -564,8 +569,18 @@ def test_a_missing_base_falls_back_to_an_empty_object():
 
 
 def test_a_fixed_array_must_hold_exactly_what_was_declared():
-    element = ("TStreamerBasicType", "fArr", "", OFFSET_L + 8, 80, 10, 1,
-               (10, 0, 0, 0, 0), "double", ())
+    element = (
+        "TStreamerBasicType",
+        "fArr",
+        "",
+        OFFSET_L + 8,
+        80,
+        10,
+        1,
+        (10, 0, 0, 0, 0),
+        "double",
+        (),
+    )
     buf = WBuffer()
     _element(buf, element, {"fArr": [1.0] * 10}, {})
     assert len(buf.data) == 80
@@ -574,8 +589,18 @@ def test_a_fixed_array_must_hold_exactly_what_was_declared():
 
 
 def test_a_counted_array_answers_to_its_counter():
-    element = ("TStreamerBasicPointer", "fX", "", OFFSET_P + 8, 8, 0, 0,
-               (0, 0, 0, 0, 0), "double*", (4, "fNpoints", "TGraph"))
+    element = (
+        "TStreamerBasicPointer",
+        "fX",
+        "",
+        OFFSET_P + 8,
+        8,
+        0,
+        0,
+        (0, 0, 0, 0, 0),
+        "double*",
+        (4, "fNpoints", "TGraph"),
+    )
     with pytest.raises(ValueError, match="counted by fNpoints, which is not here"):
         _element(WBuffer(), element, {"fX": [1.0]}, {})
     with pytest.raises(ValueError, match="fNpoints says 3"):
@@ -586,15 +611,20 @@ def test_a_counted_array_answers_to_its_counter():
 
 
 def test_a_streamer_type_the_writer_does_not_lay_out_is_refused():
-    element = ("TStreamerSTL", "fVec", "", 500, 0, 0, 0, (0, 0, 0, 0, 0),
-               "vector<int>", ())
+    element = ("TStreamerSTL", "fVec", "", 500, 0, 0, 0, (0, 0, 0, 0, 0), "vector<int>", ())
     with pytest.raises(UnsupportedFeatureError, match="streamer type 500"):
         _element(WBuffer(), element, {"fVec": []}, {})
 
 
 def test_the_infos_table_covers_exactly_what_the_writer_promises():
-    for classname in ("TH1D", "TH1F", "TH2D", "TH2F",
-                      "TGraph", "TGraphErrors", "TGraphAsymmErrors"):
+    for classname in (
+        "TH1D",
+        "TH1F",
+        "TH2D",
+        "TH2F",
+        "TGraph",
+        "TGraphErrors",
+        "TGraphAsymmErrors",
+    ):
         assert classname in INFOS
     assert "TGraphMultiErrors" not in INFOS  # refused by name, never guessed at
-

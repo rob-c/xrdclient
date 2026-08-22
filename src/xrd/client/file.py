@@ -248,18 +248,14 @@ class File:
 
     def _do_open(self) -> bytes:
         """Issue the ``kXR_open`` and adopt the handle it returns."""
-        request = r.Open(
-            self.url.path_with_cgi, int(self._flags) | c.kXR_retstat, self._mode
-        )
+        request = r.Open(self.url.path_with_cgi, int(self._flags) | c.kXR_retstat, self._mode)
         result = self._router.execute(request, path=self.url.path)
         # The open may have been redirected; every later operation on this
         # handle must stay on the server that issued it. A connection this
         # handle made itself is handed over rather than shared, so that there
         # is exactly one router responsible for putting it back.
         self._router = self._router.pin(transfer=self._owns_router)
-        self._handle, self._stat, self._compression = rp.parse_open(
-            result.data, self.url.path
-        )
+        self._handle, self._stat, self._compression = rp.parse_open(result.data, self.url.path)
         if self._stat is not None:
             self._size_hint = self._stat.st_size
         return self.handle
@@ -479,9 +475,7 @@ class File:
         With ``verify`` the checksums are checked here and any failing page
         offsets come back in :attr:`~xrd.types.PageResult.corrupt_pages`.
         """
-        result = self._execute(
-            lambda handle: r.PgRead(handle, offset, size, pathid=self._pathid)
-        )
+        result = self._execute(lambda handle: r.PgRead(handle, offset, size, pathid=self._pathid))
         if not verify:
             data, _ = unpack_pages(result.data, offset)
             return PageResult(data, offset)
@@ -539,9 +533,7 @@ class File:
         self, chunks: Iterable[WriteChunk | tuple[int, bytes]], *, sync: bool = False
     ) -> int:
         """``kXR_writev`` - many scattered writes in one round trip."""
-        items = [
-            ch if isinstance(ch, WriteChunk) else WriteChunk(ch[0], ch[1]) for ch in chunks
-        ]
+        items = [ch if isinstance(ch, WriteChunk) else WriteChunk(ch[0], ch[1]) for ch in chunks]
         if not items:
             return 0
         if self._checkpoint:
@@ -552,9 +544,7 @@ class File:
         total = 0
         high = 0
         for batch in _write_batches(items):
-            request = r.WriteV(
-                [(self.handle, ch.offset, ch.data) for ch in batch], sync=sync
-            )
+            request = r.WriteV([(self.handle, ch.offset, ch.data) for ch in batch], sync=sync)
             self._router.execute(request, path=self.url.path)
             for ch in batch:
                 total += len(ch.data)
@@ -590,6 +580,21 @@ class File:
         request code" a stock xrootd sends.
         """
         target, origin = self.handle, source.handle  # both open, or this raises
+        self._validate_clone(source)
+        items = self._clone_items(source, origin, ranges)
+        total = 0
+        high = 0
+        for start in range(0, len(items), CLONE_MAX_RANGES):
+            batch = items[start : start + CLONE_MAX_RANGES]
+            self._send_clone(target, batch)
+            copied, extent = _clone_extent(batch)
+            total += copied
+            high = max(high, extent)
+        if total:
+            self._invalidate(high)
+        return total
+
+    def _validate_clone(self, source: File) -> None:
         if source._router.session is not self._router.session:
             raise ValueError(
                 f"{source.url} and {self.url} are open on different connections; "
@@ -600,28 +605,29 @@ class File:
                 kXR_Unsupported,
                 "kXR_clone cannot be checkpointed; write, pgwrite and truncate can",
             )
+
+    @staticmethod
+    def _clone_items(
+        source: File,
+        origin: bytes,
+        ranges: Iterable[CloneRange | tuple[int, int] | tuple[int, int, int]] | None,
+    ) -> list[tuple[bytes, int, int, int]]:
         wanted = [CloneRange(0, source.size)] if ranges is None else [_range(x) for x in ranges]
-        items = [(origin, cr.offset, cr.length, cr.destination) for cr in wanted if cr.length]
-        total = 0
-        high = 0
-        for start in range(0, len(items), CLONE_MAX_RANGES):
-            batch = items[start : start + CLONE_MAX_RANGES]
-            try:
-                self._router.execute(r.Clone(target, batch), path=self.url.path)
-            except ServerError as exc:
-                if exc.code != kXR_InvalidRequest:
-                    raise
-                raise UnsupportedError(
-                    kXR_Unsupported,
-                    f"{self.url.host} does not implement kXR_clone (opcode 3032, "
-                    f"outside XProtocol.hh); copy the ranges through the client",
-                ) from exc
-            for _, _, length, at in batch:
-                total += length
-                high = max(high, at + length)
-        if total:
-            self._invalidate(high)
-        return total
+        return [
+            (origin, item.offset, item.length, item.destination) for item in wanted if item.length
+        ]
+
+    def _send_clone(self, target: bytes, batch: list[tuple[bytes, int, int, int]]) -> None:
+        try:
+            self._router.execute(r.Clone(target, batch), path=self.url.path)
+        except ServerError as exc:
+            if exc.code != kXR_InvalidRequest:
+                raise
+            raise UnsupportedError(
+                kXR_Unsupported,
+                f"{self.url.host} does not implement kXR_clone (opcode 3032, "
+                f"outside XProtocol.hh); copy the ranges through the client",
+            ) from exc
 
     def pgwrite(self, data: bytes, offset: int = 0) -> int:
         """``kXR_pgwrite`` - write with a CRC-32C per 4 KiB page.
@@ -691,18 +697,14 @@ class File:
         raise KeyError(name)
 
     def setxattr(self, name: str, value: bytes) -> None:
-        self._router.execute(
-            r.Fattr.set("", name, value, fhandle=self.handle), path=self.url.path
-        )
+        self._router.execute(r.Fattr.set("", name, value, fhandle=self.handle), path=self.url.path)
 
     def listxattr(self) -> list[str]:
         result = self._execute(lambda handle: r.Fattr.list("", fhandle=handle))
         return [i.name for i in rp.parse_fattr(result.data, values=False).items]
 
     def removexattr(self, name: str) -> None:
-        self._router.execute(
-            r.Fattr.delete("", name, fhandle=self.handle), path=self.url.path
-        )
+        self._router.execute(r.Fattr.delete("", name, fhandle=self.handle), path=self.url.path)
 
     # ------------------------------------------------------------------
     # Checkpoints
@@ -727,9 +729,7 @@ class File:
         Checkpoints do not nest - the server keeps one per handle.
         """
         if self._checkpoint:
-            raise UnsupportedError(
-                kXR_Unsupported, f"{self.url} already has a checkpoint open"
-            )
+            raise UnsupportedError(kXR_Unsupported, f"{self.url} already has a checkpoint open")
         self._router.execute(r.ChkPoint(self.handle, int(ChkPointCode.BEGIN)))
         self._checkpoint = True
         try:
@@ -842,6 +842,12 @@ def _range(item: CloneRange | tuple[int, int] | tuple[int, int, int]) -> CloneRa
     if span.offset < 0 or span.length < 0 or span.destination < 0:
         raise ValueError(f"a clone range is two offsets and a length, none negative: {span}")
     return span
+
+
+def _clone_extent(batch: list[tuple[bytes, int, int, int]]) -> tuple[int, int]:
+    copied = sum(length for _, _, length, _ in batch)
+    extent = max((destination + length for _, _, length, destination in batch), default=0)
+    return copied, extent
 
 
 def _write_batches(chunks: Sequence[WriteChunk]) -> Iterator[list[WriteChunk]]:

@@ -529,22 +529,29 @@ def _imports(source: pathlib.Path) -> list[tuple[str, bool]]:
     only runs when the function around it is called.
     """
     tree = ast.parse(source.read_text(encoding="utf-8"))
+    guarded = _guarded_nodes(tree)
+    found = []
+    for node in ast.walk(tree):
+        found.extend((name, node in guarded) for name in _import_names(node))
+    return found
+
+
+def _guarded_nodes(tree: ast.AST) -> set[ast.AST]:
     guarded: set[ast.AST] = set()
     for node in ast.walk(tree):
         shelter = isinstance(node, (ast.Try, ast.FunctionDef, ast.AsyncFunctionDef))
         for child in ast.iter_child_nodes(node):
             if shelter or node in guarded:
                 guarded.add(child)
-    found = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            names = [alias.name.split(".")[0] for alias in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            names = [node.module.split(".")[0]] if node.level == 0 and node.module else []
-        else:
-            continue
-        found += [(name, node in guarded) for name in names]
-    return found
+    return guarded
+
+
+def _import_names(node: ast.AST) -> list[str]:
+    if isinstance(node, ast.Import):
+        return [alias.name.split(".")[0] for alias in node.names]
+    if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+        return [node.module.split(".")[0]]
+    return []
 
 
 #: Both purity checks below read the interpreter's own list of standard

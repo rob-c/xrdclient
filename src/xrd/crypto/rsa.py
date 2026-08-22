@@ -64,18 +64,31 @@ def pem_blocks(data: bytes | str) -> list[tuple[str, bytes]]:
     body: list[str] = []
     for line in text.splitlines():
         line = line.strip()
-        if line.startswith("-----BEGIN ") and line.endswith("-----"):
+        if _pem_boundary(line, "BEGIN"):
             label, body = line[11:-5].strip(), []
-        elif line.startswith("-----END ") and line.endswith("-----"):
-            if label is not None and line[9:-5].strip() == label:
-                try:
-                    out.append((label, base64.b64decode("".join(body))))
-                except ValueError:  # a corrupt block must not lose the good ones
-                    pass
+        elif _pem_boundary(line, "END"):
+            decoded = _decoded_pem(label, line[9:-5].strip(), body, base64.b64decode)
+            if decoded is not None:
+                out.append(decoded)
             label, body = None, []
         elif label is not None:
             body.append(line)
     return out
+
+
+def _pem_boundary(line: str, kind: str) -> bool:
+    return line.startswith(f"-----{kind} ") and line.endswith("-----")
+
+
+def _decoded_pem(
+    label: str | None, end: str, body: list[str], decode: object
+) -> tuple[str, bytes] | None:
+    if label is None or end != label:
+        return None
+    try:
+        return label, decode("".join(body))  # type: ignore[operator]
+    except ValueError:  # a corrupt block must not lose the good ones
+        return None
 
 
 @dataclass(frozen=True, **SLOTS)
@@ -164,12 +177,50 @@ class RSAPrivateKey:
 
 
 _SMALL_PRIMES = (
-    2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97,
+    2,
+    3,
+    5,
+    7,
+    11,
+    13,
+    17,
+    19,
+    23,
+    29,
+    31,
+    37,
+    41,
+    43,
+    47,
+    53,
+    59,
+    61,
+    67,
+    71,
+    73,
+    79,
+    83,
+    89,
+    97,
 )
 
 
 def _probably_prime(n: int, rounds: int = 40) -> bool:
     """Miller-Rabin. ``rounds`` random bases put the error below 2^-80."""
+    small_result = _small_prime_result(n)
+    if small_result is not None:
+        return small_result
+    import secrets
+
+    d, r = _factor_twos(n - 1)
+    for _ in range(rounds):
+        a = secrets.randbelow(n - 3) + 2
+        if _composite_witness(a, d, r, n):
+            return False
+    return True
+
+
+def _small_prime_result(n: int) -> bool | None:
     if n < 2:
         return False
     for small in _SMALL_PRIMES:
@@ -177,22 +228,24 @@ def _probably_prime(n: int, rounds: int = 40) -> bool:
             return True
         if n % small == 0:
             return False
-    import secrets
+    return None
 
-    d, r = n - 1, 0
-    while not d & 1:
-        d >>= 1
-        r += 1
-    for _ in range(rounds):
-        a = secrets.randbelow(n - 3) + 2
-        x = pow(a, d, n)
-        if x in (1, n - 1):
-            continue
-        for _ in range(r - 1):
-            x = x * x % n
-            if x == n - 1:
-                break
-        else:
+
+def _factor_twos(value: int) -> tuple[int, int]:
+    power = 0
+    while not value & 1:
+        value >>= 1
+        power += 1
+    return value, power
+
+
+def _composite_witness(base: int, odd: int, power: int, modulus: int) -> bool:
+    value = pow(base, odd, modulus)
+    if value in (1, modulus - 1):
+        return False
+    for _ in range(power - 1):
+        value = value * value % modulus
+        if value == modulus - 1:
             return False
     return True
 

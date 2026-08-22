@@ -180,29 +180,13 @@ class Graph:
         count = len(xs)
         across = _sides(xerr, count, "xerr")
         upward = _sides(yerr, count, "yerr")
-        core: dict[str, Any] = {
-            "TNamed": {"fName": str(name), "fTitle": str(title)},
-            "TAttLine": dict(LINE), "TAttFill": dict(FILL), "TAttMarker": dict(MARKER),
-            "fNpoints": count, "fX": xs, "fY": ys,
-            "fFunctions": None, "fHistogram": None,
-            "fMinimum": -1111.0, "fMaximum": -1111.0,
-        }
+        core = _graph_core(name, title, xs, ys)
         if across is None and upward is None:
             return cls("TGraph", core)
         zeros = array.array("d", [0.0]) * count
-        if (across is None or not across[2]) and (upward is None or not upward[2]):
-            return cls("TGraphErrors", {
-                "TGraph": core,
-                "fEX": across[0] if across is not None else zeros,
-                "fEY": upward[0] if upward is not None else zeros,
-            })
-        return cls("TGraphAsymmErrors", {
-            "TGraph": core,
-            "fEXlow": across[0] if across is not None else zeros,
-            "fEXhigh": across[1] if across is not None else zeros,
-            "fEYlow": upward[0] if upward is not None else zeros,
-            "fEYhigh": upward[1] if upward is not None else zeros,
-        })
+        if _symmetric(across, upward):
+            return cls("TGraphErrors", _even_members(core, across, upward, zeros))
+        return cls("TGraphAsymmErrors", _uneven_members(core, across, upward, zeros))
 
     def plot(self, ax: Any = None, **options: Any) -> Any:
         """Draw onto matplotlib axes, made fresh unless ``ax`` brings some.
@@ -236,7 +220,7 @@ class Graph:
             grid[height - 1 - line][column] = "*"
         lines = []
         for index, cells in enumerate(grid):
-            label = f"{yhi:g}" if index == 0 else f"{ylo:g}" if index == height - 1 else ""
+            label = _axis_label(index, height, ylo, yhi)
             lines.append(f"{label:>10} |{''.join(cells)}|")
         left, right = f"{xlo:g}", f"{xhi:g}"
         lines.append(f"{'':>10}  {left:<{width - len(right)}}{right}")
@@ -258,14 +242,28 @@ def _sides(
     if err is None:
         return None
     given = list(err)
-    if len(given) == 2 and not any(isinstance(side, (int, float)) for side in given):
-        low = array.array("d", (float(value) for value in given[0]))
-        high = array.array("d", (float(value) for value in given[1]))
-        if len(low) != count or len(high) != count:
-            raise ValueError(
-                f"{label} has {len(low)} low and {len(high)} high bars for {count} points"
-            )
-        return (low, high, True)
+    if _is_side_pair(given):
+        return _uneven_sides(given, count, label)
+    return _even_sides(given, count, label)
+
+
+def _is_side_pair(given: list[Any]) -> bool:
+    return len(given) == 2 and not any(isinstance(side, (int, float)) for side in given)
+
+
+def _uneven_sides(
+    given: list[Any], count: int, label: str
+) -> tuple[array.array[float], array.array[float], bool]:
+    low = array.array("d", (float(value) for value in given[0]))
+    high = array.array("d", (float(value) for value in given[1]))
+    if len(low) != count or len(high) != count:
+        raise ValueError(f"{label} has {len(low)} low and {len(high)} high bars for {count} points")
+    return low, high, True
+
+
+def _even_sides(
+    given: list[Any], count: int, label: str
+) -> tuple[array.array[float], array.array[float], bool]:
     bars = array.array("d", (float(value) for value in given))
     if len(bars) != count:
         raise ValueError(
@@ -273,3 +271,51 @@ def _sides(
             f"point, or a (low, high) pair of runs"
         )
     return (bars, bars, False)
+
+
+def _graph_core(
+    name: str, title: str, xs: array.array[float], ys: array.array[float]
+) -> dict[str, Any]:
+    return {
+        "TNamed": {"fName": str(name), "fTitle": str(title)},
+        "TAttLine": dict(LINE),
+        "TAttFill": dict(FILL),
+        "TAttMarker": dict(MARKER),
+        "fNpoints": len(xs),
+        "fX": xs,
+        "fY": ys,
+        "fFunctions": None,
+        "fHistogram": None,
+        "fMinimum": -1111.0,
+        "fMaximum": -1111.0,
+    }
+
+
+def _symmetric(across: Any, upward: Any) -> bool:
+    return (across is None or not across[2]) and (upward is None or not upward[2])
+
+
+def _even_members(core: dict[str, Any], across: Any, upward: Any, zeros: Any) -> dict[str, Any]:
+    return {
+        "TGraph": core,
+        "fEX": across[0] if across is not None else zeros,
+        "fEY": upward[0] if upward is not None else zeros,
+    }
+
+
+def _uneven_members(core: dict[str, Any], across: Any, upward: Any, zeros: Any) -> dict[str, Any]:
+    return {
+        "TGraph": core,
+        "fEXlow": across[0] if across is not None else zeros,
+        "fEXhigh": across[1] if across is not None else zeros,
+        "fEYlow": upward[0] if upward is not None else zeros,
+        "fEYhigh": upward[1] if upward is not None else zeros,
+    }
+
+
+def _axis_label(index: int, height: int, low: float, high: float) -> str:
+    if index == 0:
+        return f"{high:g}"
+    if index == height - 1:
+        return f"{low:g}"
+    return ""

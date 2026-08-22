@@ -193,53 +193,74 @@ def read_branch(buf: Buffer) -> BranchRecord:
     modern = version >= 10
     branch = BranchRecord()
     branch.name, branch.title = buf.named()
+    write_basket, max_baskets = _branch_header(buf, branch, version, modern)
+    _branch_contents(buf, branch)
+    _basket_tables(buf, branch, modern, max_baskets, write_basket)
+    _inline_basket_bounds(branch)
+    buf.resume(end)
+    return branch
+
+
+def _branch_header(
+    buf: Buffer, branch: BranchRecord, version: int, modern: bool
+) -> tuple[int, int]:
     if version > 7:
-        buf.skip_record()  # TAttFill: the colour it is drawn in
-    buf.i32()  # compression, which the baskets state for themselves
-    buf.i32()  # the size a basket was aimed at
+        buf.skip_record()  # TAttFill
+    buf.i32(), buf.i32()  # compression and target basket size
     branch.entry_offset_len = buf.i32()
     write_basket = buf.i32()
-    buf.i64() if modern else buf.i32()  # the entry number the next basket would start at
+    buf.i64() if modern else buf.i32()
     if version >= 13:
         buf.skip_record()  # TIOFeatures
-    buf.i32()  # this branch's offset inside its parent's entry
+    buf.i32()
     max_baskets = buf.i32()
     if version > 6:
-        buf.i32()  # split level
+        buf.i32()
+    _branch_counts(buf, branch, version, modern)
+    return write_basket, max_baskets
+
+
+def _branch_counts(buf: Buffer, branch: BranchRecord, version: int, modern: bool) -> None:
     if modern:
         branch.entries = buf.i64()
         if version >= 11:
             branch.first_entry = buf.i64()
-        buf.i64(), buf.i64()  # bytes written, before and after compression
+        buf.i64(), buf.i64()
     else:
         branch.entries = int(buf.f64())
         buf.f64(), buf.f64()
 
-    branch.branches = [b for b in buf.objarray(CLASSES) if isinstance(b, BranchRecord)]
-    branch.leaves = [leaf for leaf in buf.objarray(CLASSES) if isinstance(leaf, LeafRecord)]
+
+def _branch_contents(buf: Buffer, branch: BranchRecord) -> None:
+    branch.branches = [item for item in buf.objarray(CLASSES) if isinstance(item, BranchRecord)]
+    branch.leaves = [item for item in buf.objarray(CLASSES) if isinstance(item, LeafRecord)]
     branch.baskets = _held(buf.objarray(CLASSES))
 
+
+def _basket_tables(
+    buf: Buffer, branch: BranchRecord, modern: bool, maximum: int, written: int
+) -> None:
     buf.u8()
-    branch.basket_bytes = buf.i32s(max_baskets)[:write_basket]
+    branch.basket_bytes = buf.i32s(maximum)[:written]
     buf.u8()
     if modern:
-        branch.basket_entry = buf.i64s(max_baskets)[: write_basket + 1]
+        branch.basket_entry = buf.i64s(maximum)[: written + 1]
         buf.u8()
-        branch.basket_seek = buf.i64s(max_baskets)[:write_basket]
-    else:
-        branch.basket_entry = buf.i32s(max_baskets)[: write_basket + 1]
-        wide = buf.u8() == 2  # 2 says the seek points needed 64 bits apiece
-        seeks = buf.i64s(max_baskets) if wide else buf.i32s(max_baskets)
-        branch.basket_seek = seeks[:write_basket]
-    if branch.baskets and not branch.basket_seek:
-        # Nothing was ever flushed, so the seek table is all zeroes and where
-        # each basket starts is what the baskets themselves say.
-        bounds = [0]
-        for basket in branch.baskets:
-            bounds.append(bounds[-1] + basket.nevbuf)
-        branch.basket_entry = bounds
-    buf.resume(end)
-    return branch
+        branch.basket_seek = buf.i64s(maximum)[:written]
+        return
+    branch.basket_entry = buf.i32s(maximum)[: written + 1]
+    wide = buf.u8() == 2
+    seeks = buf.i64s(maximum) if wide else buf.i32s(maximum)
+    branch.basket_seek = seeks[:written]
+
+
+def _inline_basket_bounds(branch: BranchRecord) -> None:
+    if not branch.baskets or branch.basket_seek:
+        return
+    bounds = [0]
+    for basket in branch.baskets:
+        bounds.append(bounds[-1] + basket.nevbuf)
+    branch.basket_entry = bounds
 
 
 def read_branch_element(buf: Buffer) -> BranchRecord:
@@ -336,9 +357,7 @@ def read_tree(buf: Buffer, source: Source, name: str, classname: str = "TTree") 
     """Read a ``TTree`` record and hand back something that can be iterated."""
     from .tree import TTree
 
-    if classname != "TTree":
-        buf.header()  # a TNtuple is a TTree with a field after it
-
+    _tuple_header(buf, classname)
     version, end = buf.header()
     if version < 5:
         raise UnsupportedFeatureError(
@@ -347,35 +366,56 @@ def read_tree(buf: Buffer, source: Source, name: str, classname: str = "TTree") 
         )
     modern = version > 5  # ROOT 5 widened the counters; ROOT 4 kept them narrow
     title = buf.named()[1]
-    for _ in range(3):
-        buf.skip_record()  # line, fill and marker attributes
-
-    entries = buf.i64() if modern else int(buf.f64())
-    for _ in range(3):
-        buf.i64() if modern else buf.f64()  # bytes written, three ways
-    if version >= 18:
-        buf.i64()
-    if version >= 16:
-        buf.f64()  # the weight given to each entry
-    buf.i32(), buf.i32(), buf.i32()  # timer interval, scan field, update
-    if version >= 17:
-        buf.i32()
-    clusters = buf.i32() if version >= 19 else 0
-    if modern:
-        buf.i64()  # the entry count it was told to stop at, which ROOT 4 had no field for
-    for _ in range(3):
-        buf.i64() if modern else buf.i32()  # max entry loop, max virtual size, autosave
-    if version >= 18:
-        buf.i64()
-    buf.i64() if modern else buf.i32()  # the estimated number of entries
-    if version >= 19:
-        buf.u8()
-        buf.i64s(clusters)  # where each cluster of baskets ends
-        buf.u8()
-        buf.i64s(clusters)
-    if version >= 20:
-        buf.skip_record()  # TIOFeatures
+    entries = _tree_fields(buf, version, modern)
 
     branches = [b for b in buf.objarray(CLASSES) if isinstance(b, BranchRecord)]
     buf.resume(end)
     return TTree(name, title, entries, branches, source)
+
+
+def _tuple_header(buf: Buffer, classname: str) -> None:
+    if classname != "TTree":
+        buf.header()
+
+
+def _tree_fields(buf: Buffer, version: int, modern: bool) -> int:
+    for _ in range(3):
+        buf.skip_record()
+    entries = buf.i64() if modern else int(buf.f64())
+    _tree_counters(buf, version, modern)
+    clusters = buf.i32() if version >= 19 else 0
+    _tree_limits(buf, version, modern)
+    _tree_clusters(buf, version, clusters)
+    return entries
+
+
+def _tree_counters(buf: Buffer, version: int, modern: bool) -> None:
+    for _ in range(3):
+        buf.i64() if modern else buf.f64()
+    if version >= 18:
+        buf.i64()
+    if version >= 16:
+        buf.f64()
+    buf.i32(), buf.i32(), buf.i32()
+    if version >= 17:
+        buf.i32()
+
+
+def _tree_limits(buf: Buffer, version: int, modern: bool) -> None:
+    if modern:
+        buf.i64()
+    for _ in range(3):
+        buf.i64() if modern else buf.i32()
+    if version >= 18:
+        buf.i64()
+    buf.i64() if modern else buf.i32()
+
+
+def _tree_clusters(buf: Buffer, version: int, clusters: int) -> None:
+    if version >= 19:
+        buf.u8()
+        buf.i64s(clusters)
+        buf.u8()
+        buf.i64s(clusters)
+    if version >= 20:
+        buf.skip_record()

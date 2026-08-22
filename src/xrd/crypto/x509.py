@@ -168,28 +168,14 @@ def _parse_certificate(der: bytes) -> Certificate:
     tbs = certificate.children()[0]
     fields = tbs.children()
     index = 1 if fields and fields[0].tag == 0xA0 else 0  # [0] EXPLICIT version
-    if len(fields) < index + 6:
-        raise DERError("certificate body is missing required fields")
+    _require_certificate_fields(fields, index)
     serial = read_integer(fields[index]) if fields[index].tag == TAG_INTEGER else 0
     issuer = _decode_name(fields[index + 2])
     validity = fields[index + 3].children()
-    if len(validity) != 2:
-        raise DERError("certificate validity is not a pair of times")
+    _require_validity(validity)
     subject = _decode_name(fields[index + 4])
-    spki = fields[index + 5].children()
-    key: RSAPublicKey | None = None
-    if len(spki) == 2 and spki[1].tag == TAG_BIT_STRING:
-        try:
-            key = public_key_from_bitstring(spki[1])
-        except DERError:
-            key = None  # an EC or DSA certificate: readable, just not RSA
-    extensions: list[str] = []
-    for extra in fields[index + 6 :]:
-        if extra.tag == 0xA3:  # [3] EXPLICIT extensions
-            for extension in extra.children()[0].children():
-                parts = extension.children()
-                if parts:
-                    extensions.append(oid_string(parts[0]))
+    key = _certificate_key(fields[index + 5])
+    extensions = _extension_oids(fields[index + 6 :])
     return Certificate(
         subject=subject,
         issuer=issuer,
@@ -200,6 +186,43 @@ def _parse_certificate(der: bytes) -> Certificate:
         extensions=tuple(extensions),
         der=der,
     )
+
+
+def _require_certificate_fields(fields: list[Element], index: int) -> None:
+    if len(fields) < index + 6:
+        raise DERError("certificate body is missing required fields")
+
+
+def _require_validity(validity: list[Element]) -> None:
+    if len(validity) != 2:
+        raise DERError("certificate validity is not a pair of times")
+
+
+def _certificate_key(element: Element) -> RSAPublicKey | None:
+    spki = element.children()
+    if len(spki) != 2 or spki[1].tag != TAG_BIT_STRING:
+        return None
+    try:
+        return public_key_from_bitstring(spki[1])
+    except DERError:
+        return None  # an EC or DSA certificate: readable, just not RSA
+
+
+def _extension_oids(extras: list[Element]) -> list[str]:
+    extensions: list[str] = []
+    for extra in extras:
+        if extra.tag == 0xA3:  # [3] EXPLICIT extensions
+            extensions.extend(_extension_block(extra))
+    return extensions
+
+
+def _extension_block(extra: Element) -> list[str]:
+    result = []
+    for extension in extra.children()[0].children():
+        parts = extension.children()
+        if parts:
+            result.append(oid_string(parts[0]))
+    return result
 
 
 def load_certificates(data: bytes | str) -> list[Certificate]:

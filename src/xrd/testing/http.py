@@ -307,24 +307,37 @@ class _Handler(BaseHTTPRequestHandler):
         if path in self.fake.dirs:
             self._send(200, b"", Content_Type="text/html")
             return
+        self._get_file(path)
+
+    def _get_file(self, path: str) -> None:
+        """Serve one file, including digest and byte-range response headers."""
         data = self.fake.files.get(path)
         if data is None:
             self._send(404, b"not found")
             return
+        extra = self._get_headers(data)
+        span = self.headers.get("Range")
+        if span and not self.fake.ignore_ranges:
+            self._send_range(span, data, extra)
+            return
+        self._send(200, data, **extra)
+
+    def _get_headers(self, data: bytes) -> dict[str, str]:
+        """Metadata headers for a successful file response."""
         extra = {"Last-Modified": formatdate(0, usegmt=True), "Accept-Ranges": "bytes"}
         wanted = self.headers.get("Want-Digest")
         if wanted and self.fake.digests:
             offered = _digest_header(wanted, data)
             if offered:
                 extra["Digest"] = offered
-        span = self.headers.get("Range")
-        if span and not self.fake.ignore_ranges:
-            start, end = _range(span, len(data))
-            piece = data[start:end]
-            extra["Content-Range"] = f"bytes {start}-{start + len(piece) - 1}/{len(data)}"
-            self._send(206, piece, **extra)
-            return
-        self._send(200, data, **extra)
+        return extra
+
+    def _send_range(self, span: str, data: bytes, extra: dict[str, str]) -> None:
+        """Serve the requested inclusive HTTP byte range."""
+        start, end = _range(span, len(data))
+        piece = data[start:end]
+        extra["Content-Range"] = f"bytes {start}-{start + len(piece) - 1}/{len(data)}"
+        self._send(206, piece, **extra)
 
     def do_PUT(self) -> None:
         if not self._gate():

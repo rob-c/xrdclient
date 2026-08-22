@@ -44,9 +44,7 @@ def digits(tmp_path):
     """Pictures separated by class, as :mod:`xrd.root.datasets` writes them."""
     columns = {"image": ("B", 4), "label": "i", "index": "i"}
     trees = {
-        f"{split}_{digit}": [
-            {"image": PIXELS, "label": digit, "index": n} for n in range(rows)
-        ]
+        f"{split}_{digit}": [{"image": PIXELS, "label": digit, "index": n} for n in range(rows)]
         for split, rows in (("train", 4), ("test", 2))
         for digit in range(3)
     }
@@ -154,8 +152,11 @@ def test_a_tree_with_no_numbers_in_it_is_not_a_dataset():
 
 
 def test_a_file_of_nothing_but_bookkeeping_has_nothing_to_learn_from(tmp_path):
-    path = _write(tmp_path / "empty.root", {"label": "i", "index": "i"}, {"Events": [{
-        "label": 1, "index": 0}]})
+    path = _write(
+        tmp_path / "empty.root",
+        {"label": "i", "index": "i"},
+        {"Events": [{"label": 1, "index": 0}]},
+    )
     with pytest.raises(ValueError, match="nothing to learn from"):
         load(path)
 
@@ -326,8 +327,9 @@ class Tensor:
         return Tensor([value for row in taken for value in row], self.dtype, shape, self.device)
 
     def __truediv__(self, divisor):
-        return Tensor([value / divisor for value in self.values], self.dtype, self.shape,
-                      self.device)
+        return Tensor(
+            [value / divisor for value in self.values], self.dtype, self.shape, self.device
+        )
 
     def reshape(self, rows, width):
         return Tensor(self.values, self.dtype, (rows, width), self.device)
@@ -344,16 +346,34 @@ class Tensor:
 
 def _cat(tensors, dim=0):
     """The tensors one after another, down the rows or across them."""
-    first = tensors[0]
     if dim == 0:
-        shape = (sum(len(tensor) for tensor in tensors), first.width) if first.shape else None
-        return Tensor([v for tensor in tensors for v in tensor.values], first.dtype, shape,
-                      first.device)
+        return _cat_rows(tensors)
+    return _cat_columns(tensors)
+
+
+def _cat_rows(tensors):
+    first = tensors[0]
+    shape = (sum(len(tensor) for tensor in tensors), first.width) if first.shape else None
+    return Tensor(
+        [value for tensor in tensors for value in tensor.values],
+        first.dtype,
+        shape,
+        first.device,
+    )
+
+
+def _cat_columns(tensors):
+    first = tensors[0]
     rows = [
         [value for tensor in tensors for value in tensor.rows()[at]] for at in range(len(first))
     ]
     width = sum(tensor.width for tensor in tensors)
-    return Tensor([v for row in rows for v in row], first.dtype, (len(rows), width), first.device)
+    return Tensor(
+        [value for row in rows for value in row],
+        first.dtype,
+        (len(rows), width),
+        first.device,
+    )
 
 
 @pytest.fixture
@@ -422,8 +442,11 @@ def test_several_input_columns_arrive_side_by_side(torch, tabular):
 
 
 def test_an_answer_that_is_measured_rather_than_named_stays_a_float(torch, tmp_path):
-    path = _write(tmp_path / "energy.root", {"first": "f", "target": "d"},
-                  {"Events": [{"first": 1.0, "target": 2.5}]})
+    path = _write(
+        tmp_path / "energy.root",
+        {"first": "f", "target": "d"},
+        {"Events": [{"first": 1.0, "target": 2.5}]},
+    )
     with load(path) as data:
         _, answers = next(iter(data.default.batches(1, shuffle=False)))
     assert (answers.dtype, answers.values) == ("float32", [2.5])

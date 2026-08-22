@@ -67,7 +67,7 @@ def test_a_column_of_every_type_comes_back_as_it_went_in():
             "H": 1000 * step,
             "i": -100_000 * step,
             "I": 100_000 * step,
-            "q": -10**12 * step,
+            "q": -(10**12) * step,
             "Q": 10**12 * step,
             "f": 0.5 * step,
             "d": 0.1 * step,
@@ -78,14 +78,13 @@ def test_a_column_of_every_type_comes_back_as_it_went_in():
         tree = back["events"]
         assert len(tree) == 7
         for code in LEAVES:
-            got = list(tree[code].array())
-            want = [row[code] for row in rows]
-            if code == "f":
-                assert got == pytest.approx(want)
-            elif code == "d":
-                assert got == pytest.approx(want)
-            else:
-                assert got == want
+            _assert_column_values(tree, rows, code)
+
+
+def _assert_column_values(tree, rows, code):
+    got = list(tree[code].array())
+    want = [row[code] for row in rows]
+    assert got == pytest.approx(want) if code in {"f", "d"} else got == want
 
 
 def test_the_types_a_reader_reports_are_the_types_that_were_asked_for():
@@ -330,8 +329,12 @@ def test_a_written_tree_describes_its_classes_exactly_as_the_donors_do():
         for name, member in members.items():
             other = theirs[classname][name]
             assert (
-                member.name, member.title, member.stype,
-                member.typename, member.length, member.count,
+                member.name,
+                member.title,
+                member.stype,
+                member.typename,
+                member.length,
+                member.count,
             ) == (other.name, other.title, other.stype, other.typename, other.length, other.count)
 
 
@@ -372,6 +375,12 @@ def test_a_branch_says_what_root_would_say_about_itself():
     rows = [{"x": float(step)} for step in range(10)]
     buf, _version, end = tree_record(written({"x": float}, rows, basket_size=32))
     (fields,) = at_branches(buf).objarray({"TBranch": branch_fields})
+    _assert_branch_geometry(fields)
+    _assert_branch_sizes(fields)
+    buf.resume(end)
+
+
+def _assert_branch_geometry(fields):
     assert fields["version"] == BRANCH_VERSION
     assert fields["basket_size"] == 32
     assert fields["entry_offset_len"] == 0  # every entry the same size
@@ -380,9 +389,11 @@ def test_a_branch_says_what_root_would_say_about_itself():
     assert fields["split_level"] == 0  # a column is a column
     assert fields["entries"] == fields["entry_number"] == 10
     assert fields["first_entry"] == 0
+
+
+def _assert_branch_sizes(fields):
     assert fields["tot_bytes"] > 80  # ten doubles and three basket keys
     assert fields["zip_bytes"] > 0
-    buf.resume(end)
 
 
 def test_a_basket_key_says_how_many_entries_it_holds_and_how_big_one_is():
@@ -393,9 +404,7 @@ def test_a_basket_key_says_how_many_entries_it_holds_and_how_big_one_is():
         seek, nbytes = record.basket_seek[0], record.basket_bytes[0]
     raw = data[seek : seek + nbytes]
     keylen = _keylen("TBasket", "x", "events", extra=19)
-    version, buffer_size, nevsize, nev, last, flag = struct.unpack_from(
-        ">hiiiiB", raw, keylen - 19
-    )
+    version, buffer_size, nevsize, nev, last, flag = struct.unpack_from(">hiiiiB", raw, keylen - 19)
     assert (version, nevsize, nev, flag) == (3, 8, 4, 0)
     assert buffer_size == 32_000
     assert last == keylen + 32

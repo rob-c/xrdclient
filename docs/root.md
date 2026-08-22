@@ -24,20 +24,20 @@ that cross the wire are the ones asked for.
 ## Opening
 
 ```python
-xrd.root.open_root("/local/path/f.root")                  # a path
-xrd.root.open_root("davs://dav.example.org/store/f.root") # any scheme this library speaks
-xrd.root.open_root(open("f.root", "rb"))                  # an open file, left open
+xrd.root.open_root("/local/path/f.root")  # a path
+xrd.root.open_root("davs://dav.example.org/store/f.root")  # any scheme this library speaks
+xrd.root.open_root(open("f.root", "rb"))  # an open file, left open
 ```
 
 A file is a mapping from name to object:
 
 ```python
-f.keys()             # ['Events', 'metadata']
-f.classnames()       # {'Events': 'TTree', 'metadata': 'TH1F'}
-f.trees()            # ['Events']
-f.tree()             # the only tree, or a KeyError naming the ones there are
+f.keys()  # ['Events', 'metadata']
+f.classnames()  # {'Events': 'TTree', 'metadata': 'TH1F'}
+f.trees()  # ['Events']
+f.tree()  # the only tree, or a KeyError naming the ones there are
 f["dir/sub/Events"]  # directories nest, with a path
-f["Events;1"]        # an older cycle, when a file kept several
+f["Events;1"]  # an older cycle, when a file kept several
 ```
 
 `classnames()` is the first thing to try when something will not open: it says
@@ -48,10 +48,10 @@ holds — which is the usual case for a C++ class somebody wrote, and for most o
 ROOT's own kit as well:
 
 ```python
-f["tlv"]                # {'TObject': {...}, 'fP': {'fX': 10.0, ...}, 'fE': 40.0}
+f["tlv"]  # {'TObject': {...}, 'fP': {'fX': 10.0, ...}, 'fE': 40.0}
 f["FileSummaryRecord"]  # a std::string key is a str
-f["written"]            # a TDatime is a datetime.datetime
-f["h1d"]                # a histogram is a Histogram, and a graph a Graph
+f["written"]  # a TDatime is a datetime.datetime
+f["h1d"]  # a histogram is a Histogram, and a graph a Graph
 ```
 
 Objects held by pointer are followed, whether the class promises they are there
@@ -80,13 +80,13 @@ edges and what is in them, counted the way Python counts.
 
 ```python
 h = f["h1d"]
-h.name, h.title, h.shape          # ('h1d', 'h1d', (10,))
-h.values()                        # array('d', [6.6, 72.6, 543.4, ...])
-h.errors()                        # the same shape, from the sums of squared weights
-h.edges()                         # 11 edges for 10 bins
-h.axes[0].centers()               # where a point would be drawn
-h.sum(), h.entries                # 11000.0, 10004.0
-len(h), len(h.axes[0])            # 10, 10
+h.name, h.title, h.shape  # ('h1d', 'h1d', (10,))
+h.values()  # array('d', [6.6, 72.6, 543.4, ...])
+h.errors()  # the same shape, from the sums of squared weights
+h.edges()  # 11 edges for 10 bins
+h.axes[0].centers()  # where a point would be drawn
+h.sum(), h.entries  # 11000.0, 10004.0
+len(h), len(h.axes[0])  # 10, 10
 ```
 
 `values()[0]` is the first bin of the axis, not the underflow. ROOT keeps two
@@ -116,12 +116,12 @@ back as a `Graph`, which is a sequence of points:
 
 ```python
 g = f["tge"]
-len(g), g[0]                      # 4, (1.0, 2.0)
+len(g), g[0]  # 4, (1.0, 2.0)
 for x, y in g:
     ...
-g.x, g.y                          # array('d', [...]) each, one value per point
-g.points()                        # [(1.0, 2.0), (2.0, 4.0), ...]
-below, above = g.yerr             # the bars either side, or None if none were kept
+g.x, g.y  # array('d', [...]) each, one value per point
+g.points()  # [(1.0, 2.0), (2.0, 4.0), ...]
+below, above = g.yerr  # the bars either side, or None if none were kept
 ```
 
 `xerr` and `yerr` are always a pair, low side first, so the same code reads a
@@ -147,8 +147,8 @@ matplotlib axes — made on demand, or brought along — and returns them, so
 styling and saving carry on where it left off:
 
 ```python
-ax = f["h1d"].plot()                       # steps for 1D, a shaded mesh for 2D
-f["tge"].plot(ax=ax, color="crimson")      # points with their error bars
+ax = f["h1d"].plot()  # steps for 1D, a shaded mesh for 2D
+f["tge"].plot(ax=ax, color="crimson")  # points with their error bars
 ax.figure.savefig("both.png")
 ```
 
@@ -158,9 +158,9 @@ and without it `plot()` refuses with both ways out by name. The other way is
 goes — a terminal, a log file, a CI transcript:
 
 ```python
-print(f["h1d"].text())     # one line per bin: its edges, a bar and the value
-print(f["h2d"].text())     # a shaded grid, y upward
-print(f["tge"].text())     # a grid of stars with the axis ends labelled
+print(f["h1d"].text())  # one line per bin: its edges, a bar and the value
+print(f["h2d"].text())  # a shaded grid, y upward
+print(f["tge"].text())  # a grid of stars with the axis ends labelled
 ```
 
 A graph of layered error bars draws every layer over the same points; a
@@ -170,11 +170,11 @@ saying to slice `values()` down to the two dimensions you want to see.
 ## Columns
 
 ```python
-tree.show()                 # one line per column: name, type, variable or not
-tree.typenames()            # {'Muon_pt': 'float32', 'nMuon': 'int32', ...}
-tree.keys()                 # every column
-tree.readable()             # the ones this reader decodes
-tree.unreadable             # {name: why not}, rather than quietly missing
+tree.show()  # one line per column: name, type, variable or not
+tree.typenames()  # {'Muon_pt': 'float32', 'nMuon': 'int32', ...}
+tree.keys()  # every column
+tree.readable()  # the ones this reader decodes
+tree.unreadable  # {name: why not}, rather than quietly missing
 ```
 
 A column comes back as one of three things, and which one is knowable in
@@ -190,13 +190,13 @@ advance from `tree[name].is_jagged` and `typename`:
 | an STL container | a `list`, one Python object per entry |
 
 ```python
-tree["nMuon"].array()             # array('i', [2, 0, 3, ...])
-tree["Muon_pt"].array(0, 1000)    # <Jagged 1000 rows of 2431 f values>
+tree["nMuon"].array()  # array('i', [2, 0, 3, ...])
+tree["Muon_pt"].array(0, 1000)  # <Jagged 1000 rows of 2431 f values>
 jets = tree["Muon_pt"].array()
-jets[7]                           # array('f', [22.5, 19.0])
-jets.lengths()                    # [2, 0, 3, ...]
+jets[7]  # array('f', [22.5, 19.0])
+jets.lengths()  # [2, 0, 3, ...]
 jets.tolist()
-values, width = jets.padded()     # a flat rectangle and its width
+values, width = jets.padded()  # a flat rectangle and its width
 ```
 
 Entry numbers behave like a Python slice, negatives included:
@@ -221,8 +221,8 @@ by ROOT into one branch per member. Those branches are columns here like any
 other, under the names ROOT gave them:
 
 ```python
-tree.keys()             # ['Muon.pt', 'Muon.eta', 'evt.N', 'evt.StlVecF64', ...]
-tree["evt.StlVecF64"].array(0, 100)   # <Jagged 100 rows of ...>
+tree.keys()  # ['Muon.pt', 'Muon.eta', 'evt.N', 'evt.StlVecF64', ...]
+tree["evt.StlVecF64"].array(0, 100)  # <Jagged 100 rows of ...>
 ```
 
 The object itself is a branch too, holding nothing at all — every byte of it
@@ -230,7 +230,7 @@ is in the members — so asking for it gives back one dictionary per entry, and
 an object nested inside it is a dictionary inside that:
 
 ```python
-tree.groups()                  # ['evt', 'P3'] - the objects that were split
+tree.groups()  # ['evt', 'P3'] - the objects that were split
 tree["evt"].array(1, 2)
 # [{'I32': 1, 'Str': 'evt-001', 'P3': {'Px': 0, 'Py': 1.0, 'Pz': 0}, ...}]
 ```
@@ -248,7 +248,7 @@ member by member in the order the class declares them, using the layout the
 file's own streamer information gives:
 
 ```python
-tree.keys()                    # ['evt'] - the object, and nothing under it
+tree.keys()  # ['evt'] - the object, and nothing under it
 tree["evt"].array(1, 2)
 # [{'Beg': 'beg-001', 'I32': 1, 'P3': {'Px': 0, 'Py': 1.0, 'Pz': 0}, ...}]
 ```
@@ -316,8 +316,8 @@ import torch, xrd.root, xrd.root.ml
 tree = xrd.root.open_root("root://eos.example.org//store/events.root").tree()
 loader = torch.utils.data.DataLoader(
     xrd.root.ml.dataset(tree, ["Muon_pt", "Muon_eta"], step=8192),
-    batch_size=None,          # each item is already a batch
-    num_workers=4,            # each worker reads its own share of the entries
+    batch_size=None,  # each item is already a batch
+    num_workers=4,  # each worker reads its own share of the entries
 )
 
 for batch in loader:
@@ -362,7 +362,7 @@ Fixed-size array columns arrive shaped `(entries, width)`. Variable ones are
 padded to the widest row in the batch, or to a width you give:
 
 ```python
-xrd.root.ml.to_tensor(jets, width=4, fill=0.0)      # (entries, 4)
+xrd.root.ml.to_tensor(jets, width=4, fill=0.0)  # (entries, 4)
 xrd.root.ml.iter_tensors(tree, step=8192, device="cuda")
 ```
 
@@ -511,7 +511,7 @@ with xrd.root.open_root("mnist.root") as f:
         )
         for digit in range(10)
     ]
-    for parts in zip(*loaders):            # 64 of each digit: a balanced batch
+    for parts in zip(*loaders):  # 64 of each digit: a balanced batch
         x = torch.cat([part["image"] for part in parts]).float().div_(255)
         y = torch.cat([part["label"] for part in parts]).long()
         loss = torch.nn.functional.cross_entropy(model(x.view(-1, 1, 28, 28)), y)
@@ -529,11 +529,13 @@ straight off a storage element, reading the baskets it needs and nothing else.
 
 ### The datasets everyone teaches with
 
-MNIST is one of five hundred and eighty-eight. `xrd.root.datasets` converts
+MNIST is one of 1,422 datasets admitted to a public mirror. Two more registered
+sets below the source ceiling are available for private builds but have no
+formal redistribution licence. `xrd.root.datasets` converts
 the sets machine learning is actually taught and benchmarked with, all of them
 the same way — one tree per class, the label beside the data, and the row's
 place in the original file so any number can be traced back to where it came
-from. The three hundred and thirty-nine that have a number to predict rather
+from. Of the original 627, three hundred and fifty have a number to predict rather
 than a class to sort into get one tree of every row instead, and the number to
 predict is a column like any other. What ships here is the converter, not the
 data: no dataset is redistributed in this repository, and `datasets/` is where
@@ -562,7 +564,7 @@ datasets.convert("iris", "iris.root")
 | `penguins` | 344 penguins measured at Palmer Station, 3 species | CC0 | 13 kB |
 | `covertype` | 581,012 patches of Colorado forest, 54 features, 7 cover types | CC BY 4.0 | 8.3 MB |
 | `emnist` | 131,600 handwritten characters, 28×28 greyscale, 47 balanced classes | US federal government work | 33.2 MB |
-| `fsdd` | 3,000 recordings of spoken digits, 8 kHz mono, 6 speakers, 10 classes | CC BY-SA 4.0 | 16.1 MB |
+| `fsdd` | 3,000 recordings of spoken digits, 8 kHz mono, 6 speakers, 10 classes | CC BY-SA 4.0 | build-dependent |
 | `adult` | 48,842 census records, 14 features, 2 income classes | CC BY 4.0 | 570 kB |
 | `mushroom` | 8,124 mushrooms described 22 ways, edible or poisonous | CC BY 4.0 | 66 kB |
 | `letter` | 20,000 printed capitals measured 16 ways, 26 classes | CC BY 4.0 | 320 kB |
@@ -1142,10 +1144,10 @@ datasets.convert("iris", "iris.root")
 | `international_migrants` | 2,176 country-years and how many people living in each were born elsewhere | CC BY 4.0 | 23 kB |
 | `broadband_subscriptions` | 4,590 country-years and how many broadband lines each had per hundred people | CC BY 4.0 | 55 kB |
 
-Three hundred and thirty-nine of them have a number to predict rather than a
-class; the rest sort rows into classes. The last column is one file holding
+Three hundred and fifty of this hand-curated shelf have a number to predict
+rather than a class; the rest sort rows into classes. The last column is one file holding
 every split, written with the default `zlib`, as measured on a conversion of
-all five hundred and eighty-eight — every split of a set that has them, a
+the original 627 public sets — every split of a set that has them, a
 tree a class, and the `about` key beside them.
 
 The last four hundred come from two places that publish whole shelves at once.
@@ -1177,6 +1179,212 @@ yields, and how many people live off it; where a chart measures a band as well
 as a value — the temperature anomaly and its low and high — the value is the
 number to predict and the band is carried beside it.
 
+Another 500 entries are generated from explicitly licensed, public Hugging
+Face dataset repositories with complete scalar Parquet conversions. They add
+783 publisher splits in 1,236 shards and 12.13 GB of source data; 24 expose a
+published `ClassLabel`, while 476 expose a named or explicitly designated
+numeric teaching target. Every scalar source field is retained. Text becomes
+fixed-width UTF-8 bytes with a companion length, missing floats become NaN,
+`ClassLabel` metadata becomes an integer, and one `rows` TTree is written per
+official split. The generated [selection manifest](https://github.com/rob-c/PyXRootDClient/blob/main/catalogues/hub-open.json)
+records every repository, revision, canonical licence URL, source size and
+split. Ambiguous `public` metadata, gated repositories, incomplete conversions
+and nested schemas are rejected rather than guessed.
+
+Seventy default large archives use disk-backed readers rather than putting
+their sources wholesale into memory. This behavior is independent of origin:
+EMNIST and both CIFAR archives use the same retained source cache as UCI, JetNet,
+OmniFold Big, TinySOL, WikiText-103, ReefSet, BioDCASE and BirdSet, alongside
+37 members of the Hub shelf. A dataset's
+complete unique source
+payload must be at least 100 MB and strictly below 2,000,000,000 bytes for
+`--large` by default; `convert` enforces the same ceiling when it fetches the
+declared source. `--allow-oversize` (alias `--no-size-limit`) removes the upper
+source-selection bound for registered converters, as does
+`convert(..., allow_oversize=True)` in Python. Exact published source-size
+checks remain in force. Explicit local `parts=` remain available for converter
+tests and private data without claiming them as catalogue downloads.
+
+| name | retained conversion | compressed source |
+|---|---|---:|
+| `emnist` | selected IDX members are decoded per official split; pixels are unchanged | 535.7 MiB |
+| `cifar10` | binary RGB planes and official train/test split are preserved | 162.2 MiB |
+| `cifar100` | binary RGB planes, fine labels, coarse labels and official split are preserved | 160.7 MiB |
+
+The UCI archives below the ceiling have purpose-built streaming readers:
+
+| name | ROOT rows | compressed source |
+|---|---|---:|
+| `susy` | 5,000,000 collision events, official last-500,000 test split | 879.6 MiB |
+| `multimodal_damage` | 640×640 RGB images paired with their captions | 1.05 GiB |
+| `pems_sf` | one 963×144 occupancy matrix per day, official train/test split | 104.4 MiB |
+| `physical_unclonable_functions` | 64- and 128-bit challenges in four official partitions | 152.4 MiB |
+| `daily_sports_activities` | one 125×45 motion segment per entry | 162.9 MiB |
+| `gas_sensor_temperature` | environmental controls and 14 resistance channels | 174.8 MiB |
+| `twin_gas_sensor_arrays` | padded ten-minute, eight-channel exposure records | 194.6 MiB |
+| `electricity_load_diagrams` | quarter-hour loads for all 370 clients | 249.2 MiB |
+| `opportunity_activity` | raw sensor timestamps and locomotion labels | 292.4 MiB |
+| `gas_sensor_dynamic_mixtures` | concentrations and 16 raw sensor channels | 351.9 MiB |
+| `p53_mutants` | 5,408 molecular features and activity label | 527.0 MiB |
+| `pamap2` | timestamps, 52 measurements and activity labels | 656.3 MiB |
+| `hhar` | heterogeneous phone/watch motion rows | 784.0 MiB |
+| `year_prediction_msd` | 90 timbre statistics and release year, official train/test split | 201.2 MiB |
+
+Fifty-four more explicitly licensed archive families are admitted: JetNet (five
+HDF5 shards, 436.5 MB total), OmniFold Big (817.9 MB), TinySOL (1.03 GB),
+WikiText-103 (313.1 MB), ReefSet (1.63 GB), BioDCASE 2025 Task 3 (224.7 MB),
+Speech Commands v0.01 (1.49 GB), AudioMNIST (1.91 GB through its fixed
+Hugging Face mirror), CirCor heart sounds (471.3 MB), BirdSet BASEAL
+(225.2 MB), UAV Maize Stress (1.18 GB), Wildlife MNIST (1.48 GB), SODv2
+(14.5 MB), All-Sky Cloud Segmentation Almeria (16.8 MB), 17 CC BY MedMNIST
+28-pixel classification/volume sources (686.0 MB together), Galaxy10 SDSS
+(210.2 MB), Mars Surface Image v1 (60.6 MB), and SWEFil (151.5 MB).
+
+The condensed-matter shelf contributes 20 individually buildable problems. Seven are
+image-first collections, and every source remains below the strict two-gigabyte ceiling:
+
+| name | ROOT representation | compressed source |
+|---|---|---:|
+| `jarvis_stm_bravais` | paired positive/negative-bias RGB STM images; five Bravais TTrees | 313.9 MB |
+| `nffa_sem_compact` | grayscale SEM images; five nanomaterial-morphology TTrees | 1.97 GB |
+| `moke_skyrmion_segmentation` | MOKE intensity image plus background/skyrmion/defect mask | 957.2 MB |
+| `wse2_stm_defects` | float32 atomic STM patch plus three-class defect mask and author split | 1.79 GB |
+| `tem_nanoparticle_morphology` | grayscale TEM images; three balanced assembly TTrees | 1.57 GB |
+| `polymer_blend_afm` | five aligned, unnormalised float32 AFM channels | 483.8 MB |
+| `perovskite_sem_segmentation` | RGB SEM image plus rasterized phase/defect mask, retaining image/annotation geometry | 77.1 MB |
+
+The other 13 are the complete Matbench v0.1 task suite: `matbench_dielectric`,
+`matbench_expt_gap`, `matbench_expt_is_metal`, `matbench_glass`,
+`matbench_jdft2d`, `matbench_log_gvrh`, `matbench_log_kvrh`,
+`matbench_mp_e_form`, `matbench_mp_gap`, `matbench_mp_is_metal`,
+`matbench_perovskites`, `matbench_phonons`, and `matbench_steels`. Composition
+tasks retain the formula and add a normalized 8×16 elemental image. Structure tasks
+also retain the 3×3 lattice and every site/species occupancy, plus three 32×32
+fractional-coordinate projections. The Matbench gzip JSON is streamed row by row.
+
+The JARVIS visual-physics shelf adds another 100 independently buildable
+regression problems: 50 from the 93,902-crystal JARVIS-DFT 3D snapshot and the
+same 50 concepts from the 1,103-crystal JARVIS-DFT 2D snapshot. They are the
+Cartesian product of these source prefixes and target groups:
+
+| name prefix | logical tasks | pinned compressed source | canonical record |
+|---|---:|---:|---|
+| `jarvis_dft3d_` | 50 | 48.45 MB | [JARVIS-DFT 3D](https://doi.org/10.6084/m9.figshare.6815699.v11) |
+| `jarvis_dft2d_` | 50 | 8.39 MB | [JARVIS-DFT 2D](https://doi.org/10.6084/m9.figshare.6815705.v8) |
+
+Thirty-two targets preserve published calculated observables: formation and
+total energies, OptB88vdW/MBJ gaps, density, energy above hull, cutoff and
+k-point parameters, atom count, two magnetic moments, six dielectric-axis
+responses, electron/hole effective mass, two band-difference measures, eight
+n/p thermoelectric quantities, SLME, spin-orbit spillage and exfoliation
+energy. Eighteen transparent teaching targets are derived from the published
+structure: lattice lengths and angles, volume, volume per atom, length/angle
+statistics, anisotropy, element count and atomic-number statistics.
+
+Every task retains the JARVIS id, formula, lattice, padded atomic numbers and
+fractional positions. It also supplies a normalized 8×16 elemental image and
+three 32×32 orthogonal crystal projections. Numeric-id modulo ten provides a
+stable 80/10/10 train/validation/test tree partition; this project-created
+partition is stated on every generated detail page. The two input ZIPs have
+shared cache names, so building all 100 tasks downloads 56.84 MB once rather
+than downloading the same structures 100 times. The task files intentionally
+repeat the input representation so each `.root` remains independently usable:
+
+```console
+$ xrd-datasets build /nfs/datasets --only 'jarvis_dft*' \
+    --source-cache /nfs/dataset-sources --jobs 4
+```
+
+The Alex-MP-20 shelf adds another 100 visual materials-physics regressions over
+675,204 inorganic structures and preserves OMatG's train/validation/test split.
+Its 197.51 MB of CC BY 4.0 Parquet shards are shared in the source cache by all
+tasks. Six targets are published observables, 32 are documented cell and
+aggregate-composition derivations, and 62 are elemental stoichiometric fractions.
+Every row retains the cell, padded atoms and source identifiers together with a
+normalized 8×16 elemental image, an occupancy-only three-plane image and three
+atomic-number 32×32 crystal projections:
+
+```console
+$ xrd-datasets build /nfs/datasets --only 'alex_mp20_*' \
+    --source-cache /nfs/dataset-sources --jobs 2
+```
+
+For an elemental-fraction exercise, choose `occupancy_projection` as the model
+input instead of `atomic_numbers`, `element_image` or `projection`; the latter
+branches deliberately retain exact composition for provenance and would leak
+that target. The canonical MatterGen paper, the OMatG repository and the
+Alexandria source collection are linked from every generated detail page.
+
+The `well_*` shelf adds 100 visual field-learning tasks from sixteen distinct
+CC BY 4.0 repositories in [The Well](https://polymathic-ai.org/the_well/).
+Its domains include acoustic and Helmholtz waves, active matter,
+reaction-diffusion, planetary atmospheres, convection, hydrodynamic
+instabilities, non-Newtonian flow, plasma mixing and stellar/relativistic
+astrophysics. Six common tasks per source predict the next state, temporal
+change, gradient magnitude, Laplacian, an above-mean mask and next-state mean;
+four sources add RMS regression.
+
+Each entry is a traceable 64×64 central plane containing raw and min-max
+normalized input values, validity masks, a transformed target image, scalar
+target, source field name and original limits. Sixteen pinned HDF5 objects are
+shared across the 100 outputs. Eight are admitted by the default ceiling; the
+complete 86.52 GB physical source shelf needs the explicit production opt-in:
+
+```console
+$ xrd-datasets build /nfs/datasets --only 'well_*' --allow-oversize \
+    --source-cache /nfs/dataset-sources --jobs 1
+```
+
+This is deliberately an educational slice, not a claim to mirror The Well's
+full 15 TB. Every detail page links the domain-specific documentation and
+paper, identifies the selected upstream test shard, and states the derived
+contiguous temporal split.
+
+[`xrd.ml.load_image_2d`](ml.md#raw-and-normalized-2d-crystal-images) reads one
+entry and reconstructs any `xy`, `xz` or `yz` plane as both its raw
+atomic-number image and a normalized floating-point image. Its optional plot
+puts the two side by side; `examples/jarvis_2d_visualize.py` can display or
+save the result directly from a local path, hosted URL or catalogue name.
+
+Wildlife MNIST's float32 RGB arrays remain channel-first and at their
+published scale; its official non-mixed training and mixed test labels become
+digit, background and foreground branches under split-and-digit TTrees. The maize converter
+joins four ZIP shards, writes the water and rust source orthomosaics as padded
+224×224 six-band tiles, casts the published float16 derived patches to float32,
+and keeps their five-class masks and coordinates in separate source/patch TTrees.
+All 229 default large registrations total 93.70 GB when logical task sources are
+summed; the public build withholds the two unlicensed CIFAR sources and reports
+93.36 GB. Shared cache names reduce the physical source fetch to about
+41.15 GB. Sources are cached on disk and read a member or record at a time; allow 500 GiB for the
+source cache, expanding output, temporary nested members and writer baskets
+on a first complete pass. JetNet's HDF5 and the multimodal archive's JPEG
+formats use optional readers, as does WikiText-103's Parquet source:
+
+The explicit oversized selection adds eight UCI archives, all with
+purpose-built, bounded-source readers:
+
+| name | retained conversion | compressed source |
+|---|---|---:|
+| `higgs` | float32 collision features; official train/test boundary; signal/background TTrees | 2.82 GB |
+| `realdisp` | timestamps, subject/placement metadata and 117 sensor readings; activity TTrees | 2.67 GB |
+| `cuffless_blood_pressure` | HDF5 PPG, pressure and ECG signals in length-preserving 1,000-sample windows | 3.36 GB |
+| `ppg_dalia` | synchronized wrist signals in overlapping eight-second windows with subject and heart-rate target | 2.87 GB |
+| `medical_deepfakes` | original signed 512×512 DICOM pixels, calibration and tamper labels | 6.40 GB |
+| `gas_sensor_arrays_open_sampling` | controls and 72 sensor series padded with their true lengths; chemical TTrees | 8.37 GB |
+| `hepmass` | all six gzip CSV files; three hypotheses and their official train/test splits | 7.89 GB |
+| `chipseq` | run-length bedGraph coverage split at published weak-label boundaries; label TTrees | 37.28 GB |
+
+Together the default and oversized selections are 287 registered converters
+and 681.39 GB of declared logical source payload (285 and 681.05 GB in the public build,
+which still withholds CIFAR-10 and CIFAR-100). Start an oversized production
+pass with one conversion job and at least 1 TiB of working space. Shared-cache
+deduplication reduces the actual source fetch to about 193.10 GB; ROOT output
+and temporary space must still be measured on the production filesystem.
+
+```console
+$ pip install 'pyxrootdclient[datasets]'
+```
+
 Nothing is redistributed here. Each set is fetched from whoever publishes it,
 on the machine doing the converting, and the licences above are what those
 publishers say — read them before passing the converted file on. The CIFAR
@@ -1191,14 +1399,19 @@ with xrd.root.open_root("cifar10.root") as f:
 # split: train
 # licence: no formal licence; Krizhevsky asks that the tech report be cited
 # source: https://www.cs.toronto.edu/~kriz/cifar.html
-# converted by xrd.root.datasets, one tree per class
+# transformation: extracted the publisher's binary records; preserved 32x32
+# RGB-plane unsigned-byte pixels, labels and official train/test split without
+# normalization or augmentation; wrote one ROOT TTree per class
+# layout: one tree per class
 ```
 
 The CIFAR sets are taken in their **binary** distribution rather than the
-Python one, on purpose: the Python one is a pickle, and unpickling a download
-is a way to run somebody else's code. Every archive here — IDX, tar, zip, a zip
-inside a zip, gzip, WAV, ARFF, CSV, and the XML a spreadsheet keeps inside its
-own zip — is read with the standard library and nothing else.
+Python one, on purpose: that Python distribution is a pickle. The ordinary
+archive readers — IDX, tar, zip, a zip inside a zip, gzip, WAV, ARFF, CSV and
+the XML a spreadsheet keeps inside its own zip — use the standard library.
+PPG-DaLiA itself publishes NumPy arrays in a pickle; its large reader uses a
+restricted unpickler that permits only NumPy's inert array constructors and
+built-in containers, never an arbitrary class or callable from the download.
 
 A table that gives its names in a header takes them from the first line that is
 neither blank nor a comment, because a file is as likely to name its columns
@@ -1217,8 +1430,18 @@ loaders = [
         xrd.root.ml.dataset(f[f"train_{cls}"], ["image", "label"], step=64),
         batch_size=None,
     )
-    for cls in ("airplane", "automobile", "bird", "cat", "deer",
-                "dog", "frog", "horse", "ship", "truck")
+    for cls in (
+        "airplane",
+        "automobile",
+        "bird",
+        "cat",
+        "deer",
+        "dog",
+        "frog",
+        "horse",
+        "ship",
+        "truck",
+    )
 ]
 for parts in zip(*loaders):
     x = torch.cat([part["image"] for part in parts]).float().div_(255)
@@ -1241,21 +1464,132 @@ The set converted is the **balanced** split, 47 classes: the ten digits, the
 capital — `a b d e f g h n q r t`. The other fifteen were merged into their
 capitals by NIST because nothing in a 28×28 bitmap tells `c` from `C`.
 
-Sound is the same idea with a longer row. `fsdd` is 3,000 WAV recordings read
+### Detection and pixel masks
+
+Twenty-two open sources now provide visual problems tied directly to astronomy,
+planetary and atmospheric physics, microscopy and medical imaging. The latest
+20 are the 17 redistributable MedMNIST subsets plus Galaxy10 SDSS, the Curiosity
+rover collection and SWEFil; DermaMNIST is deliberately absent because its
+CC BY-NC terms do not permit the public mirror.
+
+| name | task retained in ROOT | complete source |
+|---|---|---:|
+| `pathmnist`, `chestmnist`, `octmnist`, `pneumoniamnist`, `retinamnist`, `breastmnist`, `bloodmnist`, `tissuemnist` | compact histology, radiography, OCT, ultrasound and microscopy image tasks with official splits | 511,802,078 B total |
+| `organamnist`, `organcmnist`, `organsmnist` | axial, coronal and sagittal CT organ classification | 70,302,478 B total |
+| `organmnist3d`, `nodulemnist3d`, `adrenalmnist3d`, `fracturemnist3d`, `vesselmnist3d`, `synapsemnist3d` | 9,996 compact 28³ CT, vessel, shape-mask and electron-microscopy volumes | 103,944,897 B total |
+| `galaxy10_sdss` | 21,785 69×69 SDSS/Galaxy Zoo morphology examples in ten classes | 210,234,548 B |
+| `mars_surface_images` | 6,691 roughly 256-pixel Curiosity images in publisher train/validation/test splits | 60,635,475 B |
+| `swefil` | 554 raw/processed H-alpha images, 4,144 COCO boxes and four overlap-preserving masks | 151,465,835 B |
+| `sodv2` | 600 simulated orbital scenes, 1,339 normalized YOLO boxes, official train/validation split and near/mid/far distance TTrees | 14,516,386 B |
+| `allsky_cloud_segmentation` | 818 all-sky images paired with unchanged five-class masks, official train/validation/test split and four-camera test set | 16,828,503 B |
+
+Every MedMNIST file keeps its published 28×28 or 28×28×28 uint8 tensor with no
+new scaling and preserves `train`, `validation` and `test`. Single-label tasks
+write one TTree per class; ChestMNIST writes one `samples` tree with its
+fourteen-wide binary `targets` vector. The NPZ members are safely extracted and
+memory-mapped, so TissueMNIST's 236,386 cells do not become one Python-memory
+copy. The generated pages credit the eight MedMNIST creators, link the versioned
+Zenodo origin and licence, and cite the dataset paper.
+
+Galaxy10 keeps the publisher's complete HDF5 array as 69×69×3 uint8 pixels and
+the ten Galaxy Zoo morphology labels; no unofficial split is invented. Mars
+converts its small grayscale subset to RGB and letterboxes variable source
+geometry within 256×256 while retaining source dimensions, padding, sol,
+instrument and product id. Its 25 published category ids become TTrees, with
+the unused `sun` id correctly left empty because the official manifests contain
+24 populated categories.
+
+SWEFil is the requested real solar-physics detection and masking problem. Each
+2048×2048 GONG JPEG is resized to 512×512 RGB; every COCO polygon is rasterized
+into separate QRF, IRF, ARF and sunspot masks, so overlaps are not erased.
+Forty normalized source boxes, category ids, source areas and annotation ids
+are padded beside a true `objects` count. Separate `processed` and `raw` TTrees
+retain the official train/test division and observatory/timestamp identity.
+
+SODv2's `image` is a channel-last `794×706×3` uint8 row. `boxes` is a
+16×4 float32 tensor in the source's normalized `(centre_x, centre_y, width,
+height)` convention; `objects` says how many rows are real, and the unused
+tail is zero-padded. `object_labels` is zero for each satellite and `-1` in
+the padding. Trees retain the publisher's three observation-distance strata,
+for example `train_mid_0_5_to_2_km`.
+
+The all-sky `image` is channel-last `512×512×3` uint8 and `mask` is a
+`512×512` uint8 semantic map. Values remain exactly the publisher's `0`
+camera mask, `1` sky, `2` low cloud, `3` mid cloud and `4` high cloud.
+`class_fractions`, camera id, acquisition timestamp and camera coordinates sit
+beside each pair. The source's validation CSV defines the 616/154 training and
+validation partition; the 48-row test tree keeps 12 observations from each of
+four independent imagers.
+
+```console
+$ python -m pip install 'pyxrootdclient[datasets]'
+$ xrd-datasets build /nfs/datasets \
+    --only swefil --only galaxy10_sdss --only mars_surface_images \
+    --only pathmnist --only organmnist3d \
+    --source-cache /nfs/dataset-sources --jobs 1
+$ xrd-datasets verify /nfs/datasets
+```
+
+No synthetic mask or box is inferred during conversion: JPEG/PNG pixels are
+decoded to model-ready unsigned bytes, annotations are joined by filename and
+their coordinate or class convention is kept. The ROOT file's `about` key and
+the generated site credit the creators and publisher, link the canonical
+record or repository and state this transformation.
+
+Sound is the same idea with a longer row. Every raw-audio converter decodes
+signed 16-bit PCM to float32 in `[-1, 1)` before writing it; models therefore
+receive waveform values directly rather than compressed audio bytes or integer
+amplitudes. `fsdd` is 3,000 WAV recordings read
 with the standard library's `wave`, and because a tree column is a fixed size,
 every clip is written into a 20,000-sample column — 2.5 seconds at 8 kHz — with
 a `length` beside it saying how much of that is recording and how much is the
 zeroes after it. A clip longer than the column is refused by name rather than
 truncated, and so is a file that is not 8 kHz mono 16-bit, which is what
-`speaker` being a column can be trusted against:
+`speaker` being a column can be trusted against. Its publisher's repetition
+rule becomes `train_0` … `train_9` and `test_0` … `test_9` trees:
 
 ```python
 with xrd.root.open_root("fsdd.root") as f:
-    for batch in xrd.root.ml.iter_tensors(f["7"], ["audio", "length", "speaker"], step=32):
-        wave = batch["audio"].float().div_(32768)      # int16 -> -1..1
+    for batch in xrd.root.ml.iter_tensors(f["train_7"], ["audio", "length", "speaker"], step=32):
+        wave = batch["audio"]  # float32, already normalized to [-1, 1)
         mask = torch.arange(20000) < batch["length"][:, None]
         loss = criterion(model(wave * mask), ...)
 ```
+
+The other waveform sets exercise different teaching problems while remaining
+below the default two-gigabyte source ceiling:
+
+| name | waveform layout in ROOT | source payload |
+|---|---|---:|
+| `speech_commands_v001` | 16,000 float32 values, official train/validation/test lists, 30 words plus one-second noise windows | 1.489 GB |
+| `audiomnist` | 48,000 float32 values with speaker, repetition, age, sex, accent and origin metadata | 1.907 GB |
+| `circor_heart_sound` | non-overlapping five-second 4 kHz windows with patient, auscultation, murmur and outcome labels | 471.3 MB |
+| `tinysol` | up to ten seconds per orchestral note, one tree per instrument | 1.027 GB |
+| `reefset` | 30,720 values plus the source's acoustic and recorder provenance | 1.629 GB |
+| `biodcase_2025_task3` | up to 32,000 values with the official training/validation split | 224.7 MB |
+
+Build only the waveform shelf with one conversion job so archive inflation and
+ROOT compression do not compete for the same disk:
+
+```console
+$ xrd-datasets build /nfs/datasets \
+    --only fsdd --only speech_commands_v001 --only audiomnist \
+    --only circor_heart_sound --only tinysol --only reefset \
+    --only biodcase_2025_task3 \
+    --source-cache /nfs/dataset-sources --jobs 1
+$ xrd-datasets verify /nfs/datasets
+```
+
+AudioMNIST is only 92,968,703 bytes below the strict two-gigabyte source
+ceiling and its decoded 48 kHz float rows can occupy several gigabytes before
+ROOT compression. Keep both the source cache and output on the production NFS
+mount for this pass.
+
+AudioMNIST is the useful mirror example: `origin` names the authors' GitHub
+project, while `source`, `repository`, and `mirrors` identify the fixed
+Hugging Face adaptation that supplies the three registered archives. Those
+roles are separate in `index.json`, the generated HTML, JSON-LD, and each
+ROOT file's `about` key.
 
 Some sets are neither pictures nor a table of named fields, but one long row
 of numbers an example — and those become one fixed-size column called
@@ -1410,8 +1744,9 @@ Converting is one pass, and `parts=` takes archives already on disk when you
 would rather not download them twice:
 
 ```python
-datasets.convert("cifar100", "cifar100.root", split="test",
-                 parts={"archive": "cifar-100-binary.tar.gz"})
+datasets.convert(
+    "cifar100", "cifar100.root", split="test", parts={"archive": "cifar-100-binary.tar.gz"}
+)
 ```
 
 `base=` points the downloads at a mirror of your own, and `target` may be a
@@ -1453,9 +1788,9 @@ URL = "root://127.0.0.1:21094//home/you/datasets/mnist.root"
 with open_root(URL) as handle:
     trees = [handle[f"train_{cls}"] for cls in range(10)]
     loader = torch.utils.data.DataLoader(
-        mixed(trees, ["image", "label"], step=512, batch=256, device="cuda"),
-        batch_size=None)
-    for batch in loader:                         # 60,000 rows an epoch
+        mixed(trees, ["image", "label"], step=512, batch=256, device="cuda"), batch_size=None
+    )
+    for batch in loader:  # 60,000 rows an epoch
         train(batch["image"].float().view(-1, 1, 28, 28) / 255, batch["label"].long())
 ```
 
@@ -1469,7 +1804,8 @@ to predict a column beside the rest:
 with open_root("root://127.0.0.1:21094//victorian_electricity.root") as handle:
     loader = torch.utils.data.DataLoader(
         dataset(handle["rows"], ["temperature", "holiday", "time", "demand"], step=4096),
-        batch_size=None)
+        batch_size=None,
+    )
 ```
 
 ## Compression

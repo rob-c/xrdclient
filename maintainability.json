@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "paths": [
+    "src",
+    "tools",
+    "tests",
+    "benchmarks"
+  ],
+  "exclude": [
+    "src/xrd/root/_hub_tables.py",
+    "src/xrd/root/_uci_tables.py"
+  ],
+  "limits": {
+    "ccn": 10,
+    "cognitive": 15,
+    "npath": 200,
+    "halstead_volume": 500.0,
+    "max_nesting": 4
+  }
+}

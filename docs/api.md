@@ -250,6 +250,12 @@ call's keyword arguments into them.
 
 ::: xrd.ml.load
 
+::: xrd.ml.load_image_2d
+
+::: xrd.ml.visualize_2d
+
+::: xrd.ml.Image2D
+
 ::: xrd.ml.Dataset
 
 ::: xrd.ml.Split

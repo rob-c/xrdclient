@@ -192,25 +192,40 @@ def _credentials(run: _Run) -> None:
         cls = auth.registry().get(name)
         if cls is None:  # pragma: no cover - the registry is filled at import
             continue
-        offer = auth.Offer(name)
-        try:
-            cred = cls.available(offer, run.config, username=run.config.username, host=run.host)
-        except Exception as exc:  # a broken mechanism must not stop the rest
-            run.add(f"auth:{name}", "warn", f"{type(exc).__name__}: {exc}")
-            continue
-        if cred is not None:
+        if _credential_ready(run, name, cls):
             ready.append(name)
-            run.add(f"auth:{name}", "ok", "ready")
-            continue
-        try:
-            ask = cls.missing(offer, run.config, username=run.config.username, host=run.host)
-        except Exception as exc:
-            run.add(f"auth:{name}", "warn", f"cannot say what it wants: {exc}")
-            continue
-        if ask is None:
-            run.add(f"auth:{name}", "warn", "no material here")
-            continue
-        run.add(f"auth:{name}", "warn", ask.reason, ask.hint)
+    _credential_summary(run, ready)
+
+
+def _credential_ready(run: _Run, name: str, cls: type[auth.Credential]) -> bool:
+    offer = auth.Offer(name)
+    try:
+        cred = cls.available(offer, run.config, username=run.config.username, host=run.host)
+    except Exception as exc:  # a broken mechanism must not stop the rest
+        run.add(f"auth:{name}", "warn", f"{type(exc).__name__}: {exc}")
+        return False
+    if cred is not None:
+        run.add(f"auth:{name}", "ok", "ready")
+        return True
+    _missing_credential(run, name, cls, offer)
+    return False
+
+
+def _missing_credential(
+    run: _Run, name: str, cls: type[auth.Credential], offer: auth.Offer
+) -> None:
+    try:
+        ask = cls.missing(offer, run.config, username=run.config.username, host=run.host)
+    except Exception as exc:
+        run.add(f"auth:{name}", "warn", f"cannot say what it wants: {exc}")
+        return
+    if ask is None:
+        run.add(f"auth:{name}", "warn", "no material here")
+        return
+    run.add(f"auth:{name}", "warn", ask.reason, ask.hint)
+
+
+def _credential_summary(run: _Run, ready: list[str]) -> None:
     proving = [name for name in ready if name in IDENTIFYING]
     if proving:
         run.add("auth", "ok", f"{', '.join(proving)} can prove who you are")

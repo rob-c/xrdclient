@@ -114,46 +114,92 @@ def third_party(
     only complete when the far side says ``success:`` - a ``failure:`` raises
     the exception the quoted status maps to.
     """
-    cfg = config or Config()
-    if timeout is not None:
-        cfg = cfg.evolve(request_timeout=timeout)
+    cfg = _copy_config(config, timeout)
     su, du = parse(source), parse(target)
-    for url in (su, du):
+    _require_http(su, du)
+    near, far = (du, su) if mode == "pull" else (su, du)
+    headers = _copy_headers(
+        far, cfg, mode, overwrite, remote_token, delegate, verify, streams, transfer_headers
+    )
+    owned = client or HTTPClient(cfg)
+    started = time.monotonic()
+    _log.debug("COPY %s %s -> %s", mode, su, du)
+    try:
+        size = _run_copy(owned, near, headers, progress)
+    finally:
+        if client is None:
+            owned.close()
+    return CopyResult(source=str(su), target=str(du), size=size, seconds=time.monotonic() - started)
+
+
+def _copy_config(config: Config | None, timeout: float | None) -> Config:
+    made = config or Config()
+    return made.evolve(request_timeout=timeout) if timeout is not None else made
+
+
+def _require_http(source: XRootDURL, target: XRootDURL) -> None:
+    for url in (source, target):
         if not url.is_http:
             raise ValueError(f"HTTP third-party copy needs two http(s) endpoints, not {url.scheme}")
 
-    near, far = (du, su) if mode == "pull" else (su, du)
+
+def _copy_headers(
+    far: XRootDURL,
+    config: Config,
+    mode: Literal["pull", "push"],
+    overwrite: bool,
+    explicit_token: str | None,
+    delegate: bool,
+    verify: bool | None,
+    streams: int | None,
+    transfer_headers: Mapping[str, str] | None,
+) -> dict[str, str]:
     headers = {
         "Source" if mode == "pull" else "Destination": _remote_url(far),
         "Overwrite": "T" if overwrite else "F",
         # Without this a server that supports delegation waits for one.
         "Credential": "gridsite" if delegate else "none",
     }
-    token = _remote_token(far, remote_token, cfg)
+    _add_token(headers, _remote_token(far, explicit_token, config))
+    _add_verification(headers, verify)
+    _add_streams(headers, streams)
+    _add_transfer_headers(headers, transfer_headers)
+    return headers
+
+
+def _add_token(headers: dict[str, str], token: str | None) -> None:
     if token:
         headers["TransferHeaderAuthorization"] = f"Bearer {token}"
+
+
+def _add_verification(headers: dict[str, str], verify: bool | None) -> None:
     if verify is not None:
         headers["RequireChecksumVerification"] = "true" if verify else "false"
+
+
+def _add_streams(headers: dict[str, str], streams: int | None) -> None:
     if streams is not None:
         headers["X-Number-Of-Streams"] = str(streams)
+
+
+def _add_transfer_headers(
+    headers: dict[str, str], transfer_headers: Mapping[str, str] | None
+) -> None:
     for name, value in (transfer_headers or {}).items():
         headers[f"TransferHeader{name}"] = value
 
-    owned = client or HTTPClient(cfg)
-    started = time.monotonic()
-    _log.debug("COPY %s %s -> %s", mode, su, du)
+
+def _run_copy(
+    client: HTTPClient,
+    near: XRootDURL,
+    headers: dict[str, str],
+    progress: Callable[[int, int | None], None] | None,
+) -> int:
+    response = client.open("COPY", near, headers=headers, expect=(200, 201, 202))
     try:
-        response = owned.open("COPY", near, headers=headers, expect=(200, 201, 202))
-        try:
-            size = _follow(response, near, progress)
-        finally:
-            response.close()
+        return _follow(response, near, progress)
     finally:
-        if client is None:
-            owned.close()
-    return CopyResult(
-        source=str(su), target=str(du), size=size, seconds=time.monotonic() - started
-    )
+        response.close()
 
 
 def _remote_url(url: XRootDURL) -> str:
@@ -188,29 +234,53 @@ def _follow(
     stripes: dict[int, int] = {}
     block: dict[str, str] = {}
     while True:
-        line = stream.readline(MAX_LINE)
-        if not line:
-            raise ProtocolError(
-                f"{url.host} closed the connection before reporting the outcome of the copy"
-            )
-        text = line.decode("utf-8", "replace").strip()
-        if not text:
-            continue
-        lowered = text.lower()
-        if lowered.startswith(("success", "failure", "failed")):
-            _outcome(text, url)
+        text = _marker_line(stream, url)
+        finished, block = _consume_line(text, url, block, stripes, progress)
+        if finished:
             return sum(stripes.values())
-        if lowered == "perf marker":
-            block = {}
-        elif lowered == "end":
-            marker = _marker(block)
-            if marker is not None:
-                stripes[marker.index] = marker.transferred
-                if progress is not None:
-                    progress(sum(stripes.values()), None)
-        elif ":" in text:
-            name, _, value = text.partition(":")
-            block[name.strip().lower()] = value.strip()
+
+
+def _marker_line(stream: _Lines, url: XRootDURL) -> str:
+    line = stream.readline(MAX_LINE)
+    if not line:
+        raise ProtocolError(
+            f"{url.host} closed the connection before reporting the outcome of the copy"
+        )
+    return line.decode("utf-8", "replace").strip()
+
+
+def _consume_line(
+    text: str,
+    url: XRootDURL,
+    block: dict[str, str],
+    stripes: dict[int, int],
+    progress: Callable[[int, int | None], None] | None,
+) -> tuple[bool, dict[str, str]]:
+    lowered = text.lower()
+    if lowered.startswith(("success", "failure", "failed")):
+        _outcome(text, url)
+        return True, block
+    if lowered == "perf marker":
+        return False, {}
+    if lowered == "end":
+        _record_marker(block, stripes, progress)
+    elif ":" in text:
+        name, _, value = text.partition(":")
+        block[name.strip().lower()] = value.strip()
+    return False, block
+
+
+def _record_marker(
+    block: dict[str, str],
+    stripes: dict[int, int],
+    progress: Callable[[int, int | None], None] | None,
+) -> None:
+    marker = _marker(block)
+    if marker is None:
+        return
+    stripes[marker.index] = marker.transferred
+    if progress is not None:
+        progress(sum(stripes.values()), None)
 
 
 def _marker(block: dict[str, str]) -> Marker | None:

@@ -306,26 +306,7 @@ class _Handler(BaseHTTPRequestHandler):
         start = query.get("continuation-token", "")
 
         keys = sorted(k for k in self.fake.objects if k.startswith(prefix) and k > start)
-        contents: list[str] = []
-        prefixes: list[str] = []
-        taken = 0
-        last = ""
-        for key in keys:
-            if key <= last:
-                continue  # inside a group already rolled past, below
-            tail = key[len(prefix) :]
-            if delimiter and delimiter in tail:
-                group = prefix + tail.split(delimiter, 1)[0] + delimiter
-                prefixes.append(group)
-                # Past the whole group, so the next page cannot name it again:
-                # a common prefix appears in exactly one page of a listing.
-                last = max(k for k in keys if k.startswith(group))
-            else:
-                contents.append(key)
-                last = key
-            taken += 1
-            if taken >= limit:
-                break
+        contents, prefixes, last = _listing_page(keys, prefix, delimiter, limit)
         truncated = bool(last) and last != keys[-1]
         self._send(
             200,
@@ -439,6 +420,33 @@ class _Handler(BaseHTTPRequestHandler):
         # Deleting a key that is not there is a success, as it is in S3.
         self.fake.objects.pop(key, None)
         self._send(204)
+
+
+def _listing_page(
+    keys: list[str], prefix: str, delimiter: str, limit: int
+) -> tuple[list[str], list[str], str]:
+    """Select one S3 page, coalescing keys beneath a common prefix."""
+    contents: list[str] = []
+    prefixes: list[str] = []
+    taken = 0
+    last = ""
+    for key in keys:
+        if key <= last:
+            continue  # inside a group already rolled past, below
+        tail = key[len(prefix) :]
+        if delimiter and delimiter in tail:
+            group = prefix + tail.split(delimiter, 1)[0] + delimiter
+            prefixes.append(group)
+            # Past the whole group, so the next page cannot name it again:
+            # a common prefix appears in exactly one page of a listing.
+            last = max(k for k in keys if k.startswith(group))
+        else:
+            contents.append(key)
+            last = key
+        taken += 1
+        if taken >= limit:
+            break
+    return contents, prefixes, last
 
 
 def _sorted_query(query: str) -> str:

@@ -114,44 +114,114 @@ def select(
     - and yields whatever that produces.
     """
     config = config or Config()
-    offers = parse_security_trailer(sec) if isinstance(sec, str) else list(sec)
+    offers = _offers(sec)
     by_name = {o.name: o for o in offers}
-    order = [n for n in config.auth_order if n in by_name]
-    order += [o.name for o in offers if o.name not in order]
+    order = _offer_order(offers, by_name, config)
     why = {} if rejected is None else rejected
-
-    if tls is False and not config.ztn_cleartext and "ztn" in by_name:
-        del by_name["ztn"]
-        order.remove("ztn")
-        why["ztn"] = (
-            "not offered on a cleartext connection - a bearer token is "
-            "replayable by anyone on the path; use roots:// (or xroots://), "
-            "or set ztn_cleartext=True on a rig you trust end to end"
-        )
+    _withhold_cleartext_token(by_name, order, why, tls, config)
 
     found = False
-    for name in order:
-        cls = _REGISTRY.get(name)
-        if cls is None:
-            why[name] = "not supported by this client"
-            continue
-        cred = _build(cls, by_name[name], config, username=username, host=host, why=why)
-        if cred is not None:
-            found = True
-            yield cred
+    for credential in _available_credentials(order, by_name, config, username, host, why):
+        found = True
+        yield credential
 
     # Only now, with nothing to offer the server, is it worth interrupting
     # somebody: a working ``unix`` fallback must never provoke a question.
-    if found or not prompt.interactive(config):
+    if not _should_prompt(found, config):
         return
+    prompted = _first_prompted(order, by_name, config, username, host, why)
+    if prompted is not None:
+        yield prompted
+
+
+def _offers(sec: str | list[Offer]) -> list[Offer]:
+    return parse_security_trailer(sec) if isinstance(sec, str) else list(sec)
+
+
+def _offer_order(offers: list[Offer], by_name: dict[str, Offer], config: Config) -> list[str]:
+    order = [name for name in config.auth_order if name in by_name]
+    order.extend(offer.name for offer in offers if offer.name not in order)
+    return order
+
+
+def _withhold_cleartext_token(
+    offers: dict[str, Offer],
+    order: list[str],
+    why: dict[str, str],
+    tls: bool | None,
+    config: Config,
+) -> None:
+    if tls is not False or config.ztn_cleartext or "ztn" not in offers:
+        return
+    del offers["ztn"]
+    order.remove("ztn")
+    why["ztn"] = (
+        "not offered on a cleartext connection - a bearer token is "
+        "replayable by anyone on the path; use roots:// (or xroots://), "
+        "or set ztn_cleartext=True on a rig you trust end to end"
+    )
+
+
+def _named_credential(
+    name: str,
+    offers: dict[str, Offer],
+    config: Config,
+    username: str,
+    host: str,
+    why: dict[str, str],
+) -> Credential | None:
+    cls = _REGISTRY.get(name)
+    if cls is None:
+        why[name] = "not supported by this client"
+        return None
+    return _build(cls, offers[name], config, username=username, host=host, why=why)
+
+
+def _available_credentials(
+    order: list[str],
+    offers: dict[str, Offer],
+    config: Config,
+    username: str,
+    host: str,
+    why: dict[str, str],
+) -> Iterator[Credential]:
     for name in order:
-        cls = _REGISTRY.get(name)
-        if cls is None:
-            continue
-        cred = _ask(cls, by_name[name], config, username=username, host=host, why=why)
-        if cred is not None:
-            yield cred
-            return
+        credential = _named_credential(name, offers, config, username, host, why)
+        if credential is not None:
+            yield credential
+
+
+def _should_prompt(found: bool, config: Config) -> bool:
+    return not found and prompt.interactive(config)
+
+
+def _prompted_credential(
+    name: str,
+    offers: dict[str, Offer],
+    config: Config,
+    username: str,
+    host: str,
+    why: dict[str, str],
+) -> Credential | None:
+    cls = _REGISTRY.get(name)
+    if cls is None:
+        return None
+    return _ask(cls, offers[name], config, username=username, host=host, why=why)
+
+
+def _first_prompted(
+    order: list[str],
+    offers: dict[str, Offer],
+    config: Config,
+    username: str,
+    host: str,
+    why: dict[str, str],
+) -> Credential | None:
+    for name in order:
+        credential = _prompted_credential(name, offers, config, username, host, why)
+        if credential is not None:
+            return credential
+    return None
 
 
 def _build(

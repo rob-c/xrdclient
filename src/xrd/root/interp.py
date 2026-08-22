@@ -971,18 +971,32 @@ def _plain(leaf: LeafRecord) -> Column:
 
 def _declared(branch: BranchRecord, leaf: LeafRecord, source: Source) -> Column:
     """A column whose type is a class name the file has to spell out."""
-    if leaf.ltype < 0 or branch.whole:
-        name, header = branch.classname, False  # a whole object: the branch names it
-    else:
-        member = source.streamers().get(branch.classname, {}).get(leaf.name)
-        if member is None:
-            return Refused(
-                f"a member of {branch.classname or 'a class'} that this file's streamer "
-                f"information does not describe, so its type is not knowable"
-            )
-        name, header = member.typename, True
+    declared = _declared_name(branch, leaf, source)
+    if isinstance(declared, Refused):
+        return declared
+    name, header = declared
+    return _declared_node(parse(name), name, header, branch, source)
 
-    node = parse(name)
+
+def _declared_name(
+    branch: BranchRecord, leaf: LeafRecord, source: Source
+) -> tuple[str, bool] | Refused:
+    """Resolve the class name and whether a member record precedes it."""
+    if leaf.ltype < 0 or branch.whole:
+        return branch.classname, False  # a whole object: the branch names it
+    member = source.streamers().get(branch.classname, {}).get(leaf.name)
+    if member is None:
+        return Refused(
+            f"a member of {branch.classname or 'a class'} that this file's streamer "
+            f"information does not describe, so its type is not knowable"
+        )
+    return member.typename, True
+
+
+def _declared_node(
+    node: object | None, name: str, header: bool, branch: BranchRecord, source: Source
+) -> Column:
+    """Turn a parsed declared C++ type into its column interpreter."""
     if node is None:
         if not header:
             return _whole(name, source, branch.streamed)  # the whole object
@@ -1012,16 +1026,38 @@ def build(branch: BranchRecord, leaf: LeafRecord, source: Source) -> Column:
     """
     from .objects import LEAF_TYPES, PACKED_LEAVES
 
+    if leaf.classname == "TLeafElement":
+        return _element(branch, leaf, source)
     if leaf.classname in LEAF_TYPES:
         return _plain(leaf)
     if leaf.classname in PACKED_LEAVES:
         return _packed(leaf)
     if leaf.classname == "TLeafObject" and branch.classname:
         return _whole(branch.classname, source, streamed=True, named=True)
-    if leaf.classname != "TLeafElement":
-        return Refused(leaf.reason)
+    return Refused(leaf.reason)
+
+
+def _element(branch: BranchRecord, leaf: LeafRecord, source: Source) -> Column:
+    """Interpret a ``TLeafElement`` from its ROOT type code."""
     if leaf.ltype == 65:
         return Values("str", _string)  # a TString member, written with no header
+    primitive = _primitive_element(branch, leaf, source)
+    if primitive is not None:
+        return primitive
+    if leaf.ltype not in KINDS:
+        return _declared(branch, leaf, source)
+    if branch.whole:
+        # ROOT 4 left the code at zero on a branch holding a whole
+        # collection, where a later ROOT writes -1; that the branch points
+        # at no member of its class is what says the class is the column.
+        return _declared(branch, leaf, source)
+    return Refused(f"{KINDS[leaf.ltype]}, which this reader does not decode")
+
+
+def _primitive_element(
+    branch: BranchRecord, leaf: LeafRecord, source: Source
+) -> Column | None:
+    """A primitive, packed primitive, or pointer element when its code says so."""
     for base in (0, OFFSET_L, OFFSET_P):
         kind = leaf.ltype - base
         prim = BASIC.get(kind)
@@ -1032,11 +1068,4 @@ def build(branch: BranchRecord, leaf: LeafRecord, source: Source) -> Column:
         if base == OFFSET_P:
             return Rows(prim, 1, False)  # one marker byte, then the counted values
         return Flat(prim, leaf.length)
-    if leaf.ltype in KINDS:
-        if branch.whole:
-            # ROOT 4 left the code at zero on a branch holding a whole
-            # collection, where a later ROOT writes -1; that the branch points
-            # at no member of its class is what says the class is the column.
-            return _declared(branch, leaf, source)
-        return Refused(f"{KINDS[leaf.ltype]}, which this reader does not decode")
-    return _declared(branch, leaf, source)
+    return None

@@ -81,6 +81,22 @@ def _stat_lines(info: StatInfo) -> list[str]:
 
 
 def _ls(args: argparse.Namespace, endpoints: Endpoints) -> int:
+    listings = _listings(args, endpoints)
+    if args.json:
+        print(
+            dumps(
+                {
+                    root: [_entry_record(entry) for entry in items]
+                    for root, items in listings.items()
+                }
+            )
+        )
+    else:
+        _print_listings(listings, args.long)
+    return OK
+
+
+def _listings(args: argparse.Namespace, endpoints: Endpoints) -> dict[str, list[DirEntry]]:
     listings: dict[str, list[DirEntry]] = {}
     for url in args.url:
         filesystem, path = endpoints.at(url)
@@ -89,16 +105,16 @@ def _ls(args: argparse.Namespace, endpoints: Endpoints) -> int:
                 listings[root] = filesystem.scandir(root)
         else:
             listings[path] = filesystem.scandir(path)
-    if args.json:
-        print(dumps({root: [_entry_record(e) for e in items] for root, items in listings.items()}))
-        return OK
+    return listings
+
+
+def _print_listings(listings: dict[str, list[DirEntry]], long: bool) -> None:
     multiple = len(listings) > 1
     for index, (root, items) in enumerate(listings.items()):
         if multiple:
             print(f"{'' if index == 0 else chr(10)}{root}:")
         for entry in sorted(items, key=lambda e: e.name):
-            print(_long(entry) if args.long else entry.name)
-    return OK
+            print(_long(entry) if long else entry.name)
 
 
 def _entry_record(entry: DirEntry) -> dict[str, Any]:
@@ -214,9 +230,7 @@ def _du(args: argparse.Namespace, endpoints: Endpoints) -> int:
     for url in args.url:
         filesystem, path = endpoints.at(url)
         totals[url] = (
-            _du_tree(filesystem, path)
-            if filesystem.isdir(path)
-            else (filesystem.getsize(path), 1)
+            _du_tree(filesystem, path) if filesystem.isdir(path) else (filesystem.getsize(path), 1)
         )
     if args.json:
         print(dumps({url: {"bytes": s, "files": n} for url, (s, n) in totals.items()}))
@@ -368,25 +382,32 @@ def _rm(args: argparse.Namespace, endpoints: Endpoints) -> int:
     code = OK
     for url in args.url:
         filesystem, path = endpoints.at(url)
-        try:
-            if args.recursive:
-                if _too_shallow(path) and not args.yes:
-                    print(
-                        f"{PROGRAM}: {url} is the top of a namespace rather than a tree to "
-                        f"delete; say --yes if that really is what you mean",
-                        file=sys.stderr,
-                    )
-                    code = ERROR
-                    continue
-                if not _agreed(args, filesystem, url, path):
-                    continue
-                filesystem.rmtree(path)
-            else:
-                filesystem.remove(path)
-        except (XRootDError, OSError) as exc:
-            if not args.force:
-                code = fail(PROGRAM, exc)
+        if not _remove_one(args, filesystem, url, path):
+            code = ERROR
     return code
+
+
+def _remove_one(args: argparse.Namespace, filesystem: Any, url: str, path: str) -> bool:
+    try:
+        if args.recursive:
+            return _remove_tree(args, filesystem, url, path)
+        filesystem.remove(path)
+    except (XRootDError, OSError) as exc:
+        return bool(args.force) or fail(PROGRAM, exc) == OK
+    return True
+
+
+def _remove_tree(args: argparse.Namespace, filesystem: Any, url: str, path: str) -> bool:
+    if _too_shallow(path) and not args.yes:
+        print(
+            f"{PROGRAM}: {url} is the top of a namespace rather than a tree to "
+            f"delete; say --yes if that really is what you mean",
+            file=sys.stderr,
+        )
+        return False
+    if _agreed(args, filesystem, url, path):
+        filesystem.rmtree(path)
+    return True
 
 
 def _rmdir(args: argparse.Namespace, endpoints: Endpoints) -> int:

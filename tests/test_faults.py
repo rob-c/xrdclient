@@ -404,52 +404,11 @@ def test_a_peer_that_stops_reading_is_dropped_instead_of_jamming_the_proxy():
     serving the next: the wedged one is torn down and the port stays usable."""
     blast = b"Z" * (2 << 20)
     listener = socket.create_server(("127.0.0.1", 0))
-
-    def send(peer: socket.socket) -> None:
-        with peer:
-            try:
-                peer.sendall(blast)
-            except OSError:
-                pass  # the proxy hung up on us, which is the point
-
-    def flood() -> None:
-        while True:
-            peer, _ = listener.accept()
-            threading.Thread(target=send, args=(peer,), daemon=True).start()
-
-    thread = threading.Thread(target=flood, daemon=True)
+    thread = threading.Thread(target=_flood, args=(listener, blast), daemon=True)
     thread.start()
     try:
         with FaultProxy(listener.getsockname()) as proxy:
-            client = socket.socket()
-            client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)  # no autotuning
-            with client:
-                client.connect(proxy.address)
-                client.settimeout(10.0)
-                done = threading.Event()
-
-                def trickle() -> None:
-                    """Keep asking, so the proxy is never idle - only wedged."""
-                    while not done.is_set():
-                        try:
-                            client.send(b".")
-                        except OSError:
-                            return
-                        time.sleep(0.001)
-
-                threading.Thread(target=trickle, daemon=True).start()
-                quiet = 0
-                while quiet < 4:  # nothing moving means the proxy gave up
-                    seen = proxy.bytes_from_server
-                    time.sleep(0.1)
-                    quiet = quiet + 1 if proxy.bytes_from_server == seen else 0
-                done.set()
-                got = 0
-                try:
-                    while chunk := client.recv(65536):
-                        got += len(chunk)
-                except ConnectionError:
-                    pass  # dropped with a reset rather than a shutdown; dropped
+            got = _wedged_transfer(proxy)
             # How much arrived depends on the kernel's buffers; that the proxy
             # gave up part-way rather than delivering the whole 2 MiB does not.
             assert got < len(blast)
@@ -459,3 +418,58 @@ def test_a_peer_that_stops_reading_is_dropped_instead_of_jamming_the_proxy():
                 assert after.recv(1)  # and the proxy is still serving
     finally:
         listener.close()
+
+
+def _send_blast(peer: socket.socket, blast: bytes) -> None:
+    with peer:
+        try:
+            peer.sendall(blast)
+        except OSError:
+            pass  # the proxy hung up on us, which is the point
+
+
+def _flood(listener: socket.socket, blast: bytes) -> None:
+    while True:
+        peer, _ = listener.accept()
+        threading.Thread(target=_send_blast, args=(peer, blast), daemon=True).start()
+
+
+def _trickle(client: socket.socket, done: threading.Event) -> None:
+    """Keep asking, so the proxy is never idle - only wedged."""
+    while not done.is_set():
+        try:
+            client.send(b".")
+        except OSError:
+            return
+        time.sleep(0.001)
+
+
+def _wait_for_quiet(proxy: FaultProxy) -> None:
+    quiet = 0
+    while quiet < 4:  # nothing moving means the proxy gave up
+        seen = proxy.bytes_from_server
+        time.sleep(0.1)
+        quiet = quiet + 1 if proxy.bytes_from_server == seen else 0
+
+
+def _drain(client: socket.socket) -> int:
+    got = 0
+    try:
+        while chunk := client.recv(65536):
+            got += len(chunk)
+    except ConnectionError:
+        pass  # dropped with a reset rather than a shutdown; dropped
+    return got
+
+
+def _wedged_transfer(proxy: FaultProxy) -> int:
+    client = socket.socket()
+    client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)  # no autotuning
+    with client:
+        client.connect(proxy.address)
+        client.settimeout(10.0)
+        done = threading.Event()
+        threading.Thread(target=_trickle, args=(client, done), daemon=True).start()
+        _wait_for_quiet(proxy)
+        done.set()
+        return _drain(client)

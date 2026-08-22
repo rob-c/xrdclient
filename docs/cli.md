@@ -168,6 +168,11 @@ time, which is what makes `--sync` and `--delete` idempotent.
 ```console
 $ xrd-datasets list
 $ xrd-datasets build /srv/datasets --only "mnist*" --only iris --jobs 4
+$ xrd-datasets build /nfs/datasets --large --jobs 1 \
+    --source-cache /nfs/dataset-sources
+$ xrd-datasets list --large --allow-oversize
+$ xrd-datasets build /nfs/datasets --large --allow-oversize --jobs 1 \
+    --source-cache /nfs/dataset-sources
 $ xrd-datasets verify /srv/datasets
 $ xrd-datasets site /srv/datasets --base-url https://data.example.org
 ```
@@ -175,8 +180,14 @@ $ xrd-datasets site /srv/datasets --base-url https://data.example.org
 `build` converts datasets to ROOT files and writes the `index.json` that
 makes the directory a catalogue; `verify` reopens every file and checks it
 against that index; `site` adds the browsable page and ready-to-serve nginx,
-BriX and systemd configuration. The whole story, including what the licences
-allow, is in [A datasets site](datasets-site.md).
+BriX and systemd configuration. `--large` selects every disk-backed source,
+whether it comes from UCI, NIST or another publisher, whose complete declared
+source is between 100 MB and 2 GB. `--allow-oversize` (also spelled
+`--no-size-limit`) removes that upper *source-selection* ceiling for registered
+converters. It is deliberately opt-in because the source cache, extraction
+workspace and converted output all need production-sized storage. Published
+source byte counts are still checked after every download. The whole story,
+including what the licences allow, is in [A datasets site](datasets-site.md).
 
 ## Scripting with `--json`
 

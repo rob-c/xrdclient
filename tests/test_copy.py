@@ -85,8 +85,13 @@ def test_a_path_object_works_on_either_side(server, tmp_path):
 def test_progress_reports_every_chunk_and_ends_at_the_size(src, server):
     """One stream, so the steps are the chunk size - see the parallel case below."""
     seen: list[tuple[int, int | None]] = []
-    xrd.copy(src, server.url / "p.bin", chunk_size=1024, config=xrd.Config(parallel_chunks=1),
-             progress=lambda d, t: seen.append((d, t)))
+    xrd.copy(
+        src,
+        server.url / "p.bin",
+        chunk_size=1024,
+        config=xrd.Config(parallel_chunks=1),
+        progress=lambda d, t: seen.append((d, t)),
+    )
     assert [d for d, _ in seen] == list(range(1024, len(PAYLOAD) + 1, 1024))
     assert {t for _, t in seen} == {len(PAYLOAD)}
 
@@ -415,8 +420,13 @@ def test_progress_on_a_resumed_copy_counts_from_the_start_of_the_file(server, tm
     target = tmp_path / "p.root"
     target.write_bytes(b"hello ")
     seen = []
-    xrd.copy(server.url / "data/a.root", target, resume=True, chunk_size=2,
-             progress=lambda done, total: seen.append((done, total)))
+    xrd.copy(
+        server.url / "data/a.root",
+        target,
+        resume=True,
+        chunk_size=2,
+        progress=lambda done, total: seen.append((done, total)),
+    )
     assert seen[-1] == (11, 11)
     assert all(done > 6 for done, _ in seen)
 
@@ -612,8 +622,12 @@ def test_the_spans_cover_the_file_exactly():
 
 def test_progress_on_a_parallel_transfer_counts_the_whole_file(src, server):
     seen = []
-    xrd.copy(src, server.url / "pp.bin", chunk_size=1024,
-             progress=lambda done, total: seen.append((done, total)))
+    xrd.copy(
+        src,
+        server.url / "pp.bin",
+        chunk_size=1024,
+        progress=lambda done, total: seen.append((done, total)),
+    )
     assert seen[-1] == (len(PAYLOAD), len(PAYLOAD))
     assert [done for done, _ in seen] == sorted(done for done, _ in seen)
     assert {total for _, total in seen} == {len(PAYLOAD)}
@@ -654,9 +668,14 @@ def test_third_party_emits_the_stock_rendezvous(server):
         result = xrd.third_party(server.url / "data/a.root", dst.url / "pulled.root")
 
     assert result.size == 11
+    _assert_rendezvous_paths(server, dst)
+    _assert_rendezvous_order(dst)
+
+
+def _assert_rendezvous_paths(server, dst):
     # Destination first (it is the puller), then the source registers the key.
-    dst_open, = [p for p in dst.opened if "tpc.key" in p]
-    src_open, = [p for p in server.opened if "tpc.key" in p]
+    (dst_open,) = [p for p in dst.opened if "tpc.key" in p]
+    (src_open,) = [p for p in server.opened if "tpc.key" in p]
     key = dst_open.split("tpc.key=")[1].split("&")[0]
     assert len(key) == 32
     assert dst_open == (
@@ -665,6 +684,9 @@ def test_third_party_emits_the_stock_rendezvous(server):
         "&tpc.spr=root&tpc.tpr=root&tpc.dlgon=0&oss.asize=11&tpc.stage=copy"
     )
     assert src_open == f"/data/a.root?tpc.key={key}&tpc.dst={dst.address[0]}&tpc.stage=copy"
+
+
+def _assert_rendezvous_order(dst):
     # Arm, register, trigger: two syncs on the destination, one open between.
     assert dst.seen.count(c.kXR_sync) == 2
     assert dst.seen.index(c.kXR_open) < dst.seen.index(c.kXR_sync)
@@ -891,6 +913,7 @@ def test_progress_and_digests_still_see_the_file_in_order():
     payload = os.urandom(4096)
     digest = xrd.crypto.new("adler32")
     steps: list[int] = []
+
     def report(done, _total):
         steps.append(done)
 

@@ -471,10 +471,7 @@ class _Connection:
             yield _frame(sid, c.kXR_redirect, struct.pack(">i", port) + where + b"\x00")
             return
 
-        if opcode not in _DATA_REQUESTS:
-            text = body.split(b"\x00", 1)[0].decode("utf-8", "replace")
-            if text:
-                self.s.arguments.append((opcode, text))
+        self._record_argument(opcode, body)
 
         if self.s.waits.get(opcode, 0):
             self.s.waits[opcode] -= 1
@@ -489,6 +486,14 @@ class _Connection:
             yield from handler(self, sid, params, body)
         except _NotFound as missing:
             yield _error(sid, missing.code, f"{missing.message}: {missing.path}")
+
+    def _record_argument(self, opcode: int, body: bytes) -> None:
+        """Remember the textual argument of a non-data request, when present."""
+        if opcode in _DATA_REQUESTS:
+            return
+        text = body.split(b"\x00", 1)[0].decode("utf-8", "replace")
+        if text:
+            self.s.arguments.append((opcode, text))
 
     # -- namespace helpers ----------------------------------------------
 

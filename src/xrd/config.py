@@ -107,21 +107,38 @@ def _coerce(name: str, raw: str, annotation: str) -> object:
     """One INI string, as the type the field is declared with."""
     text = raw.strip()
     if "Sequence" in annotation:
-        return tuple(part.strip() for part in text.replace(",", " ").split() if part.strip())
+        return _sequence(text)
     if annotation.startswith("bool"):
-        if not text and "None" in annotation:
-            return None
-        return _as_flag(name, text)
-    if not text and "None" in annotation:
+        return _optional_flag(name, text, annotation)
+    if _empty_optional(text, annotation):
         return None
+    converter = _numeric_converter(annotation)
+    if converter is None:
+        return os.path.expanduser(text)
     try:
-        if annotation.startswith("int"):
-            return int(text)
-        if annotation.startswith("float"):
-            return float(text)
+        return converter(text)
     except ValueError:
         raise ValueError(f"{name}: {raw!r} is not a number") from None
-    return os.path.expanduser(text)
+
+
+def _sequence(text: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in text.replace(",", " ").split() if part.strip())
+
+
+def _optional_flag(name: str, text: str, annotation: str) -> bool | None:
+    return None if _empty_optional(text, annotation) else _as_flag(name, text)
+
+
+def _empty_optional(text: str, annotation: str) -> bool:
+    return not text and "None" in annotation
+
+
+def _numeric_converter(annotation: str) -> type[int] | type[float] | None:
+    if annotation.startswith("int"):
+        return int
+    if annotation.startswith("float"):
+        return float
+    return None
 
 
 def _settings_from(
@@ -308,24 +325,8 @@ class Config:
             if alias is not None:
                 raise FileNotFoundError(f"no configuration file, so no alias {alias!r}")
             return cls()
-        parser = configparser.ConfigParser()
-        try:
-            with open(target, encoding="utf-8") as handle:
-                parser.read_file(handle, source=target)
-        except configparser.Error as exc:
-            raise ValueError(f"{target}: {exc}") from None
-        settings: dict[str, object] = {}
-        if parser.has_section(DEFAULTS_SECTION):
-            settings.update(_settings_from(parser, DEFAULTS_SECTION, target))
-        if alias is not None:
-            section = f"alias {alias}"
-            if not parser.has_section(section):
-                offered = sorted(
-                    name[len("alias ") :] for name in parser.sections() if name.startswith("alias ")
-                )
-                known = f"; this file defines {', '.join(offered)}" if offered else ""
-                raise KeyError(f"{target} has no alias {alias!r}{known}")
-            settings.update(_settings_from(parser, section, f"{target} [{section}]"))
+        parser = _read_config(target)
+        settings = _file_settings(parser, target, alias)
         return cls(**settings)  # type: ignore[arg-type]
 
     def __repr__(self) -> str:
@@ -335,6 +336,37 @@ class Config:
             val = getattr(self, f)
             parts.append(f"{f}=" + ("'<redacted>'" if f in secret and val else repr(val)))
         return f"Config({', '.join(parts)})"
+
+
+def _read_config(target: str) -> configparser.ConfigParser:
+    parser = configparser.ConfigParser()
+    try:
+        with open(target, encoding="utf-8") as handle:
+            parser.read_file(handle, source=target)
+    except configparser.Error as exc:
+        raise ValueError(f"{target}: {exc}") from None
+    return parser
+
+
+def _file_settings(
+    parser: configparser.ConfigParser, target: str, alias: str | None
+) -> dict[str, object]:
+    settings = (
+        _settings_from(parser, DEFAULTS_SECTION, target)
+        if parser.has_section(DEFAULTS_SECTION)
+        else {}
+    )
+    if alias is None:
+        return settings
+    section = f"alias {alias}"
+    if not parser.has_section(section):
+        offered = sorted(
+            name[len("alias ") :] for name in parser.sections() if name.startswith("alias ")
+        )
+        known = f"; this file defines {', '.join(offered)}" if offered else ""
+        raise KeyError(f"{target} has no alias {alias!r}{known}")
+    settings.update(_settings_from(parser, section, f"{target} [{section}]"))
+    return settings
 
 
 _default = Config()

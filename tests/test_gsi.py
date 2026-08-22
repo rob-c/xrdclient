@@ -226,15 +226,21 @@ def test_a_server_can_complete_the_handshake(proxy, key):
 
     step, buckets = decode_message(response)
     by_type = {bucket.type: bucket.data for bucket in buckets}
-    assert step == STEP_CLIENT_CERT
-    assert by_type[BUCKET_CIPHER_ALG] == b"aes-128-cbc"
-    assert by_type[BUCKET_MD_ALG] == b"sha256"
+    _assert_outer_response(step, by_type)
 
     client_public = parse_peer_blob(by_type[BUCKET_PUK])
     assert client_public.p == DH_PRIME  # the group is the server's, echoed back
     secret = session_key(client_public, private)
+    _assert_inner_response(cbc_decrypt(secret, by_type[BUCKET_MAIN]), proxy, tag)
 
-    plain = cbc_decrypt(secret, by_type[BUCKET_MAIN])
+
+def _assert_outer_response(step, by_type):
+    assert step == STEP_CLIENT_CERT
+    assert by_type[BUCKET_CIPHER_ALG] == b"aes-128-cbc"
+    assert by_type[BUCKET_MD_ALG] == b"sha256"
+
+
+def _assert_inner_response(plain, proxy, tag):
     inner_step, inner = decode_message(plain)
     inner_by_type = {bucket.type: bucket.data for bucket in inner}
     assert inner_step == STEP_CLIENT_CERT

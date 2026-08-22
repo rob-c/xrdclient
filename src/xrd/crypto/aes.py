@@ -26,16 +26,8 @@ def _build_tables() -> tuple[bytes, bytes]:
     sbox = bytearray(256)
     p = q = 1
     while True:  # walk the generator 3 over the field, which visits every unit
-        p = p ^ ((p << 1) & 0xFF) ^ (0x1B if p & 0x80 else 0)
-        q ^= q << 1
-        q ^= q << 2
-        q ^= q << 4
-        q &= 0xFF
-        if q & 0x80:
-            q ^= 0x09
-        value = q ^ ((q << 1) | (q >> 7)) ^ ((q << 2) | (q >> 6))
-        value ^= ((q << 3) | (q >> 5)) ^ ((q << 4) | (q >> 4))
-        sbox[p] = (value ^ 0x63) & 0xFF
+        p, q = _next_units(p, q)
+        sbox[p] = _affine(q)
         if p == 1:
             break
     sbox[0] = 0x63
@@ -43,6 +35,21 @@ def _build_tables() -> tuple[bytes, bytes]:
     for index, value in enumerate(sbox):
         inverse[value] = index
     return bytes(sbox), bytes(inverse)
+
+
+def _next_units(p: int, q: int) -> tuple[int, int]:
+    p = p ^ ((p << 1) & 0xFF) ^ (0x1B if p & 0x80 else 0)
+    q ^= q << 1
+    q ^= q << 2
+    q ^= q << 4
+    q &= 0xFF
+    return p, q ^ 0x09 if q & 0x80 else q
+
+
+def _affine(value: int) -> int:
+    transformed = value ^ ((value << 1) | (value >> 7)) ^ ((value << 2) | (value >> 6))
+    transformed ^= ((value << 3) | (value >> 5)) ^ ((value << 4) | (value >> 4))
+    return (transformed ^ 0x63) & 0xFF
 
 
 SBOX, INV_SBOX = _build_tables()

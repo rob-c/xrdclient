@@ -81,43 +81,55 @@ def read_keytab(
     exposed - never for authenticating with it.
     """
     if require_private:
-        mode = os.stat(path).st_mode & 0o777
-        if mode & 0o077:
-            raise PermissionError(
-                _errno.EACCES,
-                f"SSS keytab is readable by group or others (mode {mode:03o}); chmod 600 it",
-                path,
-            )
+        _require_private(path)
     keys: list[SSSKey] = []
     with open(path, encoding="utf-8", errors="replace") as fh:
         for raw in fh:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            fields = line.split()
-            if fields[0] not in ("0", "1"):
-                continue
-            attrs: dict[str, str] = {}
-            for field in fields[1:]:
-                if field.startswith("#"):
-                    break
-                if len(field) > 1 and field[1] == ":":
-                    attrs[field[0]] = field[2:]
-            secret = bytes.fromhex(attrs["k"]) if "k" in attrs else b""
-            if not secret:
-                continue
-            key = SSSKey(
-                id=int(attrs.get("N", -1)),
-                secret=secret,
-                name=attrs.get("n", ""),
-                user=attrs.get("u", ""),
-                group=attrs.get("g", ""),
-                expires=int(attrs.get("e", 0)),
-            )
-            if key.expired and not include_expired:
-                continue
-            keys.append(key)
+            key = _keytab_line(raw)
+            if key is not None and (include_expired or not key.expired):
+                keys.append(key)
     return keys
+
+
+def _require_private(path: str) -> None:
+    mode = os.stat(path).st_mode & 0o777
+    if mode & 0o077:
+        raise PermissionError(
+            _errno.EACCES,
+            f"SSS keytab is readable by group or others (mode {mode:03o}); chmod 600 it",
+            path,
+        )
+
+
+def _attributes(fields: list[str]) -> dict[str, str]:
+    attrs: dict[str, str] = {}
+    for field in fields:
+        if field.startswith("#"):
+            break
+        if len(field) > 1 and field[1] == ":":
+            attrs[field[0]] = field[2:]
+    return attrs
+
+
+def _keytab_line(raw: str) -> SSSKey | None:
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        return None
+    fields = line.split()
+    if fields[0] not in ("0", "1"):
+        return None
+    attrs = _attributes(fields[1:])
+    secret = bytes.fromhex(attrs["k"]) if "k" in attrs else b""
+    if not secret:
+        return None
+    return SSSKey(
+        id=int(attrs.get("N", -1)),
+        secret=secret,
+        name=attrs.get("n", ""),
+        user=attrs.get("u", ""),
+        group=attrs.get("g", ""),
+        expires=int(attrs.get("e", 0)),
+    )
 
 
 def build_credential(

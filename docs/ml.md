@@ -89,6 +89,146 @@ how a picture is recognised without being told.
 `data.classes`, `len(data)`, `data["test"]` and `"validation" in data` answer
 the rest of what a new file raises.
 
+### Raw and normalized 2D crystal images
+
+Every `jarvis_dft2d_*` ROOT file carries three 32×32 orthogonal crystal
+projections. One entry can be inspected without loading a training framework
+or transferring the rest of a hosted file:
+
+```python
+import xrd.ml
+
+image = xrd.ml.load_image_2d(
+    "jarvis_dft2d_formation_energy",
+    tree="train",
+    entry=0,
+    plane="xy",  # also xz or yz
+)
+
+print(image.jid, image.formula, image.target)
+print(image.raw[0][0])         # atomic number as stored; zero is empty space
+print(image.normalized[0][0])  # the same pixel scaled into [0, 1]
+print(image)                    # concise: it never dumps the 1,024 pixels
+```
+
+`image.raw` and `image.normalized` are plain nested Python tuples, both with
+`image.shape == (32, 32)`. The raw pixels retain atomic number, taking the
+largest number when atoms share a cell. Normalization divides the entry by its
+largest magnitude and safely leaves an empty image at zero. The returned object
+also records the dataset URL, tree, entry, branch, plane, JARVIS id, formula,
+target and normalization in `image.metadata`, so a saved picture remains easy
+to trace back to its source.
+
+`load_image_2d` is the data-oriented name; `visualize_2d` remains an exact,
+backwards-compatible descriptive alias. Both read only the selected row's
+image and short metadata branches.
+
+#### Other fixed-size image branches
+
+The same API handles any fixed-size numeric ROOT branch, not only JARVIS. A
+single rectangular float image is explicit about its geometry and has no
+named plane:
+
+```python
+image = xrd.ml.load_image_2d(
+    url,
+    tree="validation",
+    entry=-1,                 # Python-style indexing from the end
+    branch="temperature",
+    shape=(48, 64),           # (height, width)
+    planes=None,
+    plane=None,
+    normalization="minmax",
+)
+```
+
+A square single-image branch can omit `shape`; for a layered branch, provide
+the layer names and select by name or integer:
+
+```python
+image = xrd.ml.load_image_2d(
+    url,
+    branch="detector_views",
+    shape=(128, 128),
+    planes=("front", "side", "top"),
+    plane="side",             # 1 and -2 select the same layer
+)
+```
+
+The Well field tasks use this generic path directly. Their `image` branch is
+the raw physical plane and `normalized_image` is the exact min-max input stored
+by the converter:
+
+```python
+image = xrd.ml.load_image_2d(
+    "well_turbulent_radiative_layer_2D_next_state",
+    tree="train",
+    branch="image",
+    shape=(64, 64),
+    planes=None,
+    plane=None,
+    normalization="minmax",
+)
+```
+
+Bad shapes, duplicate or unknown plane names, out-of-range entries, missing
+branches and non-numeric/jagged branches fail with messages that name the
+tree, branch and expected remedy.
+
+#### Choosing model input
+
+Three normalization policies preserve `raw` and create a floating-point
+counterpart:
+
+| setting | result |
+|---|---|
+| `max` | divide by the largest absolute value; nonnegative images become `[0, 1]` |
+| `minmax` | map the finite raw minimum and maximum to `[0, 1]` |
+| `none` | unchanged values cast to Python `float` |
+
+Changing the policy does not reread ROOT:
+
+```python
+minmax = image.with_normalization("minmax")
+features = image.flat()                         # normalized, row-major tuple
+raw_features = image.flat(normalized=False)
+array = image.to_numpy()                        # (height, width), float32
+tensor = image.to_tensor()                      # (1, height, width), float32
+tensor = image.to_tensor(channel=False)         # (height, width)
+```
+
+NumPy and PyTorch are optional and imported only by their conversion methods.
+The plain Python matrices, metadata, shape, minima and maxima are always
+available with the dependency-free core installation.
+
+#### Plotting and saving
+
+Install the plotting extra to compare them side by side:
+
+```console
+$ python3 -m pip install -e '.[plot]'
+$ python3 examples/jarvis_2d_visualize.py \
+    jarvis_dft2d_formation_energy --entry 12 --plane xz \
+    --normalization minmax --output crystal.png
+```
+
+`save` creates and closes its own figure:
+
+```python
+path = image.save("crystal.png", dpi=160, cmap="viridis")
+```
+
+For notebooks and compound figures, retain control of the figure or bring two
+existing Matplotlib axes:
+
+```python
+figure, axes = image.plot(cmap="viridis", colorbar=False)
+figure, axes = image.plot(axes=my_axes, title="Candidate 42")
+```
+
+The helper accepts the same local paths, remote URLs, open binary files and
+catalogue names as `load`.
+
 ## Batches
 
 ```python
@@ -199,12 +339,21 @@ forgets is closed for it when the dataset is collected.
 
 ## Files to train on
 
-`xrd.root.datasets` writes 588 published sets into this shape — MNIST,
+`xrd.root.datasets` registers 1,424 published sets below the default source
+ceiling and writes the 1,422 whose terms permit a public mirror into this
+shape — MNIST,
 CIFAR-10 and -100, Fashion-MNIST, and a long tail of tabular and audio sets,
-each with what it is licensed under. See
+plus 100 visualized JARVIS-DFT 2D/3D materials-property tasks, 100 broad
+The Well visual-field tasks (50 below the default source ceiling), and 500
+explicitly licensed Hub Parquet repositories, each with what it is
+licensed under. The two CIFAR archives are the private-build exceptions. See
 [the datasets everyone teaches with](root.md#the-datasets-everyone-teaches-with),
 and [Training playbooks](playbooks.md) for making one and serving it on a port
-you can bind with no daemon and no login.
+you can bind with no daemon and no login. Eight more registered UCI converters
+have complete source payloads at or above 2 GB; another 50 The Well tasks share
+eight larger HDF5 sources. Production builds admit those
+explicitly with `xrd-datasets build ... --allow-oversize` or Python's
+`convert(..., allow_oversize=True)`.
 
 ## Loading by name
 
@@ -233,11 +382,11 @@ hyperparameter sweep, an epoch loop on a small set — or when the link is worse
 than the disk.
 
 ```python
-data = xrd.ml.load("mnist", cache=True)      # pull once, then read locally
+data = xrd.ml.load("mnist", cache=True)  # pull once, then read locally
 ```
 
 ```python
-path = xrd.ml.download("mnist")              # or take the file itself
+path = xrd.ml.download("mnist")  # or take the file itself
 ```
 
 `download` returns the path the file now lives at, under `cache_dir`

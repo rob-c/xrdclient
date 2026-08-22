@@ -123,11 +123,20 @@ def test_directories_are_made_listed_walked_and_removed(rfs, sandbox):
         rfs.write_bytes(f"{sandbox}/{name}", b"x")
     rfs.write_bytes(f"{sandbox}/x/y/z/deep.root", b"y")
 
+    _assert_listing(rfs, sandbox)
+    _assert_walk(rfs, sandbox)
+    rfs.rmtree(sandbox)
+    assert not rfs.exists(sandbox)
+
+
+def _assert_listing(rfs, sandbox):
     assert sorted(rfs.listdir(sandbox)) == ["a.root", "b.dat", "x"]
     entries = {e.name: e for e in rfs.scandir(sandbox)}
     assert entries["x"].is_dir() and entries["a.root"].is_file()
     assert entries["a.root"].stat.st_size == 1
 
+
+def _assert_walk(rfs, sandbox):
     found = {root: sorted(files) for root, _dirs, files in rfs.walk(sandbox)}
     assert found[sandbox] == ["a.root", "b.dat"]
     assert found[f"{sandbox}/x/y/z"] == ["deep.root"]
@@ -136,9 +145,6 @@ def test_directories_are_made_listed_walked_and_removed(rfs, sandbox):
         f"{sandbox}/a.root",
         f"{sandbox}/x/y/z/deep.root",
     ]
-
-    rfs.rmtree(sandbox)
-    assert not rfs.exists(sandbox)
 
 
 def test_rename_and_chmod_do_what_they_say(rfs, sandbox, blob):

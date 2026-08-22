@@ -40,6 +40,14 @@ DEFAULT_BUFFER_SIZE = 1 << 20
 _WRITE_OK = (200, 201, 204)
 
 
+def _mode_access(mode: str) -> tuple[bool, bool]:
+    if "a" in mode:  # before a connection is taken, so none has to be given back
+        raise UnsupportedError(
+            kXR_Unsupported, "HTTP has no append; read, concatenate, and PUT instead"
+        )
+    return "r" in mode or "+" in mode, any(character in mode for character in "wxa+")
+
+
 class HTTPRawIO(io.RawIOBase):
     """Unbuffered binary I/O against one HTTP URL.
 
@@ -61,26 +69,26 @@ class HTTPRawIO(io.RawIOBase):
         self.url = parse(url)
         self.mode = mode
         self.config = config or Config()
-        self._readable = "r" in mode or "+" in mode
-        self._writable = any(ch in mode for ch in "wxa+")
+        self._readable, self._writable = _mode_access(mode)
         self._pos = 0
         self._size: int | None = None
+        self._eof_at: int | None = None
         self._body: http.client.HTTPResponse | None = None  # the live GET response
         self._buffer = bytearray()  # pending PUT body, while it still fits
         self._upload: http.client.HTTPConnection | None = None  # mid-chunked-PUT
-        if "a" in mode:  # before a connection is taken, so none has to be given back
-            raise UnsupportedError(
-                kXR_Unsupported, "HTTP has no append; read, concatenate, and PUT instead"
-            )
         self._owns_client = client is None
         self.client = client or HTTPClient(self.config)
+        self._check_exclusive()
+        self._done = False
+
+    def _check_exclusive(self) -> None:
         try:
-            if self._writable and "x" in mode and self._exists():
+            exists = self._writable and "x" in self.mode and self._exists()
+            if exists:
                 raise ExistsError(kXR_ItExists, "file exists", path=self.url.path)
         except BaseException:
             self._release_client()
             raise
-        self._done = False
 
     # ------------------------------------------------------------------
     # Introspection
@@ -150,6 +158,11 @@ class HTTPRawIO(io.RawIOBase):
     def readinto(self, buffer: WriteableBuffer) -> int:
         if not self._readable:
             raise io.UnsupportedOperation("not readable")
+        # Once an open-ended GET reached EOF, another read is local EOF.  Do
+        # not turn it into ``Range: bytes=<size>-``: that range is unsatisfiable
+        # and strict CDNs answer it with 416 rather than an empty body.
+        if self._eof_at is not None and self._pos >= self._eof_at:
+            return 0
         stream = self._stream()
         count = stream.readinto(buffer)
         if not count and memoryview(buffer).nbytes:
@@ -165,6 +178,7 @@ class HTTPRawIO(io.RawIOBase):
                     f"Content-Length reading {self.url.path}",
                     committed=self._pos,
                 )
+            self._size = self._eof_at = self._pos
         self._pos += count
         return count
 
@@ -413,6 +427,14 @@ def open_http(
     from ..io import parse_mode
 
     _base, binary, updating = parse_mode(mode)
+    _validate_open_layer(binary, updating, buffering, encoding)
+    handle = raw(url, mode, config=config, client=client)
+    return _http_layers(handle, binary, buffering, encoding, errors, newline)
+
+
+def _validate_open_layer(
+    binary: bool, updating: bool, buffering: int, encoding: str | None
+) -> None:
     if not binary and buffering == 0:
         raise ValueError("can't have unbuffered text I/O")
     if binary and encoding is not None:
@@ -422,7 +444,15 @@ def open_http(
             kXR_Unsupported, "HTTP has no partial update; open for reading or for writing"
         )
 
-    handle = raw(url, mode, config=config, client=client)
+
+def _http_layers(
+    handle: HTTPRawIO,
+    binary: bool,
+    buffering: int,
+    encoding: str | None,
+    errors: str | None,
+    newline: str | None,
+) -> IO[Any] | io.RawIOBase:
     if buffering == 0:
         return handle
     size = DEFAULT_BUFFER_SIZE if buffering < 0 else buffering

@@ -215,19 +215,40 @@ def _destination(source: XRootDURL, dest: XRootDURL, *, into: bool) -> XRootDURL
 
 def _misuse(args: argparse.Namespace) -> str | None:
     """The flag combinations that cannot mean anything, in words."""
+    for check in (_tree_misuse, _count_misuse, _transfer_misuse):
+        complaint = check(args)
+        if complaint is not None:
+            return complaint
+    return None
+
+
+def _tree_misuse(args: argparse.Namespace) -> str | None:
+    """Options which only describe a recursive copy need ``-r``."""
     if not args.recursive and (
         args.include or args.exclude or args.sync or args.delete or args.parallel
     ):
         return "--include, --exclude, --sync, --delete and --parallel describe a tree; add -r"
-    if args.parallel is not None and args.parallel < 1:
-        return "--parallel is how many files to copy at once, so at least one"
-    if args.in_flight is not None and args.in_flight < 1:
-        return "--in-flight is how many chunks to hold at once, so at least one"
-    if args.stripes is not None and args.stripes < 1:
-        return "--stripes is how many connections to move one file over, so at least one"
+    return None
+
+
+def _count_misuse(args: argparse.Namespace) -> str | None:
+    """Require each concurrency count to describe at least one unit."""
+    counts = (
+        (args.parallel, "--parallel is how many files to copy at once, so at least one"),
+        (args.in_flight, "--in-flight is how many chunks to hold at once, so at least one"),
+        (args.stripes, "--stripes is how many connections to move one file over, so at least one"),
+    )
+    for value, complaint in counts:
+        if value is not None and value < 1:
+            return complaint
     if args.streams is not None and args.streams < 0:
         # Nought is a real answer here: it asks for the control link alone.
         return "--streams is how many extra connections a file's data gets, so not negative"
+    return None
+
+
+def _transfer_misuse(args: argparse.Namespace) -> str | None:
+    """Reject transfer strategies whose promises contradict one another."""
     if args.tpc and (args.dry_run or args.remove_source):
         return "--tpc hands the transfer to the servers; --dry-run and --remove-source cannot"
     if args.resume and (args.tpc or args.no_clobber):
@@ -243,6 +264,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     if complaint is not None:
         print(f"{PROGRAM}: {complaint}", file=sys.stderr)
         return USAGE
+    config = _copy_config(args)
+    sources = [parse(s) for s in args.source]
+    dest = parse(args.dest)
+    show = args.progress if args.progress is not None else (sys.stderr.isatty() and not args.quiet)
+
+    try:
+        results = _transfers(sources, dest, args, config, show=show)
+    except (XRootDError, OSError, ValueError) as exc:
+        return fail(PROGRAM, exc)
+    if results is None:
+        print(f"{PROGRAM}: {args.dest} is not a directory", file=sys.stderr)
+        return USAGE
+    _show_results(results, args)
+    return OK
+
+
+def _copy_config(args: argparse.Namespace) -> Config:
+    """The common client configuration with copy-specific tuning applied."""
     config = config_from(args)
     if args.in_flight is not None:
         config = config.evolve(in_flight=args.in_flight)
@@ -250,26 +289,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = config.evolve(parallel_chunks=args.stripes)
     if args.streams is not None:
         config = config.evolve(data_streams=args.streams)
-    sources = [parse(s) for s in args.source]
-    dest = parse(args.dest)
-    show = args.progress if args.progress is not None else (sys.stderr.isatty() and not args.quiet)
+    return config
 
-    try:
-        with Endpoints(config) as endpoints:
-            into = _is_dir(dest, endpoints)
-            if len(sources) > 1 and not into:
-                print(f"{PROGRAM}: {args.dest} is not a directory", file=sys.stderr)
-                return USAGE
-            results = _run(sources, dest, args, config, into=into, show=show)
-    except (XRootDError, OSError, ValueError) as exc:
-        return fail(PROGRAM, exc)
 
+def _transfers(
+    sources: list[XRootDURL],
+    dest: XRootDURL,
+    args: argparse.Namespace,
+    config: Config,
+    *,
+    show: bool,
+) -> list[CopyResult] | None:
+    """Run a valid single-target invocation, or report an ambiguous target."""
+    with Endpoints(config) as endpoints:
+        into = _is_dir(dest, endpoints)
+        if len(sources) > 1 and not into:
+            return None
+        return _run(sources, dest, args, config, into=into, show=show)
+
+
+def _show_results(results: Sequence[CopyResult], args: argparse.Namespace) -> None:
+    """Render completed transfers in the requested command-line format."""
     if args.json:
         print(dumps([_record(r) for r in results]))
     elif not args.quiet:
         for result in results:
             print(result)
-    return OK
 
 
 def _run(
@@ -282,6 +327,21 @@ def _run(
     show: bool,
 ) -> list[CopyResult]:
     """Do the transfers the parsed command line asks for."""
+    options = _copy_options(args)
+    results: list[CopyResult] = []
+    for source in sources:
+        target = _destination(source, dest, into=into)
+        bar = Bar(posixpath.basename(source.path.rstrip("/")) or str(source)) if show else None
+        try:
+            results.extend(_copy_one(source, target, args, config, bar, options))
+        finally:
+            if bar is not None:
+                bar.finish()
+    return results
+
+
+def _copy_options(args: argparse.Namespace) -> _CopyOptions:
+    """Keyword options shared by ordinary and recursive copies."""
     options: _CopyOptions = {"overwrite": args.force or args.resume}
     if args.verify is not None:
         options["verify"] = args.verify
@@ -295,37 +355,34 @@ def _run(
         options["remove_source"] = True
     if args.resume:
         options["resume"] = True
+    return options
 
-    results: list[CopyResult] = []
-    for source in sources:
-        target = _destination(source, dest, into=into)
-        bar = Bar(posixpath.basename(source.path.rstrip("/")) or str(source)) if show else None
-        try:
-            if args.tpc:
-                results.append(
-                    third_party(source, target, config=config, overwrite=args.force)
-                )
-            elif args.recursive:
-                results.extend(
-                    copy_tree(
-                        source,
-                        target,
-                        config=config,
-                        progress=bar,
-                        include=args.include,
-                        exclude=args.exclude,
-                        sync=args.sync,
-                        delete=args.delete,
-                        workers=args.parallel,
-                        **options,
-                    )
-                )
-            else:
-                results.append(copy(source, target, config=config, progress=bar, **options))
-        finally:
-            if bar is not None:
-                bar.finish()
-    return results
+
+def _copy_one(
+    source: XRootDURL,
+    target: XRootDURL,
+    args: argparse.Namespace,
+    config: Config,
+    bar: Bar | None,
+    options: _CopyOptions,
+) -> list[CopyResult]:
+    """Copy one resolved source using the selected transfer strategy."""
+    if args.tpc:
+        return [third_party(source, target, config=config, overwrite=args.force)]
+    if args.recursive:
+        return copy_tree(
+            source,
+            target,
+            config=config,
+            progress=bar,
+            include=args.include,
+            exclude=args.exclude,
+            sync=args.sync,
+            delete=args.delete,
+            workers=args.parallel,
+            **options,
+        )
+    return [copy(source, target, config=config, progress=bar, **options)]
 
 
 def _record(result: CopyResult) -> dict[str, object]:

@@ -83,6 +83,29 @@ def _key(url: XRootDURL, config: Config) -> Key:
     )
 
 
+def _cannot_pool(session: Session, config: Config) -> bool:
+    return config.pool_size <= 0 or session.closed
+
+
+def _prune(bucket: list[tuple[float, Session]], cutoff: float) -> list[tuple[float, Session]]:
+    expired = [entry for entry in bucket if entry[0] < cutoff]
+    if expired:
+        bucket[:] = [entry for entry in bucket if entry[0] >= cutoff]
+    return expired
+
+
+def _keep(bucket: list[tuple[float, Session]], session: Session, maximum: int) -> bool:
+    if len(bucket) >= maximum:
+        return False
+    bucket.append((time.monotonic(), session))
+    return True
+
+
+def _close_entries(entries: list[tuple[float, Session]]) -> None:
+    for _, session in entries:
+        session.close()
+
+
 class SessionPool:
     """A bounded, thread-safe cache of idle sessions.
 
@@ -138,22 +161,15 @@ class SessionPool:
         leak, and the pool refuses more often than it accepts - when pooling
         is off, when the server is already gone, when the bucket is full.
         """
-        if config.pool_size <= 0 or session.closed:
+        if _cannot_pool(session, config):
             return False
         cutoff = time.monotonic() - config.pool_idle_ttl
         key = _key(url, config)
         with self._lock:
             bucket = self._idle.setdefault(key, [])
-            expired = [entry for entry in bucket if entry[0] < cutoff]
-            if expired:
-                bucket[:] = [entry for entry in bucket if entry[0] >= cutoff]
-            if len(bucket) >= config.pool_size:
-                kept = False
-            else:
-                bucket.append((time.monotonic(), session))
-                kept = True
-        for _, dead in expired:
-            dead.close()
+            expired = _prune(bucket, cutoff)
+            kept = _keep(bucket, session, config.pool_size)
+        _close_entries(expired)
         if kept:
             _log.debug("keeping the connection to %s for the next caller", session.endpoint)
         return kept

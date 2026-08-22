@@ -160,7 +160,7 @@ def test_a_clone_copies_ranges_server_side(server):
         async with xrd.aio.open(server.url / "data/c.bin", "wb") as handle:
             await handle.write(b"0123456789")
             await handle.flush()  # the server can only clone what it has
-            assert await handle.clone(handle, [(0, 4, 10)]) == 4       # the async wrapper
+            assert await handle.clone(handle, [(0, 4, 10)]) == 4  # the async wrapper
             assert await handle.clone(handle.file, [(0, 4, 14)]) == 4  # the file underneath
 
     run(main())
@@ -228,24 +228,32 @@ def test_constructing_a_filesystem_touches_no_network():
 def test_the_namespace_surface(server):
     async def main():
         async with AsyncFileSystem(server.url) as fs:
-            await fs.ping()
-            assert (await fs.protocol()).version
-            assert (await fs.stat("/data/a.root")).st_size == len(BODY)
-            assert (await fs.statvfs("/")).nodes_rw == 1
-            assert [i.is_dir() for i in await fs.statx(["/data", "/data/a.root"])] == [True, False]
-            assert await fs.exists("/data/a.root") and not await fs.exists("/data/nope")
-            assert await fs.isdir("/data") and await fs.isfile("/data/a.root")
-            assert await fs.getsize("/data/a.root") == len(BODY)
-            assert await fs.listdir("/data") == ["a.root", "empty"]
-            assert [e.name for e in await fs.scandir("/data")] == ["a.root", "empty"]
-            assert (await fs.checksum("/data/a.root")).value == "1a0b045d"
-            assert (await fs.query_config("version"))["version"]
-            assert (await fs.locate("/data/a.root"))[0].address
-            assert await fs.deep_locate("/data/a.root")
-            assert await fs.prepare(["/data/a.root"])
-            assert await fs.evict(["/data/a.root"])
+            await _assert_namespace_metadata(fs)
+            await _assert_namespace_operations(fs)
 
     run(main())
+
+
+async def _assert_namespace_metadata(fs):
+    await fs.ping()
+    assert (await fs.protocol()).version
+    assert (await fs.stat("/data/a.root")).st_size == len(BODY)
+    assert (await fs.statvfs("/")).nodes_rw == 1
+    assert [i.is_dir() for i in await fs.statx(["/data", "/data/a.root"])] == [True, False]
+    assert await fs.exists("/data/a.root") and not await fs.exists("/data/nope")
+    assert await fs.isdir("/data") and await fs.isfile("/data/a.root")
+    assert await fs.getsize("/data/a.root") == len(BODY)
+
+
+async def _assert_namespace_operations(fs):
+    assert await fs.listdir("/data") == ["a.root", "empty"]
+    assert [e.name for e in await fs.scandir("/data")] == ["a.root", "empty"]
+    assert (await fs.checksum("/data/a.root")).value == "1a0b045d"
+    assert (await fs.query_config("version"))["version"]
+    assert (await fs.locate("/data/a.root"))[0].address
+    assert await fs.deep_locate("/data/a.root")
+    assert await fs.prepare(["/data/a.root"])
+    assert await fs.evict(["/data/a.root"])
 
 
 def test_the_friendly_keywords_reach_the_synchronous_call(server):

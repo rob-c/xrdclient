@@ -7,21 +7,27 @@
 ``build`` converts every dataset whose licence allows redistribution into a
 ROOT file under one directory - see :mod:`xrd.root.datasets` for what is on
 offer - and writes an ``index.json`` beside them saying what each file is,
-where it came from, and what its checksum is. ``verify`` reopens every file
-and refuses to bless a directory that no longer matches its index. ``site``
-puts a browsable page and ready-to-serve nginx and BriX configuration next
-to the files, so the directory can go on the web as it stands.
+where it came from, its canonical licence terms, what was transformed, and
+what its checksum is. ``verify`` reopens every file and refuses to bless a
+directory that no longer matches its index. ``site`` puts a browsable page
+and ready-to-serve nginx and BriX configuration next to the files, so the
+directory can go on the web as it stands.
 
 The index is what makes the directory a catalogue: point ``XRD_CATALOGUE``
 at wherever it is served and ``xrd.ml.load("mnist")`` finds the file by
 name, on any machine, over whichever protocol the site speaks.
 """
 
+# The generated HTML and CSS remain readable as literal, inspectable assets;
+# wrapping individual style rules would only add whitespace to every site.
+# ruff: noqa: E501
+
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
 import fnmatch
+import html
 import json
 import string
 import sys
@@ -29,12 +35,13 @@ from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from ..config import Config
 from ..crypto import checksum_file
 from ..errors import XRootDError
 from ..root import open_root
-from ..root.datasets import DATASETS, convert, redistributable
+from ..root.datasets import DATASETS, SOURCE_SIZE_CEILING, convert, licence_url, redistributable
 from ..root.writer import create
 from ..types import human_bytes
 from . import ERROR, OK, common_flags, config_from, dumps, fail
@@ -49,20 +56,29 @@ PROGRAM = "xrd-datasets"
 # ---------------------------------------------------------------------------
 
 
-def _chosen(only: Sequence[str], everything: bool) -> list[str]:
+def _chosen(
+    only: Sequence[str],
+    everything: bool,
+    large: bool = False,
+    allow_oversize: bool = False,
+) -> list[str]:
     """The dataset names a command was asked for, licence gate applied.
 
     ``--only`` narrows by glob; without ``--all``, whatever the licence does
     not allow onto a mirror is left out - loudly, when it was asked for by
     name, because silently skipping what somebody typed is how a build lies.
     """
-    matched = [
-        name
-        for name in sorted(DATASETS)
-        if not only or any(fnmatch.fnmatchcase(name, pattern) for pattern in only)
-    ]
+    requested = _requested(only)
+    over = _oversize(requested)
+    if over and only and not allow_oversize:
+        raise ValueError(
+            f"{', '.join(over)} reaches the strict 2 GB per-dataset source ceiling; "
+            "this catalogue publishes complete source payloads below 2,000,000,000 bytes "
+            "by default; pass --allow-oversize after provisioning sufficient storage"
+        )
+    matched = _matching_size(requested, large=large, allow_oversize=allow_oversize)
     if not matched:
-        raise ValueError(f"no dataset matches {', '.join(only)}; try `xrd-datasets list`")
+        raise ValueError(_no_match(only, large=large))
     if everything:
         return matched
     allowed = [name for name in matched if redistributable(DATASETS[name].licence)]
@@ -75,8 +91,38 @@ def _chosen(only: Sequence[str], everything: bool) -> list[str]:
     return allowed
 
 
+def _requested(only: Sequence[str]) -> list[str]:
+    """Dataset names selected by the optional glob expressions."""
+    return [
+        name
+        for name in sorted(DATASETS)
+        if not only or any(fnmatch.fnmatchcase(name, pattern) for pattern in only)
+    ]
+
+
+def _oversize(names: Sequence[str]) -> list[str]:
+    """Selected datasets beyond the default complete-source ceiling."""
+    return [name for name in names if not DATASETS[name].within_source_ceiling()]
+
+
+def _matching_size(names: Sequence[str], *, large: bool, allow_oversize: bool) -> list[str]:
+    """Apply the source-size ceiling and optional large-dataset filter."""
+    return [
+        name
+        for name in names
+        if (allow_oversize or DATASETS[name].within_source_ceiling())
+        and (not large or DATASETS[name].large_source(allow_oversize=allow_oversize))
+    ]
+
+
+def _no_match(only: Sequence[str], *, large: bool) -> str:
+    kind = "large dataset" if large else "dataset"
+    wanted = ", ".join(only) if only else "the selection"
+    return f"no {kind} matches {wanted}; try `xrd-datasets list`"
+
+
 def _list(args: argparse.Namespace, config: Config) -> int:
-    names = _chosen(args.only, True)
+    names = _chosen(args.only, True, args.large, args.allow_oversize)
     if args.json:
         print(
             dumps(
@@ -85,7 +131,14 @@ def _list(args: argparse.Namespace, config: Config) -> int:
                         "name": name,
                         "title": DATASETS[name].title,
                         "licence": DATASETS[name].licence,
+                        "licence_url": licence_url(DATASETS[name].licence),
                         "redistributable": redistributable(DATASETS[name].licence),
+                        **DATASETS[name].provenance(),
+                        "transformation": DATASETS[name].transformation_summary(),
+                        "large": DATASETS[name].file_backed(),
+                        "source_bytes": DATASETS[name].source_payload_bytes(),
+                        "modality": DATASETS[name].modality,
+                        "task": DATASETS[name].task,
                     }
                     for name in names
                 ]
@@ -94,7 +147,12 @@ def _list(args: argparse.Namespace, config: Config) -> int:
         return OK
     for name in names:
         spec = DATASETS[name]
-        gate = "" if redistributable(spec.licence) else "  [not redistributable]"
+        flags = []
+        if spec.file_backed():
+            flags.append("large")
+        if not redistributable(spec.licence):
+            flags.append("not redistributable")
+        gate = f"  [{', '.join(flags)}]" if flags else ""
         print(f"{name:<18} {spec.title}{gate}")
     return OK
 
@@ -126,9 +184,16 @@ def _entry(name: str, path: Path, trees: dict[str, int]) -> dict[str, Any]:
         "name": name,
         "title": spec.title,
         "licence": spec.licence,
+        "licence_url": licence_url(spec.licence),
         "redistributable": redistributable(spec.licence),
-        "source": spec.source,
+        **spec.provenance(),
+        "transformation": spec.transformation_summary(),
+        "large": spec.file_backed(),
+        "source_bytes": spec.source_payload_bytes(),
+        "modality": spec.modality,
+        "task": spec.task,
         "file": path.name,
+        "download": path.name,
         "bytes": path.stat().st_size,
         "adler32": checksum_file("adler32", _chunks(path)),
         "splits": list(spec.splits),
@@ -138,7 +203,14 @@ def _entry(name: str, path: Path, trees: dict[str, int]) -> dict[str, Any]:
 
 
 def _convert_one(
-    name: str, path: Path, *, base: str | None, compression: str | None, config: Config
+    name: str,
+    path: Path,
+    *,
+    base: str | None,
+    compression: str | None,
+    source_cache: Path,
+    allow_oversize: bool,
+    config: Config,
 ) -> dict[str, Any]:
     """One dataset, every split, into one file; the index entry for it."""
     spec = DATASETS[name]
@@ -146,7 +218,17 @@ def _convert_one(
         with create(str(path), compression=compression, config=config) as out:
             trees: dict[str, int] = {}
             for split in spec.splits:
-                trees.update(convert(name, out, split=split, base=base, config=config))
+                trees.update(
+                    convert(
+                        name,
+                        out,
+                        split=split,
+                        base=base,
+                        source_cache=source_cache,
+                        allow_oversize=allow_oversize,
+                        config=config,
+                    )
+                )
     except BaseException:
         path.unlink(missing_ok=True)  # half a file is worse than none
         raise
@@ -156,43 +238,16 @@ def _convert_one(
 def _build(args: argparse.Namespace, config: Config) -> int:
     out = Path(args.directory)
     out.mkdir(parents=True, exist_ok=True)
-    names = _chosen(args.only, args.all)
+    names = _chosen(args.only, args.all, args.large, args.allow_oversize)
+    source_cache = (
+        Path(args.source_cache) if args.source_cache else out.parent / f".{out.name}-sources"
+    )
 
     kept = [name for name in names if (out / f"{name}.root").exists() and not args.force]
     todo = [name for name in names if name not in kept]
 
-    entries: dict[str, dict[str, Any]] = {}
-    failed: dict[str, str] = {}
-    for name in kept:
-        # Already on disk from an earlier run: index what is there rather
-        # than converting it again. ``--force`` is the fresh start.
-        path = out / f"{name}.root"
-        entries[name] = _entry(name, path, _trees_in(path))
-        if not args.quiet and not args.json:
-            print(f"{name}: kept, {human_bytes(entries[name]['bytes'])}")
-
-    def one(name: str) -> dict[str, Any]:
-        return _convert_one(
-            name,
-            out / f"{name}.root",
-            base=args.base,
-            compression=args.compression,
-            config=config,
-        )
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        running = {pool.submit(one, name): name for name in todo}
-        for future in concurrent.futures.as_completed(running):
-            name = running[future]
-            try:
-                entries[name] = future.result()
-            except (XRootDError, OSError, ValueError) as exc:
-                failed[name] = str(exc)
-                print(f"{PROGRAM}: {name}: {exc}", file=sys.stderr)
-            else:
-                if not args.quiet and not args.json:
-                    made = entries[name]
-                    print(f"{name}: {made['rows']} rows, {human_bytes(made['bytes'])}")
+    entries = _kept_entries(kept, out, args)
+    failed = _convert_pending(todo, entries, out, source_cache, args, config)
 
     ordered = [entries[name] for name in sorted(entries)]
     _write_index(out, ordered)
@@ -201,9 +256,64 @@ def _build(args: argparse.Namespace, config: Config) -> int:
     return ERROR if failed else OK
 
 
+def _kept_entries(
+    kept: Sequence[str], out: Path, args: argparse.Namespace
+) -> dict[str, dict[str, Any]]:
+    """Index completed files retained from an earlier build."""
+    entries: dict[str, dict[str, Any]] = {}
+    for name in kept:
+        path = out / f"{name}.root"
+        entries[name] = _entry(name, path, _trees_in(path))
+        if not args.quiet and not args.json:
+            print(f"{name}: kept, {human_bytes(entries[name]['bytes'])}")
+    return entries
+
+
+def _convert_pending(
+    todo: Sequence[str],
+    entries: dict[str, dict[str, Any]],
+    out: Path,
+    source_cache: Path,
+    args: argparse.Namespace,
+    config: Config,
+) -> dict[str, str]:
+    """Convert pending datasets concurrently and collect recoverable failures."""
+    failed: dict[str, str] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        running = {
+            pool.submit(
+                _convert_one,
+                name,
+                out / f"{name}.root",
+                base=args.base,
+                compression=args.compression,
+                source_cache=source_cache,
+                allow_oversize=args.allow_oversize,
+                config=config,
+            ): name
+            for name in todo
+        }
+        for future in concurrent.futures.as_completed(running):
+            name = running[future]
+            try:
+                entries[name] = future.result()
+            except (XRootDError, OSError, ValueError) as exc:
+                failed[name] = str(exc)
+                print(f"{PROGRAM}: {name}: {exc}", file=sys.stderr)
+            else:
+                _show_converted(name, entries[name], args)
+    return failed
+
+
+def _show_converted(name: str, made: dict[str, Any], args: argparse.Namespace) -> None:
+    """Report one successful conversion in human-readable mode."""
+    if not args.quiet and not args.json:
+        print(f"{name}: {made['rows']} rows, {human_bytes(made['bytes'])}")
+
+
 def _write_index(out: Path, entries: list[dict[str, Any]]) -> None:
     document = {
-        "format": 1,
+        "format": 2,
         "built": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "datasets": entries,
     }
@@ -220,32 +330,41 @@ def _write_index(out: Path, entries: list[dict[str, Any]]) -> None:
 def _verify(args: argparse.Namespace, config: Config) -> int:
     out = Path(args.directory)
     index = json.loads((out / "index.json").read_text())
-    problems: dict[str, str] = {}
-    for made in index["datasets"]:
-        name = made["name"]
-        path = out / made["file"]
-        if not path.exists():
-            problems[name] = "the file is missing"
-            continue
-        size = path.stat().st_size
-        if size != made["bytes"]:
-            problems[name] = f"{size} bytes on disk, {made['bytes']} in the index"
-            continue
-        if checksum_file("adler32", _chunks(path)) != made["adler32"]:
-            problems[name] = "the checksum does not match the index"
-            continue
-        trees = _trees_in(path)
-        if trees != made["trees"]:
-            problems[name] = "the trees do not match the index"
-    if args.json:
-        print(dumps({"checked": len(index["datasets"]), "problems": problems}))
-    else:
-        for name, what in problems.items():
-            print(f"{name}: {what}", file=sys.stderr)
-        if not args.quiet:
-            fine = len(index["datasets"]) - len(problems)
-            print(f"{fine} of {len(index['datasets'])} files match the index")
+    problems = {
+        made["name"]: problem
+        for made in index["datasets"]
+        if (problem := _verify_entry(out, made)) is not None
+    }
+    _show_verification(index["datasets"], problems, args)
     return ERROR if problems else OK
+
+
+def _verify_entry(out: Path, made: dict[str, Any]) -> str | None:
+    """Why one generated file disagrees with its index entry, if it does."""
+    path = out / made["file"]
+    if not path.exists():
+        return "the file is missing"
+    size = path.stat().st_size
+    if size != made["bytes"]:
+        return f"{size} bytes on disk, {made['bytes']} in the index"
+    if checksum_file("adler32", _chunks(path)) != made["adler32"]:
+        return "the checksum does not match the index"
+    if _trees_in(path) != made["trees"]:
+        return "the trees do not match the index"
+    return None
+
+
+def _show_verification(
+    entries: Sequence[dict[str, Any]], problems: dict[str, str], args: argparse.Namespace
+) -> None:
+    """Render verification results for people or scripts."""
+    if args.json:
+        print(dumps({"checked": len(entries), "problems": problems}))
+        return
+    for name, what in problems.items():
+        print(f"{name}: {what}", file=sys.stderr)
+    if not args.quiet:
+        print(f"{len(entries) - len(problems)} of {len(entries)} files match the index")
 
 
 # ---------------------------------------------------------------------------
@@ -267,26 +386,260 @@ def _root_url(base: str, given: str | None) -> str:
     return f"root://{host}"
 
 
+def _human_decimal(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "kB", "MB", "GB"):
+        if value < 1000 or unit == "GB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1000
+    return f"{size} B"  # pragma: no cover
+
+
+def _credit(made: dict[str, Any]) -> str:
+    """A short, honest credit which never promotes an archive host to author."""
+    creators = made.get("creators") or []
+    if creators:
+        return "Creators: " + ", ".join(html.escape(str(name)) for name in creators)
+    publisher = made.get("publisher")
+    if publisher:
+        return "Publisher: " + html.escape(str(publisher))
+    return "Creator attribution: see linked dataset record"
+
+
+def _origin_link(made: dict[str, Any]) -> str:
+    origin = html.escape(made.get("origin") or made["source"], quote=True)
+    label = "Canonical origin" if made.get("origin_kind") == "canonical" else "Dataset record"
+    return f'<a href="{origin}" rel="noopener">{label}</a>'
+
+
+def _repository_link(made: dict[str, Any]) -> str:
+    origin = html.escape(made.get("origin") or made["source"], quote=True)
+    source = html.escape(made["source"], quote=True)
+    repository = html.escape(made.get("repository") or "Source repository")
+    if source != origin:
+        return f'<a href="{source}" rel="noopener">Source: {repository}</a>'
+    return f"<span>Repository: {repository}</span>"
+
+
+def _mirror_links(made: dict[str, Any]) -> list[str]:
+    links = []
+    for mirror in made.get("mirrors") or []:
+        name = html.escape(str(mirror["name"]))
+        url = html.escape(str(mirror["url"]), quote=True)
+        links.append(f'<a href="{url}" rel="noopener">Mirror: {name}</a>')
+    return links
+
+
+def _citation_link(made: dict[str, Any]) -> str:
+    citation = made.get("citation")
+    if citation and str(citation).startswith(("http://", "https://")):
+        url = html.escape(str(citation), quote=True)
+        return f'<a href="{url}" rel="cite noopener">Citation</a>'
+    return ""
+
+
+def _provenance_links(made: dict[str, Any], *, parent: str = " · ") -> str:
+    """Canonical origin, serving repository, explicit mirrors, and citation links."""
+    links = [_origin_link(made), _repository_link(made), *_mirror_links(made)]
+    links.extend(filter(None, (_citation_link(made),)))
+    return parent.join(links)
+
+
+def _catalogue_cards(entries: Sequence[dict[str, Any]]) -> str:
+    cards = []
+    for made in entries:
+        name = html.escape(made["name"])
+        title = html.escape(made["title"])
+        terms = html.escape(made.get("licence_url", ""), quote=True)
+        licence = html.escape(made["licence"])
+        transformation = html.escape(made.get("transformation", ""))
+        download = html.escape(made.get("download") or made["file"], quote=True)
+        detail = f"datasets/{quote(made['name'])}.html"
+        modality = html.escape(made.get("modality", "dataset"))
+        task = html.escape(made.get("task", "machine learning"))
+        searchable = html.escape(
+            " ".join(
+                str(made.get(key, ""))
+                for key in (
+                    "name",
+                    "title",
+                    "licence",
+                    "modality",
+                    "task",
+                    "transformation",
+                    "creators",
+                    "publisher",
+                    "repository",
+                )
+            ).lower(),
+            quote=True,
+        )
+        licence_link = (
+            f'<a href="{terms}" rel="license">{licence}</a>' if terms else f"<span>{licence}</span>"
+        )
+        cards.append(
+            f'''<article class="dataset-card" data-search="{searchable}">
+  <div class="card-top"><span class="pill">{modality}</span><span class="size">{_human_decimal(made["bytes"])}</span></div>
+  <h3><a href="{detail}">{name}</a></h3>
+  <p class="card-title">{title}</p>
+  <p class="credit">{_credit(made)}</p>
+  <div class="tags"><span>{task}</span><span>{made["rows"]:,} rows</span></div>
+  <p class="transform">{transformation}</p>
+  <div class="provenance"><span>{_provenance_links(made, parent=" · ")}</span>{licence_link}</div>
+  <div class="card-actions"><a class="button primary" href="{download}" download>Download {name}.root</a><a class="button" href="{detail}">Details</a></div>
+</article>'''
+        )
+    return "\n".join(cards)
+
+
+def _json_value(made: dict[str, Any], preferred: str, fallback: str) -> Any:
+    return made.get(preferred) or made[fallback]
+
+
+def _json_same_as(made: dict[str, Any]) -> list[str]:
+    return [made["source"], *(mirror["url"] for mirror in made.get("mirrors") or [])]
+
+
+def _json_publisher(name: Any) -> dict[str, str] | None:
+    return {"@type": "Organization", "name": str(name)} if name else None
+
+
+def _json_credits(made: dict[str, Any]) -> dict[str, Any]:
+    creators = [{"@type": "Person", "name": name} for name in made.get("creators", [])]
+    values = (
+        ("creator", creators),
+        ("publisher", _json_publisher(made.get("publisher"))),
+        ("citation", made.get("citation")),
+    )
+    return {key: value for key, value in values if value}
+
+
+def _dataset_json_ld(base: str, made: dict[str, Any]) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "@type": "Dataset",
+        "name": made["title"],
+        "alternateName": made["name"],
+        "url": f"{base}/datasets/{quote(made['name'])}.html",
+        "isBasedOn": _json_value(made, "origin", "source"),
+        "license": _json_value(made, "licence_url", "licence"),
+        "description": made.get("transformation", ""),
+        "keywords": [made.get("modality", "dataset"), made.get("task", "machine learning")],
+        "distribution": {
+            "@type": "DataDownload",
+            "contentUrl": f"{base}/{_json_value(made, 'download', 'file')}",
+            "encodingFormat": "application/x-root",
+            "contentSize": made["bytes"],
+        },
+    }
+    item.update(_json_credits(made))
+    item["sameAs"] = _json_same_as(made)
+    return item
+
+
+def _catalogue_json_ld(title: str, base: str, built: str, entries: Sequence[dict[str, Any]]) -> str:
+    document = {
+        "@context": "https://schema.org",
+        "@type": "DataCatalog",
+        "name": title,
+        "url": f"{base}/",
+        "dateModified": built,
+        "description": "Open machine-learning datasets converted to ROOT and streamed by PyXRootD.",
+        "dataset": [_dataset_json_ld(base, made) for made in entries],
+    }
+    return json.dumps(document, separators=(",", ":")).replace("</", "<\\/")
+
+
+def _citation_detail(made: dict[str, Any]) -> str:
+    citation = str(made.get("citation") or "")
+    if not citation or citation.startswith(("http://", "https://")):
+        return ""
+    return f"<section><h2>Published citation or credit</h2><p>{html.escape(citation)}</p></section>"
+
+
+def _detail_page(title: str, base: str, made: dict[str, Any]) -> str:
+    name = html.escape(made["name"])
+    heading = html.escape(made["title"])
+    licence_url = html.escape(made.get("licence_url", ""), quote=True)
+    licence = html.escape(made["licence"])
+    transformation = html.escape(made.get("transformation", ""))
+    download = html.escape(made.get("download") or made["file"], quote=True)
+    canonical = f"{base}/datasets/{quote(made['name'])}.html"
+    structured = _catalogue_json_ld(title, base, "", [made])
+    terms = f'<a href="{licence_url}" rel="license">{licence}</a>' if licence_url else licence
+    return f'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{heading} as a ROOT dataset | {html.escape(title)}</title>
+<meta name="description" content="Download and stream {heading} as a provenance-rich ROOT file with PyXRootD.">
+<meta name="robots" content="index,follow"><link rel="canonical" href="{canonical}">
+<meta property="og:type" content="website"><meta property="og:title" content="{heading} as ROOT">
+<meta property="og:url" content="{canonical}"><script type="application/ld+json">{structured}</script>
+<style>{_DETAIL_STYLE}</style></head><body><main>
+<a class="back" href="../index.html">← All datasets</a><p class="eyebrow">PyXRootD dataset archive</p>
+<h1>{heading}</h1><p class="name">Catalogue name: <code>{name}</code></p>
+<dl><div><dt>Modality</dt><dd>{html.escape(made.get("modality", "dataset"))}</dd></div>
+<div><dt>ML task</dt><dd>{html.escape(made.get("task", "machine learning"))}</dd></div>
+<div><dt>Published source payload</dt><dd>{_human_decimal(made.get("source_bytes", 0))}</dd></div>
+<div><dt>ROOT result</dt><dd>{_human_decimal(made["bytes"])}, {made["rows"]:,} rows</dd></div>
+<div><dt>Creator credit</dt><dd>{_credit(made)}</dd></div>
+<div><dt>Source repository</dt><dd>{html.escape(made.get("repository") or "See source")}</dd></div>
+<div><dt>Canonical licence</dt><dd>{terms}</dd></div></dl>
+<section><h2>Transformation into ROOT</h2><p>{transformation}</p></section>
+<div class="actions"><a class="download" href="../{download}" download>Download {name}.root</a>
+{_provenance_links(made)}</div>
+{_citation_detail(made)}
+<section><h2>Stream it with PyXRootD</h2><pre><code>export XRD_CATALOGUE={html.escape(base)}
+python -c 'import xrd.ml; print(xrd.ml.load("{name}"))'</code></pre></section>
+</main></body></html>'''
+
+
 def _site(args: argparse.Namespace, config: Config) -> int:
     out = Path(args.directory)
     index = json.loads((out / "index.json").read_text())
     base = args.base_url.rstrip("/") if args.base_url else "https://data.example.org"
+    entries = index["datasets"]
+    description = (
+        "Open machine-learning datasets converted to ROOT files, with canonical licences, "
+        "provenance and fast remote streaming through PyXRootD."
+    )
+    has_oversize = any(made.get("source_bytes", 0) >= SOURCE_SIZE_CEILING for made in entries)
     values = {
         "title": args.title,
+        "description": description,
         "base_url": base,
+        "canonical": f"{base}/",
         "root_url": _root_url(base, args.root_url),
         "built": index["built"],
-        "count": str(len(index["datasets"])),
-        "plural": "" if len(index["datasets"]) == 1 else "s",
+        "count": str(len(entries)),
+        "plural": "" if len(entries) == 1 else "s",
+        "source_total": _human_decimal(sum(made.get("source_bytes", 0) for made in entries)),
+        "size_policy_value": "No cap" if has_oversize else "&lt; 2 GB",
+        "size_policy_label": (
+            "explicit oversized build" if has_oversize else "default per-dataset ceiling"
+        ),
+        "cards": _catalogue_cards(entries),
+        "json_ld": _catalogue_json_ld(args.title, base, index["built"], entries),
         # ``</`` would end the page's own script block early if a title ever
         # contained it; JSON does not need the slash, so it goes.
-        "payload": json.dumps(index["datasets"]).replace("</", "<\\/"),
+        "payload": json.dumps(entries).replace("</", "<\\/"),
         "root": str(out.resolve()),
     }
     written = []
     for filename, template in _SITE_FILES.items():
         (out / filename).write_text(string.Template(template).substitute(values))
         written.append(filename)
+    details = out / "datasets"
+    details.mkdir(exist_ok=True)
+    for made in entries:
+        filename = f"datasets/{made['name']}.html"
+        (out / filename).write_text(_detail_page(args.title, base, made))
+        written.append(filename)
+    urls = [f"{base}/", *(f"{base}/datasets/{quote(made['name'])}.html" for made in entries)]
+    sitemap = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+    sitemap += "".join(f"  <url><loc>{html.escape(url)}</loc></url>\n" for url in urls)
+    sitemap += "</urlset>\n"
+    (out / "sitemap.xml").write_text(sitemap)
+    (out / "robots.txt").write_text(f"User-agent: *\nAllow: /\nSitemap: {base}/sitemap.xml\n")
+    written.extend(("sitemap.xml", "robots.txt"))
     if args.json:
         print(dumps({"written": written}))
     elif not args.quiet:
@@ -302,7 +655,7 @@ _PAGE = """\
 <title>$title</title>
 <style>
   :root { color-scheme: light dark; --line: #8884; }
-  body { font: 16px/1.5 system-ui, sans-serif; max-width: 60rem;
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 90rem;
          margin: 2rem auto; padding: 0 1rem; }
   h1 { font-size: 1.6rem; }
   code, pre { font: 0.85rem/1.5 ui-monospace, monospace; }
@@ -316,6 +669,11 @@ _PAGE = """\
            border-bottom: 1px solid var(--line); vertical-align: top; }
   td.n { text-align: right; white-space: nowrap; }
   .muted { opacity: 0.65; font-size: 0.85rem; }
+  .dataset { min-width: 12rem; }
+  .provenance { min-width: 11rem; }
+  .transform { min-width: 22rem; }
+  .download { min-width: 12rem; }
+  .block { display: block; }
   .lede { font-size: 1.05rem; }
   h2 { font-size: 1.15rem; margin-top: 2rem; }
   .ways td { vertical-align: top; }
@@ -332,7 +690,7 @@ machinery pointed at machine-learning data: the same protocol, the same
 client, the same wide-area performance.</p>
 
 <p>Stream one straight into a training loop. Nothing is downloaded first:</p>
-<pre>pip install xrd
+<pre>pip install pyxrootdclient
 export XRD_CATALOGUE=$base_url
 
 python -c '
@@ -360,21 +718,24 @@ it against this catalogue, and reads from your own disk ever after.</p>
     notebook, <code>curl</code>, a batch node behind a proxy.
     <pre>xrd.ml.load("$base_url/mnist.root")</pre></td></tr>
 <tr><td>browser</td>
-    <td>Every name in the table below is a link. Click one and you have the
-    file; nothing here needs a login, an account or a token.</td></tr>
+    <td>Every dataset row below has a direct ROOT download. Click one and you
+    have the file; nothing here needs a login, an account or a token.</td></tr>
 </tbody>
 </table>
 
 <p class="muted">Served by <a href="https://github.com/rob-c/PyXRootDClient"
 >PyXRootDClient</a> against a BriX-Cache endpoint, read-only on every plane.
-Each file carries its licence and source in its <code>about</code> key; the
-same is recorded in <a href="index.json">index.json</a>, which is how the name
-lookup above works. Built $built.</p>
-<input id="q" type="search" placeholder="filter by name, title or licence"
+Each file carries its origin, licence terms and conversion summary in its
+<code>about</code> key; the same is recorded in <a href="index.json"
+>index.json</a>, which is how the name lookup above works. The table links to
+the publisher, the canonical licence terms, a summary of the conversion, and
+the resulting ROOT download. Built $built.</p>
+<input id="q" type="search"
+       placeholder="filter by name, title, origin, licence or transformation"
        aria-label="filter">
 <table>
-<thead><tr><th>name</th><th>what it is</th><th>rows</th><th>size</th>
-<th>licence</th></tr></thead>
+<thead><tr><th>dataset</th><th>origin &amp; canonical licence</th>
+<th>transformation into ROOT</th><th>ROOT download</th></tr></thead>
 <tbody id="rows"></tbody>
 </table>
 <script>
@@ -389,21 +750,50 @@ const rows = document.getElementById("rows");
 const show = wanted => {
   rows.textContent = "";
   for (const d of DATASETS) {
-    const text = (d.name + " " + d.title + " " + d.licence).toLowerCase();
+    const text = (d.name + " " + d.title + " " + (d.origin || d.source) + " " +
+                  d.licence + " " +
+                  (d.transformation || "")).toLowerCase();
     if (wanted && !text.includes(wanted)) continue;
     const tr = rows.insertRow();
-    const link = document.createElement("a");
-    link.href = d.file;
-    link.textContent = d.name;
-    tr.insertCell().appendChild(link);
-    tr.insertCell().textContent = d.title;
-    const count = tr.insertCell();
-    count.textContent = d.rows.toLocaleString();
-    count.className = "n";
-    const size = tr.insertCell();
-    size.textContent = human(d.bytes);
-    size.className = "n";
-    tr.insertCell().textContent = d.licence;
+    const dataset = tr.insertCell();
+    dataset.className = "dataset";
+    const name = document.createElement("strong");
+    name.className = "block";
+    name.textContent = d.name;
+    dataset.appendChild(name);
+    const title = document.createElement("span");
+    title.textContent = d.title;
+    dataset.appendChild(title);
+
+    const provenance = tr.insertCell();
+    provenance.className = "provenance";
+    const origin = document.createElement("a");
+    origin.href = d.origin || d.source;
+    origin.textContent = d.origin_kind === "canonical" ? "Canonical origin" : "Dataset record";
+    origin.className = "block";
+    provenance.appendChild(origin);
+    const terms = d.licence_url ? document.createElement("a") : document.createElement("span");
+    if (d.licence_url) terms.href = d.licence_url;
+    terms.textContent = d.licence;
+    terms.className = "block muted";
+    provenance.appendChild(terms);
+
+    const transformation = tr.insertCell();
+    transformation.className = "transform";
+    transformation.textContent = d.transformation || "Converted to ROOT; no summary recorded.";
+
+    const result = tr.insertCell();
+    result.className = "download";
+    const download = document.createElement("a");
+    download.href = d.download || d.file;
+    download.download = d.download || d.file;
+    download.textContent = "Download " + (d.download || d.file);
+    download.className = "block";
+    result.appendChild(download);
+    const detail = document.createElement("span");
+    detail.className = "muted";
+    detail.textContent = d.rows.toLocaleString() + " rows · " + human(d.bytes);
+    result.appendChild(detail);
   }
 };
 document.getElementById("q").addEventListener("input",
@@ -412,6 +802,69 @@ show("");
 </script>
 </body>
 </html>
+"""
+
+_DETAIL_STYLE = """
+:root{color-scheme:dark;--ink:#ecfdf9;--muted:#9bb8b4;--panel:#102a2d;--line:#31575a;--aqua:#52e4c4;--gold:#ffc857}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 80% 0,#17494c 0,transparent 38%),#071719;color:var(--ink);font:16px/1.65 Inter,ui-sans-serif,system-ui,sans-serif}
+main{width:min(920px,calc(100% - 2rem));margin:0 auto;padding:4rem 0 6rem}.back,a{color:var(--aqua)}.eyebrow{text-transform:uppercase;letter-spacing:.18em;color:var(--gold);font-weight:800;margin-top:4rem}h1{font-size:clamp(2.4rem,7vw,5.5rem);line-height:.96;margin:.4rem 0 1rem;letter-spacing:-.05em}.name{color:var(--muted)}code,pre{font:14px/1.6 ui-monospace,SFMono-Regular,monospace}pre{padding:1.2rem;border:1px solid var(--line);border-radius:18px;background:#061214;overflow:auto}dl{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:18px;overflow:hidden;margin:3rem 0}dl div{background:var(--panel);padding:1rem}dt{color:var(--muted);font-size:.78rem;text-transform:uppercase;letter-spacing:.1em}dd{margin:.3rem 0 0;font-weight:700}section{margin:3rem 0}.actions{display:flex;gap:1rem;align-items:center;flex-wrap:wrap}.download{background:var(--aqua);color:#03201b;text-decoration:none;font-weight:900;padding:.9rem 1.2rem;border-radius:99px}
+"""
+
+_PAGE_V2 = """\
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>$title | Open ML datasets streamed as ROOT</title>
+<meta name="description" content="$description"><meta name="robots" content="index,follow,max-image-preview:large">
+<meta name="keywords" content="machine learning datasets, ROOT files, XRootD, PyTorch, open science, physics datasets">
+<link rel="canonical" href="$canonical"><meta name="theme-color" content="#071719">
+<meta property="og:type" content="website"><meta property="og:title" content="$title">
+<meta property="og:description" content="$description"><meta property="og:url" content="$canonical">
+<meta name="twitter:card" content="summary_large_image"><script type="application/ld+json">$json_ld</script>
+<style>
+:root{color-scheme:dark;--bg:#061416;--ink:#effffb;--muted:#96b8b3;--panel:#0d292c;--panel2:#103438;--line:#285255;--aqua:#51e5c3;--gold:#ffc857;--coral:#ff7869;--shadow:0 24px 80px #0008}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:radial-gradient(circle at 76% -8%,#1a5e5b 0,transparent 32%),radial-gradient(circle at 5% 30%,#35244e 0,transparent 24%),var(--bg);color:var(--ink);font:16px/1.55 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif}a{color:inherit}header,main,footer{width:min(1240px,calc(100% - 2rem));margin-inline:auto}.nav{display:flex;align-items:center;justify-content:space-between;padding:1.2rem 0}.brand{font-weight:900;letter-spacing:-.03em;text-decoration:none}.brand i{color:var(--aqua);font-style:normal}.nav-links{display:flex;gap:1rem;color:var(--muted);font-size:.9rem}.nav-links a{text-decoration:none}.hero{padding:5rem 0 3rem;display:grid;grid-template-columns:1.08fr .92fr;gap:3rem;align-items:center}.eyebrow{text-transform:uppercase;letter-spacing:.2em;color:var(--gold);font-size:.77rem;font-weight:900}.hero h1{font-size:clamp(3.5rem,7.7vw,7.2rem);line-height:.86;letter-spacing:-.07em;margin:.7rem 0 1.5rem;max-width:9ch}.gradient{background:linear-gradient(100deg,var(--aqua),#8cbcff 56%,var(--gold));-webkit-background-clip:text;background-clip:text;color:transparent}.lede{max-width:62ch;color:#c3d9d5;font-size:1.13rem}.metrics{display:flex;gap:2rem;margin:2rem 0;flex-wrap:wrap}.metric strong{display:block;font-size:1.45rem}.metric span{color:var(--muted);font-size:.82rem}.hero-actions,.card-actions{display:flex;gap:.7rem;flex-wrap:wrap}.button{display:inline-flex;align-items:center;justify-content:center;padding:.75rem 1rem;border:1px solid var(--line);border-radius:999px;text-decoration:none;font-weight:800;font-size:.88rem;background:#ffffff08}.button.primary{background:var(--aqua);color:#03201b;border-color:var(--aqua)}.terminal{background:#051011d9;border:1px solid #3c6668;border-radius:24px;box-shadow:var(--shadow);overflow:hidden;transform:rotate(1deg)}.terminal-bar{padding:.8rem 1rem;background:#ffffff09;color:var(--muted);font-size:.78rem}.dots{color:var(--coral);letter-spacing:.25em}.terminal pre{margin:0;padding:1.3rem;max-height:540px;overflow:auto;font:12.5px/1.6 ui-monospace,SFMono-Regular,monospace;color:#d8fff6}.terminal .comment{color:#79a49e}.section{padding:5rem 0}.section-head{display:flex;justify-content:space-between;gap:2rem;align-items:end;margin-bottom:2rem}.section h2{font-size:clamp(2.2rem,5vw,4rem);line-height:1;letter-spacing:-.05em;margin:0}.section-copy{color:var(--muted);max-width:55ch}.protocols{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}.protocol{padding:1.4rem;border:1px solid var(--line);border-radius:20px;background:linear-gradient(145deg,#153638aa,#0b2426aa)}.protocol b{color:var(--aqua);font:800 1rem ui-monospace,monospace}.protocol p{color:var(--muted)}.protocol code{font-size:.78rem;word-break:break-all}.catalogue-tools{position:sticky;top:.7rem;z-index:3;padding:.7rem;background:#061416df;backdrop-filter:blur(15px);border:1px solid var(--line);border-radius:18px;margin:2rem 0}.catalogue-tools input{width:100%;padding:1rem 1.2rem;border:0;background:transparent;color:var(--ink);font:inherit;outline:none}.dataset-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}.dataset-card{display:flex;flex-direction:column;padding:1.25rem;border:1px solid var(--line);border-radius:22px;background:linear-gradient(155deg,#123438e8,#091d20e8);min-height:390px;transition:transform .2s,border-color .2s}.dataset-card:hover{transform:translateY(-4px);border-color:var(--aqua)}.card-top,.provenance{display:flex;justify-content:space-between;gap:.7rem;align-items:center}.pill,.tags span{padding:.27rem .55rem;border-radius:999px;background:#51e5c31b;color:var(--aqua);font-size:.73rem}.size{font-size:.75rem;color:var(--muted)}.dataset-card h3{font:800 1.15rem ui-monospace,monospace;margin:1.1rem 0 .25rem}.dataset-card h3 a{text-decoration:none}.card-title{font-weight:750;margin:.2rem 0 .8rem}.tags{display:flex;gap:.4rem;flex-wrap:wrap}.tags span{background:#fff1;color:#c7dcd8}.transform{color:var(--muted);font-size:.86rem;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}.provenance{font-size:.78rem;margin-top:auto;padding:1rem 0}.provenance a{color:var(--gold)}.card-actions .button{font-size:.75rem;padding:.58rem .72rem}.empty{display:none;text-align:center;color:var(--muted);padding:3rem}.index-note{font-size:.82rem;color:var(--muted);margin-top:2rem}footer{padding:4rem 0;border-top:1px solid var(--line);color:var(--muted);display:flex;justify-content:space-between;gap:2rem}code{font-family:ui-monospace,SFMono-Regular,monospace}@media(max-width:980px){.hero{grid-template-columns:1fr;padding-top:3rem}.terminal{transform:none}.dataset-grid{grid-template-columns:repeat(2,1fr)}.protocols{grid-template-columns:1fr}}@media(max-width:620px){.nav-links{display:none}.dataset-grid{grid-template-columns:1fr}.section-head,footer{display:block}.hero h1{font-size:4rem}.metrics{gap:1rem}.metric{min-width:42%}}
+</style>
+</head><body>
+<header><nav class="nav"><a class="brand" href="#top">Py<i>XRootD</i> / Open Data</a><div class="nav-links"><a href="#quickstart">Quick start</a><a href="#catalogue">Datasets</a><a href="index.json">JSON API</a><a href="sitemap.xml">Sitemap</a></div></nav>
+<section class="hero" id="top"><div><p class="eyebrow">Open science · streamed at physics scale</p><h1>Train on data <span class="gradient">without waiting.</span></h1><p class="lede">$count open machine-learning dataset$plural converted into provenance-rich ROOT files and served by PyXRootD. Start at the first minibatch, stream only the baskets you need, and keep the original source and canonical licence one click away.</p><div class="metrics"><div class="metric"><strong>$count</strong><span>ready-to-stream datasets</span></div><div class="metric"><strong>$source_total</strong><span>published source payload</span></div><div class="metric"><strong>$size_policy_value</strong><span>$size_policy_label</span></div></div><div class="hero-actions"><a class="button primary" href="#quickstart">Train a classifier</a><a class="button" href="#catalogue">Explore datasets</a></div></div>
+<div class="terminal" id="quickstart"><div class="terminal-bar"><span class="dots">● ● ●</span> &nbsp; from empty venv to a PyTorch classifier</div><pre><code><span class="comment"># 1. Create an isolated environment</span>
+python3 -m venv .venv
+source .venv/bin/activate
+
+<span class="comment"># 2. Install PyXRootD and PyTorch</span>
+python -m pip install pyxrootdclient torch
+export XRD_CATALOGUE=$base_url
+
+<span class="comment"># 3. Stream Fashion-MNIST and train</span>
+python - &lt;&lt;'PY'
+import torch
+from torch import nn
+import xrd.ml
+
+data = xrd.ml.load("fashion_mnist")
+model = nn.Sequential(
+    nn.Flatten(), nn.Linear(28 * 28, 128),
+    nn.ReLU(), nn.Linear(128, 10),
+)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+loss_fn = nn.CrossEntropyLoss()
+
+for images, labels in data.train.batches(256):
+    logits = model(images.float())
+    loss = loss_fn(logits, labels.long())
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+print(f"last minibatch loss: {loss.item():.3f}")
+PY</code></pre></div></section></header>
+<main><section class="section"><div class="section-head"><div><p class="eyebrow">One archive, three routes</p><h2>Move less. Begin sooner.</h2></div><p class="section-copy">ROOT baskets let a training loop fetch selected columns and minibatches rather than copying a monolithic archive. XRootD is the wide-area data layer used across the WLCG and OSG; here PyXRootD points that machinery at ML. Add <code>cache=True</code> when repeated epochs should pull the file into <code>~/.cache/xrd</code> once.</p></div><div class="protocols"><article class="protocol"><b>root:// native</b><p>Parallel, resumable vector reads and checksums over the protocol built for globally distributed HEP analysis.</p><code>xrd.ml.load("$root_url//mnist.root")</code></article><article class="protocol"><b>https:// ranges</b><p>Works through browsers, notebooks and ordinary proxies, while nginx handles byte-range reads.</p><code>xrd.ml.load("$base_url/mnist.root")</code></article><article class="protocol"><b>catalogue lookup</b><p>Use a stable dataset name; <a href="index.json">index.json</a> resolves the file and records its checksum and provenance.</p><code>xrd.ml.load("mnist", cache=True)</code></article></div></section>
+<section class="section" id="catalogue"><div class="section-head"><div><p class="eyebrow">The catalogue</p><h2>Open data, inspectable lineage.</h2></div><p class="section-copy">Every result separates its canonical origin, or best available dataset record, and credited creators from the repository or mirror serving the registered bytes. It also links the canonical licence, exact transformation into ROOT, and direct download. The cards are rendered in HTML for people and indexers; search only hides what is already on the page.</p></div><div class="catalogue-tools"><input id="q" type="search" placeholder="Search name, creator, repository, task, licence or transformation…" aria-label="Filter datasets"></div><div class="dataset-grid" id="cards">$cards</div><p class="empty" id="empty">No dataset matches that search.</p><p class="index-note">Built $built · Machine-readable metadata: <a href="index.json">index.json</a> · Google-compatible <a href="sitemap.xml">sitemap</a> · every ROOT file includes the same provenance in its <code>about</code> key.</p></section></main>
+<footer><strong>PyXRootDClient</strong><span>Pure-Python access to XRootD, HTTPS ranges and ROOT data for training anywhere.</span><a href="https://github.com/rob-c/PyXRootDClient">Source on GitHub</a></footer>
+<script>const q=document.getElementById("q"),cards=[...document.querySelectorAll(".dataset-card")],empty=document.getElementById("empty");q.addEventListener("input",()=>{const wanted=q.value.trim().toLowerCase();let shown=0;cards.forEach(card=>{const yes=!wanted||card.dataset.search.includes(wanted);card.hidden=!yes;if(yes)shown+=1});empty.style.display=shown?"none":"block"});</script>
+</body></html>
 """
 
 _NGINX = """\
@@ -426,11 +879,36 @@ server {
 
     root $root;
     index index.html;
+    charset utf-8;
+
+    types {
+        text/html html;
+        application/json json;
+        application/xml xml;
+        text/plain txt;
+        application/x-root root;
+    }
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+    # Large source archives may be retained here for resumable rebuilds. They
+    # are inputs, not published datasets, even when somebody guesses the path.
+    location ~ (^|/)\\. { deny all; }
 
     location / {
         # Training loops read from browsers, notebooks and batch nodes alike.
-        add_header Access-Control-Allow-Origin *;
+        add_header Access-Control-Allow-Origin * always;
+        add_header X-Content-Type-Options nosniff always;
         # ROOT files are already compressed; recompressing wastes the CPU.
+        gzip off;
+        try_files $$uri $$uri/ =404;
+    }
+
+    location ~ \\.root$$ {
+        add_header Access-Control-Allow-Origin * always;
+        add_header Accept-Ranges bytes always;
+        add_header X-Content-Type-Options nosniff always;
+        expires 7d;
         gzip off;
     }
 }
@@ -458,8 +936,19 @@ http {
         listen 8080;
         root $root;
         index index.html;
+        charset utf-8;
+        types { text/html html; application/json json; application/xml xml;
+                text/plain txt; application/x-root root; }
         location / {
-            add_header Access-Control-Allow-Origin *;
+            add_header Access-Control-Allow-Origin * always;
+            add_header X-Content-Type-Options nosniff always;
+            gzip off;
+        }
+        location ~ \\.root$$ {
+            add_header Access-Control-Allow-Origin * always;
+            add_header Accept-Ranges bytes always;
+            add_header X-Content-Type-Options nosniff always;
+            expires 7d;
             gzip off;
         }
     }
@@ -515,8 +1004,10 @@ _README = """\
 
 $count machine-learning dataset$plural, converted to ROOT files by
 `xrd-datasets build`, indexed in `index.json`, and checksummed in
-`MANIFEST`. Every file says what it is and what its licence is in its own
-`about` key, so it keeps saying so wherever it is copied.
+`MANIFEST`. Every file records its original publisher, canonical licence
+terms and the transformation into ROOT in its own `about` key, so that
+provenance stays with it wherever it is copied. The web table links those
+details directly beside the resulting ROOT download.
 
 They are served over XRootD, the data-access protocol high-energy physics
 built for globally distributed analysis and runs across the OSG and the
@@ -524,7 +1015,9 @@ WLCG. Training data streams the same way the physics does.
 
 ## Use it
 
-    pip install xrd
+    python3 -m venv .venv
+    source .venv/bin/activate
+    python -m pip install pyxrootdclient torch
     export XRD_CATALOGUE=$base_url
 
     python -c 'import xrd.ml; print(xrd.ml.load("iris"))'
@@ -563,7 +1056,7 @@ Built $built.
 
 #: What ``site`` writes, next to the files it describes.
 _SITE_FILES = {
-    "index.html": _PAGE,
+    "index.html": _PAGE_V2,
     "nginx.conf": _NGINX,
     "brix.conf": _BRIX,
     "xrd-datasets.service": _UNIT,
@@ -602,6 +1095,20 @@ def _parser() -> argparse.ArgumentParser:
             action="store_true",
             help="include datasets whose licence does not allow redistribution",
         )
+        sub.add_argument(
+            "--large",
+            action="store_true",
+            help="select every disk-backed large source, regardless of its origin",
+        )
+        sub.add_argument(
+            "--allow-oversize",
+            "--no-size-limit",
+            action="store_true",
+            help=(
+                "opt in to registered datasets at or above 2 GB; requires explicitly "
+                "provisioned source, temporary and output storage"
+            ),
+        )
 
     listing = command("list", _list, "name every dataset this tool can build")
     gates(listing)
@@ -617,6 +1124,11 @@ def _parser() -> argparse.ArgumentParser:
         "--base", metavar="URL", help="fetch the source data from this mirror instead"
     )
     build.add_argument(
+        "--source-cache",
+        metavar="DIRECTORY",
+        help="retain large source archives here (default: a hidden sibling of DIRECTORY)",
+    )
+    build.add_argument(
         "--compression",
         default="zlib",
         metavar="NAME",
@@ -628,9 +1140,7 @@ def _parser() -> argparse.ArgumentParser:
 
     site = command("site", _site, "write the page and the server configuration")
     site.add_argument("directory", help="a directory that build wrote")
-    site.add_argument(
-        "--base-url", metavar="URL", help="where this directory will be served from"
-    )
+    site.add_argument("--base-url", metavar="URL", help="where this directory will be served from")
     site.add_argument(
         "--root-url",
         metavar="URL",

@@ -71,23 +71,52 @@ def _later_spellings(source: pathlib.Path) -> list[tuple[int, str]]:
     """Every use in one module of something newer than the floor."""
     found = []
     for node in ast.walk(ast.parse(source.read_text())):
-        if isinstance(node, ast.Call):
-            keywords = {kw.arg for kw in node.keywords}
-            name = node.func.id if isinstance(node.func, ast.Name) else ""
-            if name == "zip" and "strict" in keywords:
-                found.append((node.lineno, "zip(..., strict=)"))
-            if name == "dataclass":
-                later = [k for k in ("slots", "kw_only") if k in keywords]
-                found += [(node.lineno, f"dataclass({k}=)") for k in later]
-            if name == "isinstance" and len(node.args) == 2:
-                second = node.args[1]
-                if isinstance(second, ast.BinOp) and isinstance(second.op, ast.BitOr):
-                    found.append((node.lineno, "isinstance(x, A | B)"))
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            spelling = f"{node.value.id}.{node.attr}"
-            if spelling in ("itertools.pairwise", "sys.stdlib_module_names"):
-                found.append((node.lineno, spelling))
+        found.extend(_later_call(node))
+        found.extend(_later_attribute(node))
     return found
+
+
+def _later_call(node: ast.AST) -> list[tuple[int, str]]:
+    if not isinstance(node, ast.Call):
+        return []
+    keywords = {keyword.arg for keyword in node.keywords}
+    name = node.func.id if isinstance(node.func, ast.Name) else ""
+    return [
+        *_later_zip(node, name, keywords),
+        *_later_dataclass(node, name, keywords),
+        *_later_isinstance(node, name),
+    ]
+
+
+def _later_zip(node: ast.Call, name: str, keywords: set[str | None]) -> list[tuple[int, str]]:
+    return [(node.lineno, "zip(..., strict=)")] if name == "zip" and "strict" in keywords else []
+
+
+def _later_dataclass(node: ast.Call, name: str, keywords: set[str | None]) -> list[tuple[int, str]]:
+    if name != "dataclass":
+        return []
+    return [
+        (node.lineno, f"dataclass({keyword}=)")
+        for keyword in ("slots", "kw_only")
+        if keyword in keywords
+    ]
+
+
+def _later_isinstance(node: ast.Call, name: str) -> list[tuple[int, str]]:
+    is_union = len(node.args) == 2 and _is_union(node.args[1])
+    return [(node.lineno, "isinstance(x, A | B)")] if name == "isinstance" and is_union else []
+
+
+def _is_union(node: ast.AST) -> bool:
+    return isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr)
+
+
+def _later_attribute(node: ast.AST) -> list[tuple[int, str]]:
+    if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Name):
+        return []
+    spelling = f"{node.value.id}.{node.attr}"
+    supported = ("itertools.pairwise", "sys.stdlib_module_names")
+    return [(node.lineno, spelling)] if spelling in supported else []
 
 
 @pytest.mark.parametrize("source", SOURCES, ids=lambda p: p.name)

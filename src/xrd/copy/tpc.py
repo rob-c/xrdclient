@@ -92,22 +92,9 @@ def third_party(
     cfg = config or Config()
     su, du = parse(source), parse(target)
     if su.is_http and du.is_http:
-        if token_mode:
-            raise ValueError(
-                "token_mode is a root:// option; HTTP third-party copy delegates "
-                "through the Credential header - see xrd.http.third_party"
-            )
-        from ..http import third_party as http_third_party
-
-        return http_third_party(su, du, config=cfg, overwrite=overwrite, timeout=timeout)
-    for url in (su, du):
-        if not url.is_root:
-            raise ValueError(
-                "third-party copy needs two endpoints of the same kind, not "
-                f"{su.scheme}:// and {du.scheme}://"
-            )
-    if timeout is not None:
-        cfg = cfg.evolve(request_timeout=timeout)
+        return _http_copy(su, du, cfg, overwrite, token_mode, timeout)
+    _require_root_pair(su, du)
+    cfg = _timeout_config(cfg, timeout)
 
     key = secrets.token_hex(16)
     started = time.monotonic()
@@ -153,9 +140,37 @@ def third_party(
         finally:
             dst_router.close()
 
-    return CopyResult(
-        source=str(su), target=str(du), size=size, seconds=time.monotonic() - started
-    )
+    return CopyResult(source=str(su), target=str(du), size=size, seconds=time.monotonic() - started)
+
+
+def _http_copy(
+    source: XRootDURL,
+    target: XRootDURL,
+    config: Config,
+    overwrite: bool,
+    token_mode: str,
+    timeout: float | None,
+) -> CopyResult:
+    if token_mode:
+        raise ValueError(
+            "token_mode is a root:// option; HTTP third-party copy delegates "
+            "through the Credential header - see xrd.http.third_party"
+        )
+    from ..http import third_party as http_third_party
+
+    return http_third_party(source, target, config=config, overwrite=overwrite, timeout=timeout)
+
+
+def _require_root_pair(source: XRootDURL, target: XRootDURL) -> None:
+    if not source.is_root or not target.is_root:
+        raise ValueError(
+            "third-party copy needs two endpoints of the same kind, not "
+            f"{source.scheme}:// and {target.scheme}://"
+        )
+
+
+def _timeout_config(config: Config, timeout: float | None) -> Config:
+    return config.evolve(request_timeout=timeout) if timeout is not None else config
 
 
 def _quietly(router: Router, request: Request) -> None:

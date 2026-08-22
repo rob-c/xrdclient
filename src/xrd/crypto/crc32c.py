@@ -42,23 +42,27 @@ def _crc32c_py(data: bytes | bytearray | memoryview, crc: int = 0) -> int:
     i = 0
     limit = n - (n % 8)
     while i < limit:
-        c ^= int.from_bytes(view[i : i + 4], "little")
-        b4, b5, b6, b7 = view[i + 4], view[i + 5], view[i + 6], view[i + 7]
-        c = (
-            _T7[c & 0xFF]
-            ^ _T6[(c >> 8) & 0xFF]
-            ^ _T5[(c >> 16) & 0xFF]
-            ^ _T4[c >> 24]
-            ^ _T3[b4]
-            ^ _T2[b5]
-            ^ _T1[b6]
-            ^ _T0[b7]
-        )
+        c = _eight_bytes(view, i, c)
         i += 8
     while i < n:
         c = _T0[(c ^ view[i]) & 0xFF] ^ (c >> 8)
         i += 1
     return c ^ _MASK
+
+
+def _eight_bytes(view: memoryview, index: int, crc: int) -> int:
+    crc ^= int.from_bytes(view[index : index + 4], "little")
+    b4, b5, b6, b7 = view[index + 4], view[index + 5], view[index + 6], view[index + 7]
+    return (
+        _T7[crc & 0xFF]
+        ^ _T6[(crc >> 8) & 0xFF]
+        ^ _T5[(crc >> 16) & 0xFF]
+        ^ _T4[crc >> 24]
+        ^ _T3[b4]
+        ^ _T2[b5]
+        ^ _T1[b6]
+        ^ _T0[b7]
+    )
 
 
 try:  # pragma: no cover - depends on an optional extra

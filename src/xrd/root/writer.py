@@ -56,13 +56,32 @@ BASKET_BYTES = 32_000
 
 #: The struct code for each basic streamer type this writer packs.
 FORMS = {
-    1: "b", 2: "h", 3: "i", 4: "q", 5: "f", 6: "i", 8: "d",
-    11: "B", 12: "H", 13: "I", 14: "Q", 15: "I", 16: "q", 17: "Q", 18: "B",
+    1: "b",
+    2: "h",
+    3: "i",
+    4: "q",
+    5: "f",
+    6: "i",
+    8: "d",
+    11: "B",
+    12: "H",
+    13: "I",
+    14: "Q",
+    15: "I",
+    16: "q",
+    17: "Q",
+    18: "B",
 }
 
 #: The ``TArray`` class for each :mod:`array` typecode ROOT has a class for.
-ARRAY_CLASSES = {"b": "TArrayC", "h": "TArrayS", "i": "TArrayI", "q": "TArrayL64",
-                 "f": "TArrayF", "d": "TArrayD"}
+ARRAY_CLASSES = {
+    "b": "TArrayC",
+    "h": "TArrayS",
+    "i": "TArrayI",
+    "q": "TArrayL64",
+    "f": "TArrayF",
+    "d": "TArrayD",
+}
 
 #: The lists this writer will write - empty, because what a list holds could
 #: be anything at all, and only nothing is nothing in every layout.
@@ -73,8 +92,12 @@ def packed_now() -> int:
     """The moment, in ROOT's packed date word - the inverse of ``as_datetime``."""
     now = datetime.datetime.now()
     return (
-        ((now.year - 1995) << 26) | (now.month << 22) | (now.day << 17)
-        | (now.hour << 12) | (now.minute << 6) | now.second
+        ((now.year - 1995) << 26)
+        | (now.month << 22)
+        | (now.day << 17)
+        | (now.hour << 12)
+        | (now.minute << 6)
+        | now.second
     )
 
 
@@ -258,20 +281,52 @@ def _element(buf: WBuffer, element: Element, row: dict[str, Any], used: dict[str
     """One member of one class, laid out exactly as its element describes."""
     _kind, name, _title, stype, _size, alen, _adim, _maxidx, typename, extras = element
     value = row.get(name)
+    if _base_element(buf, name, stype, value, used):
+        return
+    if _object_element(buf, stype, typename, value, used):
+        return
+    if _number_element(buf, name, stype, alen, extras, value, row):
+        return
+    raise UnsupportedFeatureError(
+        f"{name} is of streamer type {stype}, which this writer does not lay out"
+    )
+
+
+def _base_element(buf: WBuffer, name: str, stype: int, value: Any, used: dict[str, None]) -> bool:
     if stype == 66:  # the TObject base, which streams itself
-        bits = value if isinstance(value, dict) else {}
-        buf.tobject(int(bits.get("fBits", BITS)), int(bits.get("fUniqueID", 0)))
+        _write_tobject(buf, value)
     elif stype == 67:  # the TNamed base, likewise
-        named = value if isinstance(value, dict) else {}
-        buf.named(str(named.get("fName", "")), str(named.get("fTitle", "")))
+        _write_tnamed(buf, value)
     elif stype == 0:  # any other base, written under its own name
-        if name in ARRAYS:
-            _array(buf, name, value)
-        else:
-            _record(buf, name, value if value is not None else {}, used)
+        _write_base(buf, name, value, used)
     elif stype == 65:  # a TString member: its bytes, no record
         buf.string(str(value if value is not None else ""))
-    elif stype in (61, 62):  # an object held by value
+    else:
+        return False
+    return True
+
+
+def _write_tobject(buf: WBuffer, value: Any) -> None:
+    bits = value if isinstance(value, dict) else {}
+    buf.tobject(int(bits.get("fBits", BITS)), int(bits.get("fUniqueID", 0)))
+
+
+def _write_tnamed(buf: WBuffer, value: Any) -> None:
+    named = value if isinstance(value, dict) else {}
+    buf.named(str(named.get("fName", "")), str(named.get("fTitle", "")))
+
+
+def _write_base(buf: WBuffer, name: str, value: Any, used: dict[str, None]) -> None:
+    if name in ARRAYS:
+        _array(buf, name, value)
+    else:
+        _record(buf, name, value if value is not None else {}, used)
+
+
+def _object_element(
+    buf: WBuffer, stype: int, typename: str, value: Any, used: dict[str, None]
+) -> bool:
+    if stype in (61, 62):  # an object held by value
         if typename in ARRAYS:
             _array(buf, typename, value)
         else:
@@ -280,7 +335,21 @@ def _element(buf: WBuffer, element: Element, row: dict[str, Any], used: dict[str
         _record(buf, typename.rstrip("*"), value if value is not None else [], used)
     elif stype in (64, 69):  # a pointer that may be null
         _pointed(buf, typename, value, used)
-    elif stype in FORMS:  # one number
+    else:
+        return False
+    return True
+
+
+def _number_element(
+    buf: WBuffer,
+    name: str,
+    stype: int,
+    alen: int,
+    extras: tuple[Any, ...],
+    value: Any,
+    row: dict[str, Any],
+) -> bool:
+    if stype in FORMS:  # one number
         buf.raw(struct.pack(">" + FORMS[stype], value))
     elif stype - OFFSET_L in FORMS:  # a fixed-size array, x[10]
         values = list(value if value is not None else ())
@@ -299,9 +368,8 @@ def _element(buf: WBuffer, element: Element, row: dict[str, Any], used: dict[str
         buf.u8(1)
         _numbers(buf, FORMS[stype - OFFSET_P], values[:count])
     else:
-        raise UnsupportedFeatureError(
-            f"{name} is of streamer type {stype}, which this writer does not lay out"
-        )
+        return False
+    return True
 
 
 def _closure(seeds: dict[str, None]) -> list[str]:
@@ -391,46 +459,62 @@ def _info_element(buf: WBuffer, element: Element) -> None:
 
 def _payload(obj: Any) -> tuple[str, bytes, tuple[str, ...]]:
     """What one object writes as: its class, its bytes, the layouts it needs."""
-    buf = WBuffer()
     if isinstance(obj, str):
-        buf.string(obj)
-        return "string", bytes(buf.data), ()
+        return _string_payload(obj)
     if isinstance(obj, array.array):
-        code = obj.typecode
-        if code == "l":  # its width is the platform's, so pick the class by it
-            code = "q" if obj.itemsize == 8 else "i"
-        classname = ARRAY_CLASSES.get(code)
-        if classname is None:
-            raise UnsupportedFeatureError(
-                f"an array of typecode {obj.typecode!r} has no ROOT class: the "
-                f"TArrays are signed integers b, h, i, l and q, and floats f and d"
-            )
-        buf.i32(len(obj))
-        _numbers(buf, ARRAYS[classname].typecode, obj)
-        return classname, bytes(buf.data), ()
+        return _array_payload(obj)
     if isinstance(obj, (Histogram, Graph)):
-        classname = obj.classname
-        if classname not in INFOS:
-            writable = ", ".join(n for n in INFOS if n in HISTOGRAMS or n in GRAPHS)
-            raise UnsupportedFeatureError(
-                f"a {classname} is not a class this writer carries a layout for; "
-                f"the ones it does are {writable}"
-            )
-        used: dict[str, None] = {}
-        _record(buf, classname, obj.members, used)
-        return classname, bytes(buf.data), tuple(used)
+        return _object_payload(obj)
     raise UnsupportedFeatureError(
         f"a {type(obj).__name__} is not something this writer puts in a ROOT "
         f"file: it takes a Histogram, a Graph, a str, or an array.array"
     )
 
 
+def _string_payload(value: str) -> tuple[str, bytes, tuple[str, ...]]:
+    buf = WBuffer()
+    buf.string(value)
+    return "string", bytes(buf.data), ()
+
+
+def _array_payload(value: array.array[Any]) -> tuple[str, bytes, tuple[str, ...]]:
+    code = value.typecode
+    if code == "l":  # its width is the platform's, so pick the class by it
+        code = "q" if value.itemsize == 8 else "i"
+    classname = ARRAY_CLASSES.get(code)
+    if classname is None:
+        raise UnsupportedFeatureError(
+            f"an array of typecode {value.typecode!r} has no ROOT class: the "
+            f"TArrays are signed integers b, h, i, l and q, and floats f and d"
+        )
+    buf = WBuffer()
+    buf.i32(len(value))
+    _numbers(buf, ARRAYS[classname].typecode, value)
+    return classname, bytes(buf.data), ()
+
+
+def _object_payload(value: Histogram | Graph) -> tuple[str, bytes, tuple[str, ...]]:
+    classname = value.classname
+    if classname not in INFOS:
+        writable = ", ".join(name for name in INFOS if name in HISTOGRAMS or name in GRAPHS)
+        raise UnsupportedFeatureError(
+            f"a {classname} is not a class this writer carries a layout for; "
+            f"the ones it does are {writable}"
+        )
+    buf = WBuffer()
+    used: dict[str, None] = {}
+    _record(buf, classname, value.members, used)
+    return classname, bytes(buf.data), tuple(used)
+
+
 def _keylen(classname: str, name: str, title: str, extra: int = 0) -> int:
     """How long the key in front of a record is: 26 fixed bytes, then three
     strings - and whatever else the class writes into its own key, which only
     a ``TBasket`` does."""
-    return 26 + extra + sum(
-        1 + len(text.encode("utf-8", "surrogateescape")) for text in (classname, name, title)
+    return (
+        26
+        + extra
+        + sum(1 + len(text.encode("utf-8", "surrogateescape")) for text in (classname, name, title))
     )
 
 
@@ -690,9 +774,18 @@ class WritableFile:
 
         struct.pack_into(">4sii", self._data, 0, b"root", WRITER_VERSION, BEGIN)
         struct.pack_into(
-            ">iiiiiBiii", self._data, 12,
-            end, seek_free, free_keylen + 10, 1, self._nname, 4, self._codes,
-            seek_info, nbytes_info,
+            ">iiiiiBiii",
+            self._data,
+            12,
+            end,
+            seek_free,
+            free_keylen + 10,
+            1,
+            self._nname,
+            4,
+            self._codes,
+            seek_info,
+            nbytes_info,
         )
         struct.pack_into(">H16s", self._data, 45, 1, self._uuid)
 
@@ -737,9 +830,7 @@ def create(
             f"compression must be one of {', '.join(CODES)} or None, not {compression!r}"
         )
     if hasattr(target, "write"):
-        return WritableFile(
-            target, getattr(target, "name", "<file>"), False, compression, level
-        )
+        return WritableFile(target, getattr(target, "name", "<file>"), False, compression, level)
     url = parse(target)
     if url.is_local:
         handle: IO[bytes] = open(url.path, "wb")

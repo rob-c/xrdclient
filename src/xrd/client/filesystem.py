@@ -141,6 +141,12 @@ def _cgi(explicit: str, inherited: dict[str, str]) -> str:
     return f"?{explicit}&{extra}" if explicit else f"?{extra}"
 
 
+def _partition(entries: Sequence[DirEntry]) -> tuple[list[str], list[str]]:
+    dirs = [entry.name for entry in entries if entry.is_dir()]
+    files = [entry.name for entry in entries if not entry.is_dir()]
+    return dirs, files
+
+
 class FileSystem:
     """Namespace and administrative operations on one endpoint."""
 
@@ -361,17 +367,13 @@ class FileSystem:
     ) -> Iterator[tuple[str, list[str], list[str]]]:
         """``os.walk`` over the remote namespace."""
         root = self._abs(top or "/")
-        try:
-            entries = self.scandir(root)
-        except OSError as exc:
-            if callable(onerror):
-                onerror(exc)
+        entries = self._walk_entries(root, onerror)
+        if entries is None:
             return
         # Opaque data belongs on the request, not in the name of a directory:
         # what is yielded is a path, and what descends carries the token.
         base, cgi = _split_cgi(root)
-        dirs = [e.name for e in entries if e.is_dir()]
-        files = [e.name for e in entries if not e.is_dir()]
+        dirs, files = _partition(entries)
         if topdown:
             yield base, dirs, files
         for name in list(dirs):
@@ -379,6 +381,14 @@ class FileSystem:
             yield from self.walk(child, topdown=topdown, onerror=onerror)
         if not topdown:
             yield base, dirs, files
+
+    def _walk_entries(self, root: str, onerror: object) -> list[DirEntry] | None:
+        try:
+            return self.scandir(root)
+        except OSError as exc:
+            if callable(onerror):
+                onerror(exc)
+            return None
 
     def glob(self, pattern: str, *, root: str = "") -> Iterator[str]:
         """Match ``pattern`` against the namespace, absolute paths out.
@@ -399,11 +409,17 @@ class FileSystem:
         start = _literal_prefix(target)
         deep = "**" in posixpath.basename(target)  # ``/d/**.root`` still descends
         if not deep and start == posixpath.dirname(target):  # magic in the last component only
-            for entry in self.scandir(start + cgi, stat=False):
-                full = posixpath.join(start, entry.name)
-                if match(full):
-                    yield full
+            yield from self._flat_glob(start, cgi, match)
             return
+        yield from self._deep_glob(start, cgi, match)
+
+    def _flat_glob(self, start: str, cgi: str, match: Any) -> Iterator[str]:
+        for entry in self.scandir(start + cgi, stat=False):
+            full = posixpath.join(start, entry.name)
+            if match(full):
+                yield full
+
+    def _deep_glob(self, start: str, cgi: str, match: Any) -> Iterator[str]:
         for dirpath, dirs, files in self.walk(start + cgi):
             for name in sorted(dirs + files):
                 full = posixpath.join(dirpath, name)
@@ -456,18 +472,26 @@ class FileSystem:
         target = self._abs(path)
         _, cgi = _split_cgi(target)
         for dirpath, dirs, files in self.walk(target, topdown=False):
-            for name in files:
-                try:
-                    self.remove(posixpath.join(dirpath, name) + cgi)
-                except OSError:
-                    if not ignore_errors:
-                        raise
-            for name in dirs:
-                try:
-                    self.rmdir(posixpath.join(dirpath, name) + cgi)
-                except OSError:
-                    if not ignore_errors:
-                        raise
+            self._remove_names(self.remove, dirpath, files, cgi, ignore_errors)
+            self._remove_names(self.rmdir, dirpath, dirs, cgi, ignore_errors)
+        self._remove_tree_root(target, ignore_errors)
+
+    def _remove_names(
+        self,
+        operation: Any,
+        directory: str,
+        names: Sequence[str],
+        cgi: str,
+        ignore_errors: bool,
+    ) -> None:
+        for name in names:
+            try:
+                operation(posixpath.join(directory, name) + cgi)
+            except OSError:
+                if not ignore_errors:
+                    raise
+
+    def _remove_tree_root(self, target: str, ignore_errors: bool) -> None:
         try:
             self.rmdir(target)
         except OSError:

@@ -112,12 +112,32 @@ def open_url(
     costs far more than a local one.
     """
     _base, binary, updating = parse_mode(mode)
+    _validate_layers(binary, buffering, encoding)
+    target = parse(url)
+    remote = _other_protocol(target, mode, buffering, encoding, errors, newline, config)
+    if remote is not None:
+        return remote
+    handle = File(target, config, router=router)
+    raw = XRootDRawIO(handle, mode, posc=posc)
+    return _xrootd_layers(raw, binary, updating, buffering, encoding, errors, newline)
+
+
+def _validate_layers(binary: bool, buffering: int, encoding: str | None) -> None:
     if not binary and buffering == 0:
         raise ValueError("can't have unbuffered text I/O")
     if binary and encoding is not None:
         raise ValueError("binary mode doesn't take an encoding argument")
 
-    target = parse(url)
+
+def _other_protocol(
+    target: XRootDURL,
+    mode: str,
+    buffering: int,
+    encoding: str | None,
+    errors: str | None,
+    newline: str | None,
+    config: Config | None,
+) -> IO[Any] | io.RawIOBase | None:
     if target.is_s3:
         from ..s3 import open_s3
 
@@ -142,10 +162,18 @@ def open_url(
             newline=newline,
             config=config,
         )
+    return None
 
-    handle = File(target, config, router=router)
-    raw = XRootDRawIO(handle, mode, posc=posc)
 
+def _xrootd_layers(
+    raw: XRootDRawIO,
+    binary: bool,
+    updating: bool,
+    buffering: int,
+    encoding: str | None,
+    errors: str | None,
+    newline: str | None,
+) -> IO[Any] | io.RawIOBase:
     if buffering == 0:
         return raw
     size = DEFAULT_BUFFER_SIZE if buffering < 0 else buffering

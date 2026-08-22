@@ -61,16 +61,70 @@ AWS_SUFFIX = "amazonaws.com"
 
 def region_from_env() -> str:
     """``AWS_REGION``, then ``AWS_DEFAULT_REGION``, then AWS's own default."""
-    return (
-        os.environ.get("AWS_REGION")
-        or os.environ.get("AWS_DEFAULT_REGION")
-        or DEFAULT_REGION
-    )
+    return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or DEFAULT_REGION
 
 
 def endpoint_from_env() -> str:
     """``AWS_ENDPOINT_URL``: a self-hosted implementation, or nothing."""
     return os.environ.get("AWS_ENDPOINT_URL", "")
+
+
+def _list_params(prefix: str, token: str) -> dict[str, str]:
+    params = {"delimiter": "/", "prefix": prefix}
+    if token:
+        params["continuation-token"] = token
+    return params
+
+
+def _directory_entries(listing: ET.Element, prefix: str, parent: str) -> list[DirEntry]:
+    entries = []
+    for common in _elements(listing, "CommonPrefixes"):
+        name = _text(common, "Prefix")[len(prefix) :].rstrip("/")
+        if name:
+            entries.append(_directory_entry(name, parent))
+    return entries
+
+
+def _directory_entry(name: str, parent: str) -> DirEntry:
+    return DirEntry(
+        name=name,
+        parent=parent,
+        stat=StatInfo(
+            flags=StatInfoFlags.IS_DIR | StatInfoFlags.IS_READABLE,
+            path=f"{parent.rstrip('/')}/{name}",
+        ),
+    )
+
+
+def _object_entries(
+    listing: ET.Element, prefix: str, parent: str, algorithm: str
+) -> list[DirEntry]:
+    entries = []
+    for content in _elements(listing, "Contents"):
+        key = _text(content, "Key")
+        name = key[len(prefix) :]
+        if name and "/" not in name:  # omit the prefix's own marker
+            entries.append(_object_entry(content, key, name, parent, algorithm))
+    return entries
+
+
+def _object_entry(
+    content: ET.Element, key: str, name: str, parent: str, algorithm: str
+) -> DirEntry:
+    tag = _etag(_text(content, "ETag"))
+    checksum = ChecksumInfo("md5", tag) if algorithm and _is_md5(tag) else None
+    return DirEntry(
+        name=name,
+        parent=parent,
+        stat=StatInfo(
+            id=tag,
+            st_size=int(_text(content, "Size") or 0),
+            flags=StatInfoFlags.IS_READABLE | StatInfoFlags.IS_WRITABLE,
+            st_mtime=_iso8601(_text(content, "LastModified")),
+            path=f"/{key}",
+        ),
+        checksum=checksum,
+    )
 
 
 class S3FileSystem(HTTPFileSystem):
@@ -243,45 +297,9 @@ class S3FileSystem(HTTPFileSystem):
         entries: list[DirEntry] = []
         token = ""
         while True:
-            params = {"delimiter": "/", "prefix": prefix}
-            if token:
-                params["continuation-token"] = token
-            listing = self._list(params)
-            for common in _elements(listing, "CommonPrefixes"):
-                name = _text(common, "Prefix")[len(prefix) :].rstrip("/")
-                if name:
-                    entries.append(
-                        DirEntry(
-                            name=name,
-                            parent=here,
-                            stat=StatInfo(
-                                flags=StatInfoFlags.IS_DIR | StatInfoFlags.IS_READABLE,
-                                path=f"{here.rstrip('/')}/{name}",
-                            ),
-                        )
-                    )
-            for content in _elements(listing, "Contents"):
-                key = _text(content, "Key")
-                name = key[len(prefix) :]
-                if not name or "/" in name:
-                    continue  # the prefix's own key, which is not a member
-                tag = _etag(_text(content, "ETag"))
-                entries.append(
-                    DirEntry(
-                        name=name,
-                        parent=here,
-                        stat=StatInfo(
-                            id=tag,
-                            st_size=int(_text(content, "Size") or 0),
-                            flags=StatInfoFlags.IS_READABLE | StatInfoFlags.IS_WRITABLE,
-                            st_mtime=_iso8601(_text(content, "LastModified")),
-                            path=f"/{key}",
-                        ),
-                        checksum=(
-                            ChecksumInfo("md5", tag) if algorithm and _is_md5(tag) else None
-                        ),
-                    )
-                )
+            listing = self._list(_list_params(prefix, token))
+            entries.extend(_directory_entries(listing, prefix, here))
+            entries.extend(_object_entries(listing, prefix, here, algorithm))
             if _text(listing, "IsTruncated") != "true":
                 return entries
             token = _text(listing, "NextContinuationToken")
@@ -342,9 +360,7 @@ class S3FileSystem(HTTPFileSystem):
         except NotFoundError:
             pass
         else:
-            raise ExistsError(
-                kXR_ItExists, "an object already has this name", path=self._abs(path)
-            )
+            raise ExistsError(kXR_ItExists, "an object already has this name", path=self._abs(path))
         if not exist_ok and self._has_children(key):
             raise ExistsError(kXR_ItExists, "directory exists", path=self._abs(path))
         self.client.request(
@@ -578,9 +594,7 @@ class S3RawIO(HTTPRawIO):
         """Throw the parts away. A failure here is not worth masking the one
         that led to it, so it is swallowed."""
         try:
-            self.client.request(
-                "DELETE", self._with({"uploadId": upload}), expect=(200, 202, 204)
-            )
+            self.client.request("DELETE", self._with({"uploadId": upload}), expect=(200, 202, 204))
         except (OSError, ServerError):  # pragma: no cover - best effort only
             pass
 

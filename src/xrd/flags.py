@@ -66,19 +66,9 @@ class _Words:
             return cast(Any, super())._missing_(value)
         enum = cast(Any, cls)
         many = issubclass(enum, IntFlag)
-        words = [w for w in _SEPARATORS.split(value.strip().upper().replace("-", "_")) if w]
-        if not words:
-            raise ValueError(f"{enum.__name__} needs a name: it was given {value!r}")
-        if len(words) > 1 and not many:
-            raise ValueError(f"{enum.__name__} takes one name, not {len(words)}: {value!r}")
-        bits = 0
-        for word in words:
-            member = enum.__members__.get(word)
-            if member is None:
-                raise ValueError(_no_such(enum, word))
-            bits |= int(member)
-        return enum(bits)
-
+        words = _words(value)
+        _validate_words(enum, words, many, value)
+        return enum(_word_bits(enum, words))
 
     def __str__(self) -> str:
         """The words, not the number.
@@ -102,6 +92,28 @@ def _no_such(enum: Any, word: str) -> str:
     near = difflib.get_close_matches(word.lower(), known, n=1)
     hint = f"did you mean {near[0]!r}?" if near else f"the names are {', '.join(sorted(known))}"
     return f"{enum.__name__} has no {word.lower()!r}; {hint}"
+
+
+def _words(value: str) -> list[str]:
+    normalized = value.strip().upper().replace("-", "_")
+    return [word for word in _SEPARATORS.split(normalized) if word]
+
+
+def _validate_words(enum: Any, words: list[str], many: bool, value: str) -> None:
+    if not words:
+        raise ValueError(f"{enum.__name__} needs a name: it was given {value!r}")
+    if len(words) > 1 and not many:
+        raise ValueError(f"{enum.__name__} takes one name, not {len(words)}: {value!r}")
+
+
+def _word_bits(enum: Any, words: list[str]) -> int:
+    bits = 0
+    for word in words:
+        member = enum.__members__.get(word)
+        if member is None:
+            raise ValueError(_no_such(enum, word))
+        bits |= int(member)
+    return bits
 
 
 class OpenFlags(_Words, IntFlag):
@@ -141,6 +153,7 @@ class Access(_Words, IntFlag):
     """
 
     if TYPE_CHECKING:  # words as well as bits - see OpenFlags
+
         def __new__(cls, value: object = 0) -> Access: ...
 
     NONE = 0
@@ -321,6 +334,7 @@ def flags_for_mode(mode: str, *, posc: bool = False, makepath: bool = True) -> O
 
 class DirListFlags(_Words, IntFlag):
     if TYPE_CHECKING:  # words as well as bits - see OpenFlags
+
         def __new__(cls, value: object = 0) -> DirListFlags: ...
 
     NONE = 0
@@ -332,6 +346,7 @@ class DirListFlags(_Words, IntFlag):
 
 class MkDirFlags(_Words, IntFlag):
     if TYPE_CHECKING:  # words as well as bits - see OpenFlags
+
         def __new__(cls, value: object = 0) -> MkDirFlags: ...
 
     NONE = 0
@@ -340,6 +355,7 @@ class MkDirFlags(_Words, IntFlag):
 
 class QueryCode(_Words, IntEnum):
     if TYPE_CHECKING:  # words as well as bits - see OpenFlags
+
         def __new__(cls, value: object = 0) -> QueryCode: ...
 
     STATS = 1
@@ -357,6 +373,7 @@ class QueryCode(_Words, IntEnum):
 
 class StatInfoFlags(_Words, IntFlag):
     if TYPE_CHECKING:  # words as well as bits - see OpenFlags
+
         def __new__(cls, value: object = 0) -> StatInfoFlags: ...
 
     NONE = 0
@@ -382,6 +399,7 @@ class PrepareFlags(_Words, IntFlag):
     """
 
     if TYPE_CHECKING:  # words as well as bits - see OpenFlags
+
         def __new__(cls, value: object = 0) -> PrepareFlags: ...
 
     NONE = 0
@@ -398,6 +416,7 @@ class PrepareFlags(_Words, IntFlag):
 
 class LocateFlags(_Words, IntFlag):
     if TYPE_CHECKING:  # words as well as bits - see OpenFlags
+
         def __new__(cls, value: object = 0) -> LocateFlags: ...
 
     NONE = 0
@@ -413,6 +432,7 @@ class LocateFlags(_Words, IntFlag):
 
 class FattrCode(_Words, IntEnum):
     if TYPE_CHECKING:  # words as well as bits - see OpenFlags
+
         def __new__(cls, value: object = 0) -> FattrCode: ...
 
     DEL = 0
@@ -423,6 +443,7 @@ class FattrCode(_Words, IntEnum):
 
 class ChkPointCode(_Words, IntEnum):
     if TYPE_CHECKING:  # words as well as bits - see OpenFlags
+
         def __new__(cls, value: object = 0) -> ChkPointCode: ...
 
     BEGIN = 0

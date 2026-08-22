@@ -59,39 +59,17 @@ class Blowfish:
     __slots__ = ("_p", "_s")
 
     def __init__(self, key: bytes) -> None:
-        if not key:
-            raise ValueError("Blowfish key must be non-empty")
-        if len(key) > 56:
-            raise ValueError(f"Blowfish key must be <= 56 bytes, got {len(key)}")
+        _validate_key(key)
         p0, s0 = _initial_boxes()
         self._p = list(p0)
         self._s = [list(box) for box in s0]
-
-        klen = len(key)
-        j = 0
-        for i in range(18):
-            k = 0
-            for _ in range(4):
-                k = ((k << 8) | key[j % klen]) & _MASK
-                j += 1
-            self._p[i] ^= k
-
-        left = right = 0
-        for i in range(0, 18, 2):
-            left, right = self.encrypt_block(left, right)
-            self._p[i] = left
-            self._p[i + 1] = right
-        for box in self._s:
-            for i in range(0, 256, 2):
-                left, right = self.encrypt_block(left, right)
-                box[i] = left
-                box[i + 1] = right
+        _xor_key(self._p, key)
+        _expand_boxes(self)
 
     def _f(self, x: int) -> int:
         s0, s1, s2, s3 = self._s
         return (
-            (((s0[x >> 24] + s1[(x >> 16) & 0xFF]) & _MASK) ^ s2[(x >> 8) & 0xFF])
-            + s3[x & 0xFF]
+            (((s0[x >> 24] + s1[(x >> 16) & 0xFF]) & _MASK) ^ s2[(x >> 8) & 0xFF]) + s3[x & 0xFF]
         ) & _MASK
 
     def encrypt_block(self, left: int, right: int) -> tuple[int, int]:
@@ -170,3 +148,41 @@ class Blowfish:
 
     def __repr__(self) -> str:
         return "Blowfish(key=<redacted>)"
+
+
+def _validate_key(key: bytes) -> None:
+    if not key:
+        raise ValueError("Blowfish key must be non-empty")
+    if len(key) > 56:
+        raise ValueError(f"Blowfish key must be <= 56 bytes, got {len(key)}")
+
+
+def _key_words(key: bytes) -> list[int]:
+    words = []
+    for offset in range(0, 72, 4):
+        word = bytes(key[(offset + byte) % len(key)] for byte in range(4))
+        words.append(int.from_bytes(word, "big"))
+    return words
+
+
+def _xor_key(p_array: list[int], key: bytes) -> None:
+    for index, word in enumerate(_key_words(key)):
+        p_array[index] ^= word
+
+
+def _expand_pair(
+    cipher: Blowfish, target: list[int], index: int, pair: tuple[int, int]
+) -> tuple[int, int]:
+    left, right = cipher.encrypt_block(*pair)
+    target[index] = left
+    target[index + 1] = right
+    return left, right
+
+
+def _expand_boxes(cipher: Blowfish) -> None:
+    pair = (0, 0)
+    for index in range(0, 18, 2):
+        pair = _expand_pair(cipher, cipher._p, index, pair)
+    for box in cipher._s:
+        for index in range(0, 256, 2):
+            pair = _expand_pair(cipher, box, index, pair)

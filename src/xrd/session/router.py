@@ -115,13 +115,7 @@ class Router:
                 return self.session.execute(request, path=path, **kwargs)  # type: ignore[arg-type]
             except RedirectRequired as redirect:
                 hops += 1
-                if hops > self.config.redirect_limit:
-                    raise RedirectLimitError(
-                        f"more than {self.config.redirect_limit} redirects for "
-                        f"{type(request).__name__} {path}"
-                    ) from redirect
-                self._follow(redirect)
-                _retarget(request, redirect.target.token)
+                self._redirect(request, path, redirect, hops)
             except WaitLimitError:
                 # A busy server is not a broken connection: the budget for
                 # "come back later" has already been spent once here, and
@@ -129,22 +123,32 @@ class Router:
                 raise
             except XrdConnectionError as exc:
                 attempts += 1
-                if (
-                    not self.reconnect
-                    or attempts > self.config.connect_retries
-                    or not request.idempotent
-                ):
-                    # A timeout stays a timeout: "it was slow" and "it bounced"
-                    # call for different things from the caller, and both are
-                    # transient either way.
-                    kind = XrdTimeoutError if isinstance(exc, XrdTimeoutError) else TransientError
-                    raise kind(
-                        f"{type(request).__name__} on {self.endpoint} failed: {exc}",
-                        attempts=attempts,
-                    ) from exc
-                _log.debug("reconnecting to %s after %s", self.endpoint, exc)
-                self._drop()
-                self._pause(attempts)
+                self._recover(request, exc, attempts)
+
+    def _redirect(self, request: Request, path: str, redirect: RedirectRequired, hops: int) -> None:
+        if hops > self.config.redirect_limit:
+            raise RedirectLimitError(
+                f"more than {self.config.redirect_limit} redirects for "
+                f"{type(request).__name__} {path}"
+            ) from redirect
+        self._follow(redirect)
+        _retarget(request, redirect.target.token)
+
+    def _recover(self, request: Request, error: XrdConnectionError, attempts: int) -> None:
+        if not self._retryable(request, attempts):
+            # A timeout stays a timeout: "it was slow" and "it bounced" call
+            # for different things from the caller.
+            kind = XrdTimeoutError if isinstance(error, XrdTimeoutError) else TransientError
+            raise kind(
+                f"{type(request).__name__} on {self.endpoint} failed: {error}",
+                attempts=attempts,
+            ) from error
+        _log.debug("reconnecting to %s after %s", self.endpoint, error)
+        self._drop()
+        self._pause(attempts)
+
+    def _retryable(self, request: Request, attempts: int) -> bool:
+        return self.reconnect and attempts <= self.config.connect_retries and request.idempotent
 
     def _pause(self, attempts: int) -> None:
         """Wait before retrying, doubling each time.

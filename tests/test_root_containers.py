@@ -276,9 +276,7 @@ def test_a_map_of_containers_keeps_the_containers(containers):
     assert containers["map_i32_vec_i16"].array(1, 2) == [
         {-2: array.array("h", [-1, -2]), -1: array.array("h", [-1])}
     ]
-    assert containers["map_str_vec_str"].array(1, 2) == [
-        {"one": ["one"], "two": ["one", "two"]}
-    ]
+    assert containers["map_str_vec_str"].array(1, 2) == [{"one": ["one"], "two": ["one", "two"]}]
     assert containers["map_i32_set_i16"].array(1, 2) == [
         {-2: array.array("h", [-2, -1]), -1: array.array("h", [-1])}
     ]
@@ -616,16 +614,24 @@ def nosplit():
 def test_an_unsplit_object_is_a_dictionary_of_everything_the_class_declares(nosplit):
     # What the C++ that wrote this file put in entry 1, member for member.
     row = nosplit["evt"].array(1, 2)[0]
+    _assert_unsplit_scalars(row)
+    _assert_unsplit_collections(row)
+    assert nosplit.typenames()["evt"] == "dict"
+    assert nosplit.readable() == ["evt"] and nosplit.unreadable == {}
+
+
+def _assert_unsplit_scalars(row):
     assert row["Beg"] == "beg-001"
     assert (row["I16"], row["U64"], row["F64"]) == (1, 1, 1.0)
     assert row["Str"] == "evt-001"
     assert row["P3"] == {"Px": 0, "Py": 1.0, "Pz": 0}
+
+
+def _assert_unsplit_collections(row):
     assert row["ArrayF32"].tolist() == [1.0] * 10
     assert (row["N"], row["SliceI16"].tolist()) == (1, [1])
     assert (row["StdStr"], row["StlVecStr"]) == ("std-001", ["vec-001"])
     assert row["End"] == "end-001"
-    assert nosplit.typenames()["evt"] == "dict"
-    assert nosplit.readable() == ["evt"] and nosplit.unreadable == {}
 
 
 def test_the_same_events_written_split_and_unsplit_read_back_the_same(nosplit, event):

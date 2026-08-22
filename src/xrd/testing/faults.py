@@ -254,25 +254,9 @@ class FaultProxy:
             while not self._stop.is_set():
                 if not self._pump(client, upstream):
                     break
-                chunk = _read(upstream)
-                if chunk is None:
-                    continue
-                if not chunk:
+                keep_going, seen = self._forward(client, upstream, seen)
+                if not keep_going:
                     break
-                if self._stall_after is not None and seen >= self._stall_after:
-                    time.sleep(0.05)
-                    continue
-                if self._drop_after is not None and seen >= self._drop_after:
-                    break
-                chunk = self._doctor(chunk, seen)
-                if self._delay and seen >= self._delay_after:
-                    time.sleep(self._delay)
-                seen += len(chunk)
-                # Count before forwarding, so that a caller who has the bytes
-                # can never read a total that leaves them out.
-                self.bytes_from_server += len(chunk)
-                for piece in _pieces(chunk, self._chop):
-                    client.sendall(piece)
         except OSError:
             pass
         finally:
@@ -281,6 +265,41 @@ class FaultProxy:
                 self._live.discard(upstream)
             _shutdown(client)
             _shutdown(upstream)
+
+    def _forward(
+        self, client: socket.socket, upstream: socket.socket, seen: int
+    ) -> tuple[bool, int]:
+        """Forward one server chunk; return whether and where to continue."""
+        chunk = _read(upstream)
+        if chunk is None:
+            return True, seen
+        if not chunk:
+            return False, seen
+        return self._forward_chunk(client, chunk, seen)
+
+    def _forward_chunk(
+        self, client: socket.socket, chunk: bytes, seen: int
+    ) -> tuple[bool, int]:
+        """Apply an armed stop or deliver one non-empty server chunk."""
+        if self._stall_after is not None and seen >= self._stall_after:
+            time.sleep(0.05)
+            return True, seen
+        if self._drop_after is not None and seen >= self._drop_after:
+            return False, seen
+        return True, self._deliver(client, chunk, seen)
+
+    def _deliver(self, client: socket.socket, chunk: bytes, seen: int) -> int:
+        """Doctor, delay, account for, and send one server chunk."""
+        chunk = self._doctor(chunk, seen)
+        if self._delay and seen >= self._delay_after:
+            time.sleep(self._delay)
+        seen += len(chunk)
+        # Count before forwarding, so that a caller who has the bytes can
+        # never read a total that leaves them out.
+        self.bytes_from_server += len(chunk)
+        for piece in _pieces(chunk, self._chop):
+            client.sendall(piece)
+        return seen
 
     def _pump(self, client: socket.socket, upstream: socket.socket) -> bool:
         """Move one client chunk upstream. False when the client has gone."""

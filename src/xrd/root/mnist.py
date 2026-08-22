@@ -16,7 +16,7 @@ through this library like any other URL, so converting straight from the
 mirror into a file on an XRootD server is one call.
 
 MNIST keeps its own module because it is the one everybody starts with.
-:mod:`xrd.root.datasets` does the work, and holds the other seven.
+:mod:`xrd.root.datasets` does the work, and holds the wider catalogue.
 """
 
 from __future__ import annotations

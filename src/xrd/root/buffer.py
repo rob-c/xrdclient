@@ -35,12 +35,11 @@ else:  # pragma: no cover - big-endian machines, where ROOT's order is ours
         return values
 
 
-
 def as_datetime(packed: int) -> datetime.datetime:
     """ROOT's packed date word, which counts its years from 1995.
 
-        >>> as_datetime(0x2C44F105)
-        datetime.datetime(2006, 1, 2, 15, 4, 5)
+    >>> as_datetime(0x2C44F105)
+    datetime.datetime(2006, 1, 2, 15, 4, 5)
     """
     return datetime.datetime(
         (packed >> 26) + 1995,
@@ -300,9 +299,7 @@ class Buffer:
         self.resume(end)
         return items
 
-    def clones(
-        self, classes: dict[str, Any], fields: Any = None
-    ) -> list[Any]:
+    def clones(self, classes: dict[str, Any], fields: Any = None) -> list[Any]:
         """A ``TClonesArray``: many objects of one class, the class written once.
 
         ROOT keeps a pool of objects of a single class and reuses it entry
@@ -324,25 +321,36 @@ class Buffer:
         held = self.string().partition(";")[0]  # the class, and the version of it
         count, _low = abs(self.i32()), self.i32()
         if bits & BYPASS_STREAMER and not bits & NO_MEMBER_WISE:
-            steps = fields(held) if fields is not None else None
-            if steps is None:
-                raise UnsupportedFeatureError(
-                    f"a TClonesArray of {held} was written field by field, and this "
-                    f"file's streamer information does not describe {held} well "
-                    f"enough to read it that way"
-                )
-            rows: list[Any] = [{} for _ in range(count)]
-            for label, step in steps:
-                for row in rows:
-                    row[label] = step(self, row)
-            if end is not None and self.pos != end:
-                raise FormatError(
-                    f"a TClonesArray of {count} {held} written field by field ended "
-                    f"{abs(end - self.pos)} bytes from where it said it would, so "
-                    f"what was read out of it cannot be trusted"
-                )
-            self.resume(end)
-            return rows
+            return self._memberwise_clones(held, count, end, fields)
+        return self._streamed_clones(held, count, end, classes)
+
+    def _memberwise_clones(self, held: str, count: int, end: int | None, fields: Any) -> list[Any]:
+        steps = fields(held) if fields is not None else None
+        if steps is None:
+            raise UnsupportedFeatureError(
+                f"a TClonesArray of {held} was written field by field, and this "
+                f"file's streamer information does not describe {held} well "
+                f"enough to read it that way"
+            )
+        rows: list[Any] = [{} for _ in range(count)]
+        for label, step in steps:
+            for row in rows:
+                row[label] = step(self, row)
+        self._require_clone_end(held, count, end)
+        self.resume(end)
+        return rows
+
+    def _require_clone_end(self, held: str, count: int, end: int | None) -> None:
+        if end is not None and self.pos != end:
+            raise FormatError(
+                f"a TClonesArray of {count} {held} written field by field ended "
+                f"{abs(end - self.pos)} bytes from where it said it would, so "
+                f"what was read out of it cannot be trusted"
+            )
+
+    def _streamed_clones(
+        self, held: str, count: int, end: int | None, classes: dict[str, Any]
+    ) -> list[Any]:
         one = classes.get(held)
         if one is None:
             raise UnsupportedFeatureError(

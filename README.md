@@ -143,7 +143,7 @@ characters when it is not — and `xrd.root.create` writes a new ROOT file:
 trees filled entry by entry and flushed a basket at a time, histograms,
 graphs, strings and arrays of numbers, under every compression ROOT itself
 writes, still from nothing but the standard library. `xrd.root.datasets` turns
-five hundred and eighty-eight of the sets machine learning is taught with —
+more than fourteen hundred datasets and teaching tables into streamable ROOT —
 the MNIST family and EMNIST, CIFAR-10 and CIFAR-100, Semeion, the spoken
 digits of FSDD, the SMS Spam Collection, MiniBooNE, the MAGIC telescope, the
 HTRU2 pulsar survey, Human Activity Recognition, Iris, the Palmer penguins,
@@ -153,24 +153,41 @@ Cancer Wisconsin, Dry Bean, Seeds, Yeast, Heart Disease, Car Evaluation, Auto
 MPG, Bike Sharing, Energy Efficiency, Real Estate Valuation, Student
 Performance, fifty more of the UCI teaching shelf from Sonar and Soybean to
 Bank Marketing, the Landsat satellite images, the pen-written digits and the
-office-occupancy recordings, a hundred read straight from the archive's own
-CSV, from ISOLET and Poker Hand to Connect-4, the splice junctions, the Steel
-Plates faults and the CDC diabetes survey, three hundred and thirty-two
+office-occupancy recordings, more than 220 default 100 MB–2 GB disk-backed sources
+from UCI, NIST, Toronto, Zenodo and Salesforce including EMNIST, SUSY, JetNet,
+OmniFold Big, TinySOL, Speech Commands, AudioMNIST, CirCor heart sounds,
+WikiText-103, ReefSet, BioDCASE, BirdSet, UAV Maize Stress, Wildlife MNIST and
+Year Prediction MSD, the compact SODv2 orbital bounding-box and DLR all-sky
+cloud-mask sets, plus eight registered
+multi-gigabyte UCI converters admitted explicitly with `--allow-oversize`, a hundred read
+straight from the archive's own CSV, from ISOLET and Poker Hand to Connect-4,
+the splice junctions, the Steel Plates faults and the CDC diabetes survey,
+the 17 CC BY MedMNIST image and volume problems, Galaxy10 SDSS morphology,
+Curiosity rover surface images and SWEFil solar-filament masks and boxes,
+100 CC BY Alex-MP-20 crystal-image regression tasks over 675,204 inorganic
+structures, each with publisher splits, geometry-only and atomic-number projections,
+100 visual field-learning tasks drawn from sixteen CC BY 4.0 archives in The Well,
+spanning acoustics, active matter, nonlinear waves, planetary atmospheres,
+convection, hydrodynamic instabilities, soft matter, plasma and stellar astrophysics,
+three hundred and thirty-two
 teaching tables of the R world from Boston Housing and Old Faithful to the
 Lahman baseball records, the NYC flights, the survival studies, Arbuthnot's
 christenings, Snow's cholera deaths and what the archaeologists dug up, and
 sixty-eight country-year tables charted by Our World in Data, from CO2
 emissions and energy use to child mortality, the warming sea and the ice
-sheets — into ROOT files a tree per
+sheets, and 500 explicitly licensed, public Hub repositories whose complete
+scalar Parquet conversions preserve 783 publisher splits across 1,236 shards —
+into ROOT files a tree per
 class, or one tree of every row where what is predicted is a number rather
 than a class, fetched from whoever publishes them and carrying their licence
 in the file, so a training loop can read them straight off a storage element
 without anybody having to leave the tools they already use. Images, audio,
 text, dates, timestamps, spreadsheets and plain blocks of numbers all fit;
-none of the data is redistributed here, only the converter. Four programs in
-`examples/` train off a `root://` URL and print what they held while doing it
-— MNIST twice, an autoencoder on CIFAR-10 and a small convolutional net on
-Fashion-MNIST, none of them holding more than a pool of rows of the file.
+none of the data is redistributed here, only the converter. Five programs in
+`examples/` work off a `root://` URL: MNIST twice, an autoencoder on CIFAR-10,
+a small convolutional net on Fashion-MNIST, and a raw/normalized JARVIS crystal
+projection viewer. None of the training examples holds more than a pool of
+rows of the file, and the viewer reads only its selected entry.
 
 ```python
 import torch, xrd.root, xrd.root.ml
@@ -317,7 +334,10 @@ parity suite, which runs every operation through this client and the official
 XRootD bindings and compares the answers field by field. Coverage is 100% of
 statements *and* branches across the package, and the wire protocol, the
 cryptography and the client surface are gated there; `ruff` and
-`mypy --strict` pass clean and are hard gates too. The
+`mypy --strict` pass clean and are hard gates too. An absolute
+[maintainability gate](docs/maintainability.md) reports CCN, Cognitive
+Complexity, NPath, Halstead Volume and maximum nesting per function and file;
+the same limits apply to all existing and new code, without baseline allowances. The
 package ships `py.typed`, and `xrd.open` is overloaded the way the builtin is,
 so a literal mode tells your type checker whether you get bytes or text.
 

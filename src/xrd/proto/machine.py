@@ -310,9 +310,7 @@ class SessionMachine:
     def has_data_to_send(self) -> bool:
         return bool(self._out)
 
-    def submit(
-        self, request: Request, *, path: str = "", arrive_on_path: bool = False
-    ) -> int:
+    def submit(self, request: Request, *, path: str = "", arrive_on_path: bool = False) -> int:
         """Queue ``request`` on a fresh stream and return its streamid.
 
         ``path`` is carried only so that a failure can name the file it was
@@ -522,8 +520,9 @@ class SessionMachine:
 
         pending = self._pending.get(header.streamid)
         if pending is None:
-            _log.debug("response on unknown stream %d (%s)", header.streamid,
-                       c.status_name(header.status))
+            _log.debug(
+                "response on unknown stream %d (%s)", header.streamid, c.status_name(header.status)
+            )
             return
         self._on_response(header, body, pending, framer)
 
@@ -545,8 +544,7 @@ class SessionMachine:
         if header.status not in (c.kXR_ok, c.kXR_authmore):
             self._fail(
                 ProtocolError(
-                    f"unexpected {c.status_name(header.status)} during "
-                    f"{self.state.name.lower()}"
+                    f"unexpected {c.status_name(header.status)} during {self.state.name.lower()}"
                 )
             )
             return
@@ -588,9 +586,7 @@ class SessionMachine:
         # ``kXR_tlsData`` belongs here with the session-wide bits: this client
         # reads and writes on the connection it logged in on, so a server that
         # wants file data encrypted wants this socket encrypted.
-        demanded = bool(
-            flags & (c.kXR_gotoTLS | c.kXR_tlsLogin | c.kXR_tlsSess | c.kXR_tlsData)
-        )
+        demanded = bool(flags & (c.kXR_gotoTLS | c.kXR_tlsLogin | c.kXR_tlsSess | c.kXR_tlsData))
         if self.want_tls or demanded:
             if not flags & c.kXR_haveTLS:
                 self._fail(
@@ -679,68 +675,95 @@ class SessionMachine:
     def _on_response(
         self, header: ResponseHeader, body: bytes, pending: _Pending, framer: _Framer
     ) -> None:
+        handlers = {
+            c.kXR_ok: self._response_ok,
+            c.kXR_oksofar: self._response_chunk,
+            c.kXR_error: self._response_error,
+            c.kXR_redirect: self._response_redirect,
+            c.kXR_wait: self._response_wait,
+            c.kXR_waitresp: self._response_waitresp,
+            c.kXR_status: self._response_status,
+        }
+        handler = handlers.get(header.status, self._response_unexpected)
+        handler(header, body, pending, framer)
+
+    def _response_ok(
+        self, header: ResponseHeader, body: bytes, pending: _Pending, _framer: _Framer
+    ) -> None:
         sid = header.streamid
-        status = header.status
-
-        if status == c.kXR_ok:
-            if not self._within_cap(sid, pending, len(body)):
-                return
-            if pending.buffer:
-                # Extend and freeze, rather than concatenating and freezing:
-                # the latter copies the whole accumulated response twice.
-                pending.buffer += body
-                data = bytes(pending.buffer)
-            else:
-                data = body
-            self.release(sid)
-            self._events.append(Completed(sid, pending.request, data, pending.status))
-
-        elif status == c.kXR_oksofar:
-            if not self._within_cap(sid, pending, len(body)):
-                return
+        if not self._within_cap(sid, pending, len(body)):
+            return
+        if pending.buffer:
+            # Extending before freezing avoids copying the accumulated body twice.
             pending.buffer += body
-            self._events.append(Chunk(sid, pending.request, body))
-
-        elif status == c.kXR_error:
-            info = rp.parse_error(body)
-            self.release(sid)
-            self._events.append(
-                Failed(sid, pending.request, _server_error(info, pending.path))
-            )
-
-        elif status == c.kXR_redirect:
-            self._events.append(Redirected(sid, pending.request, rp.parse_redirect(body)))
-
-        elif status == c.kXR_wait:
-            wait = rp.parse_wait(body)
-            self._events.append(
-                Waiting(sid, pending.request, min(wait.seconds, self.config.wait_cap), wait.message)
-            )
-
-        elif status == c.kXR_waitresp:
-            later = rp.parse_waitresp(body)
-            self._events.append(
-                Waiting(sid, pending.request, later.seconds, resend=False)
-            )
-
-        elif status == c.kXR_status:
-            state = rp.parse_status(body)
-            pending.status = state
-            if state.dlen:
-                framer.need_trailer = state.dlen
-                framer.trailer_for = sid
-            else:
-                self._on_status_data(sid, b"")
-
+            data = bytes(pending.buffer)
         else:
-            self.release(sid)
-            self._events.append(
-                Failed(
-                    sid,
-                    pending.request,
-                    ProtocolError(f"unexpected response status {c.status_name(status)}"),
-                )
+            data = body
+        self.release(sid)
+        self._events.append(Completed(sid, pending.request, data, pending.status))
+
+    def _response_chunk(
+        self, header: ResponseHeader, body: bytes, pending: _Pending, _framer: _Framer
+    ) -> None:
+        if self._within_cap(header.streamid, pending, len(body)):
+            pending.buffer += body
+            self._events.append(Chunk(header.streamid, pending.request, body))
+
+    def _response_error(
+        self, header: ResponseHeader, body: bytes, pending: _Pending, _framer: _Framer
+    ) -> None:
+        info = rp.parse_error(body)
+        self.release(header.streamid)
+        self._events.append(
+            Failed(header.streamid, pending.request, _server_error(info, pending.path))
+        )
+
+    def _response_redirect(
+        self, header: ResponseHeader, body: bytes, pending: _Pending, _framer: _Framer
+    ) -> None:
+        self._events.append(Redirected(header.streamid, pending.request, rp.parse_redirect(body)))
+
+    def _response_wait(
+        self, header: ResponseHeader, body: bytes, pending: _Pending, _framer: _Framer
+    ) -> None:
+        wait = rp.parse_wait(body)
+        self._events.append(
+            Waiting(
+                header.streamid,
+                pending.request,
+                min(wait.seconds, self.config.wait_cap),
+                wait.message,
             )
+        )
+
+    def _response_waitresp(
+        self, header: ResponseHeader, body: bytes, pending: _Pending, _framer: _Framer
+    ) -> None:
+        later = rp.parse_waitresp(body)
+        self._events.append(Waiting(header.streamid, pending.request, later.seconds, resend=False))
+
+    def _response_status(
+        self, header: ResponseHeader, body: bytes, pending: _Pending, framer: _Framer
+    ) -> None:
+        state = rp.parse_status(body)
+        pending.status = state
+        if state.dlen:
+            framer.need_trailer = state.dlen
+            framer.trailer_for = header.streamid
+        else:
+            self._on_status_data(header.streamid, b"")
+
+    def _response_unexpected(
+        self, header: ResponseHeader, _body: bytes, pending: _Pending, _framer: _Framer
+    ) -> None:
+        self.release(header.streamid)
+        self._events.append(
+            Failed(
+                header.streamid,
+                pending.request,
+                ProtocolError(f"unexpected response status {c.status_name(header.status)}"),
+            )
+        )
 
     def _within_cap(self, sid: int, pending: _Pending, extra: int) -> bool:
         """Whether ``extra`` more bytes still fit the reply's declared size.

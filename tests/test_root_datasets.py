@@ -9,8 +9,10 @@ the way the real ones are.
 
 from __future__ import annotations
 
+import array
 import gzip
 import io
+import pickle
 import struct
 import tarfile
 import wave
@@ -20,7 +22,16 @@ from dataclasses import replace
 
 import pytest
 
+from xrd.root import _uci_large as large_module
+from xrd.root import datasets as datasets_module
 from xrd.root import open_root
+from xrd.root._alex_mp20 import ALEX_MP20
+from xrd.root._hub_tables import HUB_OPEN
+from xrd.root._jarvis_physics import JARVIS_PHYSICS
+from xrd.root._open_large import OPEN_LARGE
+from xrd.root._the_well import THE_WELL
+from xrd.root._uci_large import UCI_LARGE
+from xrd.root._uci_tables import UCI_TABLES, UCI_TABLES_SKIPPED
 from xrd.root.datasets import (
     CIFAR,
     DATASETS,
@@ -29,10 +40,12 @@ from xrd.root.datasets import (
     Audio,
     Dataset,
     Images,
+    Large,
     Matrix,
     Table,
     convert,
     describe,
+    licence_url,
     read_arff,
     read_table,
     read_xlsx,
@@ -145,8 +158,7 @@ SCRIBBLES = Images(
     splits=("train", "test"),
     archive="https://example.invalid/scribbles.zip",
     files={
-        split: (f"in/{split}-images.gz", f"in/{split}-labels.gz")
-        for split in ("train", "test")
+        split: (f"in/{split}-images.gz", f"in/{split}-labels.gz") for split in ("train", "test")
     },
     side=2,
 )
@@ -372,8 +384,20 @@ def tiny_archive(**names: bytes) -> bytes:
 @pytest.fixture
 def registry(monkeypatch: pytest.MonkeyPatch) -> None:
     """The test's own datasets, alongside the real ones, for the length of a test."""
-    for spec in (TINY, TINY_COARSE, FLOWERS, SPOKEN, SCRIBBLES, MESSAGES, SENSORS, HOT, RUNS,
-                 PRICES, CARS, SHEET):
+    for spec in (
+        TINY,
+        TINY_COARSE,
+        FLOWERS,
+        SPOKEN,
+        SCRIBBLES,
+        MESSAGES,
+        SENSORS,
+        HOT,
+        RUNS,
+        PRICES,
+        CARS,
+        SHEET,
+    ):
         monkeypatch.setitem(DATASETS, spec.name, spec)
 
 
@@ -389,155 +413,762 @@ def test_every_dataset_says_what_its_licence_is_and_where_it_came_from():
         assert spec.licence
         assert spec.source.startswith("http")
         assert spec.title
+        assert spec.transformation_summary()
+        if "no formal licence" in spec.licence:
+            assert licence_url(spec.licence) == ""
+        else:
+            assert licence_url(spec.licence).startswith("https://")
+
+
+def test_large_sources_are_source_neutral_and_have_checked_sizes():
+    expected = {
+        "cifar10": 170_052_171,
+        "cifar100": 168_513_733,
+        "emnist": 561_753_746,
+        **{item["name"]: item["source_bytes"] for item in UCI_LARGE},
+        **{item["name"]: item["source_bytes"] for item in OPEN_LARGE},
+        **{item["name"]: item["source_bytes"] for item in HUB_OPEN},
+    }
+    assert {name for name, spec in DATASETS.items() if spec.file_backed()} == set(expected)
+    for name, size in expected.items():
+        assert DATASETS[name].source_payload_bytes() == size
+
+
+def test_oversized_sources_require_an_explicit_production_opt_in(monkeypatch):
+    spec = DATASETS["higgs"]
+    assert not spec.within_source_ceiling()
+    assert not spec.large_source()
+    assert spec.large_source(allow_oversize=True)
+
+    with pytest.raises(ValueError, match="allow_oversize=True"):
+        convert("higgs", io.BytesIO())
+
+    def reached_fetch(*args, **kwargs):
+        raise RuntimeError("source fetch reached")
+
+    monkeypatch.setattr(datasets_module, "_fetch_file", reached_fetch)
+    with pytest.raises(RuntimeError, match="source fetch reached"):
+        convert("higgs", io.BytesIO(), allow_oversize=True)
 
 
 def test_the_datasets_asked_for_are_all_there():
-    assert set(DATASETS) == {
-        "mnist", "fashion_mnist", "kmnist", "cifar10", "cifar100",
-        "iris", "penguins", "covertype", "emnist", "fsdd", "adult", "mushroom",
-        "letter", "digits", "wine", "breast_cancer", "dry_bean", "seeds",
-        "miniboone", "har", "semeion", "sms_spam", "wine_quality", "spambase",
-        "ionosphere", "glass", "abalone", "banknote",
-        "magic", "htru2", "auto_mpg", "bike_sharing", "energy_efficiency",
-        "real_estate", "student", "heart_disease", "car_evaluation", "yeast",
-        "airfoil", "automobile", "balance_scale", "bank_marketing",
-        "blood_transfusion", "climate_crashes", "computer_hardware",
-        "concrete_slump", "contraceptive", "dermatology", "diabetes_risk",
-        "ecoli", "fertility", "forest_fires", "garment_productivity",
-        "german_credit", "haberman", "heart_failure", "hepatitis",
-        "image_segmentation", "indian_liver", "liver_disorders", "lymphography",
-        "mammographic_mass", "maternal_health", "nursery", "occupancy",
-        "online_shoppers", "parkinsons", "parkinsons_telemonitoring",
-        "pendigits", "phishing", "power_plant", "qsar_aquatic", "qsar_fish",
-        "raisin", "rice", "satellite", "seismic", "servo", "solar_flare",
-        "sonar", "soybean", "statlog_heart", "steel_industry", "tic_tac_toe",
-        "vertebral_column", "wifi_localisation", "yacht", "zoo",
-        "absenteeism_at_work", "acute_inflammations", "aids_clinical_trials",
-        "android_permissions", "annealing", "appliances_energy", "auction_verification",
-        "audiology", "autism_screening_adult", "autism_screening_child", "beijing_pm25",
-        "bone_marrow_transplant", "breast_cancer_coimbra", "breast_cancer_original",
-        "breast_cancer_prognostic", "breast_cancer_recurrence", "cardiotocography", "cdc_diabetes",
-        "census_income_kdd", "cervical_cancer_behaviour", "cervical_cancer_risk",
-        "challenger_o_rings", "chess_endgame", "chronic_kidney_disease", "communities_crime",
-        "concrete_strength", "congressional_voting", "connect_four", "credit_card_default",
-        "credit_screening", "daily_demand", "darwin", "diabetes_hospitals", "diabetic_retinopathy",
-        "dota2_games", "drug_consumption", "eeg_eye_state", "el_nino", "entrance_exam",
-        "facebook_live_sellers", "facebook_metrics", "flags", "gas_turbine_emissions",
-        "gender_by_name", "glioma_grading", "grid_stability", "hcv_blood_donors",
-        "healthy_aging_poll", "hepatitis_c_egypt", "higher_education_students", "horse_colic",
-        "in_vehicle_coupon", "infrared_thermography", "iot_intrusion", "iranian_churn", "isolet",
-        "istanbul_exchange", "kidney_risk_factors", "land_mines", "metro_traffic", "mice_protein",
-        "monks_problems", "multivariate_gait", "musk_version1", "musk_version2", "news_popularity",
-        "nhanes_age", "obesity_levels", "ozone_level", "page_blocks", "pittsburgh_bridges",
-        "poker_hand", "polish_bankruptcy", "post_operative_patient", "predictive_maintenance",
-        "room_occupancy_count", "secondary_mushroom", "seoul_bike_sharing", "sepsis_survival",
-        "skin_segmentation", "soybean_cultivars", "soybean_small", "spect_heart", "spectf_heart",
-        "splice_junctions", "steel_plates", "student_academics", "student_dropout",
-        "superconductivity", "support2", "taiwanese_bankruptcy", "tennis_majors", "tetouan_power",
-        "thoracic_surgery", "thyroid_recurrence", "user_knowledge", "waveform", "website_phishing",
-        "wholesale_customers", "youtube_spam",
-        "acute_myeloid_leukaemia", "alcohol_by_country", "animal_scat", "anorexia_treatment",
-        "bad_drivers", "baseball_batting", "baseball_fielding", "baseball_hall_of_fame",
-        "baseball_hitters", "baseball_managers", "baseball_pitching", "baseball_players",
-        "baseball_salaries", "bechdel_test", "biliary_cholangitis", "black_cherry_trees",
-        "bladder_tumours", "boating_trips", "boston_housing", "breast_cancer_gbsg",
-        "brushtail_possums", "california_schools", "canadian_interlocks", "canadian_womens_work",
-        "candy_rankings", "car_seat_sales", "card_default", "cat_hearts", "chicago_taxi",
-        "chick_weights", "chile_plebiscite", "chocolate_cakes", "college_distance",
-        "college_majors", "colon_cancer_trial", "commercial_oils", "congress_age",
-        "cow_milk_protein", "cps_wages", "credit_card_applications", "credit_card_balance",
-        "developer_survey", "diamonds", "dnase_assay", "doctor_visits", "doctoral_publications",
-        "earthquake_intensity", "economic_growth", "economics_journals", "email_spam",
-        "epilepsy_seizures", "exercise_histories", "extramarital_affairs", "fandango_ratings",
-        "fast_food_nutrition", "fatty_liver_disease", "fertility_labour", "fiji_earthquakes",
-        "florida_2000_vote", "flying_etiquette", "free_light_chain", "fuel_economy",
-        "galton_heights", "gapminder", "gestation_births", "granulomatous_disease",
-        "greenhouse_gases", "grouse_ticks", "guns_and_crime", "hate_crimes", "help_study",
-        "high_school_and_beyond", "historic_co2", "hpc_jobs", "infant_mortality", "infertility",
-        "insect_sprays", "italian_olive_oils", "lecture_ratings", "lending_club",
-        "leptograpsus_crabs", "life_cycle_savings", "liver_transplant_list", "loblolly_pines",
-        "low_birth_weight", "lung_cancer_survival", "mammal_sleep", "marijuana_arrests",
-        "marriage_licences", "math_achievement", "medical_care_demand", "mid_atlantic_wages",
-        "midwest_counties", "monoclonal_gammopathy", "mortgage_denial", "motor_trend_cars",
-        "movielens", "new_york_air", "nyc_flights", "nyc_weather", "occupational_prestige",
-        "oesophageal_cancer", "old_faithful", "orange_juice", "orange_trees", "orchard_sprays",
-        "orthodontic_growth", "oxford_boys", "penicillin_testing", "petroleum_rock",
-        "phenobarbital", "pima_diabetes", "professor_salaries", "psid_labour", "reported_weight",
-        "resume_callbacks", "retinopathy_laser", "sat_and_gpa", "school_absences",
-        "seat_belt_laws", "seattle_pets", "sleep_deprivation", "slid_wages", "snail_mortality",
-        "soybean_growth", "sp500_daily", "sp500_weekly", "spruce_growth", "stanford_heart",
-        "star_properties", "state_sat_scores", "steak_preferences", "student_survey",
-        "swiss_fertility", "swiss_labour", "tarantino_scripts", "teaching_evaluations",
-        "telecom_churn", "telecom_contracts", "temperature_and_carbon", "ten_mile_race",
-        "texas_housing", "theophylline", "titanic", "tooth_growth", "travel_mode", "uk_smoking",
-        "un_national_statistics", "us_aircraft", "us_airports", "us_arrests", "us_births_1978",
-        "us_births_2014", "us_cereals", "us_colleges", "us_economics", "us_gun_murders",
-        "us_state_education", "used_car_prices", "utility_bills", "verbal_aggression",
-        "vocabulary_test", "volunteering", "warp_breaks", "wheat_yield_trials", "whickham_smoking",
-        "windsor_house_prices", "womens_labour_1975", "workplace_smoking_ban",
-        "world_values_survey", "youth_risk_behaviour",
-        "adult_literacy", "air_passengers", "calorie_supply", "cereal_yields", "child_mortality",
-        "child_mortality_igme", "co2_emissions", "co2_emissions_per_person", "co2_per_dollar",
-        "consumer_price_inflation", "cumulative_co2_emissions", "electricity_access",
-        "electricity_generation", "energy_use_per_person", "freshwater_withdrawals",
-        "gdp_per_capita_maddison", "gdp_per_capita_worldbank", "human_development_index",
-        "internet_use", "internet_users", "life_expectancy_at_birth", "mobile_subscriptions",
-        "population_density", "primary_energy", "renewable_electricity", "renewable_energy",
-        "sea_level", "unemployment_rate", "urban_population",
-        "abortion_and_crime", "adult_services", "affair_counts", "alone_episodes",
-        "alone_loadouts", "alone_seasons", "alone_survivalists", "ancient_shipwrecks",
-        "animal_attributes", "anscombe_quartet", "ansett_passengers", "arbuthnot_christenings",
-        "arctic_pit_houses", "arizona_cardiac_stays", "arthritis_treatment",
-        "ashkenazi_breast_cancer", "atmospheric_radiocarbon", "australian_car_policies",
-        "australian_livestock", "australian_production", "australian_retail", "automobile_claims",
-        "bad_health_visits", "bakeoff_bakers", "bakeoff_challenges", "bakeoff_episodes",
-        "bakeoff_ratings", "barley_yields", "benthic_oxygen_stack", "big_tech_shares",
-        "blood_storage", "bodily_injury_claims", "bone_marrow_leukaemia", "bornholm_brooches",
-        "bowley_wages", "breast_feeding", "breslau_life_table", "bronze_age_cups",
-        "bundesliga_matches", "bundestag_2005", "burn_wound_infection", "care_home_incidents",
-        "cavendish_density", "chinese_bronzes", "cholera_deaths_1849", "choral_singers",
-        "coal_miners_breathing", "college_proximity", "college_scorecard", "corporal_punishment",
-        "covid_testing", "csgo_matches", "cytomegalovirus", "danish_welfare", "dart_points",
-        "datasaurus_dozen", "deep_sea_fish", "drag_race_appearances", "drag_race_contestants",
-        "drag_race_episodes", "drinks_and_wages", "end_scrapers", "epica_carbon_dioxide",
-        "ernest_witte_burials", "esophageal_cancer", "ethanol_engine", "familial_polyposis",
-        "fingerprint_patterns", "fish_adult_growth", "fish_juvenile_catches",
-        "fish_juvenile_growth", "funnel_beaker_pottery", "furze_platt_handaxes", "galton_families",
-        "galton_parent_child", "geologic_time_scale", "german_health_1984", "german_health_reform",
-        "german_suicides", "global_economy", "gosset_yeast_cells", "government_transfers",
-        "guerry_moral_statistics", "hare_and_lynx_pelts", "hepatocellular_carcinoma",
-        "hiv_test_results", "household_budgets", "indomethacin_trial", "infant_pneumonia",
-        "intcal20_curve", "interaction_triptych", "iron_age_fibulae", "iron_age_graves",
-        "jevons_guesses", "kidney_transplant", "kommos_pottery", "laryngoscope_trial",
-        "larynx_cancer", "law_dome_gases", "letters_to_politicians", "licorice_gargle",
-        "london_cholera_districts", "long_stay_patients", "macdonell_criminals", "medicare_stays",
-        "medieval_glass", "mesolithic_tools", "michelsberg_pottery", "minard_troops",
-        "mississippi_pottery", "ngrip_ice_core", "nightingale_mortality", "olympic_running",
-        "organ_donations", "oxford_pottery", "ozone_and_weather", "paris_registrations",
-        "pearson_lee_heights", "plant_carbon_isotopes", "plant_traits", "playfair_wheat",
-        "portal_rodents", "portal_species", "prediabetes", "prostate_survival",
-        "prussian_horse_kicks", "rashomon_quartet", "repeat_victimisation",
-        "republican_vote_share", "restaurant_inspections", "rice_farmer_insurance",
-        "rochdale_women", "roman_street_networks", "romano_british_glass",
-        "romano_british_pottery", "ruspini_points", "sea_level_reconstruction", "ship_damage",
-        "singapore_car_claims", "smartpill_motility", "smoking_cessation", "snodgrass_houses",
-        "snow_cholera_deaths", "std_reinfection", "stone_age_sites", "streptomycin_tuberculosis",
-        "stroke_classification", "supported_work_programme", "supraclavicular_block",
-        "swedish_motorcycles", "texas_prisons", "tongue_cancer", "trial_of_the_pyx",
-        "us_regional_mortality", "victorian_electricity", "virgil_dactyls", "woodland_birds",
-        "workers_compensation", "xclara_clusters", "yule_pauperism", "zuni_pottery",
-        "agricultural_land", "annual_precipitation", "birth_rate", "broadband_subscriptions",
-        "cattle_numbers", "cereal_production", "coal_production", "consumption_co2_emissions",
-        "electricity_carbon_intensity", "electricity_demand", "electricity_per_person",
-        "fertilizer_use", "fish_consumption", "foreign_direct_investment", "forest_cover",
-        "fossil_electricity_share", "fossil_fuel_energy", "gas_production",
-        "gdp_per_capita_growth", "greenhouse_gas_emissions", "hydro_electricity_share",
-        "ice_sheet_mass", "international_migrants", "labour_force_participation", "maize_yields",
-        "maternal_mortality", "methane_emissions", "nitrous_oxide_emissions",
-        "nuclear_electricity_share", "oil_production", "pesticide_use", "rice_yields",
-        "sea_surface_temperature", "solar_electricity_share", "temperature_anomaly",
-        "trade_share_of_gdp", "wheat_yields", "wind_electricity_share", "world_population",
+    generated = {item["name"] for item in (*UCI_TABLES, *UCI_LARGE, *OPEN_LARGE, *HUB_OPEN)}
+    assert set(DATASETS) - generated == {
+        "mnist",
+        "fashion_mnist",
+        "kmnist",
+        "cifar10",
+        "cifar100",
+        "iris",
+        "penguins",
+        "covertype",
+        "emnist",
+        "fsdd",
+        "adult",
+        "mushroom",
+        "letter",
+        "digits",
+        "wine",
+        "breast_cancer",
+        "dry_bean",
+        "seeds",
+        "miniboone",
+        "har",
+        "semeion",
+        "sms_spam",
+        "wine_quality",
+        "spambase",
+        "ionosphere",
+        "glass",
+        "abalone",
+        "banknote",
+        "magic",
+        "htru2",
+        "auto_mpg",
+        "bike_sharing",
+        "energy_efficiency",
+        "real_estate",
+        "student",
+        "heart_disease",
+        "car_evaluation",
+        "yeast",
+        "airfoil",
+        "automobile",
+        "balance_scale",
+        "bank_marketing",
+        "blood_transfusion",
+        "climate_crashes",
+        "computer_hardware",
+        "concrete_slump",
+        "contraceptive",
+        "dermatology",
+        "diabetes_risk",
+        "ecoli",
+        "fertility",
+        "forest_fires",
+        "garment_productivity",
+        "german_credit",
+        "haberman",
+        "heart_failure",
+        "hepatitis",
+        "image_segmentation",
+        "indian_liver",
+        "liver_disorders",
+        "lymphography",
+        "mammographic_mass",
+        "maternal_health",
+        "nursery",
+        "occupancy",
+        "online_shoppers",
+        "parkinsons",
+        "parkinsons_telemonitoring",
+        "pendigits",
+        "phishing",
+        "power_plant",
+        "qsar_aquatic",
+        "qsar_fish",
+        "raisin",
+        "rice",
+        "satellite",
+        "seismic",
+        "servo",
+        "solar_flare",
+        "sonar",
+        "soybean",
+        "statlog_heart",
+        "steel_industry",
+        "tic_tac_toe",
+        "vertebral_column",
+        "wifi_localisation",
+        "yacht",
+        "zoo",
+        "absenteeism_at_work",
+        "acute_inflammations",
+        "aids_clinical_trials",
+        "android_permissions",
+        "annealing",
+        "appliances_energy",
+        "auction_verification",
+        "audiology",
+        "autism_screening_adult",
+        "autism_screening_child",
+        "beijing_pm25",
+        "bone_marrow_transplant",
+        "breast_cancer_coimbra",
+        "breast_cancer_original",
+        "breast_cancer_prognostic",
+        "breast_cancer_recurrence",
+        "cardiotocography",
+        "cdc_diabetes",
+        "census_income_kdd",
+        "cervical_cancer_behaviour",
+        "cervical_cancer_risk",
+        "challenger_o_rings",
+        "chess_endgame",
+        "chronic_kidney_disease",
+        "communities_crime",
+        "concrete_strength",
+        "congressional_voting",
+        "connect_four",
+        "credit_card_default",
+        "credit_screening",
+        "daily_demand",
+        "darwin",
+        "diabetes_hospitals",
+        "diabetic_retinopathy",
+        "dota2_games",
+        "drug_consumption",
+        "eeg_eye_state",
+        "el_nino",
+        "entrance_exam",
+        "facebook_live_sellers",
+        "facebook_metrics",
+        "flags",
+        "gas_turbine_emissions",
+        "gender_by_name",
+        "glioma_grading",
+        "grid_stability",
+        "hcv_blood_donors",
+        "healthy_aging_poll",
+        "hepatitis_c_egypt",
+        "higher_education_students",
+        "horse_colic",
+        "in_vehicle_coupon",
+        "infrared_thermography",
+        "iot_intrusion",
+        "iranian_churn",
+        "isolet",
+        "istanbul_exchange",
+        "kidney_risk_factors",
+        "land_mines",
+        "metro_traffic",
+        "mice_protein",
+        "monks_problems",
+        "multivariate_gait",
+        "musk_version1",
+        "musk_version2",
+        "news_popularity",
+        "nhanes_age",
+        "obesity_levels",
+        "ozone_level",
+        "page_blocks",
+        "pittsburgh_bridges",
+        "poker_hand",
+        "polish_bankruptcy",
+        "post_operative_patient",
+        "predictive_maintenance",
+        "room_occupancy_count",
+        "secondary_mushroom",
+        "seoul_bike_sharing",
+        "sepsis_survival",
+        "skin_segmentation",
+        "soybean_cultivars",
+        "soybean_small",
+        "spect_heart",
+        "spectf_heart",
+        "splice_junctions",
+        "steel_plates",
+        "student_academics",
+        "student_dropout",
+        "superconductivity",
+        "support2",
+        "taiwanese_bankruptcy",
+        "tennis_majors",
+        "tetouan_power",
+        "thoracic_surgery",
+        "thyroid_recurrence",
+        "user_knowledge",
+        "waveform",
+        "website_phishing",
+        "wholesale_customers",
+        "youtube_spam",
+        "acute_myeloid_leukaemia",
+        "alcohol_by_country",
+        "animal_scat",
+        "anorexia_treatment",
+        "bad_drivers",
+        "baseball_batting",
+        "baseball_fielding",
+        "baseball_hall_of_fame",
+        "baseball_hitters",
+        "baseball_managers",
+        "baseball_pitching",
+        "baseball_players",
+        "baseball_salaries",
+        "bechdel_test",
+        "biliary_cholangitis",
+        "black_cherry_trees",
+        "bladder_tumours",
+        "boating_trips",
+        "boston_housing",
+        "breast_cancer_gbsg",
+        "brushtail_possums",
+        "california_schools",
+        "canadian_interlocks",
+        "canadian_womens_work",
+        "candy_rankings",
+        "car_seat_sales",
+        "card_default",
+        "cat_hearts",
+        "chicago_taxi",
+        "chick_weights",
+        "chile_plebiscite",
+        "chocolate_cakes",
+        "college_distance",
+        "college_majors",
+        "colon_cancer_trial",
+        "commercial_oils",
+        "congress_age",
+        "cow_milk_protein",
+        "cps_wages",
+        "credit_card_applications",
+        "credit_card_balance",
+        "developer_survey",
+        "diamonds",
+        "dnase_assay",
+        "doctor_visits",
+        "doctoral_publications",
+        "earthquake_intensity",
+        "economic_growth",
+        "economics_journals",
+        "email_spam",
+        "epilepsy_seizures",
+        "exercise_histories",
+        "extramarital_affairs",
+        "fandango_ratings",
+        "fast_food_nutrition",
+        "fatty_liver_disease",
+        "fertility_labour",
+        "fiji_earthquakes",
+        "florida_2000_vote",
+        "flying_etiquette",
+        "free_light_chain",
+        "fuel_economy",
+        "galton_heights",
+        "gapminder",
+        "gestation_births",
+        "granulomatous_disease",
+        "greenhouse_gases",
+        "grouse_ticks",
+        "guns_and_crime",
+        "hate_crimes",
+        "help_study",
+        "high_school_and_beyond",
+        "historic_co2",
+        "hpc_jobs",
+        "infant_mortality",
+        "infertility",
+        "insect_sprays",
+        "italian_olive_oils",
+        "lecture_ratings",
+        "lending_club",
+        "leptograpsus_crabs",
+        "life_cycle_savings",
+        "liver_transplant_list",
+        "loblolly_pines",
+        "low_birth_weight",
+        "lung_cancer_survival",
+        "mammal_sleep",
+        "marijuana_arrests",
+        "marriage_licences",
+        "math_achievement",
+        "medical_care_demand",
+        "mid_atlantic_wages",
+        "midwest_counties",
+        "monoclonal_gammopathy",
+        "mortgage_denial",
+        "motor_trend_cars",
+        "movielens",
+        "new_york_air",
+        "nyc_flights",
+        "nyc_weather",
+        "occupational_prestige",
+        "oesophageal_cancer",
+        "old_faithful",
+        "orange_juice",
+        "orange_trees",
+        "orchard_sprays",
+        "orthodontic_growth",
+        "oxford_boys",
+        "penicillin_testing",
+        "petroleum_rock",
+        "phenobarbital",
+        "pima_diabetes",
+        "professor_salaries",
+        "psid_labour",
+        "reported_weight",
+        "resume_callbacks",
+        "retinopathy_laser",
+        "sat_and_gpa",
+        "school_absences",
+        "seat_belt_laws",
+        "seattle_pets",
+        "sleep_deprivation",
+        "slid_wages",
+        "snail_mortality",
+        "soybean_growth",
+        "sp500_daily",
+        "sp500_weekly",
+        "spruce_growth",
+        "stanford_heart",
+        "star_properties",
+        "state_sat_scores",
+        "steak_preferences",
+        "student_survey",
+        "swiss_fertility",
+        "swiss_labour",
+        "tarantino_scripts",
+        "teaching_evaluations",
+        "telecom_churn",
+        "telecom_contracts",
+        "temperature_and_carbon",
+        "ten_mile_race",
+        "texas_housing",
+        "theophylline",
+        "titanic",
+        "tooth_growth",
+        "travel_mode",
+        "uk_smoking",
+        "un_national_statistics",
+        "us_aircraft",
+        "us_airports",
+        "us_arrests",
+        "us_births_1978",
+        "us_births_2014",
+        "us_cereals",
+        "us_colleges",
+        "us_economics",
+        "us_gun_murders",
+        "us_state_education",
+        "used_car_prices",
+        "utility_bills",
+        "verbal_aggression",
+        "vocabulary_test",
+        "volunteering",
+        "warp_breaks",
+        "wheat_yield_trials",
+        "whickham_smoking",
+        "windsor_house_prices",
+        "womens_labour_1975",
+        "workplace_smoking_ban",
+        "world_values_survey",
+        "youth_risk_behaviour",
+        "adult_literacy",
+        "air_passengers",
+        "calorie_supply",
+        "cereal_yields",
+        "child_mortality",
+        "child_mortality_igme",
+        "co2_emissions",
+        "co2_emissions_per_person",
+        "co2_per_dollar",
+        "consumer_price_inflation",
+        "cumulative_co2_emissions",
+        "electricity_access",
+        "electricity_generation",
+        "energy_use_per_person",
+        "freshwater_withdrawals",
+        "gdp_per_capita_maddison",
+        "gdp_per_capita_worldbank",
+        "human_development_index",
+        "internet_use",
+        "internet_users",
+        "life_expectancy_at_birth",
+        "mobile_subscriptions",
+        "population_density",
+        "primary_energy",
+        "renewable_electricity",
+        "renewable_energy",
+        "sea_level",
+        "unemployment_rate",
+        "urban_population",
+        "abortion_and_crime",
+        "adult_services",
+        "affair_counts",
+        "alone_episodes",
+        "alone_loadouts",
+        "alone_seasons",
+        "alone_survivalists",
+        "ancient_shipwrecks",
+        "animal_attributes",
+        "anscombe_quartet",
+        "ansett_passengers",
+        "arbuthnot_christenings",
+        "arctic_pit_houses",
+        "arizona_cardiac_stays",
+        "arthritis_treatment",
+        "ashkenazi_breast_cancer",
+        "atmospheric_radiocarbon",
+        "australian_car_policies",
+        "australian_livestock",
+        "australian_production",
+        "australian_retail",
+        "automobile_claims",
+        "bad_health_visits",
+        "bakeoff_bakers",
+        "bakeoff_challenges",
+        "bakeoff_episodes",
+        "bakeoff_ratings",
+        "barley_yields",
+        "benthic_oxygen_stack",
+        "big_tech_shares",
+        "blood_storage",
+        "bodily_injury_claims",
+        "bone_marrow_leukaemia",
+        "bornholm_brooches",
+        "bowley_wages",
+        "breast_feeding",
+        "breslau_life_table",
+        "bronze_age_cups",
+        "bundesliga_matches",
+        "bundestag_2005",
+        "burn_wound_infection",
+        "care_home_incidents",
+        "cavendish_density",
+        "chinese_bronzes",
+        "cholera_deaths_1849",
+        "choral_singers",
+        "coal_miners_breathing",
+        "college_proximity",
+        "college_scorecard",
+        "corporal_punishment",
+        "covid_testing",
+        "csgo_matches",
+        "cytomegalovirus",
+        "danish_welfare",
+        "dart_points",
+        "datasaurus_dozen",
+        "deep_sea_fish",
+        "drag_race_appearances",
+        "drag_race_contestants",
+        "drag_race_episodes",
+        "drinks_and_wages",
+        "end_scrapers",
+        "epica_carbon_dioxide",
+        "ernest_witte_burials",
+        "esophageal_cancer",
+        "ethanol_engine",
+        "familial_polyposis",
+        "fingerprint_patterns",
+        "fish_adult_growth",
+        "fish_juvenile_catches",
+        "fish_juvenile_growth",
+        "funnel_beaker_pottery",
+        "furze_platt_handaxes",
+        "galton_families",
+        "galton_parent_child",
+        "geologic_time_scale",
+        "german_health_1984",
+        "german_health_reform",
+        "german_suicides",
+        "global_economy",
+        "gosset_yeast_cells",
+        "government_transfers",
+        "guerry_moral_statistics",
+        "hare_and_lynx_pelts",
+        "hepatocellular_carcinoma",
+        "hiv_test_results",
+        "household_budgets",
+        "indomethacin_trial",
+        "infant_pneumonia",
+        "intcal20_curve",
+        "interaction_triptych",
+        "iron_age_fibulae",
+        "iron_age_graves",
+        "jevons_guesses",
+        "kidney_transplant",
+        "kommos_pottery",
+        "laryngoscope_trial",
+        "larynx_cancer",
+        "law_dome_gases",
+        "letters_to_politicians",
+        "licorice_gargle",
+        "london_cholera_districts",
+        "long_stay_patients",
+        "macdonell_criminals",
+        "medicare_stays",
+        "medieval_glass",
+        "mesolithic_tools",
+        "michelsberg_pottery",
+        "minard_troops",
+        "mississippi_pottery",
+        "ngrip_ice_core",
+        "nightingale_mortality",
+        "olympic_running",
+        "organ_donations",
+        "oxford_pottery",
+        "ozone_and_weather",
+        "paris_registrations",
+        "pearson_lee_heights",
+        "plant_carbon_isotopes",
+        "plant_traits",
+        "playfair_wheat",
+        "portal_rodents",
+        "portal_species",
+        "prediabetes",
+        "prostate_survival",
+        "prussian_horse_kicks",
+        "rashomon_quartet",
+        "repeat_victimisation",
+        "republican_vote_share",
+        "restaurant_inspections",
+        "rice_farmer_insurance",
+        "rochdale_women",
+        "roman_street_networks",
+        "romano_british_glass",
+        "romano_british_pottery",
+        "ruspini_points",
+        "sea_level_reconstruction",
+        "ship_damage",
+        "singapore_car_claims",
+        "smartpill_motility",
+        "smoking_cessation",
+        "snodgrass_houses",
+        "snow_cholera_deaths",
+        "std_reinfection",
+        "stone_age_sites",
+        "streptomycin_tuberculosis",
+        "stroke_classification",
+        "supported_work_programme",
+        "supraclavicular_block",
+        "swedish_motorcycles",
+        "texas_prisons",
+        "tongue_cancer",
+        "trial_of_the_pyx",
+        "us_regional_mortality",
+        "victorian_electricity",
+        "virgil_dactyls",
+        "woodland_birds",
+        "workers_compensation",
+        "xclara_clusters",
+        "yule_pauperism",
+        "zuni_pottery",
+        "agricultural_land",
+        "annual_precipitation",
+        "birth_rate",
+        "broadband_subscriptions",
+        "cattle_numbers",
+        "cereal_production",
+        "coal_production",
+        "consumption_co2_emissions",
+        "electricity_carbon_intensity",
+        "electricity_demand",
+        "electricity_per_person",
+        "fertilizer_use",
+        "fish_consumption",
+        "foreign_direct_investment",
+        "forest_cover",
+        "fossil_electricity_share",
+        "fossil_fuel_energy",
+        "gas_production",
+        "gdp_per_capita_growth",
+        "greenhouse_gas_emissions",
+        "hydro_electricity_share",
+        "ice_sheet_mass",
+        "international_migrants",
+        "labour_force_participation",
+        "maize_yields",
+        "maternal_mortality",
+        "methane_emissions",
+        "nitrous_oxide_emissions",
+        "nuclear_electricity_share",
+        "oil_production",
+        "pesticide_use",
+        "rice_yields",
+        "sea_surface_temperature",
+        "solar_electricity_share",
+        "temperature_anomaly",
+        "trade_share_of_gdp",
+        "wheat_yields",
+        "wind_electricity_share",
+        "world_population",
     }
+
+
+def test_selected_normalized_uci_tables_join_the_registry_without_shadowing_it():
+    names = [item["name"] for item in UCI_TABLES]
+    assert len(names) == len(set(names)) == 18
+    assert len(UCI_TABLES_SKIPPED) == 18
+    for item in UCI_TABLES:
+        spec = DATASETS[item["name"]]
+        assert isinstance(spec, Table)
+        assert spec.licence == "CC BY 4.0"
+        assert spec.source == item["source"]
+        assert spec.url == item["url"] and spec.url.endswith("/data.csv")
+        assert spec.header and spec.splits == ("all",)
+
+
+def test_a_generated_uci_table_cannot_shadow_a_curated_converter():
+    registry = {"balloons": DATASETS["iris"]}
+    with pytest.raises(ValueError, match="generated UCI dataset 'balloons' duplicates"):
+        datasets_module._add_uci_tables(registry, UCI_TABLES[:1])
+
+
+def test_all_large_uci_archives_are_disk_backed_and_registered():
+    names = [item["name"] for item in UCI_LARGE]
+    assert len(names) == len(set(names)) == 22
+    assert sum(item["source_bytes"] for item in UCI_LARGE) == 77_746_784_853
+    for item in UCI_LARGE:
+        spec = DATASETS[item["name"]]
+        assert isinstance(spec, Large)
+        assert spec.licence == "CC BY 4.0"
+        assert spec.source_bytes == item["source_bytes"]
+        assert spec.url.endswith(".zip")
+
+
+def test_the_non_uci_large_archives_have_canonical_terms_and_record_the_ceiling():
+    assert {item["name"] for item in OPEN_LARGE} == {
+        "adrenalmnist3d",
+        "allsky_cloud_segmentation",
+        "audiomnist",
+        "biodcase_2025_task3",
+        "birdset_baseal",
+        "bloodmnist",
+        "breastmnist",
+        "chestmnist",
+        "circor_heart_sound",
+        "fracturemnist3d",
+        "galaxy10_sdss",
+        "jetnet",
+        "jarvis_stm_bravais",
+        "mars_surface_images",
+        "matbench_dielectric",
+        "matbench_expt_gap",
+        "matbench_expt_is_metal",
+        "matbench_glass",
+        "matbench_jdft2d",
+        "matbench_log_gvrh",
+        "matbench_log_kvrh",
+        "matbench_mp_e_form",
+        "matbench_mp_gap",
+        "matbench_mp_is_metal",
+        "matbench_perovskites",
+        "matbench_phonons",
+        "matbench_steels",
+        "moke_skyrmion_segmentation",
+        "nffa_sem_compact",
+        "nodulemnist3d",
+        "omnifold_big",
+        "organamnist",
+        "organcmnist",
+        "organmnist3d",
+        "organsmnist",
+        "octmnist",
+        "pathmnist",
+        "pneumoniamnist",
+        "polymer_blend_afm",
+        "perovskite_sem_segmentation",
+        "reefset",
+        "retinamnist",
+        "sodv2",
+        "speech_commands_v001",
+        "swefil",
+        "synapsemnist3d",
+        "tem_nanoparticle_morphology",
+        "tinysol",
+        "tissuemnist",
+        "uav_maize_stress",
+        "vesselmnist3d",
+        "wildlife_mnist",
+        "wikitext_103",
+        "wse2_stm_defects",
+    } | {item["name"] for item in (*JARVIS_PHYSICS, *ALEX_MP20, *THE_WELL)}
+    for item in OPEN_LARGE:
+        spec = DATASETS[item["name"]]
+        assert isinstance(spec, Large)
+        assert spec.within_source_ceiling() == (item["source_bytes"] < 2_000_000_000)
+        assert licence_url(spec.licence).startswith("https://")
+    assert sum(not DATASETS[item["name"]].within_source_ceiling() for item in THE_WELL) == 50
+    assert DATASETS["uav_maize_stress"].layout().startswith("four TTrees")
+
+
+def test_every_dataset_has_an_origin_and_an_explicit_source_repository():
+    for spec in DATASETS.values():
+        assert spec.origin_url().startswith(("http://", "https://")), spec.name
+        assert spec.origin_kind() in {"canonical", "source record"}, spec.name
+        assert spec.source_repository(), spec.name
+        assert all(name and url.startswith("https://") for name, url in spec.mirrors), spec.name
+
+
+def test_a_known_mirror_is_not_mislabelled_as_a_canonical_origin():
+    spec = DATASETS["bad_health_visits"]
+    assert spec.origin_kind() == "source record"
+    assert spec.source_repository() == "Rdatasets mirror"
+
+
+def test_uci_is_credited_as_the_repository_while_its_records_keep_creator_and_doi_data():
+    specs = [spec for spec in DATASETS.values() if "archive.ics.uci.edu/dataset/" in spec.source]
+    assert len(specs) == 220
+    assert all(spec.source_repository() == "UCI Machine Learning Repository" for spec in specs)
+    assert all(spec.origin_kind() == "canonical" for spec in specs)
+    assert all(spec.origin_url().startswith("https://doi.org/") for spec in specs)
+    assert DATASETS["abalone"].creators[:2] == ("Warwick Nash", "Tracy Sellers")
+
+
+def test_a_large_uci_declaration_cannot_shadow_a_curated_converter():
+    registry = {"susy": DATASETS["iris"]}
+    with pytest.raises(ValueError, match="large UCI dataset 'susy' duplicates"):
+        datasets_module._add_uci_large(registry, UCI_LARGE[1:2])
 
 
 def test_class_names_can_all_be_written_as_tree_names():
@@ -634,6 +1265,14 @@ def test_a_dataset_says_what_it_is_in_a_string_the_file_keeps():
     assert "split: train" in about
     assert "licence: no formal licence" in about
     assert "https://www.cs.toronto.edu/~kriz/cifar.html" in about
+    assert "transformation: extracted the publisher's binary records" in about
+
+
+def test_a_formally_licensed_file_carries_the_canonical_terms_too():
+    about = DATASETS["iris"].about("all")
+    assert "licence: CC BY 4.0" in about
+    assert "licence URL: https://creativecommons.org/licenses/by/4.0/" in about
+    assert "transformation: parsed the published table" in about
 
 
 def test_a_single_split_dataset_does_not_talk_about_its_split():
@@ -652,8 +1291,12 @@ def test_a_tree_title_says_the_class_and_the_split_when_there_is_one():
 
 def test_a_dataset_with_no_reader_of_its_own_still_describes_itself():
     plain = Dataset(
-        name="plain", label="Plain", title="nothing much", licence="CC0",
-        source="https://example.invalid/plain", classes=("one",),
+        name="plain",
+        label="Plain",
+        title="nothing much",
+        licence="CC0",
+        source="https://example.invalid/plain",
+        classes=("one",),
     )
     assert plain.entry_title("all", "one") == "Plain rows labelled one"
     assert "licence: CC0" in plain.about("all")
@@ -669,8 +1312,11 @@ def test_a_description_missing_something_it_is_read_by_says_which():
     the message names the fields rather than the class alone.
     """
     common = {
-        "label": "Half", "title": "half a description", "licence": "CC0",
-        "source": "https://example.invalid/half", "classes": ("one",),
+        "label": "Half",
+        "title": "half a description",
+        "licence": "CC0",
+        "source": "https://example.invalid/half",
+        "classes": ("one",),
     }
     with pytest.raises(TypeError, match=r"CIFAR needs archive, files, meta"):
         CIFAR(name="half", **common)
@@ -706,8 +1352,23 @@ def test_a_dataset_nobody_has_is_refused_by_name():
 
 @pytest.mark.parametrize(
     "licence",
-    ["CC0", "CC BY 4.0", "CC BY-SA 3.0", "MIT", "Apache-2.0", "BSD-3-Clause",
-     "GPL-2 or later", "LGPL-2 or later", "Artistic-2.0", "Unlicense"],
+    [
+        "CC0",
+        "CC BY 4.0",
+        "CC BY-SA 3.0",
+        "MIT",
+        "Apache-2.0",
+        "BSD-3-Clause",
+        "GPL-2 or later",
+        "LGPL-2 or later",
+        "Artistic-2.0",
+        "Unlicense",
+        "CDLA-Permissive-2.0",
+        "ODC-By-1.0",
+        "Etalab Open Licence 2.0",
+        "PostgreSQL",
+        "Zlib",
+    ],
 )
 def test_a_licence_that_permits_passing_the_file_on_says_so(licence):
     assert redistributable(licence)
@@ -758,8 +1419,13 @@ def test_the_pictures_of_a_split_run_on_across_the_files_it_is_in():
 
 
 def test_a_coarse_label_is_read_in_front_of_the_fine_one(registry):
-    raw = tarred({"names.txt": b"tulip\nrose\n", "coarse.txt": b"flower\n",
-                  "one.bin": pictures(bytes([1, 0]), coarse=bytes([0, 0]))})
+    raw = tarred(
+        {
+            "names.txt": b"tulip\nrose\n",
+            "coarse.txt": b"flower\n",
+            "one.bin": pictures(bytes([1, 0]), coarse=bytes([0, 0])),
+        }
+    )
     classes, columns, rows = TINY_COARSE.rows({"archive": raw}, "train")
     assert classes == ("tulip", "rose")
     assert list(columns) == ["image", "label", "coarse", "index"]
@@ -771,9 +1437,17 @@ def test_a_coarse_label_is_read_in_front_of_the_fine_one(registry):
 
 def test_the_class_names_come_out_of_the_archive_and_are_made_safe_to_use():
     spec = CIFAR(
-        name="odd", label="Odd", title="odd names", licence="CC0",
-        source="https://example.invalid/odd", classes=(), splits=("train",),
-        archive="", files={"train": ("one.bin",)}, meta="names.txt", side=2,
+        name="odd",
+        label="Odd",
+        title="odd names",
+        licence="CC0",
+        source="https://example.invalid/odd",
+        classes=(),
+        splits=("train",),
+        archive="",
+        files={"train": ("one.bin",)},
+        meta="names.txt",
+        side=2,
     )
     raw = tarred({"names.txt": b"aquarium fish\n\nmaple-tree\n", "one.bin": pictures(b"\0")})
     classes, _, rows = spec.rows({"archive": raw}, "train")
@@ -842,18 +1516,34 @@ def test_a_table_can_arrive_gzipped_or_as_it_is():
 def test_a_member_is_taken_out_of_a_zip_and_unzipped_again_if_it_is_gzipped():
     inner = zipped({"rows.csv.gz": gzip.compress(FLOWER_ROWS)})
     spec = Table(
-        name="z", label="Z", title="zipped", licence="CC0", source="https://example.invalid/z",
-        classes=FLOWERS.classes, url="", member="rows.csv.gz", fields=FLOWERS.fields,
-        labels=FLOWERS.labels, codes=FLOWERS.codes,
+        name="z",
+        label="Z",
+        title="zipped",
+        licence="CC0",
+        source="https://example.invalid/z",
+        classes=FLOWERS.classes,
+        url="",
+        member="rows.csv.gz",
+        fields=FLOWERS.fields,
+        labels=FLOWERS.labels,
+        codes=FLOWERS.codes,
     )
     assert len(list(spec._entries(inner, "all"))) == 3
 
 
 def test_a_zip_without_the_member_wanted_names_what_it_does_hold():
     spec = Table(
-        name="z", label="Z", title="zipped", licence="CC0", source="https://example.invalid/z",
-        classes=FLOWERS.classes, url="", member="rows.data", fields=FLOWERS.fields,
-        labels=FLOWERS.labels, codes=FLOWERS.codes,
+        name="z",
+        label="Z",
+        title="zipped",
+        licence="CC0",
+        source="https://example.invalid/z",
+        classes=FLOWERS.classes,
+        url="",
+        member="rows.data",
+        fields=FLOWERS.fields,
+        labels=FLOWERS.labels,
+        codes=FLOWERS.codes,
     )
     with pytest.raises(ValueError, match=r"this zip holds other.csv, and not 'rows.data'"):
         list(spec._entries(zipped({"other.csv": FLOWER_ROWS}), "all"))
@@ -862,7 +1552,7 @@ def test_a_zip_without_the_member_wanted_names_what_it_does_hold():
 def test_a_gap_in_a_number_becomes_a_nan_and_a_gap_in_a_category_a_minus_one():
     for blank in sorted(MISSING - {""}):
         _, _, rows = FLOWERS.rows({"table": f"{blank},{blank},{blank},Red\n".encode()}, "all")
-        (_, row), = rows
+        ((_, row),) = rows
         assert row["width"] != row["width"]
         assert row["count"] == -1
         assert row["where"] == -1
@@ -871,6 +1561,27 @@ def test_a_gap_in_a_number_becomes_a_nan_and_a_gap_in_a_category_a_minus_one():
 def test_a_row_with_the_wrong_number_of_fields_is_refused():
     _, _, rows = FLOWERS.rows({"table": b"1.5,3,north\n"}, "all")
     with pytest.raises(ValueError, match="row 0 of Flowers has 3 fields, and its columns are 4"):
+        list(rows)
+
+
+def test_a_table_can_join_a_logical_row_split_across_physical_lines():
+    spec = replace(FLOWERS, continuations=True)
+    _, _, rows = spec.rows({"table": b"1.5,\n3,north,Red\n"}, "all")
+    ((_, row),) = rows
+    assert row["width"] == 1.5 and row["count"] == 3 and row["where"] == 0
+
+
+def test_a_continued_row_is_refused_if_it_runs_past_the_declared_fields():
+    spec = replace(FLOWERS, continuations=True)
+    _, _, rows = spec.rows({"table": b"1,2,north,Red,extra\n"}, "all")
+    with pytest.raises(ValueError, match=r"physical row 0.*past its 4 fields"):
+        list(rows)
+
+
+def test_a_continued_row_is_refused_if_the_file_ends_part_way_through_it():
+    spec = replace(FLOWERS, continuations=True)
+    _, _, rows = spec.rows({"table": b"1,2\n"}, "all")
+    with pytest.raises(ValueError, match=r"last continued row.*2 of its 4 fields"):
         list(rows)
 
 
@@ -905,9 +1616,27 @@ def written(name: str, source: bytes, role: str, **kwargs) -> tuple[dict[str, in
     return counts, buf.getvalue()
 
 
+def test_a_generated_uci_table_is_converted_with_its_categories_and_labels():
+    source = b"Color,Size,Act,Age,Inflated\nYELLOW,SMALL,STRETCH,ADULT,T\nPURPLE,LARGE,DIP,NaNN,F\n"
+    counts, raw = written("balloons", source, "table")
+    assert counts == {"f": 1, "t": 1}
+    with open_root(io.BytesIO(raw)) as back:
+        assert list(back["t"]["color"].array()) == [1]
+        assert list(back["t"]["label"].array()) == [1]
+        assert list(back["f"]["age"].array()) == [-1]
+
+
+def test_generated_class_aliases_share_the_same_safe_tree_name():
+    spec = DATASETS["census_income"]
+    assert spec.classes == ("le_50k", "gt_50k")
+    assert spec.labels == {"<=50K": 0, "<=50K.": 0, ">50K": 1, ">50K.": 1}
+    assert DATASETS["credit_approval"].classes == ("positive", "negative")
+
+
 def test_a_dataset_becomes_one_tree_per_class_named_for_the_split(registry):
-    counts, raw = written("tiny", tiny_archive(**{"test.bin": pictures(b"\0\1\1")}), "archive",
-                          split="test")
+    counts, raw = written(
+        "tiny", tiny_archive(**{"test.bin": pictures(b"\0\1\1")}), "archive", split="test"
+    )
     assert counts == {"test_cat": 1, "test_dog": 2}
     with open_root(io.BytesIO(raw)) as back:
         assert sorted(back.keys()) == ["test_about", "test_cat", "test_dog"]
@@ -918,8 +1647,9 @@ def test_a_dataset_becomes_one_tree_per_class_named_for_the_split(registry):
 
 
 def test_a_class_with_no_rows_still_gets_a_tree_of_its_own(registry):
-    counts, raw = written("tiny", tiny_archive(**{"test.bin": pictures(b"\0")}), "archive",
-                          split="test")
+    counts, raw = written(
+        "tiny", tiny_archive(**{"test.bin": pictures(b"\0")}), "archive", split="test"
+    )
     assert counts == {"test_cat": 1, "test_dog": 0}
     with open_root(io.BytesIO(raw)) as back:
         assert back["test_dog"].num_entries == 0
@@ -957,7 +1687,12 @@ def test_two_splits_can_be_written_into_one_file(registry):
         convert("tiny", out, split="test", parts={"archive": archive})
     with open_root(io.BytesIO(buf.getvalue())) as back:
         assert sorted(back.keys()) == [
-            "test_about", "test_cat", "test_dog", "train_about", "train_cat", "train_dog",
+            "test_about",
+            "test_cat",
+            "test_dog",
+            "train_about",
+            "train_cat",
+            "train_dog",
         ]
         assert back["train_cat"].num_entries == 1
         assert back["test_dog"].num_entries == 1
@@ -989,6 +1724,22 @@ def test_the_downloads_can_be_pointed_at_a_mirror(registry, tmp_path):
     archive.write_bytes(tiny_archive(**{"one.bin": pictures(b"\0")}))
     counts = convert("tiny", io.BytesIO(), split="train", base=f"{tmp_path}/")
     assert counts == {"train_cat": 1, "train_dog": 0}
+
+
+def test_a_mirror_keeps_the_filename_before_a_repository_content_suffix():
+    assert (
+        datasets_module._mirror_source(
+            "https://mirror.invalid/",
+            "https://zenodo.org/api/records/7602025/files/data.npy/content",
+        )
+        == "https://mirror.invalid/data.npy"
+    )
+    assert (
+        datasets_module._mirror_source(
+            "https://mirror.invalid/", "https://example.invalid/table.csv?download=true"
+        )
+        == "https://mirror.invalid/table.csv"
+    )
 
 
 def test_the_basket_size_and_the_compression_can_both_be_chosen(registry):
@@ -1031,7 +1782,9 @@ def test_the_spoken_digits_name_each_of_their_speakers_once():
     spec = DATASETS["fsdd"]
     assert isinstance(spec, Audio)
     assert len(set(spec.speakers)) == len(spec.speakers) == 6
-    assert spec.urls("all") == {"archive": spec.archive}
+    assert spec.urls("train") == spec.urls("test") == {"archive": spec.archive}
+    assert spec.splits == ("train", "test") and spec.test_repetitions == 5
+    assert spec.source_payload_bytes() == 7_273_063
     assert spec.rate == 8000
     assert spec.samples > 18262  # the longest recording in the set
 
@@ -1109,6 +1862,17 @@ def test_an_image_set_can_arrive_in_one_archive_rather_than_four_files():
     assert list(got[1][1]["image"]) == [4, 5, 6, 7]
 
 
+def test_a_large_image_archive_is_read_from_its_cached_path(tmp_path):
+    archive = tmp_path / "scribbles.zip"
+    archive.write_bytes(scribbled(b"\0\1"))
+    classes, columns, rows = SCRIBBLES.rows({"archive": archive}, "test")
+    assert classes == ("up", "down")
+    assert columns == {"image": ("B", 4), "label": "i", "index": "i"}
+    got = list(rows)
+    assert [label for label, _ in got] == [0, 1]
+    assert list(got[1][1]["image"]) == [4, 5, 6, 7]
+
+
 def test_a_split_can_name_its_own_member_of_the_archive():
     spec = replace(
         FLOWERS,
@@ -1144,18 +1908,37 @@ def test_a_recording_is_padded_out_to_the_width_of_the_column():
     classes, columns, rows = SPOKEN.rows({"archive": archive}, "all")
     assert classes == ("zero", "one")
     assert columns == {
-        "audio": ("h", 6), "length": "i", "label": "i", "speaker": "i", "index": "i",
+        "audio": ("f", 6),
+        "length": "i",
+        "label": "i",
+        "speaker": "i",
+        "index": "i",
     }
-    (label, row), = list(rows)
+    ((label, row),) = list(rows)
     assert label == 0
-    assert row == {"audio": (1, -2, 3, 0, 0, 0), "length": 3, "label": 0, "speaker": 0, "index": 0}
+    assert row["audio"] == pytest.approx((1 / 32768, -2 / 32768, 3 / 32768, 0, 0, 0))
+    assert {key: value for key, value in row.items() if key != "audio"} == {
+        "length": 3,
+        "label": 0,
+        "speaker": 0,
+        "index": 0,
+    }
 
 
 def test_the_recordings_are_read_in_name_order_with_who_spoke_them():
     archive = clips(**{"1_bob_1": waved([4]), "0_ann_2": waved([5]), "1_ann_0": waved([6])})
     _, _, rows = SPOKEN.rows({"archive": archive}, "all")
     got = [(label, row["speaker"], row["index"], row["audio"][0]) for label, row in rows]
-    assert got == [(0, 0, 0, 5), (1, 0, 1, 6), (1, 1, 2, 4)]
+    assert [row[:3] for row in got] == [(0, 0, 0), (1, 0, 1), (1, 1, 2)]
+    assert [row[3] for row in got] == pytest.approx([5 / 32768, 6 / 32768, 4 / 32768])
+
+
+def test_a_recording_repetition_rule_preserves_the_published_train_test_split():
+    spec = replace(SPOKEN, splits=("train", "test"), test_repetitions=1)
+    archive = clips(**{"0_ann_0": waved([1]), "0_ann_1": waved([2])})
+    for split, sample in (("test", 1), ("train", 2)):
+        _, _, rows = spec.rows({"archive": archive}, split)
+        assert next(rows)[1]["audio"][0] == pytest.approx(sample / 32768)
 
 
 def test_a_set_that_names_no_speakers_writes_no_speaker_column():
@@ -1219,7 +2002,9 @@ def test_recordings_become_one_tree_per_class_with_the_silence_written_out(regis
         assert sorted(back.keys()) == ["about", "one", "zero"]
         tree = back["one"]
         assert tree.title == "Spoken recordings of class one, 8000 Hz mono, 6 samples an entry"
-        assert list(tree["audio"].array()) == [3, 4, 5, 0, 0, 0]
+        assert list(tree["audio"].array()) == pytest.approx(
+            [3 / 32768, 4 / 32768, 5 / 32768, 0, 0, 0]
+        )
         assert list(tree["length"].array()) == [3]
         assert list(tree["speaker"].array()) == [1]
 
@@ -1256,8 +2041,10 @@ def test_text_is_written_into_a_column_of_its_own_with_the_length_beside_it():
         "index": "i",
     }
     first, second = list(rows)
-    assert first == (0, {"message": b'he said "no"' + bytes(4), "message_length": 12,
-                         "label": 0, "index": 0})
+    assert first == (
+        0,
+        {"message": b'he said "no"' + bytes(4), "message_length": 12, "label": 0, "index": 0},
+    )
     assert second[1]["message"] == b"OI" + bytes(14)
 
 
@@ -1541,8 +2328,9 @@ def test_the_text_at_the_end_of_a_row_arrives_in_its_own_column(registry):
 
 
 def test_a_table_with_no_classes_writes_one_tree_of_every_row(registry):
-    classes, columns, rows = PRICES.rows({"table": zipped({"north.csv": b"1970-01-03,5\n"})},
-                                         "north")
+    classes, columns, rows = PRICES.rows(
+        {"table": zipped({"north.csv": b"1970-01-03,5\n"})}, "north"
+    )
     assert classes == ("rows",)
     assert columns == {"when": "i", "price": "d", "index": "i"}
     assert list(rows) == [(0, {"when": 2, "price": 5.0, "index": 0})]
@@ -1573,8 +2361,11 @@ def test_a_date_becomes_the_days_since_1970_and_a_gap_becomes_minus_one():
 
 def test_a_date_written_some_other_way_says_how_this_one_is_written():
     _, _, rows = PRICES.rows({"table": zipped({"north.csv": b"01/01/2011,1\n"})}, "north")
-    with pytest.raises(ValueError, match=r"row 0 of Prices has '01/01/2011' in when, and the "
-                                         r"dates in it are written %Y-%m-%d"):
+    with pytest.raises(
+        ValueError,
+        match=r"row 0 of Prices has '01/01/2011' in when, and the "
+        r"dates in it are written %Y-%m-%d",
+    ):
         list(rows)
 
 
@@ -1622,7 +2413,8 @@ def test_the_two_spreadsheet_sets_are_read_as_spreadsheets():
     assert energy.member.endswith(".xlsx") and estate.member.endswith(".xlsx")
     assert energy.header and estate.header
     assert [name for name, role in energy.fields if role == "target"] == [
-        "heating_load", "cooling_load"
+        "heating_load",
+        "cooling_load",
     ]
     assert estate.fields[-1] == ("price_per_unit_area", "target")
 
@@ -1683,8 +2475,9 @@ def test_a_table_written_as_an_arff_is_read_as_one(registry):
 
 
 def test_a_time_becomes_the_seconds_since_1970_and_a_gap_becomes_minus_one():
-    spec = replace(PRICES, fields=(("when", "time"), ("price", "target")),
-                   dates="%Y-%m-%d %H:%M:%S")
+    spec = replace(
+        PRICES, fields=(("when", "time"), ("price", "target")), dates="%Y-%m-%d %H:%M:%S"
+    )
     _, columns, rows = spec.rows(
         {"table": zipped({"north.csv": b"2011-01-01 00:15:00,1\n?,2\n"})}, "north"
     )
@@ -1693,11 +2486,13 @@ def test_a_time_becomes_the_seconds_since_1970_and_a_gap_becomes_minus_one():
 
 
 def test_a_time_written_some_other_way_says_how_this_one_is_written():
-    spec = replace(PRICES, fields=(("when", "time"), ("price", "target")),
-                   dates="%d/%m/%Y %H:%M")
+    spec = replace(PRICES, fields=(("when", "time"), ("price", "target")), dates="%d/%m/%Y %H:%M")
     _, _, rows = spec.rows({"table": zipped({"north.csv": b"2011-01-01,1\n"})}, "north")
-    with pytest.raises(ValueError, match=r"row 0 of Prices has '2011-01-01' in when, and the "
-                                         r"dates in it are written %d/%m/%Y %H:%M"):
+    with pytest.raises(
+        ValueError,
+        match=r"row 0 of Prices has '2011-01-01' in when, and the "
+        r"dates in it are written %d/%m/%Y %H:%M",
+    ):
         list(rows)
 
 
@@ -1712,8 +2507,9 @@ def test_a_set_that_keeps_a_clock_writes_it_into_a_tree_like_any_other(
 ):
     spec = replace(PRICES, fields=(("when", "time"), ("price", "target")))
     monkeypatch.setitem(DATASETS, spec.name, spec)
-    counts, raw = written("prices", zipped({"north.csv": b"1970-01-02,1\n"}), "table",
-                          split="north")
+    counts, raw = written(
+        "prices", zipped({"north.csv": b"1970-01-02,1\n"}), "table", split="north"
+    )
     assert counts == {"north_rows": 1}
     with open_root(io.BytesIO(raw)) as back:
         assert list(back["north_rows"]["when"].array()) == [86400]
@@ -1739,16 +2535,56 @@ def test_a_header_that_is_all_there_is_leaves_a_table_with_no_rows_in_it():
 
 #: The sets added to round the shelf out, all of them from the UCI archive.
 TEACHING = (
-    "airfoil", "automobile", "balance_scale", "bank_marketing", "blood_transfusion",
-    "climate_crashes", "computer_hardware", "concrete_slump", "contraceptive",
-    "dermatology", "diabetes_risk", "ecoli", "fertility", "forest_fires",
-    "garment_productivity", "german_credit", "haberman", "heart_failure", "hepatitis",
-    "image_segmentation", "indian_liver", "liver_disorders", "lymphography",
-    "mammographic_mass", "maternal_health", "nursery", "occupancy", "online_shoppers",
-    "parkinsons", "parkinsons_telemonitoring", "pendigits", "phishing", "power_plant",
-    "qsar_aquatic", "qsar_fish", "raisin", "rice", "satellite", "seismic", "servo",
-    "solar_flare", "sonar", "soybean", "statlog_heart", "steel_industry", "tic_tac_toe",
-    "vertebral_column", "wifi_localisation", "yacht", "zoo",
+    "airfoil",
+    "automobile",
+    "balance_scale",
+    "bank_marketing",
+    "blood_transfusion",
+    "climate_crashes",
+    "computer_hardware",
+    "concrete_slump",
+    "contraceptive",
+    "dermatology",
+    "diabetes_risk",
+    "ecoli",
+    "fertility",
+    "forest_fires",
+    "garment_productivity",
+    "german_credit",
+    "haberman",
+    "heart_failure",
+    "hepatitis",
+    "image_segmentation",
+    "indian_liver",
+    "liver_disorders",
+    "lymphography",
+    "mammographic_mass",
+    "maternal_health",
+    "nursery",
+    "occupancy",
+    "online_shoppers",
+    "parkinsons",
+    "parkinsons_telemonitoring",
+    "pendigits",
+    "phishing",
+    "power_plant",
+    "qsar_aquatic",
+    "qsar_fish",
+    "raisin",
+    "rice",
+    "satellite",
+    "seismic",
+    "servo",
+    "solar_flare",
+    "sonar",
+    "soybean",
+    "statlog_heart",
+    "steel_industry",
+    "tic_tac_toe",
+    "vertebral_column",
+    "wifi_localisation",
+    "yacht",
+    "zoo",
 )
 
 
@@ -1766,9 +2602,19 @@ def test_the_fifty_teaching_sets_are_all_the_archives_own_download():
 def test_thirteen_of_the_teaching_sets_have_a_number_to_predict():
     numbers = {name for name in TEACHING if not DATASETS[name].classes}
     assert numbers == {
-        "airfoil", "automobile", "computer_hardware", "concrete_slump", "forest_fires",
-        "garment_productivity", "liver_disorders", "parkinsons_telemonitoring",
-        "power_plant", "qsar_aquatic", "qsar_fish", "servo", "yacht",
+        "airfoil",
+        "automobile",
+        "computer_hardware",
+        "concrete_slump",
+        "forest_fires",
+        "garment_productivity",
+        "liver_disorders",
+        "parkinsons_telemonitoring",
+        "power_plant",
+        "qsar_aquatic",
+        "qsar_fish",
+        "servo",
+        "yacht",
     }
 
 
@@ -1871,7 +2717,13 @@ def test_zoo_names_the_seven_kinds_of_creature_it_was_labelled_with():
     spec = DATASETS["zoo"]
     assert isinstance(spec, Table)
     assert spec.classes == (
-        "mammal", "bird", "reptile", "fish", "amphibian", "insect", "invertebrate"
+        "mammal",
+        "bird",
+        "reptile",
+        "fish",
+        "amphibian",
+        "insect",
+        "invertebrate",
     )
     assert spec.fields[0] == ("animal", "text")
 
@@ -1896,30 +2748,106 @@ def test_garment_productivity_reads_its_dates_the_way_that_file_writes_them():
 
 #: The sets the archive serves as one ``data.csv``, header row and all.
 SHELF = (
-    "absenteeism_at_work", "acute_inflammations", "aids_clinical_trials",
-    "android_permissions", "annealing", "appliances_energy", "auction_verification",
-    "audiology", "autism_screening_adult", "autism_screening_child", "beijing_pm25",
-    "bone_marrow_transplant", "breast_cancer_coimbra", "breast_cancer_original",
-    "breast_cancer_prognostic", "breast_cancer_recurrence", "cardiotocography", "cdc_diabetes",
-    "census_income_kdd", "cervical_cancer_behaviour", "cervical_cancer_risk",
-    "challenger_o_rings", "chess_endgame", "chronic_kidney_disease", "communities_crime",
-    "concrete_strength", "congressional_voting", "connect_four", "credit_card_default",
-    "credit_screening", "daily_demand", "darwin", "diabetes_hospitals", "diabetic_retinopathy",
-    "dota2_games", "drug_consumption", "eeg_eye_state", "el_nino", "entrance_exam",
-    "facebook_live_sellers", "facebook_metrics", "flags", "gas_turbine_emissions",
-    "gender_by_name", "glioma_grading", "grid_stability", "hcv_blood_donors",
-    "healthy_aging_poll", "hepatitis_c_egypt", "higher_education_students", "horse_colic",
-    "in_vehicle_coupon", "infrared_thermography", "iot_intrusion", "iranian_churn", "isolet",
-    "istanbul_exchange", "kidney_risk_factors", "land_mines", "metro_traffic", "mice_protein",
-    "monks_problems", "multivariate_gait", "musk_version1", "musk_version2", "news_popularity",
-    "nhanes_age", "obesity_levels", "ozone_level", "page_blocks", "pittsburgh_bridges",
-    "poker_hand", "polish_bankruptcy", "post_operative_patient", "predictive_maintenance",
-    "room_occupancy_count", "secondary_mushroom", "seoul_bike_sharing", "sepsis_survival",
-    "skin_segmentation", "soybean_cultivars", "soybean_small", "spect_heart", "spectf_heart",
-    "splice_junctions", "steel_plates", "student_academics", "student_dropout",
-    "superconductivity", "support2", "taiwanese_bankruptcy", "tennis_majors", "tetouan_power",
-    "thoracic_surgery", "thyroid_recurrence", "user_knowledge", "waveform", "website_phishing",
-    "wholesale_customers", "youtube_spam",
+    "absenteeism_at_work",
+    "acute_inflammations",
+    "aids_clinical_trials",
+    "android_permissions",
+    "annealing",
+    "appliances_energy",
+    "auction_verification",
+    "audiology",
+    "autism_screening_adult",
+    "autism_screening_child",
+    "beijing_pm25",
+    "bone_marrow_transplant",
+    "breast_cancer_coimbra",
+    "breast_cancer_original",
+    "breast_cancer_prognostic",
+    "breast_cancer_recurrence",
+    "cardiotocography",
+    "cdc_diabetes",
+    "census_income_kdd",
+    "cervical_cancer_behaviour",
+    "cervical_cancer_risk",
+    "challenger_o_rings",
+    "chess_endgame",
+    "chronic_kidney_disease",
+    "communities_crime",
+    "concrete_strength",
+    "congressional_voting",
+    "connect_four",
+    "credit_card_default",
+    "credit_screening",
+    "daily_demand",
+    "darwin",
+    "diabetes_hospitals",
+    "diabetic_retinopathy",
+    "dota2_games",
+    "drug_consumption",
+    "eeg_eye_state",
+    "el_nino",
+    "entrance_exam",
+    "facebook_live_sellers",
+    "facebook_metrics",
+    "flags",
+    "gas_turbine_emissions",
+    "gender_by_name",
+    "glioma_grading",
+    "grid_stability",
+    "hcv_blood_donors",
+    "healthy_aging_poll",
+    "hepatitis_c_egypt",
+    "higher_education_students",
+    "horse_colic",
+    "in_vehicle_coupon",
+    "infrared_thermography",
+    "iot_intrusion",
+    "iranian_churn",
+    "isolet",
+    "istanbul_exchange",
+    "kidney_risk_factors",
+    "land_mines",
+    "metro_traffic",
+    "mice_protein",
+    "monks_problems",
+    "multivariate_gait",
+    "musk_version1",
+    "musk_version2",
+    "news_popularity",
+    "nhanes_age",
+    "obesity_levels",
+    "ozone_level",
+    "page_blocks",
+    "pittsburgh_bridges",
+    "poker_hand",
+    "polish_bankruptcy",
+    "post_operative_patient",
+    "predictive_maintenance",
+    "room_occupancy_count",
+    "secondary_mushroom",
+    "seoul_bike_sharing",
+    "sepsis_survival",
+    "skin_segmentation",
+    "soybean_cultivars",
+    "soybean_small",
+    "spect_heart",
+    "spectf_heart",
+    "splice_junctions",
+    "steel_plates",
+    "student_academics",
+    "student_dropout",
+    "superconductivity",
+    "support2",
+    "taiwanese_bankruptcy",
+    "tennis_majors",
+    "tetouan_power",
+    "thoracic_surgery",
+    "thyroid_recurrence",
+    "user_knowledge",
+    "waveform",
+    "website_phishing",
+    "wholesale_customers",
+    "youtube_spam",
 )
 
 
@@ -1947,17 +2875,36 @@ def test_every_shelf_set_either_names_a_class_or_measures_a_number():
 def test_twenty_one_of_the_shelf_sets_have_a_number_to_predict():
     numbers = {name for name in SHELF if not DATASETS[name].classes}
     assert numbers == {
-        "absenteeism_at_work", "appliances_energy", "beijing_pm25", "challenger_o_rings",
-        "communities_crime", "concrete_strength", "daily_demand", "el_nino", "facebook_metrics",
-        "gas_turbine_emissions", "infrared_thermography", "istanbul_exchange", "metro_traffic",
-        "multivariate_gait", "news_popularity", "room_occupancy_count", "seoul_bike_sharing",
-        "soybean_cultivars", "steel_plates", "superconductivity", "tetouan_power",
+        "absenteeism_at_work",
+        "appliances_energy",
+        "beijing_pm25",
+        "challenger_o_rings",
+        "communities_crime",
+        "concrete_strength",
+        "daily_demand",
+        "el_nino",
+        "facebook_metrics",
+        "gas_turbine_emissions",
+        "infrared_thermography",
+        "istanbul_exchange",
+        "metro_traffic",
+        "multivariate_gait",
+        "news_popularity",
+        "room_occupancy_count",
+        "seoul_bike_sharing",
+        "soybean_cultivars",
+        "steel_plates",
+        "superconductivity",
+        "tetouan_power",
     }
 
 
 def test_the_six_shelf_sets_that_keep_a_day_or_a_clock_say_how_it_is_written():
-    dated = {name: DATASETS[name].dates for name in SHELF
-             if any(role in ("date", "time") for _, role in DATASETS[name].fields)}
+    dated = {
+        name: DATASETS[name].dates
+        for name in SHELF
+        if any(role in ("date", "time") for _, role in DATASETS[name].fields)
+    }
     assert dated == {
         "facebook_live_sellers": "%m/%d/%Y %H:%M",
         "metro_traffic": "%Y-%m-%d %H:%M:%S",
@@ -1982,7 +2929,13 @@ def test_steel_plates_predicts_all_seven_faults_and_sorts_into_none_of_them():
     assert isinstance(spec, Table)
     assert not spec.classes
     assert [name for name, role in spec.fields if role == "target"] == [
-        "pastry", "z_scratch", "k_scratch", "stains", "dirtiness", "bumps", "other_faults",
+        "pastry",
+        "z_scratch",
+        "k_scratch",
+        "stains",
+        "dirtiness",
+        "bumps",
+        "other_faults",
     ]
 
 
@@ -2007,8 +2960,16 @@ def test_poker_hands_are_named_rather_than_left_as_the_ten_numbers():
     spec = DATASETS["poker_hand"]
     assert isinstance(spec, Table)
     assert spec.classes == (
-        "nothing", "one_pair", "two_pairs", "three_of_a_kind", "straight",
-        "flush", "full_house", "four_of_a_kind", "straight_flush", "royal_flush",
+        "nothing",
+        "one_pair",
+        "two_pairs",
+        "three_of_a_kind",
+        "straight",
+        "flush",
+        "full_house",
+        "four_of_a_kind",
+        "straight_flush",
+        "royal_flush",
     )
     assert spec.labels["9"] == 9 and spec.fields[0] == ("s1", "i")
 
@@ -2114,7 +3075,8 @@ def test_a_youtube_comment_is_long_enough_to_arrive_whole():
 
 def test_a_shelf_set_is_written_into_a_tree_for_each_class_it_names():
     counts, raw = written(
-        "gender_by_name", b"Name,Gender,Count,Probability\nAaban,M,72,1.0\nAabha,F,21,0.5\n",
+        "gender_by_name",
+        b"Name,Gender,Count,Probability\nAaban,M,72,1.0\nAabha,F,21,0.5\n",
         "table",
     )
     assert counts == {"female": 1, "male": 1}
@@ -2128,12 +3090,16 @@ def test_a_shelf_set_is_written_into_a_tree_for_each_class_it_names():
 
 
 def test_a_shelf_set_writes_the_code_a_shared_column_was_coded_with():
-    head = (b"id,age,gender,education,country,ethnicity,nscore,escore,oscore,ascore,cscore,"
-            b"impuslive,ss,alcohol,amphet,amyl,benzos,caff,cannabis,choc,coke,crack,ecstasy,"
-            b"heroin,ketamine,legalh,lsd,meth,mushrooms,nicotine,semer,vsa\n")
-    row = (b"1,0.49788,0.48246,-0.05921,0.96082,0.126,0.31287,-0.57545,-0.58331,-0.91699,"
-           b"-0.00665,-0.21712,-1.18084,CL5,CL2,CL0,CL2,CL6,CL3,CL5,CL0,CL0,CL0,CL0,CL0,CL0,"
-           b"CL0,CL0,CL0,CL2,CL0,CL0\n")
+    head = (
+        b"id,age,gender,education,country,ethnicity,nscore,escore,oscore,ascore,cscore,"
+        b"impuslive,ss,alcohol,amphet,amyl,benzos,caff,cannabis,choc,coke,crack,ecstasy,"
+        b"heroin,ketamine,legalh,lsd,meth,mushrooms,nicotine,semer,vsa\n"
+    )
+    row = (
+        b"1,0.49788,0.48246,-0.05921,0.96082,0.126,0.31287,-0.57545,-0.58331,-0.91699,"
+        b"-0.00665,-0.21712,-1.18084,CL5,CL2,CL0,CL2,CL6,CL3,CL5,CL0,CL0,CL0,CL0,CL0,CL0,"
+        b"CL0,CL0,CL0,CL2,CL0,CL0\n"
+    )
     counts, raw = written("drug_consumption", head + row, "table")
     assert counts["cl3"] == 1 and sum(counts.values()) == 1
     with open_root(io.BytesIO(raw)) as back:
@@ -2148,44 +3114,176 @@ def test_a_shelf_set_writes_the_code_a_shared_column_was_coded_with():
 
 #: The sets Rdatasets serves as one CSV a piece, row names and all.
 RDATASETS = (
-    "acute_myeloid_leukaemia", "alcohol_by_country", "animal_scat", "anorexia_treatment",
-    "bad_drivers", "baseball_batting", "baseball_fielding", "baseball_hall_of_fame",
-    "baseball_hitters", "baseball_managers", "baseball_pitching", "baseball_players",
-    "baseball_salaries", "bechdel_test", "biliary_cholangitis", "black_cherry_trees",
-    "bladder_tumours", "boating_trips", "boston_housing", "breast_cancer_gbsg",
-    "brushtail_possums", "california_schools", "canadian_interlocks", "canadian_womens_work",
-    "candy_rankings", "car_seat_sales", "card_default", "cat_hearts", "chicago_taxi",
-    "chick_weights", "chile_plebiscite", "chocolate_cakes", "college_distance", "college_majors",
-    "colon_cancer_trial", "commercial_oils", "congress_age", "cow_milk_protein", "cps_wages",
-    "credit_card_applications", "credit_card_balance", "developer_survey", "diamonds",
-    "dnase_assay", "doctor_visits", "doctoral_publications", "earthquake_intensity",
-    "economic_growth", "economics_journals", "email_spam", "epilepsy_seizures",
-    "exercise_histories", "extramarital_affairs", "fandango_ratings", "fast_food_nutrition",
-    "fatty_liver_disease", "fertility_labour", "fiji_earthquakes", "florida_2000_vote",
-    "flying_etiquette", "free_light_chain", "fuel_economy", "galton_heights", "gapminder",
-    "gestation_births", "granulomatous_disease", "greenhouse_gases", "grouse_ticks",
-    "guns_and_crime", "hate_crimes", "help_study", "high_school_and_beyond", "historic_co2",
-    "hpc_jobs", "infant_mortality", "infertility", "insect_sprays", "italian_olive_oils",
-    "lecture_ratings", "lending_club", "leptograpsus_crabs", "life_cycle_savings",
-    "liver_transplant_list", "loblolly_pines", "low_birth_weight", "lung_cancer_survival",
-    "mammal_sleep", "marijuana_arrests", "marriage_licences", "math_achievement",
-    "medical_care_demand", "mid_atlantic_wages", "midwest_counties", "monoclonal_gammopathy",
-    "mortgage_denial", "motor_trend_cars", "movielens", "new_york_air", "nyc_flights",
-    "nyc_weather", "occupational_prestige", "oesophageal_cancer", "old_faithful", "orange_juice",
-    "orange_trees", "orchard_sprays", "orthodontic_growth", "oxford_boys", "penicillin_testing",
-    "petroleum_rock", "phenobarbital", "pima_diabetes", "professor_salaries", "psid_labour",
-    "reported_weight", "resume_callbacks", "retinopathy_laser", "sat_and_gpa", "school_absences",
-    "seat_belt_laws", "seattle_pets", "sleep_deprivation", "slid_wages", "snail_mortality",
-    "soybean_growth", "sp500_daily", "sp500_weekly", "spruce_growth", "stanford_heart",
-    "star_properties", "state_sat_scores", "steak_preferences", "student_survey",
-    "swiss_fertility", "swiss_labour", "tarantino_scripts", "teaching_evaluations",
-    "telecom_churn", "telecom_contracts", "temperature_and_carbon", "ten_mile_race",
-    "texas_housing", "theophylline", "titanic", "tooth_growth", "travel_mode", "uk_smoking",
-    "un_national_statistics", "us_aircraft", "us_airports", "us_arrests", "us_births_1978",
-    "us_births_2014", "us_cereals", "us_colleges", "us_economics", "us_gun_murders",
-    "us_state_education", "used_car_prices", "utility_bills", "verbal_aggression",
-    "vocabulary_test", "volunteering", "warp_breaks", "wheat_yield_trials", "whickham_smoking",
-    "windsor_house_prices", "womens_labour_1975", "workplace_smoking_ban", "world_values_survey",
+    "acute_myeloid_leukaemia",
+    "alcohol_by_country",
+    "animal_scat",
+    "anorexia_treatment",
+    "bad_drivers",
+    "baseball_batting",
+    "baseball_fielding",
+    "baseball_hall_of_fame",
+    "baseball_hitters",
+    "baseball_managers",
+    "baseball_pitching",
+    "baseball_players",
+    "baseball_salaries",
+    "bechdel_test",
+    "biliary_cholangitis",
+    "black_cherry_trees",
+    "bladder_tumours",
+    "boating_trips",
+    "boston_housing",
+    "breast_cancer_gbsg",
+    "brushtail_possums",
+    "california_schools",
+    "canadian_interlocks",
+    "canadian_womens_work",
+    "candy_rankings",
+    "car_seat_sales",
+    "card_default",
+    "cat_hearts",
+    "chicago_taxi",
+    "chick_weights",
+    "chile_plebiscite",
+    "chocolate_cakes",
+    "college_distance",
+    "college_majors",
+    "colon_cancer_trial",
+    "commercial_oils",
+    "congress_age",
+    "cow_milk_protein",
+    "cps_wages",
+    "credit_card_applications",
+    "credit_card_balance",
+    "developer_survey",
+    "diamonds",
+    "dnase_assay",
+    "doctor_visits",
+    "doctoral_publications",
+    "earthquake_intensity",
+    "economic_growth",
+    "economics_journals",
+    "email_spam",
+    "epilepsy_seizures",
+    "exercise_histories",
+    "extramarital_affairs",
+    "fandango_ratings",
+    "fast_food_nutrition",
+    "fatty_liver_disease",
+    "fertility_labour",
+    "fiji_earthquakes",
+    "florida_2000_vote",
+    "flying_etiquette",
+    "free_light_chain",
+    "fuel_economy",
+    "galton_heights",
+    "gapminder",
+    "gestation_births",
+    "granulomatous_disease",
+    "greenhouse_gases",
+    "grouse_ticks",
+    "guns_and_crime",
+    "hate_crimes",
+    "help_study",
+    "high_school_and_beyond",
+    "historic_co2",
+    "hpc_jobs",
+    "infant_mortality",
+    "infertility",
+    "insect_sprays",
+    "italian_olive_oils",
+    "lecture_ratings",
+    "lending_club",
+    "leptograpsus_crabs",
+    "life_cycle_savings",
+    "liver_transplant_list",
+    "loblolly_pines",
+    "low_birth_weight",
+    "lung_cancer_survival",
+    "mammal_sleep",
+    "marijuana_arrests",
+    "marriage_licences",
+    "math_achievement",
+    "medical_care_demand",
+    "mid_atlantic_wages",
+    "midwest_counties",
+    "monoclonal_gammopathy",
+    "mortgage_denial",
+    "motor_trend_cars",
+    "movielens",
+    "new_york_air",
+    "nyc_flights",
+    "nyc_weather",
+    "occupational_prestige",
+    "oesophageal_cancer",
+    "old_faithful",
+    "orange_juice",
+    "orange_trees",
+    "orchard_sprays",
+    "orthodontic_growth",
+    "oxford_boys",
+    "penicillin_testing",
+    "petroleum_rock",
+    "phenobarbital",
+    "pima_diabetes",
+    "professor_salaries",
+    "psid_labour",
+    "reported_weight",
+    "resume_callbacks",
+    "retinopathy_laser",
+    "sat_and_gpa",
+    "school_absences",
+    "seat_belt_laws",
+    "seattle_pets",
+    "sleep_deprivation",
+    "slid_wages",
+    "snail_mortality",
+    "soybean_growth",
+    "sp500_daily",
+    "sp500_weekly",
+    "spruce_growth",
+    "stanford_heart",
+    "star_properties",
+    "state_sat_scores",
+    "steak_preferences",
+    "student_survey",
+    "swiss_fertility",
+    "swiss_labour",
+    "tarantino_scripts",
+    "teaching_evaluations",
+    "telecom_churn",
+    "telecom_contracts",
+    "temperature_and_carbon",
+    "ten_mile_race",
+    "texas_housing",
+    "theophylline",
+    "titanic",
+    "tooth_growth",
+    "travel_mode",
+    "uk_smoking",
+    "un_national_statistics",
+    "us_aircraft",
+    "us_airports",
+    "us_arrests",
+    "us_births_1978",
+    "us_births_2014",
+    "us_cereals",
+    "us_colleges",
+    "us_economics",
+    "us_gun_murders",
+    "us_state_education",
+    "used_car_prices",
+    "utility_bills",
+    "verbal_aggression",
+    "vocabulary_test",
+    "volunteering",
+    "warp_breaks",
+    "wheat_yield_trials",
+    "whickham_smoking",
+    "windsor_house_prices",
+    "womens_labour_1975",
+    "workplace_smoking_ban",
+    "world_values_survey",
     "youth_risk_behaviour",
 )
 
@@ -2207,8 +3305,15 @@ def test_every_r_table_passes_on_what_the_package_it_ships_in_passes_on():
     for name in RDATASETS:
         held.setdefault(DATASETS[name].licence, []).append(name)
     assert {licence: len(names) for licence, names in sorted(held.items())} == {
-        "Artistic-2.0": 7, "CC0": 5, "GPL": 7, "GPL-2": 9, "GPL-2 or GPL-3": 51,
-        "GPL-2 or later": 42, "GPL-3": 11, "LGPL-2 or later": 13, "MIT": 26,
+        "Artistic-2.0": 7,
+        "CC0": 5,
+        "GPL": 7,
+        "GPL-2": 9,
+        "GPL-2 or GPL-3": 51,
+        "GPL-2 or later": 42,
+        "GPL-3": 11,
+        "LGPL-2 or later": 13,
+        "MIT": 26,
     }
 
 
@@ -2224,19 +3329,26 @@ def test_every_r_table_either_names_a_class_or_measures_a_number():
 def test_a_row_name_that_counts_from_one_is_told_from_one_that_names_a_thing():
     named = [name for name in RDATASETS if DATASETS[name].fields[0] == ("name", "text")]
     assert len(named) == 14 and "motor_trend_cars" in named and "swiss_fertility" in named
-    assert all(DATASETS[name].fields[0] == ("row", "i")
-               for name in RDATASETS if name not in named)
+    assert all(DATASETS[name].fields[0] == ("row", "i") for name in RDATASETS if name not in named)
 
 
 def test_the_r_tables_that_keep_a_day_or_a_clock_say_how_it_is_written():
-    dated = {name: DATASETS[name].dates for name in RDATASETS
-             if any(role in ("date", "time") for _, role in DATASETS[name].fields)}
+    dated = {
+        name: DATASETS[name].dates
+        for name in RDATASETS
+        if any(role in ("date", "time") for _, role in DATASETS[name].fields)
+    }
     assert dated == {
-        "baseball_players": "%Y-%m-%d", "congress_age": "%Y-%m-%d",
-        "email_spam": "%Y-%m-%dT%H:%M:%SZ", "gestation_births": "%Y-%m-%d",
-        "granulomatous_disease": "%Y-%m-%d", "marriage_licences": "%Y-%m-%d",
-        "nyc_flights": "%Y-%m-%dT%H:%M:%SZ", "nyc_weather": "%Y-%m-%dT%H:%M:%SZ",
-        "seattle_pets": "%Y-%m-%d", "us_births_1978": "%Y-%m-%d",
+        "baseball_players": "%Y-%m-%d",
+        "congress_age": "%Y-%m-%d",
+        "email_spam": "%Y-%m-%dT%H:%M:%SZ",
+        "gestation_births": "%Y-%m-%d",
+        "granulomatous_disease": "%Y-%m-%d",
+        "marriage_licences": "%Y-%m-%d",
+        "nyc_flights": "%Y-%m-%dT%H:%M:%SZ",
+        "nyc_weather": "%Y-%m-%dT%H:%M:%SZ",
+        "seattle_pets": "%Y-%m-%d",
+        "us_births_1978": "%Y-%m-%d",
         "us_economics": "%Y-%m-%d",
     }
 
@@ -2262,7 +3374,9 @@ def test_a_column_two_r_factors_share_is_written_once_and_named_after_the_first(
 
 def test_an_r_table_is_written_into_a_tree_for_each_class_it_names():
     counts, raw = written(
-        "cat_hearts", b"rownames,Sex,Bwt,Hwt\n1,F,2.0,7.0\n2,M,3.0,11.2\n", "table",
+        "cat_hearts",
+        b"rownames,Sex,Bwt,Hwt\n1,F,2.0,7.0\n2,M,3.0,11.2\n",
+        "table",
     )
     assert counts == {"female": 1, "male": 1}
     with open_root(io.BytesIO(raw)) as back:
@@ -2275,7 +3389,9 @@ def test_an_r_table_is_written_into_a_tree_for_each_class_it_names():
 
 def test_an_r_table_with_a_number_to_predict_writes_every_row_into_one_tree():
     counts, raw = written(
-        "old_faithful", b"rownames,eruptions,waiting\n1,3.6,79\n2,1.8,54\n", "table",
+        "old_faithful",
+        b"rownames,eruptions,waiting\n1,3.6,79\n2,1.8,54\n",
+        "table",
     )
     assert counts == {"rows": 2}
     with open_root(io.BytesIO(raw)) as back:
@@ -2288,14 +3404,35 @@ def test_an_r_table_with_a_number_to_predict_writes_every_row_into_one_tree():
 
 #: The charts Our World in Data serves as one tidy CSV a piece.
 CHARTS = (
-    "gdp_per_capita_worldbank", "electricity_access", "internet_use", "consumer_price_inflation",
-    "unemployment_rate", "freshwater_withdrawals", "air_passengers", "mobile_subscriptions",
-    "internet_users", "co2_emissions", "co2_emissions_per_person", "cumulative_co2_emissions",
-    "co2_per_dollar", "renewable_electricity", "electricity_generation", "renewable_energy",
-    "energy_use_per_person", "primary_energy", "cereal_yields", "calorie_supply",
-    "gdp_per_capita_maddison", "population_density", "urban_population",
-    "life_expectancy_at_birth", "child_mortality", "child_mortality_igme", "adult_literacy",
-    "human_development_index", "sea_level",
+    "gdp_per_capita_worldbank",
+    "electricity_access",
+    "internet_use",
+    "consumer_price_inflation",
+    "unemployment_rate",
+    "freshwater_withdrawals",
+    "air_passengers",
+    "mobile_subscriptions",
+    "internet_users",
+    "co2_emissions",
+    "co2_emissions_per_person",
+    "cumulative_co2_emissions",
+    "co2_per_dollar",
+    "renewable_electricity",
+    "electricity_generation",
+    "renewable_energy",
+    "energy_use_per_person",
+    "primary_energy",
+    "cereal_yields",
+    "calorie_supply",
+    "gdp_per_capita_maddison",
+    "population_density",
+    "urban_population",
+    "life_expectancy_at_birth",
+    "child_mortality",
+    "child_mortality_igme",
+    "adult_literacy",
+    "human_development_index",
+    "sea_level",
 )
 
 
@@ -2351,46 +3488,167 @@ def test_a_chart_writes_every_country_year_into_the_one_tree():
 #: written from, the trials medicine is taught with, what archaeologists dig up
 #: and measure, and the series forecasting is practised on.
 RDATASETS_TWO = (
-    "abortion_and_crime", "adult_services", "affair_counts", "alone_episodes", "alone_loadouts",
-    "alone_seasons", "alone_survivalists", "ancient_shipwrecks", "animal_attributes",
-    "anscombe_quartet", "ansett_passengers", "arbuthnot_christenings", "arctic_pit_houses",
-    "arizona_cardiac_stays", "arthritis_treatment", "ashkenazi_breast_cancer",
-    "atmospheric_radiocarbon", "australian_car_policies", "australian_livestock",
-    "australian_production", "australian_retail", "automobile_claims", "bad_health_visits",
-    "bakeoff_bakers", "bakeoff_challenges", "bakeoff_episodes", "bakeoff_ratings", "barley_yields",
-    "benthic_oxygen_stack", "big_tech_shares", "blood_storage", "bodily_injury_claims",
-    "bone_marrow_leukaemia", "bornholm_brooches", "bowley_wages", "breast_feeding",
-    "breslau_life_table", "bronze_age_cups", "bundesliga_matches", "bundestag_2005",
-    "burn_wound_infection", "care_home_incidents", "cavendish_density", "chinese_bronzes",
-    "cholera_deaths_1849", "choral_singers", "coal_miners_breathing", "college_proximity",
-    "college_scorecard", "corporal_punishment", "covid_testing", "csgo_matches", "cytomegalovirus",
-    "danish_welfare", "dart_points", "datasaurus_dozen", "deep_sea_fish", "drag_race_appearances",
-    "drag_race_contestants", "drag_race_episodes", "drinks_and_wages", "end_scrapers",
-    "epica_carbon_dioxide", "ernest_witte_burials", "esophageal_cancer", "ethanol_engine",
-    "familial_polyposis", "fingerprint_patterns", "fish_adult_growth", "fish_juvenile_catches",
-    "fish_juvenile_growth", "funnel_beaker_pottery", "furze_platt_handaxes", "galton_families",
-    "galton_parent_child", "geologic_time_scale", "german_health_1984", "german_health_reform",
-    "german_suicides", "global_economy", "gosset_yeast_cells", "government_transfers",
-    "guerry_moral_statistics", "hare_and_lynx_pelts", "hepatocellular_carcinoma",
-    "hiv_test_results", "household_budgets", "indomethacin_trial", "infant_pneumonia",
-    "intcal20_curve", "interaction_triptych", "iron_age_fibulae", "iron_age_graves",
-    "jevons_guesses", "kidney_transplant", "kommos_pottery", "laryngoscope_trial", "larynx_cancer",
-    "law_dome_gases", "letters_to_politicians", "licorice_gargle", "london_cholera_districts",
-    "long_stay_patients", "macdonell_criminals", "medicare_stays", "medieval_glass",
-    "mesolithic_tools", "michelsberg_pottery", "minard_troops", "mississippi_pottery",
-    "ngrip_ice_core", "nightingale_mortality", "olympic_running", "organ_donations",
-    "oxford_pottery", "ozone_and_weather", "paris_registrations", "pearson_lee_heights",
-    "plant_carbon_isotopes", "plant_traits", "playfair_wheat", "portal_rodents", "portal_species",
-    "prediabetes", "prostate_survival", "prussian_horse_kicks", "rashomon_quartet",
-    "repeat_victimisation", "republican_vote_share", "restaurant_inspections",
-    "rice_farmer_insurance", "rochdale_women", "roman_street_networks", "romano_british_glass",
-    "romano_british_pottery", "ruspini_points", "sea_level_reconstruction", "ship_damage",
-    "singapore_car_claims", "smartpill_motility", "smoking_cessation", "snodgrass_houses",
-    "snow_cholera_deaths", "std_reinfection", "stone_age_sites", "streptomycin_tuberculosis",
-    "stroke_classification", "supported_work_programme", "supraclavicular_block",
-    "swedish_motorcycles", "texas_prisons", "tongue_cancer", "trial_of_the_pyx",
-    "us_regional_mortality", "victorian_electricity", "virgil_dactyls", "woodland_birds",
-    "workers_compensation", "xclara_clusters", "yule_pauperism", "zuni_pottery",
+    "abortion_and_crime",
+    "adult_services",
+    "affair_counts",
+    "alone_episodes",
+    "alone_loadouts",
+    "alone_seasons",
+    "alone_survivalists",
+    "ancient_shipwrecks",
+    "animal_attributes",
+    "anscombe_quartet",
+    "ansett_passengers",
+    "arbuthnot_christenings",
+    "arctic_pit_houses",
+    "arizona_cardiac_stays",
+    "arthritis_treatment",
+    "ashkenazi_breast_cancer",
+    "atmospheric_radiocarbon",
+    "australian_car_policies",
+    "australian_livestock",
+    "australian_production",
+    "australian_retail",
+    "automobile_claims",
+    "bad_health_visits",
+    "bakeoff_bakers",
+    "bakeoff_challenges",
+    "bakeoff_episodes",
+    "bakeoff_ratings",
+    "barley_yields",
+    "benthic_oxygen_stack",
+    "big_tech_shares",
+    "blood_storage",
+    "bodily_injury_claims",
+    "bone_marrow_leukaemia",
+    "bornholm_brooches",
+    "bowley_wages",
+    "breast_feeding",
+    "breslau_life_table",
+    "bronze_age_cups",
+    "bundesliga_matches",
+    "bundestag_2005",
+    "burn_wound_infection",
+    "care_home_incidents",
+    "cavendish_density",
+    "chinese_bronzes",
+    "cholera_deaths_1849",
+    "choral_singers",
+    "coal_miners_breathing",
+    "college_proximity",
+    "college_scorecard",
+    "corporal_punishment",
+    "covid_testing",
+    "csgo_matches",
+    "cytomegalovirus",
+    "danish_welfare",
+    "dart_points",
+    "datasaurus_dozen",
+    "deep_sea_fish",
+    "drag_race_appearances",
+    "drag_race_contestants",
+    "drag_race_episodes",
+    "drinks_and_wages",
+    "end_scrapers",
+    "epica_carbon_dioxide",
+    "ernest_witte_burials",
+    "esophageal_cancer",
+    "ethanol_engine",
+    "familial_polyposis",
+    "fingerprint_patterns",
+    "fish_adult_growth",
+    "fish_juvenile_catches",
+    "fish_juvenile_growth",
+    "funnel_beaker_pottery",
+    "furze_platt_handaxes",
+    "galton_families",
+    "galton_parent_child",
+    "geologic_time_scale",
+    "german_health_1984",
+    "german_health_reform",
+    "german_suicides",
+    "global_economy",
+    "gosset_yeast_cells",
+    "government_transfers",
+    "guerry_moral_statistics",
+    "hare_and_lynx_pelts",
+    "hepatocellular_carcinoma",
+    "hiv_test_results",
+    "household_budgets",
+    "indomethacin_trial",
+    "infant_pneumonia",
+    "intcal20_curve",
+    "interaction_triptych",
+    "iron_age_fibulae",
+    "iron_age_graves",
+    "jevons_guesses",
+    "kidney_transplant",
+    "kommos_pottery",
+    "laryngoscope_trial",
+    "larynx_cancer",
+    "law_dome_gases",
+    "letters_to_politicians",
+    "licorice_gargle",
+    "london_cholera_districts",
+    "long_stay_patients",
+    "macdonell_criminals",
+    "medicare_stays",
+    "medieval_glass",
+    "mesolithic_tools",
+    "michelsberg_pottery",
+    "minard_troops",
+    "mississippi_pottery",
+    "ngrip_ice_core",
+    "nightingale_mortality",
+    "olympic_running",
+    "organ_donations",
+    "oxford_pottery",
+    "ozone_and_weather",
+    "paris_registrations",
+    "pearson_lee_heights",
+    "plant_carbon_isotopes",
+    "plant_traits",
+    "playfair_wheat",
+    "portal_rodents",
+    "portal_species",
+    "prediabetes",
+    "prostate_survival",
+    "prussian_horse_kicks",
+    "rashomon_quartet",
+    "repeat_victimisation",
+    "republican_vote_share",
+    "restaurant_inspections",
+    "rice_farmer_insurance",
+    "rochdale_women",
+    "roman_street_networks",
+    "romano_british_glass",
+    "romano_british_pottery",
+    "ruspini_points",
+    "sea_level_reconstruction",
+    "ship_damage",
+    "singapore_car_claims",
+    "smartpill_motility",
+    "smoking_cessation",
+    "snodgrass_houses",
+    "snow_cholera_deaths",
+    "std_reinfection",
+    "stone_age_sites",
+    "streptomycin_tuberculosis",
+    "stroke_classification",
+    "supported_work_programme",
+    "supraclavicular_block",
+    "swedish_motorcycles",
+    "texas_prisons",
+    "tongue_cancer",
+    "trial_of_the_pyx",
+    "us_regional_mortality",
+    "victorian_electricity",
+    "virgil_dactyls",
+    "woodland_birds",
+    "workers_compensation",
+    "xclara_clusters",
+    "yule_pauperism",
+    "zuni_pottery",
 )
 
 
@@ -2412,8 +3670,13 @@ def test_every_table_on_the_second_shelf_passes_on_its_own_packages_licence():
     for name in RDATASETS_TWO:
         held.setdefault(DATASETS[name].licence, []).append(name)
     assert {licence: len(names) for licence, names in sorted(held.items())} == {
-        "CC0": 11, "GPL": 22, "GPL-2": 27, "GPL-2 or later": 27, "GPL-3": 13,
-        "GPL-3 or later": 25, "MIT": 36,
+        "CC0": 11,
+        "GPL": 22,
+        "GPL-2": 27,
+        "GPL-2 or later": 27,
+        "GPL-3": 13,
+        "GPL-3 or later": 25,
+        "MIT": 36,
     }
 
 
@@ -2429,25 +3692,44 @@ def test_every_table_on_the_second_shelf_names_a_class_or_measures_a_number():
 def test_the_second_shelf_tells_a_counted_row_from_one_that_names_a_thing():
     named = [name for name in RDATASETS_TWO if DATASETS[name].fields[0] == ("name", "text")]
     assert named == [
-        "animal_attributes", "atmospheric_radiocarbon", "ernest_witte_burials", "kommos_pottery",
-        "michelsberg_pottery", "mississippi_pottery", "plant_traits", "republican_vote_share",
-        "snodgrass_houses", "woodland_birds", "zuni_pottery",
+        "animal_attributes",
+        "atmospheric_radiocarbon",
+        "ernest_witte_burials",
+        "kommos_pottery",
+        "michelsberg_pottery",
+        "mississippi_pottery",
+        "plant_traits",
+        "republican_vote_share",
+        "snodgrass_houses",
+        "woodland_birds",
+        "zuni_pottery",
     ]
-    assert all(DATASETS[name].fields[0] == ("row", "i")
-               for name in RDATASETS_TWO if name not in named)
+    assert all(
+        DATASETS[name].fields[0] == ("row", "i") for name in RDATASETS_TWO if name not in named
+    )
 
 
 def test_the_second_shelf_says_how_every_day_and_clock_it_keeps_is_written():
-    dated = {name: DATASETS[name].dates for name in RDATASETS_TWO
-             if any(role in ("date", "time") for _, role in DATASETS[name].fields)}
+    dated = {
+        name: DATASETS[name].dates
+        for name in RDATASETS_TWO
+        if any(role in ("date", "time") for _, role in DATASETS[name].fields)
+    }
     assert dated == {
-        "alone_episodes": "%Y-%m-%d", "alone_seasons": "%Y-%m-%d",
-        "atmospheric_radiocarbon": "%Y-%m-%d", "bakeoff_bakers": "%Y-%m-%d",
-        "bakeoff_ratings": "%Y-%m-%d", "big_tech_shares": "%Y-%m-%d",
-        "bundesliga_matches": "%Y-%m-%dT%H:%M:%SZ", "cholera_deaths_1849": "%Y-%m-%d",
-        "drag_race_contestants": "%Y-%m-%d", "drag_race_episodes": "%Y-%m-%d",
-        "fish_juvenile_catches": "%Y-%m-%d", "fish_juvenile_growth": "%Y-%m-%d",
-        "nightingale_mortality": "%Y-%m-%d", "paris_registrations": "%Y-%m-%d",
+        "alone_episodes": "%Y-%m-%d",
+        "alone_seasons": "%Y-%m-%d",
+        "atmospheric_radiocarbon": "%Y-%m-%d",
+        "bakeoff_bakers": "%Y-%m-%d",
+        "bakeoff_ratings": "%Y-%m-%d",
+        "big_tech_shares": "%Y-%m-%d",
+        "bundesliga_matches": "%Y-%m-%dT%H:%M:%SZ",
+        "cholera_deaths_1849": "%Y-%m-%d",
+        "drag_race_contestants": "%Y-%m-%d",
+        "drag_race_episodes": "%Y-%m-%d",
+        "fish_juvenile_catches": "%Y-%m-%d",
+        "fish_juvenile_growth": "%Y-%m-%d",
+        "nightingale_mortality": "%Y-%m-%d",
+        "paris_registrations": "%Y-%m-%d",
         "victorian_electricity": "%Y-%m-%dT%H:%M:%SZ",
     }
 
@@ -2462,8 +3744,13 @@ def test_a_table_that_keeps_a_clock_beside_a_calendar_writes_the_calendar_out():
 
 def test_a_row_left_blank_where_a_class_was_asked_for_becomes_a_class_of_its_own():
     blank = [name for name in RDATASETS_TWO if "" in DATASETS[name].labels]
-    assert blank == ["bakeoff_challenges", "college_scorecard", "geologic_time_scale",
-                     "hiv_test_results", "portal_rodents"]
+    assert blank == [
+        "bakeoff_challenges",
+        "college_scorecard",
+        "geologic_time_scale",
+        "hiv_test_results",
+        "portal_rodents",
+    ]
     assert DATASETS["bakeoff_challenges"].labels[""] == 7
     assert DATASETS["bakeoff_challenges"].classes[-1] == "not_recorded"
     assert DATASETS["geologic_time_scale"].classes[-1] == "unranked"
@@ -2497,7 +3784,9 @@ def test_a_table_from_the_second_shelf_is_written_into_a_tree_for_each_class():
 
 def test_a_table_from_the_second_shelf_with_a_number_to_predict_writes_one_tree():
     counts, raw = written(
-        "galton_parent_child", b"rownames,parent,child\n1,70.5,61.7\n2,68.5,61.7\n", "table",
+        "galton_parent_child",
+        b"rownames,parent,child\n1,70.5,61.7\n2,68.5,61.7\n",
+        "table",
     )
     assert counts == {"rows": 2}
     with open_root(io.BytesIO(raw)) as back:
@@ -2507,23 +3796,224 @@ def test_a_table_from_the_second_shelf_with_a_number_to_predict_writes_one_tree(
         assert list(tree["child"].array()) == [61.7, 61.7]
 
 
+# --- the disk-backed UCI archives ------------------------------------------
+
+
+def test_a_large_source_cache_is_atomic_reusable_and_size_checked(tmp_path):
+    cache = tmp_path / "sources"
+    payload = b"a seekable archive"
+    path, temporary = datasets_module._fetch_file(
+        io.BytesIO(payload),
+        cache=cache,
+        name="example",
+        expected=len(payload),
+        config=None,
+    )
+    assert path == cache / "example.source"
+    assert path.read_bytes() == payload and not temporary
+    assert not (cache / "example.source.part").exists()
+
+    unused = io.BytesIO(b"this must not replace the cache")
+    reused, temporary = datasets_module._fetch_file(
+        unused,
+        cache=cache,
+        name="example",
+        expected=len(payload),
+        config=None,
+    )
+    assert reused == path and not temporary and unused.tell() == 0
+
+    with pytest.raises(ValueError, match="cached source"):
+        datasets_module._fetch_file(
+            unused,
+            cache=cache,
+            name="example",
+            expected=len(payload) + 1,
+            config=None,
+        )
+
+
+def test_hepmass_streams_a_gzipped_member_from_a_disk_backed_zip(tmp_path):
+    source = tmp_path / "hepmass.zip"
+    header = ",".join(("label", *(f"f{at}" for at in range(27))))
+    rows = "\n".join(
+        (
+            header,
+            ",".join(("0", *(str(at) for at in range(27)))),
+            ",".join(("1", *(str(at + 1) for at in range(27)))),
+        )
+    )
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("1000_train.csv.gz", gzip.compress((rows + "\n").encode()))
+    target = tmp_path / "hepmass.root"
+
+    counts = convert(
+        "hepmass",
+        target,
+        split="train_1000",
+        parts={"archive": source},
+    )
+
+    assert counts == {"train_1000_background": 1, "train_1000_signal": 1}
+    with open_root(target) as back:
+        signal = back["train_1000_signal"]
+        assert signal.num_entries == 1
+        assert list(signal["features"].array()) == [float(at + 1) for at in range(27)]
+        assert list(signal["label"].array()) == [1]
+
+
+def test_realdisp_keeps_sensor_readings_and_subject_placement(tmp_path):
+    source = tmp_path / "realdisp.zip"
+    cells = ["1", "2", *(str(at / 10) for at in range(117)), "3"]
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("subject15_mutual4.log", "\t".join(cells) + "\n")
+
+    classes, columns, rows = large_module.load("realdisp", source, "all")
+    assert classes[3] == "activity_3" and columns["features"] == ("f", 117)
+    made = list(rows)
+    assert len(made) == 1 and made[0][0] == 3
+    row = made[0][1]
+    assert list(row.pop("features")) == pytest.approx([at / 10 for at in range(117)])
+    assert row == {
+        "seconds": 1,
+        "microseconds": 2,
+        "subject": 15,
+        "scenario": 2,
+        "displacement": 4,
+        "label": 3,
+        "index": 0,
+    }
+
+
+def test_one_gas_recording_becomes_the_published_75_time_series(tmp_path):
+    source = tmp_path / "gas.zip"
+    cells = ["0"] * 92
+    cells[9:11] = ["21.5", "58.0"]
+    for board in range(9):
+        cells[11 + board * 9] = "1"
+    name = (
+        "WTD_upload/Benzene_200/L3/"
+        "201105121600_board_setPoint_400V_fan_setPoint_100_"
+        "mfc_setPoint_Benzene_200ppm_p5"
+    )
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr(name, "\t".join(cells) + "\n")
+
+    classes, columns, rows = large_module.load("gas", source, "all")
+    made = list(rows)
+    which, row = made[0]
+    assert classes[which] == "benzene" and columns["sensors"] == ("f", 72 * 26_000)
+    assert row["length"] == 1 and len(row["sensors"]) == 72 * 26_000
+    assert row["temperature"][0] == 21.5 and row["humidity"][0] == 58.0
+    assert row["concentration"] == 200 and row["location"] == 3
+
+
+def test_chipseq_splits_coverage_runs_at_weak_label_boundaries():
+    coverage = io.BytesIO(gzip.compress(b"chr1 0 10 7\n"))
+    labels = b"chr1 2 4 noPeaks\nchr1 6 8 peaks\n"
+    rows = list(large_module._chip_problem(coverage, labels, name="problem", problem=5, first=10))
+    assert [(which, row["start"], row["end"]) for which, row in rows] == [
+        (0, 0, 2),
+        (1, 2, 4),
+        (0, 4, 6),
+        (2, 6, 8),
+        (0, 8, 10),
+    ]
+    assert all(row["count"] == 7 and row["problem"] == 5 for _, row in rows)
+
+
+def _dicom_element(group, element, vr, value):
+    tag = struct.pack("<HH", group, element)
+    if vr in (b"OW",):
+        return tag + vr + b"\0\0" + struct.pack("<I", len(value)) + value
+    return tag + vr + struct.pack("<H", len(value)) + value
+
+
+def test_the_medical_deepfake_reader_keeps_signed_dicom_pixels():
+    pixels = array.array("h", [-1000, 50])
+    raw = bytearray(128) + b"DICM"
+    raw += _dicom_element(0x0028, 0x0010, b"US", struct.pack("<H", 512))
+    raw += _dicom_element(0x0028, 0x0011, b"US", struct.pack("<H", 512))
+    raw += _dicom_element(0x0028, 0x0100, b"US", struct.pack("<H", 16))
+    raw += _dicom_element(0x0028, 0x0103, b"US", struct.pack("<H", 1))
+    raw += _dicom_element(0x0028, 0x1052, b"DS", b"-1024 ")
+    raw += _dicom_element(0x0028, 0x1053, b"DS", b"1 ")
+    raw += _dicom_element(
+        0x7FE0,
+        0x0010,
+        b"OW",
+        pixels.tobytes() + bytes((512 * 512 - len(pixels)) * 2),
+    )
+
+    image, intercept, slope = large_module._dicom_pixels(bytes(raw))
+
+    assert len(image) == 512 * 512 and list(image[:2]) == [-1000, 50]
+    assert intercept == -1024 and slope == 1
+
+
+def test_medical_deepfake_truth_labels_locations_not_whole_scans(tmp_path):
+    source = tmp_path / "labels.zip"
+    header = "type,uuid,slice,x,y\n"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("Tampered Scans/labels_exp1.csv", header + "TB,7,12,20,21\n")
+        archive.writestr("Tampered Scans/labels_exp2.csv", header + "FM,8,13,22,23\n")
+    with zipfile.ZipFile(source) as archive:
+        truth = large_module._dicom_truth(archive)
+
+    assert truth == {(1, 7, 12): (1, 20, 21), (2, 8, 13): (4, 22, 23)}
+    assert (1, 7, 11) not in truth  # a benign location does not label its entire scan
+
+
+def test_ppg_pickles_cannot_name_an_arbitrary_python_callable():
+    with pytest.raises(pickle.UnpicklingError, match=r"forbidden builtins\.eval"):
+        large_module._ArraysOnly(io.BytesIO(pickle.dumps(eval))).load()
+
+
 # --- what the second shelf of country-year charts reads ---------------------
 
 #: The rest of the Our World in Data shelf: what the world burns and generates,
 #: what it lets into the air, how warm the air and the sea have grown, and what
 #: the land is put to.
 CHARTS_TWO = (
-    "fossil_electricity_share", "nuclear_electricity_share", "wind_electricity_share",
-    "solar_electricity_share", "hydro_electricity_share", "electricity_per_person",
-    "electricity_demand", "fossil_fuel_energy", "electricity_carbon_intensity", "coal_production",
-    "oil_production", "gas_production", "consumption_co2_emissions", "methane_emissions",
-    "nitrous_oxide_emissions", "greenhouse_gas_emissions", "temperature_anomaly",
-    "sea_surface_temperature", "ice_sheet_mass", "annual_precipitation", "forest_cover",
-    "agricultural_land", "fertilizer_use", "pesticide_use", "wheat_yields", "maize_yields",
-    "rice_yields", "cereal_production", "cattle_numbers", "fish_consumption",
-    "gdp_per_capita_growth", "trade_share_of_gdp", "foreign_direct_investment",
-    "labour_force_participation", "world_population", "birth_rate", "maternal_mortality",
-    "international_migrants", "broadband_subscriptions",
+    "fossil_electricity_share",
+    "nuclear_electricity_share",
+    "wind_electricity_share",
+    "solar_electricity_share",
+    "hydro_electricity_share",
+    "electricity_per_person",
+    "electricity_demand",
+    "fossil_fuel_energy",
+    "electricity_carbon_intensity",
+    "coal_production",
+    "oil_production",
+    "gas_production",
+    "consumption_co2_emissions",
+    "methane_emissions",
+    "nitrous_oxide_emissions",
+    "greenhouse_gas_emissions",
+    "temperature_anomaly",
+    "sea_surface_temperature",
+    "ice_sheet_mass",
+    "annual_precipitation",
+    "forest_cover",
+    "agricultural_land",
+    "fertilizer_use",
+    "pesticide_use",
+    "wheat_yields",
+    "maize_yields",
+    "rice_yields",
+    "cereal_production",
+    "cattle_numbers",
+    "fish_consumption",
+    "gdp_per_capita_growth",
+    "trade_share_of_gdp",
+    "foreign_direct_investment",
+    "labour_force_participation",
+    "world_population",
+    "birth_rate",
+    "maternal_mortality",
+    "international_migrants",
+    "broadband_subscriptions",
 )
 
 
@@ -2531,14 +4021,17 @@ def test_the_second_shelf_of_charts_reads_the_csv_owid_serves_as_well():
     assert len(CHARTS_TWO) == len(set(CHARTS_TWO)) == 39
     assert not set(CHARTS_TWO) & set(CHARTS)
     for name in CHARTS_TWO:
-        spec = DATASETS[name]
-        assert isinstance(spec, Table)
-        assert spec.licence == "CC BY 4.0"
-        assert spec.source.startswith("https://ourworldindata.org/grapher/")
-        assert spec.url == f"{spec.source}.csv?v=1&csvType=full&useColumnShortNames=true"
-        assert spec.header and not spec.classes and spec.splits == ("all",)
-        assert spec.fields[:2] == (("entity", "text"), ("code", "text"))
-        assert sum(role == "target" for _, role in spec.fields) == 1
+        _assert_second_shelf_chart(DATASETS[name])
+
+
+def _assert_second_shelf_chart(spec):
+    assert isinstance(spec, Table)
+    assert spec.licence == "CC BY 4.0"
+    assert spec.source.startswith("https://ourworldindata.org/grapher/")
+    assert spec.url == f"{spec.source}.csv?v=1&csvType=full&useColumnShortNames=true"
+    assert spec.header and not spec.classes and spec.splits == ("all",)
+    assert spec.fields[:2] == (("entity", "text"), ("code", "text"))
+    assert sum(role == "target" for _, role in spec.fields) == 1
 
 
 def test_every_chart_on_the_second_shelf_but_the_ice_counts_by_the_year():
@@ -2551,14 +4044,27 @@ def test_every_chart_on_the_second_shelf_but_the_ice_counts_by_the_year():
 
 def test_a_chart_that_carries_more_than_one_measure_predicts_the_named_one():
     late = [name for name in CHARTS_TWO if DATASETS[name].fields[-1][1] != "target"]
-    assert late == ["temperature_anomaly", "sea_surface_temperature",
-                    "forest_cover", "maternal_mortality"]
+    assert late == [
+        "temperature_anomaly",
+        "sea_surface_temperature",
+        "forest_cover",
+        "maternal_mortality",
+    ]
     assert DATASETS["temperature_anomaly"].fields[3:] == (
-        ("anomaly_c", "target"), ("anomaly_low", "d"), ("anomaly_high", "d"))
+        ("anomaly_c", "target"),
+        ("anomaly_low", "d"),
+        ("anomaly_high", "d"),
+    )
     assert DATASETS["sea_surface_temperature"].fields[3:] == (
-        ("anomaly_c", "target"), ("anomaly_low", "d"), ("anomaly_high", "d"))
+        ("anomaly_c", "target"),
+        ("anomaly_low", "d"),
+        ("anomaly_high", "d"),
+    )
     assert DATASETS["maternal_mortality"].fields[3:] == (
-        ("deaths_per_100k", "target"), ("region", "text"), ("note", "text"))
+        ("deaths_per_100k", "target"),
+        ("region", "text"),
+        ("note", "text"),
+    )
     assert DATASETS["forest_cover"].fields[-1] == ("note", "text")
     # The carbon-intensity chart used to carry a region beside the measure and
     # no longer does: OWID reshaped it to the four columns it has now.

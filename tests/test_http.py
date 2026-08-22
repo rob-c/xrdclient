@@ -112,6 +112,18 @@ def test_the_request_target_is_encoded_and_keeps_no_secrets():
     assert request_target(url) == "/store/a%20b?cks.type=adler32"
 
 
+def test_the_request_target_preserves_valid_percent_escapes_only():
+    url = parse("https://h/resolve/refs%2Fconvert/a%zz b")
+    assert request_target(url) == "/resolve/refs%2Fconvert/a%25zz%20b"
+
+
+def test_the_request_target_preserves_a_signed_query_byte_for_byte():
+    query = "name=a+b%2Ac&Policy=eyJ__&Signature=abc%7Edef&authz=SECRET"
+    assert request_target(parse(f"https://cdn.example/p?{query}")) == (
+        "/p?name=a+b%2Ac&Policy=eyJ__&Signature=abc%7Edef"
+    )
+
+
 def test_a_token_is_presented_as_a_bearer_header(dav):
     dav.require_token = "s3cr3t"
     with xrd.FileSystem(dav.url) as anonymous, pytest.raises(PermissionError):
@@ -199,6 +211,13 @@ def test_reading_is_a_get_and_seeking_is_a_ranged_get(dav):
         fh.seek(6)
         assert fh.read() == b"world"
         assert fh.seek(0, io.SEEK_END) == len(BODY)
+
+
+def test_reading_again_after_eof_does_not_request_an_unsatisfiable_range(dav):
+    with open_http(dav.url / "d/a.root", "rb", buffering=0) as fh:
+        assert fh.read() == BODY
+        assert fh.read() == b""
+    assert dav.seen.count(("GET", "/d/a.root")) == 1
 
 
 def test_a_server_that_ignores_ranges_still_gives_the_right_bytes(dav):

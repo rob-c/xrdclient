@@ -315,3 +315,21 @@ The gate in `pyproject.toml` deliberately covers only the wire protocol, the
 cryptography and the client surface, because coverage of the optional adapters
 (fsspec, the CLI, `asyncio`) depends on which extras are installed. Run the
 second form to see the whole package.
+
+## Maintainability regression test
+
+The suite also measures every handwritten Python function for cyclomatic,
+cognitive and NPath complexity, Halstead Volume and maximum nesting depth. The
+same absolute limits apply to existing and new code; there is no baseline or
+allowance mechanism. A separate policy test pins CCN at 10, Cognitive
+Complexity at 15, NPath at 200, Halstead Volume at 500 and maximum nesting at
+4 so the suite cannot be made green by quietly relaxing a threshold.
+
+```console
+$ python tools/maintainability.py check
+$ python tools/maintainability.py hotspots
+$ python tools/maintainability.py report --top 50
+```
+
+See [Maintainability metrics](maintainability.md) for the metric definitions,
+machine-readable reports and the complete hotspot drill-down.

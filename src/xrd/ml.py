@@ -38,11 +38,12 @@ import hashlib
 import json
 import math
 import os
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, Union, cast
 
 from .root import open_root
+from .root.errors import UnsupportedFeatureError
 from .root.interp import Numeric
 
 # ``_torch`` is the import of PyTorch with the refusal that says what to
@@ -55,7 +56,17 @@ if TYPE_CHECKING:
     from .root.file import ROOTFile
     from .root.tree import TTree
 
-__all__ = ["load", "download", "Dataset", "Split", "Column"]
+__all__ = [
+    "load",
+    "download",
+    "load_image_2d",
+    "visualize_2d",
+    "Image2D",
+    "Normalization",
+    "Dataset",
+    "Split",
+    "Column",
+]
 
 #: Tree-name prefixes that mean "this part of the data", in the order they
 #: belong in a summary: a dataset is trained on the first and scored on the
@@ -79,6 +90,628 @@ POOL_BYTES = 64 * 1024 * 1024
 
 #: Darkest last: a byte becomes one of these when a picture is printed.
 SHADES = " .:-=+*#%@"
+
+#: The order in which the visual materials converters flatten their three
+#: orthogonal projections into the ``projection`` branch.
+IMAGE_PLANES = ("xy", "xz", "yz")
+
+#: Ways an :class:`Image2D` can turn its stored values into model inputs.
+Normalization = Literal["max", "minmax", "none"]
+
+_Pixel = Union[int, float]
+_Pixels = tuple[tuple[_Pixel, ...], ...]
+_NormalizedPixels = tuple[tuple[float, ...], ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class Image2D:
+    """One ROOT image in both its stored and model-ready forms.
+
+    ``raw`` is the two-dimensional matrix exactly as stored in its branch.
+    ``normalized`` is a floating-point matrix made according to
+    :attr:`normalization`. For the JARVIS projections, a raw zero is empty
+    space and a nonzero pixel is the largest atomic number occupying that
+    fractional-coordinate cell.
+
+    Instances come from :func:`load_image_2d` (or its descriptive alias,
+    :func:`visualize_2d`). The matrices are immutable nested tuples of ordinary
+    Python numbers, so inspection and serialization require no NumPy,
+    Matplotlib, or training framework. Conversion and presentation helpers
+    import their optional dependencies only when called.
+    """
+
+    dataset: str
+    tree: str
+    entry: int
+    plane: str | None
+    jid: str
+    formula: str
+    target: float | None
+    raw: _Pixels = dataclasses.field(repr=False)
+    normalized: _NormalizedPixels = dataclasses.field(repr=False)
+    branch: str = "projection"
+    normalization: Normalization = "max"
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        """The image height and width."""
+        return len(self.raw), len(self.raw[0]) if self.raw else 0
+
+    @property
+    def height(self) -> int:
+        """The number of pixel rows."""
+        return self.shape[0]
+
+    @property
+    def width(self) -> int:
+        """The number of pixels in each row."""
+        return self.shape[1]
+
+    @property
+    def raw_min(self) -> _Pixel:
+        """The smallest stored pixel value, or zero for an empty image."""
+        return min((min(row, default=0) for row in self.raw), default=0)
+
+    @property
+    def raw_max(self) -> _Pixel:
+        """The largest stored pixel value, or zero for an empty image."""
+        return max((max(row, default=0) for row in self.raw), default=0)
+
+    @property
+    def metadata(self) -> dict[str, str | int | float | None]:
+        """Traceable identifiers and the exact ROOT location of this image."""
+        return {
+            "dataset": self.dataset,
+            "tree": self.tree,
+            "entry": self.entry,
+            "branch": self.branch,
+            "plane": self.plane,
+            "jid": self.jid,
+            "formula": self.formula,
+            "target": self.target,
+            "normalization": self.normalization,
+        }
+
+    def values(self, *, normalized: bool = True) -> _Pixels | _NormalizedPixels:
+        """Return the normalized matrix by default, or the stored values."""
+        return self.normalized if normalized else self.raw
+
+    def flat(self, *, normalized: bool = True) -> tuple[_Pixel, ...]:
+        """Return a row-major flat tuple, ready for a non-image model input."""
+        return tuple(value for row in self.values(normalized=normalized) for value in row)
+
+    def with_normalization(self, normalization: Normalization) -> Image2D:
+        """Return the same raw image normalized a different way."""
+        normalized = _normalizer(normalization)(self.raw)
+        return dataclasses.replace(
+            self,
+            normalized=normalized,
+            normalization=normalization,
+        )
+
+    def to_numpy(self, *, normalized: bool = True, dtype: Any = None) -> Any:
+        """Return a two-dimensional NumPy array.
+
+        Normalized values default to ``float32``; raw values retain NumPy's
+        inferred integer or floating-point type unless ``dtype`` is supplied.
+        NumPy remains optional and is imported only for this call.
+        """
+        numpy = _numpy()
+        wanted = dtype if dtype is not None else ("float32" if normalized else None)
+        return numpy.asarray(self.values(normalized=normalized), dtype=wanted)
+
+    def to_tensor(
+        self,
+        *,
+        normalized: bool = True,
+        channel: bool = True,
+        dtype: Any = None,
+        device: Any = None,
+    ) -> Any:
+        """Return a PyTorch tensor, optionally with a leading channel axis.
+
+        The default shape is ``(1, height, width)``, ready for a convolutional
+        model. ``channel=False`` returns ``(height, width)``. Normalized values
+        default to PyTorch ``float32``; a raw conversion lets PyTorch infer its
+        type unless ``dtype`` is supplied.
+        """
+        torch = _torch()
+        wanted = dtype if dtype is not None else (torch.float32 if normalized else None)
+        options = {"device": device}
+        if wanted is not None:
+            options["dtype"] = wanted
+        tensor = torch.tensor(self.values(normalized=normalized), **options)
+        return tensor.unsqueeze(0) if channel else tensor
+
+    def plot(
+        self,
+        *,
+        axes: Any = None,
+        cmap: str = "magma",
+        origin: Literal["lower", "upper"] = "lower",
+        interpolation: str = "nearest",
+        colorbar: bool = True,
+        title: str | None = None,
+    ) -> tuple[Any, Any]:
+        """Draw the raw and normalized images side by side with matplotlib.
+
+        Bring a pair of ``axes`` to embed the comparison in an existing
+        figure, or omit it to create one. The returned ``(figure, axes)`` can
+        be further styled or displayed. ``title=""`` suppresses the automatic
+        dataset title. Install the optional dependency with
+        ``pip install pyxrootdclient[plot]``.
+        """
+        pyplot = _pyplot()
+        figure, selected = _image_axes(pyplot, axes)
+        _draw_image(
+            figure,
+            selected[0],
+            self.raw,
+            "Raw values",
+            cmap,
+            origin,
+            interpolation,
+            colorbar,
+        )
+        _draw_image(
+            figure,
+            selected[1],
+            self.normalized,
+            f"Normalized ({self.normalization})",
+            cmap,
+            origin,
+            interpolation,
+            colorbar,
+        )
+        caption = self._title() if title is None else title
+        if caption:
+            figure.suptitle(caption)
+        return figure, selected
+
+    def save(
+        self,
+        destination: str | os.PathLike[str],
+        *,
+        dpi: int = 160,
+        **plot_options: Any,
+    ) -> Path:
+        """Plot to ``destination`` and return its path.
+
+        A figure created by this call is closed after writing. If ``axes=``
+        embeds the plot in a caller-owned figure, that figure is left open.
+        """
+        if type(dpi) is not int or dpi <= 0:
+            raise ValueError(f"dpi must be a positive integer, not {dpi!r}")
+        pyplot = _pyplot()
+        private = plot_options.get("axes") is None
+        figure, _axes = self.plot(**plot_options)
+        try:
+            figure.savefig(destination, dpi=dpi)
+        finally:
+            if private:
+                pyplot.close(figure)
+        return Path(destination)
+
+    def _title(self) -> str:
+        """A concise title retaining both human and source identity."""
+        identity = self.formula or self.jid or Path(self.dataset).name
+        plane = f" · {self.plane}" if self.plane is not None else ""
+        return f"{identity} · {self.tree}[{self.entry}] · {self.branch}{plane}"
+
+    def __repr__(self) -> str:
+        """Describe the image without printing thousands of pixels."""
+        plane = f", plane={self.plane!r}" if self.plane is not None else ""
+        return (
+            f"<Image2D {self.width}x{self.height} from {self.tree!r}/{self.branch!r}"
+            f" entry={self.entry}{plane}, normalization={self.normalization!r}>"
+        )
+
+
+def load_image_2d(
+    source: Any,
+    *,
+    tree: str = "train",
+    entry: int = 0,
+    branch: str = "projection",
+    plane: str | int | None = "xy",
+    shape: tuple[int, int] | None = None,
+    planes: Sequence[str] | None = IMAGE_PLANES,
+    normalization: Normalization = "max",
+    config: Config | None = None,
+) -> Image2D:
+    """Read one 2D image without downloading the whole ROOT dataset.
+
+        >>> image = load_image_2d("jarvis_dft2d_formation_energy")  # doctest: +SKIP
+        >>> image.shape, image.raw_max                              # doctest: +SKIP
+        ((32, 32), 83)
+        >>> image.to_tensor().shape                                # doctest: +SKIP
+        torch.Size([1, 32, 32])
+
+    ``source`` accepts the same local path, remote URL, open binary file, or
+    catalogue name as :func:`load`. ``tree``, ``entry`` and ``branch`` select
+    the stored values; negative entries count from the end. Only that row and
+    its short metadata columns are read, so this remains a small range read
+    against a hosted ``.root`` file.
+
+    The defaults understand every ``jarvis_dft2d_*`` file: ``projection`` is
+    three square images named ``xy``, ``xz`` and ``yz``. For an ordinary
+    single-image branch, pass ``planes=None`` and ``plane=None``; a square is
+    inferred, or ``shape=(height, width)`` describes a rectangle. A layered
+    custom branch can provide names through ``planes`` and select one by name
+    or zero-based integer through ``plane``.
+
+    ``normalization="max"`` divides by the largest absolute value,
+    ``"minmax"`` maps the stored minimum and maximum to zero and one, and
+    ``"none"`` makes an unchanged floating-point copy. The raw matrix is
+    always retained.
+    """
+    normalize = _normalizer(normalization)
+    names = _plane_names(planes)
+    if isinstance(source, str) and _is_name(source):
+        source = _from_catalogue(source, config)[0]
+    with open_root(source, config=config) as handle:
+        selected, actual = _selected_entry(handle, tree, entry)
+        raw, selected_plane = _image_rows(
+            selected,
+            actual,
+            branch,
+            plane,
+            shape,
+            names,
+        )
+        return Image2D(
+            dataset=handle.name,
+            tree=tree,
+            entry=actual,
+            plane=selected_plane,
+            jid=_text_value(selected, "jid", actual),
+            formula=_text_value(selected, "formula", actual),
+            target=_number_value(selected, "target", actual),
+            raw=raw,
+            normalized=normalize(raw),
+            branch=branch,
+            normalization=normalization,
+        )
+
+
+def visualize_2d(
+    source: Any,
+    *,
+    tree: str = "train",
+    entry: int = 0,
+    branch: str = "projection",
+    plane: str | int | None = "xy",
+    shape: tuple[int, int] | None = None,
+    planes: Sequence[str] | None = IMAGE_PLANES,
+    normalization: Normalization = "max",
+    config: Config | None = None,
+) -> Image2D:
+    """Alias for :func:`load_image_2d`, retained for visualization-first code."""
+    return load_image_2d(
+        source,
+        tree=tree,
+        entry=entry,
+        branch=branch,
+        plane=plane,
+        shape=shape,
+        planes=planes,
+        normalization=normalization,
+        config=config,
+    )
+
+
+def _selected_entry(file: ROOTFile, name: str, entry: int) -> tuple[TTree, int]:
+    """Find one tree entry and turn a negative index into its real position."""
+    try:
+        tree = cast("TTree", file[name])
+    except KeyError:
+        raise KeyError(
+            f"{file.name} has no {name!r} tree; it has {', '.join(file.keys())}"
+        ) from None
+    actual = len(tree) + entry if entry < 0 else entry
+    if not 0 <= actual < len(tree):
+        raise IndexError(f"entry {entry} is outside {name!r}, which has {len(tree)} entries")
+    return tree, actual
+
+
+def _image_rows(
+    tree: TTree,
+    entry: int,
+    name: str,
+    plane: str | int | None,
+    shape: tuple[int, int] | None,
+    planes: tuple[str, ...],
+) -> tuple[_Pixels, str | None]:
+    """Read and reshape one layer of one fixed-size image branch."""
+    if name not in tree:
+        raise KeyError(f"{tree.name!r} has no {name!r} branch; it has {', '.join(tree.keys())}")
+    branch = tree[name]
+    if not isinstance(branch.column, Numeric) or branch.is_jagged:
+        raise ValueError(
+            f"{tree.name!r}/{name!r} is not a fixed-size numeric branch and cannot be a 2D image"
+        )
+    height, width, layers = _image_layout(tree.name, name, branch.length, shape, planes)
+    layer, label = _plane_index(plane, planes, layers)
+    size = height * width
+    start = layer * size
+    values = branch.array(entry, entry + 1)[start : start + size]
+    return _pixel_rows(values, height, width), label
+
+
+def _image_layout(
+    tree: str,
+    branch: str,
+    width: int,
+    shape: tuple[int, int] | None,
+    planes: tuple[str, ...],
+) -> tuple[int, int, int]:
+    """Validate and describe the rectangular layers in an image column."""
+    if shape is None:
+        return _square_layout(tree, branch, width, len(planes) or 1)
+    return _shaped_layout(tree, branch, width, shape, planes)
+
+
+def _square_layout(tree: str, branch: str, width: int, layers: int) -> tuple[int, int, int]:
+    """Infer equal square layers from a fixed column width."""
+    size, remainder = divmod(width, layers)
+    side = math.isqrt(size)
+    if remainder or not side or side * side != size:
+        raise _image_layout_error(tree, branch, width)
+    return side, side, layers
+
+
+def _shaped_layout(
+    tree: str,
+    branch: str,
+    width: int,
+    shape: tuple[int, int],
+    planes: tuple[str, ...],
+) -> tuple[int, int, int]:
+    """Check an explicit height and width against the column and layer names."""
+    height, image_width = _valid_shape(shape)
+    size = height * image_width
+    layers, remainder = divmod(width, size)
+    if remainder or not layers:
+        raise _image_layout_error(tree, branch, width)
+    if planes and len(planes) != layers:
+        raise ValueError(
+            f"{tree!r}/{branch!r} contains {layers} images of shape {shape}, "
+            f"but {len(planes)} plane names were supplied"
+        )
+    return height, image_width, layers
+
+
+def _valid_shape(shape: tuple[int, int]) -> tuple[int, int]:
+    """Return a positive integer image shape with a user-facing refusal."""
+    if not isinstance(shape, tuple) or len(shape) != 2:
+        raise ValueError(f"shape must be two positive integers, not {shape!r}")
+    if any(type(value) is not int or value <= 0 for value in shape):
+        raise ValueError(f"shape must be two positive integers, not {shape!r}")
+    return shape
+
+
+def _image_layout_error(tree: str, branch: str, width: int) -> ValueError:
+    """Explain how to resolve a branch whose image geometry is ambiguous."""
+    return ValueError(
+        f"{tree!r}/{branch!r} has {width} values per entry, which does not match "
+        "the requested image layout; provide shape=(height, width), planes=, "
+        "and plane= explicitly"
+    )
+
+
+def _plane_names(planes: Sequence[str] | None) -> tuple[str, ...]:
+    """Freeze and validate optional layer names."""
+    names = _frozen_plane_names(planes)
+    _require_named_planes(names)
+    _require_unique_planes(names)
+    return names
+
+
+def _frozen_plane_names(planes: Sequence[str] | None) -> tuple[str, ...]:
+    """Distinguish a sequence of names from one accidentally bare name."""
+    if planes is None:
+        return ()
+    if isinstance(planes, str):
+        raise ValueError("planes must be a sequence of names, not one string")
+    return tuple(planes)
+
+
+def _require_named_planes(names: tuple[str, ...]) -> None:
+    """Reject empty and non-text plane labels."""
+    if any(not isinstance(name, str) or not name for name in names):
+        raise ValueError("every plane name must be a non-empty string")
+
+
+def _require_unique_planes(names: tuple[str, ...]) -> None:
+    """Reject a layer map whose labels cannot identify one layer."""
+    if len(set(names)) != len(names):
+        raise ValueError(f"plane names must be unique, not {names!r}")
+
+
+def _plane_index(
+    plane: str | int | None,
+    names: tuple[str, ...],
+    layers: int,
+) -> tuple[int, str | None]:
+    """Resolve a named, numbered, or sole image layer."""
+    if plane is None:
+        return _sole_plane(layers)
+    if type(plane) is int:
+        return _numbered_plane(plane, names, layers)
+    if isinstance(plane, str):
+        return _named_plane(plane, names)
+    raise TypeError(f"plane must be a name, integer, or None, not {type(plane).__name__}")
+
+
+def _sole_plane(layers: int) -> tuple[int, None]:
+    """Select an unnamed branch only when it holds exactly one image."""
+    if layers != 1:
+        raise ValueError(f"plane=None is ambiguous for a branch containing {layers} images")
+    return 0, None
+
+
+def _named_plane(plane: str, names: tuple[str, ...]) -> tuple[int, str]:
+    """Resolve a layer label against the declared names."""
+    if plane not in names:
+        choices = ", ".join(repr(name) for name in names) or "no named planes"
+        raise ValueError(f"plane must be one of {choices}, not {plane!r}")
+    return names.index(plane), plane
+
+
+def _numbered_plane(index: int, names: tuple[str, ...], layers: int) -> tuple[int, str]:
+    """Resolve a Python-style integer layer index and give it a display name."""
+    actual = layers + index if index < 0 else index
+    if not 0 <= actual < layers:
+        raise IndexError(f"plane index {index} is outside a branch containing {layers} images")
+    return actual, names[actual] if names else str(actual)
+
+
+def _pixel_rows(values: Any, height: int, width: int) -> _Pixels:
+    """Turn one flat numeric array into immutable rows without losing floats."""
+    convert: Callable[[Any], _Pixel] = float if getattr(values, "typecode", "") in "fd" else int
+    return tuple(
+        tuple(convert(value) for value in values[row : row + width])
+        for row in range(0, height * width, width)
+    )
+
+
+def _text_value(tree: TTree, name: str, entry: int) -> str:
+    """Decode one optional, zero-padded byte metadata column."""
+    if name not in tree:
+        return ""
+    raw = bytes(tree[name].array(entry, entry + 1))
+    return raw.split(b"\0", 1)[0].decode("utf-8", "replace")
+
+
+def _number_value(tree: TTree, name: str, entry: int) -> float | None:
+    """Read one optional numeric metadata value."""
+    if name not in tree:
+        return None
+    values = tree[name].array(entry, entry + 1)
+    return float(values[0]) if values else None
+
+
+def _normalizer(normalization: Normalization) -> Callable[[_Pixels], _NormalizedPixels]:
+    """Select a normalization implementation or reject a misspelling early."""
+    if normalization == "max":
+        return _maximum_normalized
+    if normalization == "minmax":
+        return _minmax_normalized
+    if normalization == "none":
+        return _float_pixels
+    raise ValueError("normalization must be 'max', 'minmax', or 'none'")
+
+
+def _maximum_normalized(raw: _Pixels) -> _NormalizedPixels:
+    """Scale by the largest magnitude, preserving the sign of every value."""
+    finite = (
+        abs(float(value)) for row in raw for value in row if math.isfinite(float(value))
+    )
+    magnitude = max(finite, default=0.0)
+    return _scaled_pixels(raw, 0.0, 1.0 / magnitude if magnitude else 0.0)
+
+
+def _minmax_normalized(raw: _Pixels) -> _NormalizedPixels:
+    """Map the smallest value to zero and largest to one."""
+    lower, upper = _value_limits(raw)
+    span = upper - lower
+    return _scaled_pixels(raw, lower, 1.0 / span if span else 0.0)
+
+
+def _float_pixels(raw: _Pixels) -> _NormalizedPixels:
+    """Make the unchanged floating-point counterpart of a raw image."""
+    return _scaled_pixels(raw, 0.0, 1.0)
+
+
+def _scaled_pixels(raw: _Pixels, offset: float, scale: float) -> _NormalizedPixels:
+    """Apply one affine scaling operation to every pixel."""
+    return tuple(tuple((float(value) - offset) * scale for value in row) for row in raw)
+
+
+def _value_limits(values: Sequence[Sequence[_Pixel]]) -> tuple[float, float]:
+    """The finite display range, widened to include zero for a flat image."""
+    flattened = _finite_values(values)
+    if not flattened:
+        return 0.0, 1.0
+    lower, upper = min(flattened), max(flattened)
+    if lower == upper:
+        return min(0.0, lower), max(1.0, upper)
+    return lower, upper
+
+
+def _finite_values(values: Sequence[Sequence[_Pixel]]) -> list[float]:
+    """Flatten only the values which can define a normalization or color range."""
+    return [float(value) for row in values for value in row if math.isfinite(float(value))]
+
+
+def _pyplot() -> Any:
+    """Import the optional plotting surface with an actionable refusal."""
+    try:
+        from matplotlib import pyplot
+    except ImportError:
+        raise UnsupportedFeatureError(
+            "visualizing a 2D dataset needs matplotlib, which is not installed: "
+            "pip install pyxrootdclient[plot]; the raw and normalized Python "
+            "matrices remain available without it"
+        ) from None
+    return pyplot
+
+
+def _numpy() -> Any:
+    """Import optional NumPy with the same actionable behavior as plotting."""
+    try:
+        import numpy
+    except ImportError:
+        raise UnsupportedFeatureError(
+            "converting an Image2D to an array needs NumPy, which is not installed: "
+            "pip install numpy; raw and normalized Python matrices remain available"
+        ) from None
+    return numpy
+
+
+def _image_axes(pyplot: Any, axes: Any) -> tuple[Any, tuple[Any, Any]]:
+    """Create two plotting axes, or validate the pair supplied by the caller."""
+    if axes is None:
+        figure, made = pyplot.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
+        return figure, (made[0], made[1])
+    try:
+        selected = tuple(axes)
+    except TypeError:
+        raise ValueError("axes must contain exactly two matplotlib axes") from None
+    if len(selected) != 2:
+        raise ValueError("axes must contain exactly two matplotlib axes")
+    first, second = selected
+    figure = getattr(first, "figure", None)
+    if figure is None or getattr(second, "figure", None) is not figure:
+        raise ValueError("both axes must belong to the same matplotlib figure")
+    return figure, (first, second)
+
+
+def _draw_image(
+    figure: Any,
+    axes: Any,
+    values: Sequence[Sequence[_Pixel]],
+    title: str,
+    cmap: str,
+    origin: str,
+    interpolation: str,
+    colorbar: bool,
+) -> None:
+    """Draw one half of an :class:`Image2D` comparison."""
+    lower, upper = _value_limits(values)
+    image = axes.imshow(
+        values,
+        origin=origin,
+        interpolation=interpolation,
+        cmap=cmap,
+        vmin=lower,
+        vmax=upper,
+    )
+    axes.set_title(title)
+    axes.set_xlabel("column")
+    axes.set_ylabel("row")
+    if colorbar:
+        figure.colorbar(image, ax=axes, shrink=0.82)
 
 
 @dataclasses.dataclass(frozen=True)

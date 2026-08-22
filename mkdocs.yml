@@ -55,6 +55,7 @@ nav:
   - Under the hood:
       - Performance: performance.md
       - Testing and fault injection: testing.md
+      - Maintainability metrics: maintainability.md
       - Interoperability and parity: interop.md
       - Security: security.md
   - Design notes:

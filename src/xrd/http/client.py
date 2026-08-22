@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import http.client
 import os
+import re
 import ssl
 import urllib.parse
 from collections.abc import Callable
@@ -363,10 +364,41 @@ def _key(url: XRootDURL) -> tuple[str, str, int]:
     return (scheme, url.host, url.port)
 
 
+_PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
+_PATH_SAFE = "/:@!$&'()*+,;=~"
+
+
+def _quote_path(path: str) -> str:
+    """Quote a path without corrupting an already encoded path delimiter."""
+    parts: list[str] = []
+    end = 0
+    for match in _PERCENT_ESCAPE.finditer(path):
+        parts.append(urllib.parse.quote(path[end : match.start()], safe=_PATH_SAFE))
+        parts.append(match.group())
+        end = match.end()
+    parts.append(urllib.parse.quote(path[end:], safe=_PATH_SAFE))
+    return "".join(parts)
+
+
 def request_target(url: XRootDURL) -> str:
     """The origin-form request target: percent-encoded path plus query."""
-    target = urllib.parse.quote(url.path or "/", safe="/:@!$&'()*+,;=~")
-    query = {k: v for k, v in url.query.items() if k not in ("authz", "access_token")}
+    target = _quote_path(url.path or "/")
+    secrets = ("authz", "access_token")
+    if url._raw_query:
+        # A CDN's signed redirect covers the precise query spelling: ``+`` is
+        # not interchangeable with ``%20`` there, nor ``%7E`` with ``~``.
+        # Retain it byte-for-byte while still enforcing the rule that bearer
+        # tokens never appear in an HTTP request target.
+        fields = url._raw_query.split("&")
+        raw = "&".join(
+            field
+            for field in fields
+            if urllib.parse.unquote_plus(field.partition("=")[0]) not in secrets
+        )
+        if raw:
+            target += "?" + raw
+        return target
+    query = {k: v for k, v in url.query.items() if k not in secrets}
     if query:
         # ``quote``, not the default ``quote_plus``: a space is ``%20`` here.
         # Both are legal in a query string, but only one of them is what a
