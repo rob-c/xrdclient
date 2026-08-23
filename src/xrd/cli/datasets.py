@@ -26,11 +26,16 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import faulthandler
 import fnmatch
 import html
 import json
+import os
+import signal
 import string
 import sys
+import threading
+import time
 from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -162,6 +167,174 @@ def _list(args: argparse.Namespace, config: Config) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _diagnostic_seconds(text: str) -> float:
+    """A positive heartbeat interval accepted by ``--diagnostics``."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of seconds: {text!r}") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError("diagnostic interval must be positive")
+    return value
+
+
+class _Diagnostics:
+    """Timestamped build state plus an on-demand all-thread stack dump."""
+
+    def __init__(self, interval: float | None, out: Path, source_cache: Path) -> None:
+        self.interval = interval
+        self.out = out
+        self.source_cache = source_cache
+        self._active: dict[str, dict[str, Any]] = {}
+        self._phase = "starting"
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._signal = False
+
+    @property
+    def enabled(self) -> bool:
+        return self.interval is not None
+
+    def __enter__(self) -> _Diagnostics:
+        if not self.enabled:
+            return self
+        self._install_stack_dump()
+        assert self.interval is not None
+        self._emit(
+            f"diagnostics enabled: pid={os.getpid()}, heartbeat={self.interval:g}s; "
+            f"send SIGUSR1 to dump every Python thread"
+        )
+        self._thread = threading.Thread(target=self._heartbeats, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if not self.enabled:
+            return
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        if self._signal:
+            faulthandler.unregister(signal.SIGUSR1)
+
+    def phase(self, description: str) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            self._phase = description
+        self._emit(description)
+
+    def begin(self, name: str, partial: Path, source_bytes: int) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            self._active[name] = {
+                "partial": partial,
+                "started": time.monotonic(),
+                "split": "opening",
+                "rows": 0,
+            }
+        self._emit(f"{name}: started; declared source={human_bytes(source_bytes)}")
+
+    def split(self, name: str, split: str) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            state = self._active[name]
+            state["split"] = split
+            state["rows"] = 0
+        self._emit(f"{name}: {split}: fetching sources and converting")
+
+    def rows(self, name: str, split: str, rows: int) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            state = self._active.get(name)
+            if state is not None and state["split"] == split:
+                state["rows"] = rows
+
+    def progress_for(self, name: str, split: str) -> Callable[[int], None]:
+        def report(rows: int) -> None:
+            self.rows(name, split, rows)
+
+        return report
+
+    def split_done(self, name: str, split: str, rows: int) -> None:
+        if self.enabled:
+            self._emit(f"{name}: {split}: finished {rows:,} rows")
+
+    def finalizing(self, name: str, output: Path) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            state = self._active[name]
+            state["partial"] = output
+            state["split"] = "final ROOT readback and checksum"
+        self._emit(f"{name}: ROOT file closed; reading it back and checksumming")
+
+    def finish(self, name: str, problem: str | None = None) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            state = self._active.pop(name, None)
+        elapsed = time.monotonic() - state["started"] if state is not None else 0.0
+        outcome = f"failed: {problem}" if problem is not None else "completed"
+        self._emit(f"{name}: {outcome} after {elapsed:.1f}s")
+
+    def _install_stack_dump(self) -> None:
+        try:
+            faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
+        except (AttributeError, OSError, RuntimeError, ValueError):
+            self._emit("SIGUSR1 stack dumps are unavailable on this platform")
+        else:
+            self._signal = True
+
+    def _heartbeats(self) -> None:
+        assert self.interval is not None
+        while not self._stop.wait(self.interval):
+            self._heartbeat()
+
+    def _heartbeat(self) -> None:
+        with self._lock:
+            active = [(name, dict(state)) for name, state in self._active.items()]
+            phase = self._phase
+        if not active:
+            self._emit(f"heartbeat: {phase}")
+            return
+        cache = self._cache_parts()
+        for name, state in active:
+            partial = state["partial"]
+            size = self._path_size(partial)
+            elapsed = time.monotonic() - state["started"]
+            self._emit(
+                f"heartbeat: {name}: split={state['split']}, rows={state['rows']:,}, "
+                f"output={human_bytes(size)}, elapsed={elapsed:.1f}s{cache}"
+            )
+
+    def _cache_parts(self) -> str:
+        parts = sorted(self.source_cache.glob("*.part"))
+        if not parts:
+            return ""
+        shown = ", ".join(
+            f"{path.name}={human_bytes(self._path_size(path))}" for path in parts[:3]
+        )
+        suffix = f", +{len(parts) - 3} more" if len(parts) > 3 else ""
+        return f", downloads=[{shown}{suffix}]"
+
+    @staticmethod
+    def _path_size(path: Path) -> int:
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+
+    @staticmethod
+    def _emit(message: str) -> None:
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        print(f"[{stamp}] {PROGRAM}: {message}", file=sys.stderr, flush=True)
+
+
 def _chunks(path: Path) -> Iterator[bytes]:
     with path.open("rb") as handle:
         while chunk := handle.read(1 << 20):
@@ -211,27 +384,32 @@ def _convert_one(
     source_cache: Path,
     allow_oversize: bool,
     config: Config,
+    diagnostics: _Diagnostics,
 ) -> dict[str, Any]:
     """One dataset, every split, into one file; the index entry for it."""
     spec = DATASETS[name]
     partial = path.with_name(f".{path.name}.partial")
     partial.unlink(missing_ok=True)
+    diagnostics.begin(name, partial, spec.source_payload_bytes())
     try:
         with create(str(partial), compression=compression, config=config) as out:
             trees: dict[str, int] = {}
             for split in spec.splits:
-                trees.update(
-                    convert(
-                        name,
-                        out,
-                        split=split,
-                        base=base,
-                        source_cache=source_cache,
-                        allow_oversize=allow_oversize,
-                        config=config,
-                    )
+                diagnostics.split(name, split)
+                made = convert(
+                    name,
+                    out,
+                    split=split,
+                    base=base,
+                    source_cache=source_cache,
+                    allow_oversize=allow_oversize,
+                    progress=diagnostics.progress_for(name, split),
+                    config=config,
                 )
+                trees.update(made)
+                diagnostics.split_done(name, split, sum(made.values()))
         partial.replace(path)
+        diagnostics.finalizing(name, path)
     except BaseException:
         partial.unlink(missing_ok=True)  # half a file is worse than none
         raise
@@ -241,17 +419,32 @@ def _convert_one(
 def _build(args: argparse.Namespace, config: Config) -> int:
     out = Path(args.directory)
     out.mkdir(parents=True, exist_ok=True)
-    names = _chosen(args.only, args.all, args.large, args.allow_oversize)
     source_cache = (
         Path(args.source_cache) if args.source_cache else out.parent / f".{out.name}-sources"
     )
+    with _Diagnostics(args.diagnostics, out, source_cache) as diagnostics:
+        return _run_build(args, config, out, source_cache, diagnostics)
+
+
+def _run_build(
+    args: argparse.Namespace,
+    config: Config,
+    out: Path,
+    source_cache: Path,
+    diagnostics: _Diagnostics,
+) -> int:
+    """Select, resume, convert and index while diagnostics observe each phase."""
+    names = _chosen(args.only, args.all, args.large, args.allow_oversize)
 
     candidates = [name for name in names if (out / f"{name}.root").exists() and not args.force]
-    entries = _kept_entries(candidates, out, args)
+    diagnostics.phase(f"validating {len(candidates)} existing outputs")
+    entries = _kept_entries(candidates, out, args, diagnostics)
     kept = list(entries)
     todo = [name for name in names if name not in entries]
-    failed = _convert_pending(todo, entries, out, source_cache, args, config)
+    diagnostics.phase(f"converting {len(todo)} pending datasets with {args.jobs} worker(s)")
+    failed = _convert_pending(todo, entries, out, source_cache, args, config, diagnostics)
 
+    diagnostics.phase(f"writing index for {len(entries)} completed datasets")
     ordered = [entries[name] for name in sorted(entries)]
     _write_index(out, ordered)
     if args.json:
@@ -260,11 +453,15 @@ def _build(args: argparse.Namespace, config: Config) -> int:
 
 
 def _kept_entries(
-    kept: Sequence[str], out: Path, args: argparse.Namespace
+    kept: Sequence[str],
+    out: Path,
+    args: argparse.Namespace,
+    diagnostics: _Diagnostics,
 ) -> dict[str, dict[str, Any]]:
     """Index completed files retained from an earlier build."""
     entries: dict[str, dict[str, Any]] = {}
-    for name in kept:
+    for position, name in enumerate(kept, 1):
+        diagnostics.phase(f"validating existing output {position}/{len(kept)}: {name}")
         path = out / f"{name}.root"
         try:
             entries[name] = _entry(name, path, _trees_in(path))
@@ -287,6 +484,7 @@ def _convert_pending(
     source_cache: Path,
     args: argparse.Namespace,
     config: Config,
+    diagnostics: _Diagnostics,
 ) -> dict[str, str]:
     """Convert pending datasets concurrently and collect recoverable failures."""
     failed: dict[str, str] = {}
@@ -301,6 +499,7 @@ def _convert_pending(
                 source_cache=source_cache,
                 allow_oversize=args.allow_oversize,
                 config=config,
+                diagnostics=diagnostics,
             ): name
             for name in todo
         }
@@ -311,8 +510,10 @@ def _convert_pending(
             except Exception as exc:
                 problem = f"{type(exc).__name__}: {exc}"
                 failed[name] = problem
+                diagnostics.finish(name, problem)
                 print(f"{PROGRAM}: {name}: {problem}", file=sys.stderr)
             else:
+                diagnostics.finish(name)
                 _show_converted(name, entries[name], args)
     return failed
 
@@ -1145,6 +1346,17 @@ def _parser() -> argparse.ArgumentParser:
         default="zlib",
         metavar="NAME",
         help="zlib, lzma, lz4, zstd or none (default zlib)",
+    )
+    build.add_argument(
+        "--diagnostics",
+        nargs="?",
+        const=30.0,
+        type=_diagnostic_seconds,
+        metavar="SECONDS",
+        help=(
+            "emit timestamped phase, row, download and output heartbeats; optional "
+            "interval defaults to 30 seconds and SIGUSR1 dumps every Python thread"
+        ),
     )
 
     verify = command("verify", _verify, "check every file against the index")

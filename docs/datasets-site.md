@@ -277,6 +277,32 @@ reported without aborting the remaining queue. The retained source archive
 means a retry starts at conversion rather than downloading tens of gigabytes
 again.
 
+For an unattended or apparently idle build, diagnostics make every silent
+phase observable:
+
+```console
+$ PYTHONUNBUFFERED=1 xrd-datasets build /nfs/datasets \
+    --allow-oversize --large --all --jobs 1 \
+    --source-cache /nfs/dataset-sources --diagnostics 30 -vvv
+```
+
+`--diagnostics` takes an optional heartbeat interval in seconds (30 by
+default). It reports the active dataset and split, rows written, hidden partial
+ROOT size, elapsed time, and any growing source-cache `.part` downloads, all
+with UTC timestamps on standard error. It also prints the process ID and
+installs an on-demand all-thread Python stack dump. Send `SIGUSR1` without
+stopping the build when a heartbeat is not enough:
+
+```console
+$ kill -USR1 BUILD_PID
+```
+
+The traceback goes through the existing `tee` pipeline into the build log and
+usually distinguishes a network read, Parquet/HDF5 decode, image transform,
+ROOT basket compression, checksum pass, or thread wait immediately. `-vvv`
+adds client and wire-level logging; `PYTHONUNBUFFERED=1` keeps every line
+visible through `tee`.
+
 For the 287-converter oversized pass, begin with at least 1 TiB of working
 space as a conservative production-test allocation, not a final sizing
 promise. The retained logical sources total 681.39 GB, while shared-cache

@@ -42,7 +42,7 @@ import threading
 import wave
 import xml.etree.ElementTree as ET
 import zipfile
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from math import nan, prod
@@ -22362,6 +22362,7 @@ def convert(
     basket_size: int | None = None,
     source_cache: str | os.PathLike[str] | None = None,
     allow_oversize: bool = False,
+    progress: Callable[[int], None] | None = None,
     config: Any = None,
 ) -> dict[str, int]:
     """Write one dataset into a ROOT file, a tree per class; say what went where.
@@ -22378,6 +22379,8 @@ def convert(
     redirects the downloads at a mirror of your own. Sources at or above the
     default two-gigabyte ceiling require ``allow_oversize=True``; this is an
     explicit storage-capacity decision and does not weaken source-size checks.
+    ``progress``, when supplied, receives the number of rows written in the
+    current split at bounded intervals and once more when that split finishes.
 
     Each tree is named for its split and its class - ``train_frog`` - with the
     split left off when the dataset has only one. Beside them goes an
@@ -22396,7 +22399,17 @@ def convert(
         classes, columns, rows = spec.rows(raw, split)
         prefix = _conversion_prefix(spec, split, prefix)
         return _write_conversion(
-            target, spec, split, prefix, classes, columns, rows, compression, basket_size, config
+            target,
+            spec,
+            split,
+            prefix,
+            classes,
+            columns,
+            rows,
+            compression,
+            basket_size,
+            progress,
+            config,
         )
     finally:
         _remove_conversion_sources(temporary)
@@ -22494,6 +22507,7 @@ def _write_conversion(
     rows: Rows,
     compression: str | None,
     basket_size: int | None,
+    progress: Callable[[int], None] | None,
     config: Any,
 ) -> dict[str, int]:
     """Fill and finish the output trees, closing only a writer opened here."""
@@ -22501,7 +22515,7 @@ def _write_conversion(
     out = target if given else create(target, compression=compression, config=config)
     try:
         trees = _conversion_trees(out, spec, split, prefix, classes, columns, basket_size)
-        _fill_conversion(trees, rows, spec, classes)
+        _fill_conversion(trees, rows, spec, classes, progress)
         out.write(_about_name(prefix), spec.about(split))
         return {tree.name: len(tree) for tree in trees.values()}
     finally:
@@ -22531,9 +22545,14 @@ def _conversion_trees(
 
 
 def _fill_conversion(
-    trees: Mapping[int, Any], rows: Rows, spec: Dataset, classes: Sequence[str]
+    trees: Mapping[int, Any],
+    rows: Rows,
+    spec: Dataset,
+    classes: Sequence[str],
+    progress: Callable[[int], None] | None,
 ) -> None:
     """Route every row to its declared class tree."""
+    written = 0
     for at, row in rows:
         tree = trees.get(at)
         if tree is None:
@@ -22542,6 +22561,11 @@ def _fill_conversion(
                 f"{len(classes)} classes"
             )
         tree.fill(**row)
+        written += 1
+        if progress is not None and written % 1024 == 0:
+            progress(written)
+    if progress is not None:
+        progress(written)
 
 
 def _about_name(prefix: str) -> str:

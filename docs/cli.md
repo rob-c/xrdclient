@@ -173,6 +173,8 @@ $ xrd-datasets build /nfs/datasets --large --jobs 1 \
 $ xrd-datasets list --large --allow-oversize
 $ xrd-datasets build /nfs/datasets --large --allow-oversize --jobs 1 \
     --source-cache /nfs/dataset-sources
+$ xrd-datasets build /nfs/datasets --large --allow-oversize --jobs 1 \
+    --source-cache /nfs/dataset-sources --diagnostics 30 -vvv
 $ xrd-datasets verify /srv/datasets
 $ xrd-datasets site /srv/datasets --base-url https://data.example.org
 ```
@@ -188,6 +190,10 @@ converters. It is deliberately opt-in because the source cache, extraction
 workspace and converted output all need production-sized storage. Published
 source byte counts are still checked after every download. The whole story,
 including what the licences allow, is in [A datasets site](datasets-site.md).
+`--diagnostics [SECONDS]` writes timestamped phase, row-count, partial-output
+and active-download heartbeats to stderr every 30 seconds by default. It also
+installs a `SIGUSR1` handler that dumps every Python thread without terminating
+the build; `-vvv` adds client and wire-level logs.
 
 ## Scripting with `--json`
 

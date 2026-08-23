@@ -8,6 +8,7 @@ answered from a directory via ``--base``, so no test touches the network.
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
@@ -395,6 +396,40 @@ def test_an_unexpected_converter_error_does_not_abort_later_datasets(
     assert (out / "flowers.root").exists()
     index = json.loads((out / "index.json").read_text())
     assert [entry["name"] for entry in index["datasets"]] == ["flowers"]
+
+
+def test_diagnostics_report_phase_rows_output_and_completion(
+    registry, out, capsys, monkeypatch
+):
+    def convert_with_progress(_name, target, *, progress, **_options):
+        target["about"] = "diagnostic conversion"
+        progress(12_345)
+        time.sleep(0.05)
+        return {}
+
+    monkeypatch.setattr(datasets_cli, "convert", convert_with_progress)
+    code, _, err = run(
+        [
+            "build",
+            str(out),
+            "--only",
+            "flowers",
+            "--jobs",
+            "1",
+            "--diagnostics",
+            "0.01",
+            "-q",
+        ],
+        capsys,
+    )
+
+    assert code == 0
+    assert "diagnostics enabled" in err
+    assert "flowers: started" in err
+    assert "flowers: all: fetching sources and converting" in err
+    assert "heartbeat: flowers: split=all, rows=12,345" in err
+    assert "ROOT file closed; reading it back and checksumming" in err
+    assert "flowers: completed" in err
 
 
 # --- verify -----------------------------------------------------------------

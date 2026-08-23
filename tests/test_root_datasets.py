@@ -1762,6 +1762,19 @@ def test_a_table_that_needs_no_archive_reads_straight_from_a_path(registry, tmp_
     assert convert("flowers", io.BytesIO(), parts={"table": str(rows)}) == {"red": 2, "blue": 1}
 
 
+def test_conversion_progress_reports_the_final_row_count(registry):
+    seen = []
+    made = convert(
+        "flowers",
+        io.BytesIO(),
+        parts={"table": FLOWER_ROWS},
+        progress=seen.append,
+    )
+
+    assert made == {"red": 2, "blue": 1}
+    assert seen == [3]
+
+
 # --- the ten that came later ------------------------------------------------
 
 
