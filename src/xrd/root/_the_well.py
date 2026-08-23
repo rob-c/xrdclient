@@ -314,14 +314,16 @@ def _counts(field: Any) -> tuple[int, int]:
 
 
 def _frame(field: Any, sample: int, time: int, numpy: Any) -> Any:
-    index: list[int] = []
+    index: list[int | slice] = []
     if bool(field.attrs.get("sample_varying", True)):
         index.append(sample)
     if bool(field.attrs.get("time_varying", True)):
         index.append(time)
+    remaining = len(field.shape) - len(index)
+    if remaining > 2:
+        index.extend((slice(None), slice(None)))
+        index.extend(size // 2 for size in field.shape[len(index) :])
     values = numpy.asarray(field[tuple(index)], dtype="float32").squeeze()
-    while values.ndim > 2:
-        values = values.take(values.shape[-1] // 2, axis=-1)
     if values.ndim == 1:
         values = values.reshape(1, -1)
     if values.ndim != 2 or not values.size:

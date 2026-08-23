@@ -269,9 +269,13 @@ $ xrd-datasets build /nfs/datasets --large \
 $ xrd-datasets verify /nfs/datasets
 ```
 
-Successful files are kept by the next run, while a failed conversion removes
-its partial ROOT file. The retained source archive means a retry starts at
-conversion rather than downloading tens of gigabytes again.
+Successful files are kept by the next run. A conversion is written to a hidden
+temporary file and atomically published only after the ROOT writer closes; a
+failed conversion removes that temporary output, and an unreadable file left by
+an older interrupted build is detected and rebuilt. One converter failure is
+reported without aborting the remaining queue. The retained source archive
+means a retry starts at conversion rather than downloading tens of gigabytes
+again.
 
 For the 287-converter oversized pass, begin with at least 1 TiB of working
 space as a conservative production-test allocation, not a final sizing

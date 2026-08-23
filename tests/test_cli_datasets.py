@@ -316,6 +316,23 @@ def test_build_keeps_what_is_already_there_and_force_starts_over(registry, mirro
     assert (out / "flowers.root").stat().st_mtime_ns != before
 
 
+def test_build_replaces_an_unreadable_partial_output(registry, mirror, out, capsys):
+    out.mkdir()
+    target = out / "flowers.root"
+    target.write_bytes(b"interrupted ROOT output")
+
+    code, _, err = run(
+        ["build", str(out), "--only", "flowers", "--base", mirror, "-q"], capsys
+    )
+    index = json.loads((out / "index.json").read_text())
+
+    assert code == 0
+    assert index["datasets"][0]["name"] == "flowers"
+    assert target.read_bytes() != b"interrupted ROOT output"
+    assert "existing output is unreadable" in err
+    assert not (out / ".flowers.root.partial").exists()
+
+
 def test_build_refuses_a_licence_that_withholds_redistribution(registry, mirror, out, capsys):
     code, _, err = run(["build", str(out), "--only", "closed", "--base", mirror], capsys)
     assert code == 1
@@ -342,7 +359,42 @@ def test_a_download_that_fails_fails_that_dataset_and_no_other(registry, out, tm
     assert code == 1
     assert "flowers" in err
     assert not (out / "flowers.root").exists()  # no half-written file left behind
+    assert not (out / ".flowers.root.partial").exists()
     assert json.loads((out / "index.json").read_text())["datasets"] == []
+
+
+def test_an_unexpected_converter_error_does_not_abort_later_datasets(
+    registry, out, capsys, monkeypatch
+):
+    def convert_with_one_broken_dataset(name, target, **_options):
+        if name == "closed":
+            raise RuntimeError("broken HDF5 decoder")
+        target["about"] = "successful conversion after a failed future"
+        return {}
+
+    monkeypatch.setattr(datasets_cli, "convert", convert_with_one_broken_dataset)
+    code, _, err = run(
+        [
+            "build",
+            str(out),
+            "--only",
+            "closed",
+            "--only",
+            "flowers",
+            "--all",
+            "--jobs",
+            "1",
+            "-q",
+        ],
+        capsys,
+    )
+
+    assert code == 1
+    assert "closed: RuntimeError: broken HDF5 decoder" in err
+    assert not (out / "closed.root").exists()
+    assert (out / "flowers.root").exists()
+    index = json.loads((out / "index.json").read_text())
+    assert [entry["name"] for entry in index["datasets"]] == ["flowers"]
 
 
 # --- verify -----------------------------------------------------------------

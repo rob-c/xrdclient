@@ -214,8 +214,10 @@ def _convert_one(
 ) -> dict[str, Any]:
     """One dataset, every split, into one file; the index entry for it."""
     spec = DATASETS[name]
+    partial = path.with_name(f".{path.name}.partial")
+    partial.unlink(missing_ok=True)
     try:
-        with create(str(path), compression=compression, config=config) as out:
+        with create(str(partial), compression=compression, config=config) as out:
             trees: dict[str, int] = {}
             for split in spec.splits:
                 trees.update(
@@ -229,8 +231,9 @@ def _convert_one(
                         config=config,
                     )
                 )
+        partial.replace(path)
     except BaseException:
-        path.unlink(missing_ok=True)  # half a file is worse than none
+        partial.unlink(missing_ok=True)  # half a file is worse than none
         raise
     return _entry(name, path, trees)
 
@@ -243,10 +246,10 @@ def _build(args: argparse.Namespace, config: Config) -> int:
         Path(args.source_cache) if args.source_cache else out.parent / f".{out.name}-sources"
     )
 
-    kept = [name for name in names if (out / f"{name}.root").exists() and not args.force]
-    todo = [name for name in names if name not in kept]
-
-    entries = _kept_entries(kept, out, args)
+    candidates = [name for name in names if (out / f"{name}.root").exists() and not args.force]
+    entries = _kept_entries(candidates, out, args)
+    kept = list(entries)
+    todo = [name for name in names if name not in entries]
     failed = _convert_pending(todo, entries, out, source_cache, args, config)
 
     ordered = [entries[name] for name in sorted(entries)]
@@ -263,7 +266,15 @@ def _kept_entries(
     entries: dict[str, dict[str, Any]] = {}
     for name in kept:
         path = out / f"{name}.root"
-        entries[name] = _entry(name, path, _trees_in(path))
+        try:
+            entries[name] = _entry(name, path, _trees_in(path))
+        except Exception as exc:
+            problem = f"{type(exc).__name__}: {exc}"
+            print(
+                f"{PROGRAM}: {name}: existing output is unreadable ({problem}); rebuilding",
+                file=sys.stderr,
+            )
+            continue
         if not args.quiet and not args.json:
             print(f"{name}: kept, {human_bytes(entries[name]['bytes'])}")
     return entries
@@ -297,9 +308,10 @@ def _convert_pending(
             name = running[future]
             try:
                 entries[name] = future.result()
-            except (XRootDError, OSError, ValueError) as exc:
-                failed[name] = str(exc)
-                print(f"{PROGRAM}: {name}: {exc}", file=sys.stderr)
+            except Exception as exc:
+                problem = f"{type(exc).__name__}: {exc}"
+                failed[name] = problem
+                print(f"{PROGRAM}: {name}: {problem}", file=sys.stderr)
             else:
                 _show_converted(name, entries[name], args)
     return failed

@@ -18,6 +18,7 @@ from xrd.root._the_well import (
     SOURCES,
     TASKS,
     THE_WELL,
+    _frame,
     load,
 )
 from xrd.root.datasets import DATASETS, Large, _conversion_cache_name, convert
@@ -97,6 +98,59 @@ def test_loader_resamples_raw_and_normalized_images_and_temporal_splits(
     assert columns["target_image"] == ("f", PIXELS)
     assert Counter(tree for tree, _row in made) == {0: 16, 1: 2, 2: 2}
     _assert_visual_row(made[0][1])
+
+
+def test_a_three_dimensional_field_is_sliced_before_it_is_loaded() -> None:
+    numpy = pytest.importorskip("numpy")
+
+    class Volume:
+        shape = (1, 2, 256, 128, 256)
+
+        def __init__(self) -> None:
+            self.attrs = {"sample_varying": True, "time_varying": True}
+            self.requested = None
+
+        def __getitem__(self, index):
+            self.requested = index
+            return numpy.arange(256 * 128, dtype="float32").reshape(256, 128)
+
+    field = Volume()
+    image = _frame(field, 0, 1, numpy)
+
+    assert field.requested == (0, 1, slice(None), slice(None), 128)
+    assert image.shape == (64, 64)
+
+
+def test_the_convective_envelope_gradient_converts_a_three_dimensional_field(
+    tmp_path: Path,
+) -> None:
+    h5py = pytest.importorskip("h5py")
+    numpy = pytest.importorskip("numpy")
+    source = tmp_path / "convective.hdf5"
+    plane = numpy.arange(8 * 12 * 10, dtype="float32").reshape(8, 12, 10)
+    values = numpy.stack([plane + time for time in range(11)])[None, ...]
+    with h5py.File(source, "w") as book:
+        fields = book.create_group("t0_fields")
+        fields.attrs["field_names"] = ["density"]
+        density = fields.create_dataset("density", data=values)
+        density.attrs["sample_varying"] = True
+        density.attrs["time_varying"] = True
+        density.attrs["dim_varying"] = [True, True, True]
+
+    output = io.BytesIO()
+    convert(
+        "well_convective_envelope_rsg_gradient_magnitude",
+        output,
+        split="all",
+        parts={"sample": source},
+        allow_oversize=True,
+    )
+
+    with open_root(io.BytesIO(output.getvalue())) as back:
+        assert len(back["train"]) == 8
+        assert len(back["validation"]) == 1
+        assert len(back["test"]) == 1
+        assert back["train"]["target"].array()[0] > 0
 
 
 def _assert_visual_row(row: Mapping[str, Any]) -> None:
