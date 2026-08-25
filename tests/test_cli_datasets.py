@@ -7,12 +7,15 @@ answered from a directory via ``--base``, so no test touches the network.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import threading
 import time
 
 import pytest
 
 from xrd.cli import datasets as datasets_cli
+from xrd.config import Config
 from xrd.root import open_root
 from xrd.root._alex_mp20 import ALEX_MP20
 from xrd.root._hub_tables import HUB_OPEN
@@ -362,6 +365,81 @@ def test_a_download_that_fails_fails_that_dataset_and_no_other(registry, out, tm
     assert not (out / "flowers.root").exists()  # no half-written file left behind
     assert not (out / ".flowers.root.partial").exists()
     assert json.loads((out / "index.json").read_text())["datasets"] == []
+
+
+def test_concurrent_conversions_use_independent_atomic_temporary_files(
+    registry, out, monkeypatch
+):
+    out.mkdir()
+    barrier = threading.Barrier(2)
+    targets = []
+
+    def convert_together(_name, target, **_options):
+        targets.append(target.name)
+        barrier.wait()
+        target["about"] = "complete concurrent conversion"
+        return {}
+
+    monkeypatch.setattr(datasets_cli, "convert", convert_together)
+    diagnostics = datasets_cli._Diagnostics(None, out, out / "cache")
+    options = {
+        "base": None,
+        "compression": "zlib",
+        "source_cache": out / "cache",
+        "allow_oversize": False,
+        "config": Config(),
+        "diagnostics": diagnostics,
+    }
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(datasets_cli._convert_one, "flowers", out / "flowers.root", **options)
+            for _ in range(2)
+        ]
+        assert all(future.result()["name"] == "flowers" for future in futures)
+
+    assert len(set(targets)) == 2
+    assert (out / "flowers.root").exists()
+    assert (out / "flowers.root").stat().st_mode & 0o444 == 0o444
+    assert not list(out.glob("*.partial"))
+
+
+def test_oversized_multi_split_outputs_are_catalogued_as_root_shards(
+    monkeypatch, out, capsys
+):
+    def convert_without_fetch(_name, target, *, split, **_options):
+        target["about"] = f"HEPMASS {split}"
+        return {}
+
+    monkeypatch.setattr(datasets_cli, "convert", convert_without_fetch)
+    code, _, err = run(
+        [
+            "build",
+            str(out),
+            "--only",
+            "hepmass",
+            "--allow-oversize",
+            "--jobs",
+            "1",
+            "-q",
+        ],
+        capsys,
+    )
+    assert code == 0, err
+    (entry,) = json.loads((out / "index.json").read_text())["datasets"]
+    assert [file["split"] for file in entry["files"]] == list(DATASETS["hepmass"].splits)
+    assert all((out / file["file"]).exists() for file in entry["files"])
+    assert "hepmass--train_1000.root" in (out / "MANIFEST").read_text()
+
+    code, _, err = run(["verify", str(out), "-q"], capsys)
+    assert code == 0, err
+
+    code, _, err = run(
+        ["site", str(out), "--base-url", "https://data.example.org", "-q"], capsys
+    )
+    assert code == 0, err
+    detail = (out / "datasets" / "hepmass.html").read_text()
+    assert "train_1000" in detail and "test_not1000" in detail
+    assert 'split="train_1000"' in detail
 
 
 def test_an_unexpected_converter_error_does_not_abort_later_datasets(

@@ -535,6 +535,27 @@ def test_a_bare_name_is_found_in_the_catalogue(catalogue):
         assert len(data) == 18
 
 
+def test_a_catalogue_file_shard_must_be_selected_by_publisher_split(digits, tmp_path):
+    index = {
+        "format": 2,
+        "datasets": [
+            {
+                "name": "digits_sharded",
+                "files": [
+                    {"split": "train", "file": pathlib.Path(digits).name},
+                    {"split": "test", "file": pathlib.Path(digits).name},
+                ],
+            }
+        ],
+    }
+    (tmp_path / "index.json").write_text(json.dumps(index))
+    config = xrd.Config(catalogue=str(tmp_path))
+    with pytest.raises(ValueError, match="pass split="):
+        load("digits_sharded", config=config)
+    with load("digits_sharded", split="train", config=config) as data:
+        assert len(data) == 18
+
+
 def test_the_catalogue_can_come_from_the_environment(catalogue, monkeypatch):
     monkeypatch.setenv("XRD_CATALOGUE", catalogue)
     with load("digits") as data:

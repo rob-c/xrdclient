@@ -163,3 +163,10 @@ def test_hub_parquet_preserves_scalars_text_lengths_classes_and_missing_values(
     assert made[1][1]["review_length"] == 0
     assert made[1][1]["sentiment"] == made[1][1]["label"] == 0
     assert math.isnan(made[1][1]["score"])
+
+
+def test_hub_text_can_losslessly_hold_multi_megabyte_publisher_values():
+    raw = "physics " * 500_000
+    encoded = hub_module._encoded(raw, dataset="owner/long", field="trace", index=7)
+    assert len(encoded) == len(raw.encode())
+    assert len(encoded) > 32_768

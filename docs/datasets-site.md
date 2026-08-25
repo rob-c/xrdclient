@@ -198,6 +198,21 @@ It also admits only converters present in this release; it does not pretend an
 unimplemented external archive is buildable. Splitting a download does not
 change the logical source size.
 
+Two outputs have a second, independent constraint: the pure-Python writer's
+interoperable ROOT layout uses 32-bit key offsets, so one physical file must
+remain below 2 GB. The build therefore publishes HEPMASS as one ROOT file per
+official mass/split pair and Gas Sensor Arrays in Open Sampling Settings as
+one ROOT file per chemical. `index.json`, `MANIFEST`, `verify`, and the site
+record these as one logical dataset with several checksummed downloads. Select
+one without spelling its URL using the publisher split or chemical name:
+
+```python
+train = xrd.ml.load("hepmass", split="train_1000")
+acetone = xrd.ml.load("gas_sensor_arrays_open_sampling", split="acetone")
+```
+
+No row is sampled or discarded by this output sharding.
+
 The external-archive audit applies the default rule to the logical dataset
 rather than the largest file visible on a deposit page. It admitted [ReefSet
 v1.0](https://zenodo.org/records/11060189) (1,628,719,176 bytes), the

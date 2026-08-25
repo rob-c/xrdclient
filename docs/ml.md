@@ -372,6 +372,16 @@ as one, so a real path or URL is never shadowed by a catalogue entry. The
 catalogue can also be set per call with `Config(catalogue=...)`, and can be a
 local directory as easily as a URL.
 
+When one logical dataset is published as several physical ROOT files, choose
+the publisher split recorded in the catalogue:
+
+```python
+data = xrd.ml.load("hepmass", split="train_1000")
+```
+
+Omitting `split=` names every available shard in the error instead of silently
+choosing an incomplete view. `xrd.ml.download` accepts the same argument.
+
 ## Keeping a local copy
 
 Streaming is the default because it is usually the faster answer: a minibatch

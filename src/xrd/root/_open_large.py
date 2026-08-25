@@ -1150,7 +1150,10 @@ def _audiomnist_entry(
 
 
 def _audiomnist_entries(path: Path, metadata: Mapping[str, dict[str, Any]]) -> Rows:
-    archive = tarfile.open(path, mode="r:gz")
+    # The pinned Hugging Face adaptation uses ``.tar.gz`` names for both gzip
+    # and plain tar shards.  Let tarfile inspect the bytes instead of trusting
+    # the suffix; the contents and publisher split remain unchanged.
+    archive = tarfile.open(path, mode="r:*")
     index = 0
     try:
         for member in archive:

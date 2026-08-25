@@ -43,6 +43,7 @@ def test_pems_puf_and_daily_segment_layouts(tmp_path):
 
 
 def test_the_three_gas_formats_stream_raw_sensor_values(tmp_path):
+
     temperature = tmp_path / "temperature.zip"
     with zipfile.ZipFile(temperature, "w") as archive:
         archive.writestr("20160930_203718.csv", " ".join(["0"] * 20) + "\n")
@@ -65,12 +66,26 @@ def test_the_three_gas_formats_stream_raw_sensor_values(tmp_path):
     assert row["length"] == 1 and row["concentration"] == 40
 
 
+def test_open_sampling_gas_is_partitioned_losslessly_by_chemical(tmp_path):
+    open_sampling = tmp_path / "open-sampling.zip"
+    filename = "130101010101_board_setPoint_5V_fan_setPoint_50_mfc_setPoint_acetone_100ppm_p1"
+    cells = ["0", *(["1"] * 8), "20", "40", *(["1"] * 81)]
+    with zipfile.ZipFile(open_sampling, "w") as archive:
+        archive.writestr(f"dataset/run/L1/{filename}", " ".join(cells) + "\n")
+    classes, _, rows = load("gas", open_sampling, "acetone")
+    label, row = next(rows)
+    assert classes == ("acetone",) and label == 0
+    assert row["label"] == 1 and row["length"] == 1
+    assert list(load("gas", open_sampling, "methane")[2]) == []
+
+
 def test_electricity_and_opportunity_preserve_wide_rows(tmp_path):
     electricity = tmp_path / "electricity.zip"
     header = ";".join(["timestamp", *(f"MT_{at}" for at in range(370))])
     values = ";".join(["2011-01-01 00:15:00", *(["1,5"] * 370)])
     with zipfile.ZipFile(electricity, "w") as archive:
         archive.writestr("LD2011_2014.txt", header + "\n" + values + "\n")
+        archive.writestr("__MACOSX/._LD2011_2014.txt", b"resource fork")
     _, _, rows = load("electricity", electricity, "all")
     _, row = next(rows)
     assert row["loads"][0] == pytest.approx(1.5) and len(row["loads"]) == 370

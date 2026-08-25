@@ -5,7 +5,9 @@
     $ xrd-datasets site /srv/datasets --base-url https://data.example.org
 
 ``build`` converts every dataset whose licence allows redistribution into a
-ROOT file under one directory - see :mod:`xrd.root.datasets` for what is on
+ROOT file, or explicit publisher-split ROOT shards when the complete result
+cannot use ROOT's 32-bit file layout, under one directory - see
+:mod:`xrd.root.datasets` for what is on
 offer - and writes an ``index.json`` beside them saying what each file is,
 where it came from, its canonical licence terms, what was transformed, and
 what its checksum is. ``verify`` reopens every file and refuses to bless a
@@ -34,6 +36,7 @@ import os
 import signal
 import string
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -46,7 +49,14 @@ from ..config import Config
 from ..crypto import checksum_file
 from ..errors import XRootDError
 from ..root import open_root
-from ..root.datasets import DATASETS, SOURCE_SIZE_CEILING, convert, licence_url, redistributable
+from ..root.datasets import (
+    DATASETS,
+    SOURCE_SIZE_CEILING,
+    Large,
+    convert,
+    licence_url,
+    redistributable,
+)
 from ..root.writer import create
 from ..types import human_bytes
 from . import ERROR, OK, common_flags, config_from, dumps, fail
@@ -246,6 +256,12 @@ class _Diagnostics:
             state["rows"] = 0
         self._emit(f"{name}: {split}: fetching sources and converting")
 
+    def output(self, name: str, path: Path) -> None:
+        """Track the particular atomic file currently receiving rows."""
+        if self.enabled:
+            with self._lock:
+                self._active[name]["partial"] = path
+
     def rows(self, name: str, split: str, rows: int) -> None:
         if not self.enabled:
             return
@@ -375,6 +391,106 @@ def _entry(name: str, path: Path, trees: dict[str, int]) -> dict[str, Any]:
     }
 
 
+def _part_path(path: Path, split: str) -> Path:
+    """The stable file name for one split of a sharded dataset."""
+    safe = quote(split, safe="-_.")
+    return path.with_name(f"{path.stem}--{safe}{path.suffix}")
+
+
+def _sharded_entry(
+    name: str, parts: Sequence[tuple[str, Path, dict[str, int]]]
+) -> dict[str, Any]:
+    """One catalogue record backed by independently streamable ROOT files."""
+    spec = DATASETS[name]
+    files: list[dict[str, Any]] = [
+        {
+            "split": split,
+            "file": path.name,
+            "download": path.name,
+            "bytes": path.stat().st_size,
+            "adler32": checksum_file("adler32", _chunks(path)),
+            "trees": trees,
+            "rows": sum(trees.values()),
+        }
+        for split, path, trees in parts
+    ]
+    entry = {
+        "name": name,
+        "title": spec.title,
+        "licence": spec.licence,
+        "licence_url": licence_url(spec.licence),
+        "redistributable": redistributable(spec.licence),
+        **spec.provenance(),
+        "transformation": spec.transformation_summary(),
+        "large": spec.file_backed(),
+        "source_bytes": spec.source_payload_bytes(),
+        "modality": spec.modality,
+        "task": spec.task,
+        "files": files,
+        "bytes": sum(item["bytes"] for item in files),
+        "rows": sum(item["rows"] for item in files),
+        "trees": {
+            f"{item['split']}/{tree}": rows
+            for item in files
+            for tree, rows in item["trees"].items()
+        },
+    }
+    return entry
+
+
+def _temporary_output(path: Path) -> Path:
+    """Reserve a conversion-owned temporary beside its atomic destination."""
+    held = tempfile.NamedTemporaryFile(
+        prefix=f".{path.name}.", suffix=".partial", dir=path.parent, delete=False
+    )
+    partial = Path(held.name)
+    held.close()
+    partial.chmod(0o644)  # the published replacement must be readable by nginx
+    return partial
+
+
+def _write_splits(
+    name: str,
+    path: Path,
+    splits: Sequence[str],
+    *,
+    base: str | None,
+    compression: str | None,
+    source_cache: Path,
+    allow_oversize: bool,
+    config: Config,
+    diagnostics: _Diagnostics,
+) -> dict[str, int]:
+    """Atomically write a selected run of splits to one ROOT file."""
+    partial = _temporary_output(path)
+    spec = DATASETS[name]
+    prefix = "" if isinstance(spec, Large) and spec.split_files else None
+    diagnostics.output(name, partial)
+    try:
+        with create(str(partial), compression=compression, config=config) as out:
+            trees: dict[str, int] = {}
+            for split in splits:
+                diagnostics.split(name, split)
+                made = convert(
+                    name,
+                    out,
+                    split=split,
+                    prefix=prefix,
+                    base=base,
+                    source_cache=source_cache,
+                    allow_oversize=allow_oversize,
+                    progress=diagnostics.progress_for(name, split),
+                    config=config,
+                )
+                trees.update(made)
+                diagnostics.split_done(name, split, sum(made.values()))
+        partial.replace(path)
+        return trees
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+
+
 def _convert_one(
     name: str,
     path: Path,
@@ -386,33 +502,39 @@ def _convert_one(
     config: Config,
     diagnostics: _Diagnostics,
 ) -> dict[str, Any]:
-    """One dataset, every split, into one file; the index entry for it."""
+    """Convert one logical dataset atomically into one or more ROOT files."""
     spec = DATASETS[name]
-    partial = path.with_name(f".{path.name}.partial")
-    partial.unlink(missing_ok=True)
-    diagnostics.begin(name, partial, spec.source_payload_bytes())
-    try:
-        with create(str(partial), compression=compression, config=config) as out:
-            trees: dict[str, int] = {}
-            for split in spec.splits:
-                diagnostics.split(name, split)
-                made = convert(
-                    name,
-                    out,
-                    split=split,
-                    base=base,
-                    source_cache=source_cache,
-                    allow_oversize=allow_oversize,
-                    progress=diagnostics.progress_for(name, split),
-                    config=config,
-                )
-                trees.update(made)
-                diagnostics.split_done(name, split, sum(made.values()))
-        partial.replace(path)
-        diagnostics.finalizing(name, path)
-    except BaseException:
-        partial.unlink(missing_ok=True)  # half a file is worse than none
-        raise
+    diagnostics.begin(name, path, spec.source_payload_bytes())
+    if isinstance(spec, Large) and spec.split_files:
+        parts = []
+        for split in spec.splits:
+            part = _part_path(path, split)
+            trees = _write_splits(
+                name,
+                part,
+                (split,),
+                base=base,
+                compression=compression,
+                source_cache=source_cache,
+                allow_oversize=allow_oversize,
+                config=config,
+                diagnostics=diagnostics,
+            )
+            parts.append((split, part, trees))
+        diagnostics.finalizing(name, parts[0][1])
+        return _sharded_entry(name, parts)
+    trees = _write_splits(
+        name,
+        path,
+        spec.splits,
+        base=base,
+        compression=compression,
+        source_cache=source_cache,
+        allow_oversize=allow_oversize,
+        config=config,
+        diagnostics=diagnostics,
+    )
+    diagnostics.finalizing(name, path)
     return _entry(name, path, trees)
 
 
@@ -436,7 +558,7 @@ def _run_build(
     """Select, resume, convert and index while diagnostics observe each phase."""
     names = _chosen(args.only, args.all, args.large, args.allow_oversize)
 
-    candidates = [name for name in names if (out / f"{name}.root").exists() and not args.force]
+    candidates = [name for name in names if _dataset_exists(out, name) and not args.force]
     diagnostics.phase(f"validating {len(candidates)} existing outputs")
     entries = _kept_entries(candidates, out, args, diagnostics)
     kept = list(entries)
@@ -452,6 +574,20 @@ def _run_build(
     return ERROR if failed else OK
 
 
+def _dataset_paths(out: Path, name: str) -> list[tuple[str | None, Path]]:
+    """Every expected output path for one logical catalogue dataset."""
+    spec = DATASETS[name]
+    path = out / f"{name}.root"
+    if isinstance(spec, Large) and spec.split_files:
+        return [(split, _part_path(path, split)) for split in spec.splits]
+    return [(None, path)]
+
+
+def _dataset_exists(out: Path, name: str) -> bool:
+    """Whether every file needed to resume this dataset is present."""
+    return all(path.exists() for _split, path in _dataset_paths(out, name))
+
+
 def _kept_entries(
     kept: Sequence[str],
     out: Path,
@@ -462,9 +598,16 @@ def _kept_entries(
     entries: dict[str, dict[str, Any]] = {}
     for position, name in enumerate(kept, 1):
         diagnostics.phase(f"validating existing output {position}/{len(kept)}: {name}")
-        path = out / f"{name}.root"
         try:
-            entries[name] = _entry(name, path, _trees_in(path))
+            paths = _dataset_paths(out, name)
+            if paths[0][0] is None:
+                path = paths[0][1]
+                entries[name] = _entry(name, path, _trees_in(path))
+            else:
+                parts = [
+                    (str(split), path, _trees_in(path)) for split, path in paths
+                ]
+                entries[name] = _sharded_entry(name, parts)
         except Exception as exc:
             problem = f"{type(exc).__name__}: {exc}"
             print(
@@ -531,7 +674,11 @@ def _write_index(out: Path, entries: list[dict[str, Any]]) -> None:
         "datasets": entries,
     }
     (out / "index.json").write_text(json.dumps(document, indent=2) + "\n")
-    lines = [f"{made['adler32']}  {made['bytes']:>12}  {made['file']}" for made in entries]
+    lines = [
+        f"{file['adler32']}  {file['bytes']:>12}  {file['file']}"
+        for made in entries
+        for file in _entry_files(made)
+    ]
     (out / "MANIFEST").write_text("\n".join(lines) + "\n" if lines else "")
 
 
@@ -554,6 +701,20 @@ def _verify(args: argparse.Namespace, config: Config) -> int:
 
 def _verify_entry(out: Path, made: dict[str, Any]) -> str | None:
     """Why one generated file disagrees with its index entry, if it does."""
+    for file in _entry_files(made):
+        problem = _verify_file(out, file)
+        if problem is not None:
+            return f"{file['file']}: {problem}" if made.get("files") else problem
+    return None
+
+
+def _entry_files(made: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize one-file and split-file catalogue entries."""
+    return list(made.get("files") or [made])
+
+
+def _verify_file(out: Path, made: dict[str, Any]) -> str | None:
+    """Why one physical ROOT file disagrees with its recorded metadata."""
     path = out / made["file"]
     if not path.exists():
         return "the file is missing"
@@ -658,6 +819,15 @@ def _provenance_links(made: dict[str, Any], *, parent: str = " · ") -> str:
     return parent.join(links)
 
 
+def _card_download(made: dict[str, Any], name: str, detail: str) -> str:
+    """A direct download for one file, or an honest link to every shard."""
+    files = made.get("files")
+    if files:
+        return f'<a class="button primary" href="{detail}">{len(files)} ROOT shards</a>'
+    download = html.escape(made.get("download") or made["file"], quote=True)
+    return f'<a class="button primary" href="{download}" download>Download {name}.root</a>'
+
+
 def _catalogue_cards(entries: Sequence[dict[str, Any]]) -> str:
     cards = []
     for made in entries:
@@ -666,7 +836,6 @@ def _catalogue_cards(entries: Sequence[dict[str, Any]]) -> str:
         terms = html.escape(made.get("licence_url", ""), quote=True)
         licence = html.escape(made["licence"])
         transformation = html.escape(made.get("transformation", ""))
-        download = html.escape(made.get("download") or made["file"], quote=True)
         detail = f"datasets/{quote(made['name'])}.html"
         modality = html.escape(made.get("modality", "dataset"))
         task = html.escape(made.get("task", "machine learning"))
@@ -699,7 +868,7 @@ def _catalogue_cards(entries: Sequence[dict[str, Any]]) -> str:
   <div class="tags"><span>{task}</span><span>{made["rows"]:,} rows</span></div>
   <p class="transform">{transformation}</p>
   <div class="provenance"><span>{_provenance_links(made, parent=" · ")}</span>{licence_link}</div>
-  <div class="card-actions"><a class="button primary" href="{download}" download>Download {name}.root</a><a class="button" href="{detail}">Details</a></div>
+  <div class="card-actions">{_card_download(made, name, detail)}<a class="button" href="{detail}">Details</a></div>
 </article>'''
         )
     return "\n".join(cards)
@@ -737,15 +906,23 @@ def _dataset_json_ld(base: str, made: dict[str, Any]) -> dict[str, Any]:
         "license": _json_value(made, "licence_url", "licence"),
         "description": made.get("transformation", ""),
         "keywords": [made.get("modality", "dataset"), made.get("task", "machine learning")],
-        "distribution": {
-            "@type": "DataDownload",
-            "contentUrl": f"{base}/{_json_value(made, 'download', 'file')}",
-            "encodingFormat": "application/x-root",
-            "contentSize": made["bytes"],
-        },
+        "distribution": [_json_distribution(base, file) for file in _entry_files(made)],
     }
     item.update(_json_credits(made))
     item["sameAs"] = _json_same_as(made)
+    return item
+
+
+def _json_distribution(base: str, file: dict[str, Any]) -> dict[str, Any]:
+    """Schema.org metadata for one physical ROOT distribution."""
+    item = {
+        "@type": "DataDownload",
+        "contentUrl": f"{base}/{_json_value(file, 'download', 'file')}",
+        "encodingFormat": "application/x-root",
+        "contentSize": file["bytes"],
+    }
+    if file.get("split"):
+        item["name"] = str(file["split"])
     return item
 
 
@@ -769,13 +946,29 @@ def _citation_detail(made: dict[str, Any]) -> str:
     return f"<section><h2>Published citation or credit</h2><p>{html.escape(citation)}</p></section>"
 
 
+def _detail_downloads(made: dict[str, Any], name: str) -> str:
+    """Download buttons for every physical file behind a catalogue entry."""
+    links = []
+    for file in _entry_files(made):
+        download = html.escape(file.get("download") or file["file"], quote=True)
+        label = html.escape(str(file.get("split") or f"{name}.root"))
+        links.append(f'<a class="download" href="../{download}" download>{label}</a>')
+    return "".join(links)
+
+
+def _load_example(made: dict[str, Any], name: str) -> str:
+    """A catalogue load expression, selecting a shard when one is required."""
+    files = made.get("files") or []
+    option = f', split="{files[0]["split"]}"' if files else ""
+    return f'xrd.ml.load("{name}"{option})'
+
+
 def _detail_page(title: str, base: str, made: dict[str, Any]) -> str:
     name = html.escape(made["name"])
     heading = html.escape(made["title"])
     licence_url = html.escape(made.get("licence_url", ""), quote=True)
     licence = html.escape(made["licence"])
     transformation = html.escape(made.get("transformation", ""))
-    download = html.escape(made.get("download") or made["file"], quote=True)
     canonical = f"{base}/datasets/{quote(made['name'])}.html"
     structured = _catalogue_json_ld(title, base, "", [made])
     terms = f'<a href="{licence_url}" rel="license">{licence}</a>' if licence_url else licence
@@ -797,11 +990,11 @@ def _detail_page(title: str, base: str, made: dict[str, Any]) -> str:
 <div><dt>Source repository</dt><dd>{html.escape(made.get("repository") or "See source")}</dd></div>
 <div><dt>Canonical licence</dt><dd>{terms}</dd></div></dl>
 <section><h2>Transformation into ROOT</h2><p>{transformation}</p></section>
-<div class="actions"><a class="download" href="../{download}" download>Download {name}.root</a>
+<div class="actions">{_detail_downloads(made, name)}
 {_provenance_links(made)}</div>
 {_citation_detail(made)}
 <section><h2>Stream it with PyXRootD</h2><pre><code>export XRD_CATALOGUE={html.escape(base)}
-python -c 'import xrd.ml; print(xrd.ml.load("{name}"))'</code></pre></section>
+python -c 'import xrd.ml; print({_load_example(made, name)})'</code></pre></section>
 </main></body></html>'''
 
 
@@ -997,12 +1190,14 @@ const show = wanted => {
 
     const result = tr.insertCell();
     result.className = "download";
-    const download = document.createElement("a");
-    download.href = d.download || d.file;
-    download.download = d.download || d.file;
-    download.textContent = "Download " + (d.download || d.file);
-    download.className = "block";
-    result.appendChild(download);
+    for (const file of (d.files || [d])) {
+      const download = document.createElement("a");
+      download.href = file.download || file.file;
+      download.download = file.download || file.file;
+      download.textContent = "Download " + (file.split || file.download || file.file);
+      download.className = "block";
+      result.appendChild(download);
+    }
     const detail = document.createElement("span");
     detail.className = "muted";
     detail.textContent = d.rows.toLocaleString() + " rows · " + human(d.bytes);

@@ -190,6 +190,9 @@ converters. It is deliberately opt-in because the source cache, extraction
 workspace and converted output all need production-sized storage. Published
 source byte counts are still checked after every download. The whole story,
 including what the licences allow, is in [A datasets site](datasets-site.md).
+HEPMASS and Gas Sensor Arrays use checksummed per-split ROOT files so no
+physical output crosses the writer's 2 GB ROOT-layout boundary; the catalogue
+and generated site expose every shard.
 `--diagnostics [SECONDS]` writes timestamped phase, row-count, partial-output
 and active-download heartbeats to stderr every 30 seconds by default. It also
 installs a `SIGUSR1` handler that dumps every Python thread without terminating

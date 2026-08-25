@@ -99,9 +99,11 @@ UCI_LARGE: tuple[dict[str, Any], ...] = (
         "transformation": (
             "parsed every wind-tunnel recording without sensor scaling; retained controls, "
             "temperature, humidity and 72 sensor series, padding each to 26,000 samples while "
-            "recording its true length; wrote one ROOT TTree per chemical"
+            "recording its true length; wrote one ROOT file and TTree per chemical"
         ),
         "classes": GASES,
+        "splits": GASES,
+        "split_files": True,
     },
     {
         "name": "susy",
@@ -179,7 +181,8 @@ UCI_LARGE: tuple[dict[str, Any], ...] = (
         "transformation": (
             "streamed all six published gzip CSV files, converted features to float32 without "
             "scaling and preserved train/test files for the 1000, not-1000 and all-mass "
-            "hypotheses; wrote signal and background ROOT TTrees"
+            "hypotheses; wrote one ROOT file per publisher split with signal and background "
+            "TTrees"
         ),
         "classes": ("background", "signal"),
         "splits": (
@@ -190,6 +193,7 @@ UCI_LARGE: tuple[dict[str, Any], ...] = (
             "train_not1000",
             "test_not1000",
         ),
+        "split_files": True,
     },
     {
         "name": "chipseq",
@@ -629,7 +633,7 @@ def _realdisp(path: Path) -> Loaded:
     return ACTIVITIES, columns, _realdisp_entries(path)
 
 
-def _gas_entries(path: Path) -> Rows:
+def _gas_entries(path: Path, split: str) -> Rows:
     archive = zipfile.ZipFile(path)
     labels = {name: at for at, name in enumerate(GASES)}
     index = 0
@@ -639,9 +643,15 @@ def _gas_entries(path: Path) -> Rows:
             if info.is_dir() or len(parts) != 4:
                 continue
             matched, gas = _gas_name(parts[-1], labels)
-            arrays = _gas_arrays(archive, info)
-            yield _gas_entry(arrays, matched, parts[2], labels[gas], index, info.filename)
+            source_index = index
             index += 1
+            if split != "all" and gas != split:
+                continue
+            arrays = _gas_arrays(archive, info)
+            which, row = _gas_entry(
+                arrays, matched, parts[2], labels[gas], source_index, info.filename
+            )
+            yield (which if split == "all" else 0), row
     finally:
         archive.close()
 
@@ -754,7 +764,7 @@ def _gas_entry(
     }
 
 
-def _gas(path: Path) -> Loaded:
+def _gas(path: Path, split: str) -> Loaded:
     columns: dict[str, Any] = {
         "time_ms": ("i", 26_000),
         "controls": ("f", 8 * 26_000),
@@ -771,7 +781,8 @@ def _gas(path: Path) -> Loaded:
         "label": "i",
         "index": "i",
     }
-    return GASES, columns, _gas_entries(path)
+    classes = GASES if split == "all" else (split,)
+    return classes, columns, _gas_entries(path, split)
 
 
 @contextmanager
@@ -1459,7 +1470,14 @@ def _dicom(path: Path) -> Loaded:
 
 
 def _member_ending(archive: zipfile.ZipFile, ending: str) -> zipfile.ZipInfo:
-    matches = [info for info in archive.infolist() if info.filename.endswith(ending)]
+    # ZIPs made on macOS commonly carry ``__MACOSX/._name`` resource forks.
+    # Suffix matching mistakes that metadata for the real data member because
+    # ``._name`` also ends in ``name``.  Match the complete basename instead.
+    matches = [
+        info
+        for info in archive.infolist()
+        if not info.is_dir() and Path(info.filename).name == ending
+    ]
     if len(matches) != 1:
         raise ValueError(f"the archive has {len(matches)} members ending in {ending!r}, not one")
     return matches[0]
@@ -2076,7 +2094,6 @@ def load(converter: str, path: Path, split: str) -> Loaded:
 
 
 _SIMPLE_CONVERTERS: dict[str, Callable[[Path], Loaded]] = {
-    "gas": _gas,
     "realdisp": _realdisp,
     "cuffless": _cuffless,
     "chipseq": _chipseq,
@@ -2095,6 +2112,7 @@ _SIMPLE_CONVERTERS: dict[str, Callable[[Path], Loaded]] = {
 }
 
 _SPLIT_CONVERTERS: dict[str, Callable[[Path, str], Loaded]] = {
+    "gas": _gas,
     "hepmass": _hepmass,
     "pems": _pems,
     "puf": _puf,

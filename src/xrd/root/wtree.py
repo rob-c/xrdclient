@@ -181,9 +181,7 @@ class _Column:
 
     def pack(self, value: Any) -> bytes:
         """One entry's bytes, or a ``ValueError`` saying what was wrong with it."""
-        if self.length == 1:
-            values: Any = (value,)
-        elif self.typecode == "B" and isinstance(value, (bytes, bytearray, memoryview)):
+        if self.typecode == "B" and isinstance(value, (bytes, bytearray, memoryview)):
             raw = bytes(value)  # bytes are exactly what an unsigned byte column holds
             if len(raw) != self.length:
                 raise ValueError(
@@ -191,6 +189,8 @@ class _Column:
                     f"{len(raw)}"
                 )
             return raw
+        if self.length == 1:
+            values: Any = (value,)
         else:
             try:
                 values = list(value)

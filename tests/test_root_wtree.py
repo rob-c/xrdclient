@@ -144,6 +144,12 @@ def test_unsigned_columns_come_back_unsigned_rather_than_negative():
         assert tree.typenames() == {"n": "uint8", "m": "uint16"}
 
 
+def test_a_one_byte_buffer_fills_a_one_byte_unsigned_array_column():
+    """Width-one fixed text is still an array value, not an integer scalar."""
+    with read_back(written({"code": ("B", 1)}, [{"code": b"D"}, {"code": b"\0"}])) as back:
+        assert list(back["events"]["code"].array()) == [ord("D"), 0]
+
+
 def test_the_tree_keeps_its_name_and_title_and_the_file_lists_it():
     data = written({"x": float}, [{"x": 1.0}], name="ntuple", title="what it holds")
     with read_back(data) as back:

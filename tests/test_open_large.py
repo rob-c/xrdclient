@@ -127,9 +127,12 @@ def test_speech_commands_preserves_lists_and_turns_noise_into_training_windows(t
     assert [row["length"] for _, row in made] == [2, 16_000, 16_000]
 
 
-def test_audiomnist_joins_mirror_splits_to_the_authors_speaker_metadata(tmp_path):
+@pytest.mark.parametrize("tar_mode", ["w", "w:gz"])
+def test_audiomnist_joins_mirror_splits_to_the_authors_speaker_metadata(
+    tmp_path, tar_mode
+):
     source = tmp_path / "train.tar.gz"
-    with tarfile.open(source, "w:gz") as archive:
+    with tarfile.open(source, tar_mode) as archive:
         raw = _wav(struct.pack("<2h", 16384, -16384), rate=48_000)
         info = tarfile.TarInfo("dataset/01/7_01_3.wav")
         info.size = len(raw)
@@ -246,6 +249,16 @@ def test_biodcase_preserves_split_class_and_filename_metadata(tmp_path):
     assert made[1][1]["song_id"] == 63
     assert made[1][1]["location"].rstrip(b"\0") == b"grassland"
     assert made[1][1]["distance"] == b"D"
+
+    target = tmp_path / "biodcase.root"
+    convert(
+        "biodcase_2025_task3",
+        target,
+        split="train",
+        parts={"archive": source},
+    )
+    with open_root(target) as back:
+        assert list(back["train_yellowhammer"]["distance"].array()) == [ord("D")]
 
 
 def test_birdset_safely_joins_multilabel_embeddings_and_provenance(tmp_path):

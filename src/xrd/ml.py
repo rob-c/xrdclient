@@ -762,6 +762,7 @@ class _Part:
 def load(
     source: Any,
     *,
+    split: str | None = None,
     inputs: Sequence[str] | None = None,
     answer: str | None = None,
     scale: bool = True,
@@ -780,6 +781,9 @@ def load(
     :attr:`~xrd.Config.catalogue` (usually the ``XRD_CATALOGUE`` environment
     variable), which is the ``index.json`` an ``xrd-datasets`` site serves;
     that is how the second line above finds the same file as the first.
+    A catalogue dataset split into physical ROOT shards requires
+    ``split="train"`` (or another split named in its index entry); this keeps
+    a multi-gigabyte logical dataset streamable without an ambiguous default.
 
     The columns to learn from and the one to learn are worked out from their
     names - see :class:`Dataset` - and ``inputs`` and ``answer`` say so
@@ -803,9 +807,18 @@ def load(
                 "cache= pulls a file to a local copy, so it needs somewhere to "
                 "pull from: a name or a URL, not an already-open file"
             )
-        source = str(download(source, into=None if cache is True else cache, config=config))
+        source = str(
+            download(
+                source,
+                split=split,
+                into=None if cache is True else cache,
+                config=config,
+            )
+        )
     elif isinstance(source, str) and _is_name(source):
-        source = _from_catalogue(source, config)[0]
+        source = _from_catalogue(source, config, split=split)[0]
+    elif split is not None:
+        raise ValueError("split= selects a file shard only when source is a catalogue name")
     handle = open_root(source, config=config)
     try:
         return Dataset(
@@ -831,7 +844,9 @@ def _is_name(source: str) -> bool:
     )
 
 
-def _from_catalogue(name: str, config: Config | None) -> tuple[str, dict[str, Any]]:
+def _from_catalogue(
+    name: str, config: Config | None, *, split: str | None = None
+) -> tuple[str, dict[str, Any]]:
     """The URL behind ``name`` and its index entry, from the catalogue.
 
     The entry comes back with the URL because it carries the size and the
@@ -852,7 +867,8 @@ def _from_catalogue(name: str, config: Config | None) -> tuple[str, dict[str, An
     index = json.loads(fetch(f"{base}/index.json", config=config))
     for entry in index["datasets"]:
         if entry["name"] == name:
-            return f"{base}/{entry['file']}", entry
+            file = _catalogue_file(name, entry, split)
+            return f"{base}/{file['file']}", file
     names = sorted(entry["name"] for entry in index["datasets"])
     held = ", ".join(names[:8]) + (f", and {len(names) - 8} more" if len(names) > 8 else "")
     raise ValueError(
@@ -860,9 +876,31 @@ def _from_catalogue(name: str, config: Config | None) -> tuple[str, dict[str, An
     )
 
 
+def _catalogue_file(
+    name: str, entry: dict[str, Any], split: str | None
+) -> dict[str, Any]:
+    """Select one physical file from a logical catalogue entry."""
+    files: list[dict[str, Any]] | None = entry.get("files")
+    if not files:
+        if split is not None:
+            raise ValueError(f"{name!r} is one ROOT file and has no file shard {split!r}")
+        return entry
+    if split is None:
+        names = ", ".join(str(file["split"]) for file in files)
+        raise ValueError(
+            f"{name!r} is stored in ROOT file shards {names}; pass split= to choose one"
+        )
+    for file in files:
+        if file["split"] == split:
+            return file
+    names = ", ".join(str(file["split"]) for file in files)
+    raise ValueError(f"{name!r} has ROOT file shards {names}, not {split!r}")
+
+
 def download(
     source: str,
     *,
+    split: str | None = None,
     into: str | os.PathLike[str] | None = None,
     refresh: bool = False,
     config: Config | None = None,
@@ -879,6 +917,7 @@ def download(
     second call with the same source transfers nothing and returns the same
     path. Anything already on this machine is its own cache: a local path
     comes straight back, uncopied.
+    ``split=`` selects one physical ROOT shard of a sharded catalogue dataset.
 
     The pull goes to a ``.part`` beside the target and is renamed onto it only
     once the bytes are all there and the catalogue's checksum agrees, so an
@@ -898,7 +937,9 @@ def download(
     settings = config or _Config()
     entry: dict[str, Any] = {}
     if _is_name(source):
-        source, entry = _from_catalogue(source, settings)
+        source, entry = _from_catalogue(source, settings, split=split)
+    elif split is not None:
+        raise ValueError("split= selects a file shard only when source is a catalogue name")
     if parse(source).is_local:
         return Path(source)
     where = Path(into) if into is not None else Path(settings.cache_dir) / "datasets"

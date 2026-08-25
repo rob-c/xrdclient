@@ -1536,6 +1536,10 @@ class Large(Dataset):
     source_sizes: Mapping[str, int] = field(default_factory=dict)
     #: Optional cache names shared by logical tasks backed by an identical source.
     cache_names: Mapping[str, str] = field(default_factory=dict)
+    #: Write each publisher split as its own ROOT file in catalogue builds.
+    #: This keeps complete datasets whose combined ROOT layout exceeds 2 GB
+    #: within the writer's interoperable 32-bit file layout.
+    split_files: bool = False
 
     NEEDS: ClassVar[tuple[str, ...]] = (
         "source_bytes",
@@ -22143,6 +22147,7 @@ def _uci_large(item: Mapping[str, Any]) -> Large:
         converter=item["converter"],
         requires=tuple(item.get("requires", ())),
         transformation_note=item["transformation"],
+        split_files=bool(item.get("split_files", False)),
     )
 
 
@@ -22189,6 +22194,7 @@ def _open_large(item: Mapping[str, Any]) -> Large:
         sources=item.get("sources", {}),
         source_sizes=item.get("source_sizes", {}),
         cache_names=item.get("cache_names", {}),
+        split_files=bool(item.get("split_files", False)),
     )
 
 

@@ -21,7 +21,11 @@ from ._hub_tables import HUB_OPEN
 Rows = Iterator[tuple[int, dict[str, Any]]]
 Loaded = tuple[tuple[str, ...], dict[str, Any], Rows]
 
-TEXT_LIMIT = 32_768
+# Fixed-width byte leaves can represent substantially more than 32 KiB.  Keep
+# a defensive per-value ceiling so a corrupt Parquet cell cannot allocate an
+# unbounded branch, but admit the multi-megabyte conversations, structures and
+# embedded media published by the registered Hub datasets.
+TEXT_LIMIT = 16 * 1024 * 1024
 _BY_NAME = {item["name"]: item for item in HUB_OPEN}
 
 
