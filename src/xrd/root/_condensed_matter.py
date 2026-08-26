@@ -436,9 +436,10 @@ VISUAL_CONDENSED_MATTER: tuple[dict[str, Any], ...] = (
         "converter": "open:condensed:moke_skyrmions",
         "transformation": (
             "paired publisher MOKE PNGs with RGB-coded masks; resized intensity images "
-            "to 256x256 and masks with nearest-neighbour sampling; mapped blue/red/green "
-            "to background/skyrmion/defect and retained source and partition-group ids; "
-            "omitted packaged trained models and statistics because they are not examples"
+            "to 256x256 and masks with nearest-neighbour sampling; mapped exact and quantized "
+            "colours to the nearest blue/red/green background/skyrmion/defect palette value and "
+            "retained source and partition-group ids; omitted packaged trained models and "
+            "statistics because they are not examples"
         ),
         "classes": SKYRMION_CLASSES,
         "splits": ("all",),
@@ -837,8 +838,12 @@ def _moke_mask(source: IO[bytes]) -> tuple[array.array[int], array.array[float]]
     colours = ((0, 0, 255), (255, 0, 0), (0, 255, 0))
     for label, colour in enumerate(colours):
         mask[numpy.all(rgb == colour, axis=2)] = label
-    if bool(numpy.any(mask == 255)):
-        raise ValueError("MOKE label image contains a colour outside its three-class palette")
+    unknown = mask == 255
+    if bool(numpy.any(unknown)):
+        held = rgb[unknown].astype(numpy.int32)
+        palette = numpy.asarray(colours, dtype=numpy.int32)
+        distances = numpy.sum((held[:, None, :] - palette[None, :, :]) ** 2, axis=2)
+        mask[unknown] = numpy.argmin(distances, axis=1).astype(numpy.uint8)
     pixels = mask.size
     fractions = array.array(
         "f", (int(numpy.count_nonzero(mask == label)) / pixels for label in range(3))

@@ -68,6 +68,25 @@ def test_omnifold_accepts_the_publishers_event_number_before_the_level(tmp_path)
     assert made[0][1]["zg"] == 0 and made[1][1]["multiplicity"] == 12
 
 
+def test_omnifold_streams_every_numbered_shard_in_numeric_order(tmp_path):
+    source = tmp_path / "omnifold-numbered.zip"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr(
+            "OmniFold_Big/OmniFold_Big_10.txt", "0 reco 230 1 2 3 4 5 6 7 8 9 10 0.3 11\n"
+        )
+        archive.writestr(
+            "OmniFold_Big/OmniFold_Big_2.txt", "0 truth 220 1 2 3 4 5 6 7 8 9 10 0.2 10\n"
+        )
+        archive.writestr(
+            "OmniFold_Big/OmniFold_Big_1.txt", "0 truth 210 1 2 3 4 5 6 7 8 9 10 0.1 9\n"
+        )
+
+    made = list(load("omnifold", {"archive": source}, "all")[2])
+
+    assert [row["z_pt"] for _tree, row in made] == [210, 220, 230]
+    assert [row["index"] for _tree, row in made] == [0, 1, 2]
+
+
 def test_wikitext_keeps_nonempty_pretokenized_lines_in_each_split(tmp_path):
     pyarrow = pytest.importorskip("pyarrow")
     parquet = pytest.importorskip("pyarrow.parquet")
@@ -89,13 +108,13 @@ def test_tinysol_reads_pcm_and_uses_the_instrument_code_in_the_filename(tmp_path
         recording.writeframes(b"\x01\x00\x02\x00")
     source = tmp_path / "tinysol.tar.gz"
     with tarfile.open(source, "w:gz") as archive:
-        info = tarfile.TarInfo("Brass/BTb/ordinario/BTb-ord-C2-ff-N-N.wav")
+        info = tarfile.TarInfo("TinySOL2020/Winds/Bassoon/ordinario/Bn-ord-G#4-ff-N-N.wav")
         info.size = len(wav.getvalue())
         archive.addfile(info, io.BytesIO(wav.getvalue()))
     classes, columns, entries = load("tinysol", {"archive": source}, "all")
-    assert classes[2] == "bass_tuba" and columns["audio"] == ("f", 441_000)
+    assert classes[3] == "bassoon" and columns["audio"] == ("f", 441_000)
     label, row = next(entries)
-    assert label == 2 and row["length"] == 2 and row["sample_rate"] == 44_100
+    assert label == 3 and row["length"] == 2 and row["sample_rate"] == 44_100
     assert row["audio"][:3] == pytest.approx([1 / 32768, 2 / 32768, 0])
 
 
@@ -229,6 +248,33 @@ def test_reefset_joins_json_provenance_to_fixed_width_pcm(tmp_path):
     assert made[0][1]["audio"][:3] == pytest.approx([1 / 32768, 2 / 32768, 0])
     assert made[0][1]["length"] == 2 and made[0][1]["source_id"] == 7
     assert made[0][1]["dataset"].rstrip(b"\0") == b"somewhere"
+
+
+def test_reefset_normalizes_the_publishers_32_bit_pcm_recording(tmp_path):
+    source = tmp_path / "reefset.zip"
+    name = "8610.indonesia_bombs.b_williams_ucl.anthrop_bomb.wav"
+    held = io.BytesIO()
+    with wave.open(held, "wb") as recording:
+        recording.setnchannels(1)
+        recording.setsampwidth(4)
+        recording.setframerate(16_000)
+        recording.writeframes(struct.pack("<3i", 1, 1_073_741_824, -2_147_483_648))
+    annotation = {
+        "id": 8610,
+        "file_name": name,
+        "label": "anthrop_bomb",
+        "data_sharer": "b_williams_ucl",
+        "dataset": "indonesia_bombs",
+        "recorder": "unknown",
+    }
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr(f"ReefSet_v1.0/full_dataset/{name}", held.getvalue())
+        archive.writestr("ReefSet_v1.0/reefset_annotations.json", json.dumps([annotation]))
+
+    label, row = next(load("reefset", {"archive": source}, "all")[2])
+
+    assert label == 2 and row["length"] == 3 and row["sample_rate"] == 16_000
+    assert row["audio"][:4] == pytest.approx([1 / 2_147_483_648, 0.5, -1.0, 0.0])
 
 
 def test_biodcase_preserves_split_class_and_filename_metadata(tmp_path):

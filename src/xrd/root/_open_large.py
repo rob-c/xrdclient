@@ -16,6 +16,7 @@ import io
 import itertools
 import json
 import math
+import re
 import shutil
 import tarfile
 import tempfile
@@ -57,6 +58,7 @@ TINYSOL_CODES = {
     "Acc": "accordion",
     "ASax": "alto_saxophone",
     "BTb": "bass_tuba",
+    "Bn": "bassoon",
     "Bsn": "bassoon",
     "Vc": "cello",
     "ClBb": "clarinet",
@@ -293,7 +295,8 @@ OPEN_LARGE: tuple[dict[str, Any], ...] = (
         "source_bytes": 817_938_159,
         "converter": "open:omnifold",
         "transformation": (
-            "streamed the published truth and reconstructed event lines, retained jet "
+            "streamed all 201 numbered publisher event shards and their truth and reconstructed "
+            "event lines, retained jet "
             "kinematics, width, tau2, soft-drop mass, zg and multiplicity without scaling, "
             "mapped NaN zg to zero as the publisher notebook does, and wrote one ROOT TTree "
             "per simulation level"
@@ -511,9 +514,9 @@ OPEN_LARGE: tuple[dict[str, Any], ...] = (
         "source_bytes": 1_628_719_176,
         "converter": "open:reefset",
         "transformation": (
-            "decoded each published mono PCM WAV without resampling; normalized signed "
-            "16-bit samples to float32 in [-1, 1), retained 30,720 values, true length "
-            "and sample rate, "
+            "decoded each published mono PCM WAV without resampling; normalized its declared "
+            "8-, 16-, 24- or 32-bit integer samples to float32 in [-1, 1), retained 30,720 "
+            "values, true length and sample rate, "
             "joined the publisher's JSON label, dataset, recorder and data-sharer "
             "provenance, and wrote one ROOT TTree per acoustic class"
         ),
@@ -797,45 +800,96 @@ def _jetnet(paths: Mapping[str, Path]) -> Loaded:
     return JETNET_CLASSES, columns, _jetnet_entries(paths)
 
 
+_OMNIFOLD_SHARD = re.compile(r"omnifold_big_(\d+)\.txt$", re.IGNORECASE)
+
+
+def _numbered_omnifold_members(
+    archive: zipfile.ZipFile,
+) -> list[tuple[int, zipfile.ZipInfo]]:
+    numbered: list[tuple[int, zipfile.ZipInfo]] = []
+    for info in archive.infolist():
+        matched = _OMNIFOLD_SHARD.search(info.filename)
+        if matched is not None:
+            numbered.append((int(matched.group(1)), info))
+    return numbered
+
+
+def _sorted_omnifold_members(
+    numbered: Sequence[tuple[int, zipfile.ZipInfo]],
+) -> list[zipfile.ZipInfo]:
+    identifiers = [identifier for identifier, _info in numbered]
+    if len(identifiers) != len(set(identifiers)):
+        raise ValueError("OmniFold Big has a duplicate numbered event shard")
+    return [info for _identifier, info in sorted(numbered)]
+
+
+def _legacy_omnifold_member(archive: zipfile.ZipFile) -> zipfile.ZipInfo:
+    for info in archive.infolist():
+        if Path(info.filename).name.lower() == "test_omni.txt":
+            return info
+    raise ValueError("OmniFold Big has no numbered event shards")
+
+
+def _omnifold_members(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+    numbered = _numbered_omnifold_members(archive)
+    return _sorted_omnifold_members(numbered) if numbered else [_legacy_omnifold_member(archive)]
+
+
+def _omnifold_level(cells: Sequence[str], description: str) -> int:
+    if "truth" in cells[:2]:
+        return 0
+    if "reco" in cells[:2]:
+        return 1
+    raise ValueError(f"{description} names neither truth nor reco level")
+
+
+def _omnifold_row(cells: Sequence[str], index: int, description: str) -> tuple[int, dict[str, Any]]:
+    if len(cells) < 15:
+        raise ValueError(f"{description} has {len(cells)} fields, not at least 15")
+    level = _omnifold_level(cells, description)
+    zg = float(cells[13])
+    return (
+        level,
+        {
+            "z_pt": float(cells[2]),
+            "jet": array.array("f", (float(value) for value in cells[3:7])),
+            "width": float(cells[7]),
+            "tau2": float(cells[8]),
+            "soft_drop_mass": float(cells[12]),
+            "zg": 0.0 if math.isnan(zg) else zg,
+            "multiplicity": int(cells[14]),
+            "label": level,
+            "index": index,
+        },
+    )
+
+
+def _omnifold_rows(archive: zipfile.ZipFile, info: zipfile.ZipInfo, first: int) -> Rows:
+    with archive.open(info) as held:
+        text = io.TextIOWrapper(held, encoding="utf-8", newline="")
+        try:
+            for physical, line in enumerate(text):
+                cells = line.split()
+                if not cells:
+                    continue
+                yield _omnifold_row(
+                    cells,
+                    first,
+                    f"OmniFold row {physical} of {info.filename}",
+                )
+                first += 1
+        finally:
+            text.close()
+
+
 def _omnifold_entries(path: Path) -> Rows:
     archive = zipfile.ZipFile(path)
-    candidates = [info for info in archive.infolist() if info.filename.lower().endswith(".txt")]
-    if len(candidates) != 1:
-        archive.close()
-        raise ValueError(f"OmniFold Big holds {len(candidates)} text event files, not one")
     index = 0
     try:
-        with archive.open(candidates[0]) as held:
-            text = io.TextIOWrapper(held, encoding="utf-8", newline="")
-            try:
-                for physical, line in enumerate(text):
-                    cells = line.split()
-                    if not cells:
-                        continue
-                    level_word = next(
-                        (cell for cell in cells[:2] if cell in ("truth", "reco")), None
-                    )
-                    if len(cells) < 15 or level_word is None:
-                        raise ValueError(f"OmniFold row {physical} has an unknown layout")
-                    level = 0 if level_word == "truth" else 1
-                    zg = float(cells[13])
-                    yield (
-                        level,
-                        {
-                            "z_pt": float(cells[2]),
-                            "jet": array.array("f", (float(value) for value in cells[3:7])),
-                            "width": float(cells[7]),
-                            "tau2": float(cells[8]),
-                            "soft_drop_mass": float(cells[12]),
-                            "zg": 0.0 if math.isnan(zg) else zg,
-                            "multiplicity": int(cells[14]),
-                            "label": level,
-                            "index": index,
-                        },
-                    )
-                    index += 1
-            finally:
-                text.close()
+        for info in _omnifold_members(archive):
+            for row in _omnifold_rows(archive, info, index):
+                yield row
+                index += 1
     finally:
         archive.close()
 
@@ -927,6 +981,42 @@ def _pcm16(recording: Any, maximum: int, name: str) -> tuple[array.array[float],
         raise ValueError(f"recording {name!r} ends after {len(pcm)} of {length} samples")
     samples = _float_pcm(pcm, maximum)
     return samples, length, recording.getframerate()
+
+
+def _integer_pcm(recording: Any, maximum: int, name: str) -> tuple[array.array[float], int, int]:
+    """One mono integer-PCM WAV normalized according to its declared sample width."""
+    if recording.getnchannels() != 1 or recording.getcomptype() != "NONE":
+        raise ValueError(f"recording {name!r} is not uncompressed mono PCM")
+    width = recording.getsampwidth()
+    if width not in (1, 2, 3, 4):
+        raise ValueError(f"recording {name!r} has unsupported {width}-byte PCM samples")
+    length = recording.getnframes()
+    if length > maximum:
+        raise ValueError(f"recording {name!r} exceeds {maximum} samples")
+    raw = recording.readframes(length)
+    if len(raw) != length * width:
+        raise ValueError(f"recording {name!r} ends after {len(raw) // width} of {length} samples")
+    samples = _integer_pcm_samples(raw, width)
+    samples.extend([0.0] * (maximum - length))
+    return samples, length, recording.getframerate()
+
+
+def _integer_pcm_samples(raw: bytes, width: int) -> array.array[float]:
+    """Little-endian integer PCM of one supported width as normalized float32."""
+    if width == 1:
+        return array.array("f", ((sample - 128) / 128.0 for sample in raw))
+    if width == 3:
+        values = (
+            int.from_bytes(raw[at : at + 3], "little", signed=True)
+            for at in range(0, len(raw), 3)
+        )
+        return array.array("f", (sample / 8_388_608.0 for sample in values))
+    code, scale = ("h", 32_768.0) if width == 2 else ("i", 2_147_483_648.0)
+    pcm = array.array(code)
+    pcm.frombytes(raw)
+    if __import__("sys").byteorder == "big":
+        pcm.byteswap()
+    return array.array("f", (sample / scale for sample in pcm))
 
 
 def _float_pcm(pcm: array.array[int], maximum: int) -> array.array[float]:
@@ -1402,7 +1492,7 @@ def _reefset_entry(
     if not isinstance(source_id, int):
         raise ValueError(f"ReefSet recording {name!r} has no integer source id")
     with archive.open(members[name]) as held, wave.open(held, "rb") as recording:
-        audio, length, sample_rate = _pcm16(recording, 30_720, name)
+        audio, length, sample_rate = _integer_pcm(recording, 30_720, name)
     label = labels[label_name]
     row = {
         "audio": audio,

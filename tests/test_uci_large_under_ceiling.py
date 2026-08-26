@@ -58,12 +58,13 @@ def test_the_three_gas_formats_stream_raw_sensor_values(tmp_path):
     assert label == 0 and len(row["sensors"]) == 16
 
     twin = tmp_path / "twin.zip"
+    recording = " ".join(["1"] * 9) + "\n"
     with zipfile.ZipFile(twin, "w") as archive:
-        archive.writestr("B1_GEa_F040_R2.txt", " ".join(["1"] * 9) + "\n")
+        archive.writestr("B1_GEa_F040_R2.txt", recording * 60_001)
     _, columns, rows = load("twin_gas", twin, "all")
     label, row = next(rows)
-    assert label == 0 and columns["sensors"] == ("f", 480_000)
-    assert row["length"] == 1 and row["concentration"] == 40
+    assert label == 0 and columns["sensors"] == ("f", 480_008)
+    assert row["length"] == 60_001 and row["concentration"] == 40
 
 
 def test_open_sampling_gas_is_partitioned_losslessly_by_chemical(tmp_path):
@@ -71,6 +72,7 @@ def test_open_sampling_gas_is_partitioned_losslessly_by_chemical(tmp_path):
     filename = "130101010101_board_setPoint_5V_fan_setPoint_50_mfc_setPoint_acetone_100ppm_p1"
     cells = ["0", *(["1"] * 8), "20", "40", *(["1"] * 81)]
     with zipfile.ZipFile(open_sampling, "w") as archive:
+        archive.writestr("dataset/run/L1/batch_execution", "publisher control metadata\n")
         archive.writestr(f"dataset/run/L1/{filename}", " ".join(cells) + "\n")
     classes, _, rows = load("gas", open_sampling, "acetone")
     label, row = next(rows)
@@ -108,6 +110,11 @@ def test_nested_p53_pamap_and_hhar_archives(tmp_path):
     _, columns, rows = load("p53", p53, "all")
     label, row = next(rows)
     assert label == 1 and columns["features"] == ("f", 5408) and len(row["features"]) == 5408
+
+    current_p53 = tmp_path / "current-p53.zip"
+    with zipfile.ZipFile(current_p53, "w") as archive:
+        archive.writestr("p53_new_2012.zip", nested_zip({"Data Sets/K9.data": line}))
+    assert next(load("p53", current_p53, "all")[2])[0] == 1
 
     pamap = tmp_path / "pamap.zip"
     cells = ["0", "1", *(["nan"] * 52)]

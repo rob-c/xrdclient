@@ -22,6 +22,7 @@ from dataclasses import replace
 
 import pytest
 
+from xrd import Config, TransientError
 from xrd.root import _uci_large as large_module
 from xrd.root import datasets as datasets_module
 from xrd.root import open_root
@@ -1074,6 +1075,18 @@ def test_all_large_uci_archives_are_disk_backed_and_registered():
         assert spec.licence == "CC BY 4.0"
         assert spec.source_bytes == item["source_bytes"]
         assert spec.url.endswith(".zip")
+
+
+def test_medical_deepfakes_use_bounded_patient_disjoint_root_shards():
+    medical = DATASETS["medical_deepfakes"]
+    assert isinstance(medical, Large) and medical.split_files
+    assert len(medical.splits) == 8
+
+
+def test_realdisp_uses_one_bounded_root_shard_per_subject():
+    realdisp = DATASETS["realdisp"]
+    assert isinstance(realdisp, Large) and realdisp.split_files
+    assert realdisp.splits == tuple(f"subject_{subject:02d}" for subject in range(1, 18))
 
 
 def test_the_non_uci_large_archives_have_canonical_terms_and_record_the_ceiling():
@@ -3846,6 +3859,88 @@ def test_a_large_source_cache_is_atomic_reusable_and_size_checked(tmp_path):
         )
 
 
+def test_a_cached_remote_source_resumes_a_part_and_recovers_a_dropped_read(
+    tmp_path, monkeypatch
+):
+    cache = tmp_path / "sources"
+    cache.mkdir()
+    part = cache / "example.source.part"
+    part.write_bytes(b"abc")
+
+    class InterruptedRemote:
+        def __init__(self):
+            self.position = 0
+            self.interrupted = False
+            self.seeks = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_error):
+            return None
+
+        def seek(self, offset):
+            self.position = offset
+            self.seeks.append(offset)
+            return offset
+
+        def read(self, maximum):
+            if not self.interrupted:
+                self.interrupted = True
+                raise TransientError("publisher connection dropped", committed=self.position)
+            chunk = b"abcdef"[self.position : self.position + maximum]
+            self.position += len(chunk)
+            return chunk
+
+    remote = InterruptedRemote()
+    monkeypatch.setattr("xrd.io.open_url", lambda *_args, **_kwargs: remote)
+
+    path, temporary = datasets_module._fetch_file(
+        "https://publisher.example/archive",
+        cache=cache,
+        name="example",
+        expected=6,
+        config=Config(connect_retries=1),
+    )
+
+    assert path.read_bytes() == b"abcdef" and not temporary
+    assert remote.seeks == [3, 3]
+    assert not part.exists()
+
+
+def test_an_exhausted_remote_retry_keeps_the_download_part(tmp_path, monkeypatch):
+    cache = tmp_path / "sources"
+    cache.mkdir()
+    part = cache / "example.source.part"
+    part.write_bytes(b"abc")
+
+    class BrokenRemote:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_error):
+            return None
+
+        def seek(self, offset):
+            return offset
+
+        def read(self, _maximum):
+            raise TransientError("publisher connection dropped", committed=3)
+
+    monkeypatch.setattr("xrd.io.open_url", lambda *_args, **_kwargs: BrokenRemote())
+
+    with pytest.raises(TransientError, match="publisher connection dropped"):
+        datasets_module._fetch_file(
+            "https://publisher.example/archive",
+            cache=cache,
+            name="example",
+            expected=6,
+            config=Config(connect_retries=0),
+        )
+
+    assert part.read_bytes() == b"abc"
+
+
 def test_hepmass_streams_a_gzipped_member_from_a_disk_backed_zip(tmp_path):
     source = tmp_path / "hepmass.zip"
     header = ",".join(("label", *(f"f{at}" for at in range(27))))
@@ -3881,7 +3976,7 @@ def test_realdisp_keeps_sensor_readings_and_subject_placement(tmp_path):
     with zipfile.ZipFile(source, "w") as archive:
         archive.writestr("subject15_mutual4.log", "\t".join(cells) + "\n")
 
-    classes, columns, rows = large_module.load("realdisp", source, "all")
+    classes, columns, rows = large_module.load("realdisp", source, "subject_15")
     assert classes[3] == "activity_3" and columns["features"] == ("f", 117)
     made = list(rows)
     assert len(made) == 1 and made[0][0] == 3
@@ -3919,6 +4014,27 @@ def test_one_gas_recording_becomes_the_published_75_time_series(tmp_path):
     assert row["length"] == 1 and len(row["sensors"]) == 72 * 26_000
     assert row["temperature"][0] == 21.5 and row["humidity"][0] == 58.0
     assert row["concentration"] == 200 and row["location"] == 3
+
+
+def test_multimodal_damage_letterboxes_variable_publisher_geometry(tmp_path):
+    image_module = pytest.importorskip("PIL.Image")
+    encoded = io.BytesIO()
+    image_module.new("RGB", (480, 288), (20, 40, 60)).save(encoded, format="JPEG")
+    source = tmp_path / "multimodal.zip"
+    name = "multimodal/damaged_infrastructure/images/accrafloods.jpg"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr(name, encoded.getvalue())
+        archive.writestr("multimodal/damaged_infrastructure/text/accrafloods.txt", "damaged road")
+
+    classes, columns, rows = large_module.load("humanitarian", source, "all")
+    tree, row = next(rows)
+
+    assert classes[tree] == "infrastructural_damage"
+    assert columns["image"] == ("B", 640 * 640 * 3)
+    assert len(row["image"]) == 640 * 640 * 3
+    assert (row["source_width"], row["source_height"]) == (480, 288)
+    assert (row["resized_width"], row["resized_height"]) == (480, 288)
+    assert (row["left_padding"], row["top_padding"]) == (80, 176)
 
 
 def test_chipseq_splits_coverage_runs_at_weak_label_boundaries():
@@ -3975,6 +4091,35 @@ def test_medical_deepfake_truth_labels_locations_not_whole_scans(tmp_path):
 
     assert truth == {(1, 7, 12): (1, 20, 21), (2, 8, 13): (4, 22, 23)}
     assert (1, 7, 11) not in truth  # a benign location does not label its entire scan
+
+
+def test_medical_deepfakes_are_patient_disjoint_across_bounded_output_shards(tmp_path):
+    pixels = array.array("h", [0]) * (512 * 512)
+    raw = bytearray(128) + b"DICM"
+    raw += _dicom_element(0x0028, 0x0010, b"US", struct.pack("<H", 512))
+    raw += _dicom_element(0x0028, 0x0011, b"US", struct.pack("<H", 512))
+    raw += _dicom_element(0x0028, 0x0100, b"US", struct.pack("<H", 16))
+    raw += _dicom_element(0x0028, 0x0103, b"US", struct.pack("<H", 1))
+    raw += _dicom_element(0x0028, 0x1052, b"DS", b"-1024 ")
+    raw += _dicom_element(0x0028, 0x1053, b"DS", b"1 ")
+    raw += _dicom_element(0x7FE0, 0x0010, b"OW", pixels.tobytes())
+    nested = io.BytesIO()
+    header = "type,uuid,slice,x,y\n"
+    with zipfile.ZipFile(nested, "w") as archive:
+        archive.writestr("Tampered Scans/labels_exp1.csv", header + "TB,5,1,20,21\n")
+        archive.writestr("Tampered Scans/labels_exp2.csv", header)
+        archive.writestr("Tampered Scans/Experiment 1/5/1.dcm", raw)
+        archive.writestr("Tampered Scans/Experiment 1/6/1.dcm", raw)
+    source = tmp_path / "medical.zip"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("data.zip", nested.getvalue())
+
+    classes, _columns, rows = large_module.load("dicom", source, "experiment_1_patients_1")
+    made = list(rows)
+
+    assert classes == large_module.DICOM_LABELS
+    assert len(made) == 1 and made[0][1]["patient"] == 5
+    assert made[0][1]["label"] == 1
 
 
 def test_ppg_pickles_cannot_name_an_arbitrary_python_callable():

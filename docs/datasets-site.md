@@ -289,8 +289,9 @@ temporary file and atomically published only after the ROOT writer closes; a
 failed conversion removes that temporary output, and an unreadable file left by
 an older interrupted build is detected and rebuilt. One converter failure is
 reported without aborting the remaining queue. The retained source archive
-means a retry starts at conversion rather than downloading tens of gigabytes
-again.
+and its adjacent `.part` are resumable: a dropped connection is reopened at
+the last byte committed to disk, and an exhausted retry keeps that part so the
+next build does not download tens of gigabytes again.
 
 For an unattended or apparently idle build, diagnostics make every silent
 phase observable:

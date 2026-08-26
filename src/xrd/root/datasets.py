@@ -51,6 +51,9 @@ from typing import Any, ClassVar
 from urllib.parse import urlsplit
 
 from .._compat import SLOTS, zip_strict
+from .._log import get_logger
+from ..config import Config
+from ..errors import TransientError
 from ..url import parse
 from ._hub_tables import HUB_OPEN
 from ._open_large import OPEN_LARGE
@@ -58,6 +61,8 @@ from ._uci_attribution import UCI_ATTRIBUTION
 from ._uci_large import UCI_LARGE
 from ._uci_tables import UCI_TABLES
 from .writer import WritableFile, create
+
+_log = get_logger(__name__)
 
 __all__ = [
     "CIFAR",
@@ -412,12 +417,24 @@ def _spool_file(
     cached = _cached_source(target, name, expected)
     if cached is not None:
         return cached, False
-    part, handle, temporary = _source_handle(target, name)
+    part, handle, temporary = _source_handle(target, name, resume=url is not None)
     try:
-        _copy_source(source, url, handle, config)
+        offset = handle.tell()
+        if expected and offset > expected:
+            raise ValueError(
+                f"the partial source for {name} is {offset} bytes, and the published "
+                f"archive is {expected}"
+            )
+        if not expected or offset < expected:
+            _copy_source(source, url, handle, config)
         handle.close()
         _check_source_size(part, source, name, expected)
         return _retain_source(part, target, temporary)
+    except TransientError:
+        handle.close()
+        if temporary:
+            part.unlink(missing_ok=True)
+        raise
     except BaseException:
         handle.close()
         part.unlink(missing_ok=True)
@@ -436,12 +453,16 @@ def _cached_source(target: Path | None, name: str, expected: int) -> Path | None
     return target
 
 
-def _source_handle(target: Path | None, name: str) -> tuple[Path, Any, bool]:
+def _source_handle(
+    target: Path | None, name: str, *, resume: bool
+) -> tuple[Path, Any, bool]:
     """Open the temporary or cache-adjacent file which receives a source."""
     if target is not None:
         target.parent.mkdir(parents=True, exist_ok=True)
         part = target.with_name(target.name + ".part")
-        handle: Any = part.open("wb")
+        handle: Any = part.open("ab" if resume else "wb")
+        if handle.tell():
+            _log.info("resuming %s source download at byte %d", name, handle.tell())
         return part, handle, False
     held = tempfile.NamedTemporaryFile(prefix=f"xrd-{name}-", suffix=".source", delete=False)
     return Path(held.name), held, True
@@ -459,9 +480,35 @@ def _copy_source(source: Any, url: Any, handle: Any, config: Any) -> None:
     from ..io import open_url
 
     assert url is not None
-    with open_url(url, "rb", config=config) as remote:
-        while chunk := remote.read(1 << 20):
-            handle.write(chunk)
+    with open_url(url, "rb", buffering=0, config=config) as remote:
+        if handle.tell():
+            remote.seek(handle.tell())
+        _copy_remote(remote, handle, config)
+
+
+def _copy_remote(remote: Any, handle: Any, config: Any) -> None:
+    """Copy a remote stream, resuming recoverable drops at the last committed byte."""
+    retries = (config or Config()).connect_retries
+    failures = 0
+    while True:
+        try:
+            chunk = remote.read(1 << 20)
+        except TransientError:
+            failures += 1
+            if failures > retries:
+                raise
+            _log.info(
+                "source connection dropped at byte %d; retrying %d/%d",
+                handle.tell(),
+                failures,
+                retries,
+            )
+            remote.seek(handle.tell())
+            continue
+        if not chunk:
+            return
+        handle.write(chunk)
+        failures = 0
 
 
 def _check_source_size(part: Path, source: Any, name: str, expected: int) -> None:

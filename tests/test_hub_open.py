@@ -165,6 +165,82 @@ def test_hub_parquet_preserves_scalars_text_lengths_classes_and_missing_values(
     assert math.isnan(made[1][1]["score"])
 
 
+class _NordSchemaBook:
+    def __init__(self, _path):
+        self.schema_arrow = SimpleNamespace(names=["document", "summary", "seed_dataset"])
+
+    def iter_batches(self, *, batch_size, columns):
+        assert batch_size == 4096
+        values = {
+            "document": ["Tre bogstaver"],
+            "summary": ["Kort"],
+            "seed_dataset": ["publisher"],
+        }
+        yield _Batch({name: values[name] for name in columns})
+
+
+def test_hub_nord_schema_aliases_document_and_derives_character_lengths(monkeypatch, tmp_path):
+    name = "hub_alexandrainst_nordjylland_news_summarization"
+    item = {
+        "name": name,
+        "label": "alexandrainst/nordjylland-news-summarization",
+        "features": [
+            {"source": "text", "branch": "text", "dtype": "string"},
+            {"source": "summary", "branch": "summary", "dtype": "string"},
+            {"source": "text_len", "branch": "text_len", "dtype": "int64"},
+            {"source": "summary_len", "branch": "summary_len", "dtype": "int64"},
+        ],
+        "target": 3,
+        "split_roles": {"train": ["train_001"]},
+    }
+    monkeypatch.setitem(hub_module._BY_NAME, name, item)
+    monkeypatch.setattr(
+        hub_module.importlib,
+        "import_module",
+        lambda _name: SimpleNamespace(ParquetFile=_NordSchemaBook),
+    )
+
+    _classes, _columns, entries = load(name, {"train_001": tmp_path / "train.parquet"}, "train")
+    _tree, row = next(entries)
+
+    assert row["text_len"] == len("Tre bogstaver")
+    assert row["summary_len"] == row["target"] == len("Kort")
+
+
+class _SupersetBook:
+    def __init__(self, _path):
+        self.schema_arrow = SimpleNamespace(names=["extra", "score", "review"])
+
+    def iter_batches(self, *, batch_size, columns):
+        values = {"review": ["ok"], "score": [0.75], "extra": [99]}
+        yield _Batch({name: values[name] for name in columns})
+
+
+def test_hub_shards_may_reorder_columns_and_add_new_publisher_fields(monkeypatch, tmp_path):
+    item = {
+        "name": "hub_superset",
+        "label": "owner/superset",
+        "features": [
+            {"source": "review", "branch": "review", "dtype": "string"},
+            {"source": "score", "branch": "score", "dtype": "float64"},
+        ],
+        "target": 1,
+        "split_roles": {"train": ["train_001"]},
+    }
+    monkeypatch.setitem(hub_module._BY_NAME, "hub_superset", item)
+    monkeypatch.setattr(
+        hub_module.importlib,
+        "import_module",
+        lambda _name: SimpleNamespace(ParquetFile=_SupersetBook),
+    )
+
+    _classes, _columns, entries = load(
+        "hub_superset", {"train_001": tmp_path / "train.parquet"}, "train"
+    )
+
+    assert next(entries)[1]["target"] == 0.75
+
+
 def test_hub_text_can_losslessly_hold_multi_megabyte_publisher_values():
     raw = "physics " * 500_000
     encoded = hub_module._encoded(raw, dataset="owner/long", field="trace", index=7)

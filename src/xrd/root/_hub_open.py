@@ -27,6 +27,12 @@ Loaded = tuple[tuple[str, ...], dict[str, Any], Rows]
 # embedded media published by the registered Hub datasets.
 TEXT_LIMIT = 16 * 1024 * 1024
 _BY_NAME = {item["name"]: item for item in HUB_OPEN}
+_COLUMN_ALIASES: dict[str, dict[str, str]] = {
+    "hub_alexandrainst_nordjylland_news_summarization": {"text": "document"},
+}
+_DERIVED_LENGTHS: dict[str, frozenset[str]] = {
+    "hub_alexandrainst_nordjylland_news_summarization": frozenset({"text_len", "summary_len"}),
+}
 
 
 def _safe_branches(features: Sequence[Mapping[str, Any]]) -> list[str]:
@@ -55,22 +61,136 @@ def _roles(item: Mapping[str, Any], split: str) -> tuple[str, ...]:
     return tuple(roles)
 
 
+def _existing_source(
+    source: str, available: set[str], aliases: Mapping[str, str]
+) -> str | None:
+    if source in available:
+        return source
+    actual = aliases.get(source)
+    if actual in available:
+        return actual
+    return None
+
+
+def _resolved_source(
+    source: str,
+    available: set[str],
+    aliases: Mapping[str, str],
+    derivable: frozenset[str],
+) -> tuple[str | None, bool]:
+    actual = _existing_source(source, available, aliases)
+    if actual is not None:
+        return actual, False
+    if source not in derivable:
+        return None, False
+    base = source.removesuffix("_len")
+    actual = _existing_source(base, available, aliases)
+    return actual, actual is not None
+
+
+def _schema_sources(item: Mapping[str, Any]) -> list[str]:
+    sources = []
+    for feature in item["features"]:
+        sources.append(str(feature["source"]))
+    return sources
+
+
+def _resolved_sources(
+    sources: Sequence[str],
+    available: set[str],
+    aliases: Mapping[str, str],
+    derivable: frozenset[str],
+) -> list[tuple[str, str | None, bool]]:
+    resolved = []
+    for source in sources:
+        resolved.append((source, *_resolved_source(source, available, aliases, derivable)))
+    return resolved
+
+
+def _missing_sources(resolved: Sequence[tuple[str, str | None, bool]]) -> list[str]:
+    missing = []
+    for source, actual, _derived in resolved:
+        if actual is None:
+            missing.append(source)
+    return missing
+
+
+def _completed_schema(
+    resolved: Sequence[tuple[str, str | None, bool]],
+) -> tuple[dict[str, str], frozenset[str]]:
+    plan = {}
+    derived = set()
+    for source, actual, made in resolved:
+        plan[source] = str(actual)
+        if made:
+            derived.add(source)
+    return plan, frozenset(derived)
+
+
+def _schema_plan(
+    item: Mapping[str, Any], names: Sequence[str]
+) -> tuple[dict[str, str], frozenset[str]]:
+    """Resolve registered fields against a compatible publisher schema revision."""
+    aliases = _COLUMN_ALIASES.get(item["name"], {})
+    derivable = _DERIVED_LENGTHS.get(item["name"], frozenset())
+    available = set(names)
+    resolved = _resolved_sources(_schema_sources(item), available, aliases, derivable)
+    missing = _missing_sources(resolved)
+    if missing:
+        raise ValueError(
+            f"the Hub dataset {item['label']} is missing recorded columns {', '.join(missing)}; "
+            f"the shard contains {', '.join(names)}"
+        )
+    return _completed_schema(resolved)
+
+
 def _books(
     item: Mapping[str, Any], paths: Mapping[str, Path], split: str
-) -> Iterator[tuple[str, Any]]:
+) -> Iterator[tuple[str, Any, dict[str, str], frozenset[str]]]:
     parquet = importlib.import_module("pyarrow.parquet")
-    expected = [feature["source"] for feature in item["features"]]
     for role in _roles(item, split):
         if role not in paths:
             raise ValueError(f"the Hub dataset {item['label']} is missing its {role} shard")
         book = parquet.ParquetFile(paths[role])
         names = list(book.schema_arrow.names)
-        if names != expected:
-            raise ValueError(
-                f"the Hub dataset {item['label']} {role} columns are {', '.join(names)}, "
-                f"not the recorded {', '.join(expected)}"
+        try:
+            plan, derived = _schema_plan(item, names)
+        except ValueError as error:
+            raise ValueError(f"{error} ({role})") from None
+        yield role, book, plan, derived
+
+
+def _derived_text_lengths(values: Sequence[Any], *, dataset: str, field: str) -> list[int]:
+    result = []
+    for value in values:
+        if value is None:
+            result.append(-1)
+        elif isinstance(value, str):
+            result.append(len(value))
+        else:
+            raise ValueError(f"the Hub dataset {dataset} cannot derive {field} from non-text data")
+    return result
+
+
+def _source_batches(
+    item: Mapping[str, Any],
+    book: Any,
+    sources: Sequence[str],
+    plan: Mapping[str, str],
+    derived: frozenset[str],
+) -> Iterator[tuple[Any, dict[str, Sequence[Any]]]]:
+    columns = list(dict.fromkeys(plan[source] for source in sources))
+    for batch in book.iter_batches(batch_size=4096, columns=columns):
+        raw = batch.to_pydict()
+        values: dict[str, Sequence[Any]] = {}
+        for source in sources:
+            actual = plan[source]
+            values[source] = (
+                _derived_text_lengths(raw[actual], dataset=item["label"], field=source)
+                if source in derived
+                else raw[actual]
             )
-        yield role, book
+        yield batch, values
 
 
 def _encoded(value: Any, *, dataset: str, field: str, index: int) -> bytes:
@@ -89,27 +209,66 @@ def _encoded(value: Any, *, dataset: str, field: str, index: int) -> bytes:
     return raw
 
 
+def _text_sources(item: Mapping[str, Any]) -> list[str]:
+    result = []
+    for feature in item["features"]:
+        if feature["dtype"] == "string":
+            result.append(str(feature["source"]))
+    return result
+
+
+def _initial_widths(sources: Sequence[str]) -> dict[str, int]:
+    result = {}
+    for source in sources:
+        result[source] = 1
+    return result
+
+
+def _update_text_widths(
+    item: Mapping[str, Any],
+    columns: Sequence[str],
+    widths: dict[str, int],
+    values: Mapping[str, Sequence[Any]],
+    first: int,
+) -> None:
+    for name in columns:
+        widths[name] = max(widths[name], _batch_text_width(item, name, values[name], first))
+
+
+def _book_text_widths(
+    item: Mapping[str, Any],
+    book: Any,
+    columns: Sequence[str],
+    widths: dict[str, int],
+    plan: Mapping[str, str],
+    derived: frozenset[str],
+    first: int,
+) -> int:
+    for batch, values in _source_batches(item, book, columns, plan, derived):
+        _update_text_widths(item, columns, widths, values, first)
+        first += batch.num_rows
+    return first
+
+
 def _text_widths(item: Mapping[str, Any], paths: Mapping[str, Path], split: str) -> dict[str, int]:
-    text = [feature for feature in item["features"] if feature["dtype"] == "string"]
-    widths = {feature["source"]: 1 for feature in text}
-    if not text:
+    columns = _text_sources(item)
+    widths = _initial_widths(columns)
+    if not columns:
         return widths
-    columns = list(widths)
     index = 0
-    for _role, book in _books(item, paths, split):
-        for batch in book.iter_batches(batch_size=4096, columns=columns):
-            values = batch.to_pydict()
-            for name in columns:
-                for offset, value in enumerate(values[name]):
-                    raw = _encoded(
-                        value,
-                        dataset=item["label"],
-                        field=name,
-                        index=index + offset,
-                    )
-                    widths[name] = max(widths[name], len(raw))
-            index += batch.num_rows
+    for _role, book, plan, derived in _books(item, paths, split):
+        index = _book_text_widths(item, book, columns, widths, plan, derived, index)
     return widths
+
+
+def _batch_text_width(
+    item: Mapping[str, Any], name: str, values: Sequence[Any], first: int
+) -> int:
+    width = 1
+    for offset, value in enumerate(values):
+        raw = _encoded(value, dataset=item["label"], field=name, index=first + offset)
+        width = max(width, len(raw))
+    return width
 
 
 def _class(value: Any, feature: Mapping[str, Any], dataset: str, index: int) -> int:
@@ -212,9 +371,9 @@ def _entries(
     sources = [feature["source"] for feature in item["features"]]
     target_at = int(item["target"])
     index = 0
-    for _role, book in _books(item, paths, split):
-        for batch in book.iter_batches(batch_size=4096, columns=sources):
-            for row in _batch_rows(item, batch, branches, widths, target_at, index):
+    for _role, book, plan, derived in _books(item, paths, split):
+        for batch, values in _source_batches(item, book, sources, plan, derived):
+            for row in _batch_rows(item, batch, values, branches, widths, target_at, index):
                 yield row
                 index += 1
 
@@ -222,12 +381,12 @@ def _entries(
 def _batch_rows(
     item: Mapping[str, Any],
     batch: Any,
+    values: Mapping[str, Sequence[Any]],
     branches: Sequence[str],
     widths: Mapping[str, int],
     target_at: int,
     first: int,
 ) -> Rows:
-    values = batch.to_pydict()
     for offset in range(batch.num_rows):
         yield 0, _converted_row(item, values, offset, branches, widths, target_at, first)
         first += 1

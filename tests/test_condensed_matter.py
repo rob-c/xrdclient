@@ -149,6 +149,21 @@ def test_moke_converts_the_publishers_rgb_mask_palette(tmp_path: Path) -> None:
     assert row["source_id"] == 17 and row["partition_group"] == 0
 
 
+def test_moke_maps_quantized_mask_colours_to_the_nearest_publisher_class(tmp_path: Path) -> None:
+    source = tmp_path / "moke-quantized.zip"
+    prefix = "public_unet_skyrmion_dataset"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr(f"{prefix}/table.csv", "source_id;img_fn\n17;sample.png\n")
+        archive.writestr(f"{prefix}/partition.txt", "only_training;17\ntrain_test_val;18\n")
+        archive.writestr(f"{prefix}/images/sample.png", _picture("L", (3, 3), 29))
+        archive.writestr(f"{prefix}/labels/sample.png", _picture("RGB", (3, 3), (254, 2, 1)))
+
+    _classes, _columns, entries = load("condensed:moke_skyrmions", {"archive": source}, "all")
+    _tree, row = next(entries)
+
+    assert set(row["mask"]) == {1}
+
+
 def test_perovskite_labelme_polygons_and_circles_become_a_mask(tmp_path: Path) -> None:
     source = tmp_path / "perovskite.zip"
     document = {

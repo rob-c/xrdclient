@@ -58,11 +58,16 @@ CHIP_CODES = {"noPeaks": 1, "peaks": 2, "peakStart": 3, "peakEnd": 4}
 DICOM_LABELS = (
     "unlabelled",
     "true_benign",
-    "true_malignant",
+    "true_malicious",
     "false_benign",
-    "false_malignant",
+    "false_malicious",
 )
 DICOM_CODES = {"TB": 1, "TM": 2, "FB": 3, "FM": 4}
+DICOM_SPLITS = tuple(
+    f"experiment_{experiment}_patients_{bucket}"
+    for experiment in (1, 2)
+    for bucket in range(4)
+)
 HUMANITARIAN = (
     "fires",
     "floods",
@@ -85,6 +90,7 @@ PAMAP_ACTIVITIES = tuple(
     f"activity_{at}" for at in (0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 16, 17, 18, 19, 20, 24)
 )
 HHAR_ACTIVITIES = ("unlabelled", "bike", "sit", "stand", "walk", "stairs_up", "stairs_down")
+REALDISP_SPLITS = tuple(f"subject_{subject:02d}" for subject in range(1, 18))
 
 
 UCI_LARGE: tuple[dict[str, Any], ...] = (
@@ -99,7 +105,8 @@ UCI_LARGE: tuple[dict[str, Any], ...] = (
         "transformation": (
             "parsed every wind-tunnel recording without sensor scaling; retained controls, "
             "temperature, humidity and 72 sensor series, padding each to 26,000 samples while "
-            "recording its true length; wrote one ROOT file and TTree per chemical"
+            "recording its true length; ignored publisher execution-control metadata and wrote "
+            "one ROOT file and TTree per chemical"
         ),
         "classes": GASES,
         "splits": GASES,
@@ -150,9 +157,11 @@ UCI_LARGE: tuple[dict[str, Any], ...] = (
         "transformation": (
             "parsed each wearable timestamp without resampling or feature scaling; grouped "
             "117 float32 sensor readings with subject, placement and activity metadata; wrote "
-            "one ROOT TTree per activity"
+            "one ROOT file per subject with one TTree per activity"
         ),
         "classes": ACTIVITIES,
+        "splits": REALDISP_SPLITS,
+        "split_files": True,
     },
     {
         "name": "cuffless_blood_pressure",
@@ -219,9 +228,10 @@ UCI_LARGE: tuple[dict[str, Any], ...] = (
         "source_bytes": 1132451409,
         "converter": "humanitarian",
         "transformation": (
-            "decoded each JPEG to its published 640x640 RGB unsigned-byte pixels without "
-            "resizing, paired it with the supplied caption and retained the damage class; "
-            "wrote one ROOT TTree per class"
+            "decoded each JPEG to RGB unsigned-byte pixels, proportionally letterboxed variable "
+            "source geometry to 640x640 while retaining the original and resized geometry, paired "
+            "it with the supplied caption and retained the damage class; wrote one ROOT TTree per "
+            "class"
         ),
         "classes": HUMANITARIAN,
         "requires": ("Pillow",),
@@ -255,9 +265,13 @@ UCI_LARGE: tuple[dict[str, Any], ...] = (
         "transformation": (
             "decoded each DICOM slice to its original 512x512 signed 16-bit pixels, retained "
             "slope/intercept calibration and attached only the published slice-level tamper "
-            "class and x/y location; no image normalization or resizing was applied"
+            "class and x/y location; no image normalization or resizing was applied; partitioned "
+            "the output into eight deterministic, patient-disjoint experiment shards to keep each "
+            "ROOT file within the interoperable writer layout"
         ),
         "classes": DICOM_LABELS,
+        "splits": DICOM_SPLITS,
+        "split_files": True,
     },
     {
         "name": "pems_sf",
@@ -339,8 +353,9 @@ UCI_LARGE: tuple[dict[str, Any], ...] = (
         "converter": "twin_gas",
         "transformation": (
             "streamed each experiment, retained its time and eight raw resistance channels, "
-            "padded only recordings shorter than 60,000 readings and preserved board, gas, "
-            "concentration and repetition metadata; wrote one ROOT TTree per gas"
+            "padded only recordings shorter than the publisher's inclusive 60,001-sample "
+            "limit and preserved board, gas, concentration and repetition metadata; wrote "
+            "one ROOT TTree per gas"
         ),
         "classes": ("ethanol", "carbon_monoxide", "ethylene", "methane"),
         "modality": "chemical sensor time series",
@@ -403,9 +418,9 @@ UCI_LARGE: tuple[dict[str, Any], ...] = (
         "source_bytes": 552632888,
         "converter": "p53",
         "transformation": (
-            "streamed the complete K8 feature table from the current nested archive, retained "
-            "5,408 features without scaling, mapped missing cells to NaN and wrote active and "
-            "inactive ROOT TTrees"
+            "streamed the complete K9 feature table from the current nested archive (accepting "
+            "the legacy K8 name), retained 5,408 features without scaling, mapped missing cells "
+            "to NaN and wrote active and inactive ROOT TTrees"
         ),
         "classes": ("inactive", "active"),
         "modality": "molecular features",
@@ -555,14 +570,15 @@ def _hepmass(path: Path, split: str) -> Loaded:
     )
 
 
-def _realdisp_entries(path: Path) -> Rows:
+def _realdisp_entries(path: Path, split: str) -> Rows:
     archive = zipfile.ZipFile(path)
     index = 0
     pattern = re.compile(r"subject(\d+)_(ideal|self|mutual(\d+))\.log$")
+    wanted = None if split == "all" else int(split.removeprefix("subject_"))
     try:
         for info in sorted(archive.infolist(), key=lambda item: item.filename):
             matched = pattern.fullmatch(info.filename)
-            if matched is None:
+            if matched is None or (wanted is not None and int(matched.group(1)) != wanted):
                 continue
             for row in _realdisp_file(archive, info, matched, index):
                 yield row
@@ -619,7 +635,7 @@ def _realdisp_row(
     }
 
 
-def _realdisp(path: Path) -> Loaded:
+def _realdisp(path: Path, split: str) -> Loaded:
     columns: dict[str, Any] = {
         "features": ("f", 117),
         "seconds": "i",
@@ -630,30 +646,41 @@ def _realdisp(path: Path) -> Loaded:
         "label": "i",
         "index": "i",
     }
-    return ACTIVITIES, columns, _realdisp_entries(path)
+    return ACTIVITIES, columns, _realdisp_entries(path, split)
+
+
+def _gas_member(
+    info: zipfile.ZipInfo, labels: Mapping[str, int]
+) -> tuple[re.Match[str], str, str] | None:
+    parts = info.filename.split("/")
+    if info.is_dir():
+        return None
+    if len(parts) != 4:
+        return None
+    if _GAS_NAME.fullmatch(parts[-1]) is None:
+        return None
+    matched, gas = _gas_name(parts[-1], labels)
+    return matched, gas, parts[2]
 
 
 def _gas_entries(path: Path, split: str) -> Rows:
-    archive = zipfile.ZipFile(path)
     labels = {name: at for at, name in enumerate(GASES)}
     index = 0
-    try:
+    with zipfile.ZipFile(path) as archive:
         for info in sorted(archive.infolist(), key=lambda item: item.filename):
-            parts = info.filename.split("/")
-            if info.is_dir() or len(parts) != 4:
+            recording = _gas_member(info, labels)
+            if recording is None:
                 continue
-            matched, gas = _gas_name(parts[-1], labels)
+            matched, gas, location = recording
             source_index = index
             index += 1
-            if split != "all" and gas != split:
+            if split not in ("all", gas):
                 continue
             arrays = _gas_arrays(archive, info)
             which, row = _gas_entry(
-                arrays, matched, parts[2], labels[gas], source_index, info.filename
+                arrays, matched, location, labels[gas], source_index, info.filename
             )
             yield (which if split == "all" else 0), row
-    finally:
-        archive.close()
 
 
 def _gas_name(filename: str, labels: Mapping[str, int]) -> tuple[re.Match[str], str]:
@@ -1281,53 +1308,80 @@ def _fixed_text(raw: bytes, width: int, name: str) -> bytes:
     return raw + bytes(width - len(raw))
 
 
-def _humanitarian_entries(path: Path) -> Rows:
+def _humanitarian_image(raw: bytes, image_module: Any) -> tuple[bytes, tuple[int, ...]]:
+    """Decode and letterbox one publisher JPEG without distorting its aspect ratio."""
+    with image_module.open(io.BytesIO(raw)) as picture:
+        width, height = picture.size
+        image = picture.convert("RGB")
+        image.thumbnail((640, 640), image_module.Resampling.BILINEAR)
+        resized_width, resized_height = image.size
+        left = (640 - resized_width) // 2
+        top = (640 - resized_height) // 2
+        canvas = image_module.new("RGB", (640, 640))
+        canvas.paste(image, (left, top))
+        return canvas.tobytes(), (width, height, resized_width, resized_height, left, top)
+
+
+def _humanitarian_module() -> Any:
     try:
-        image_module = importlib.import_module("PIL.Image")
+        return importlib.import_module("PIL.Image")
     except ModuleNotFoundError:
         raise ValueError(
             "Multimodal Damage needs the datasets extra: pip install 'pyxrootdclient[datasets]'"
         ) from None
-    archive = zipfile.ZipFile(path)
-    index = 0
-    try:
+
+
+def _humanitarian_images(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+    return sorted(
+        (
+            info
+            for info in archive.infolist()
+            if "/images/" in info.filename and info.filename.lower().endswith(".jpg")
+        ),
+        key=lambda item: item.filename,
+    )
+
+
+def _humanitarian_entry(
+    archive: zipfile.ZipFile,
+    held: Mapping[str, zipfile.ZipInfo],
+    info: zipfile.ZipInfo,
+    image_module: Any,
+    index: int,
+) -> tuple[int, dict[str, Any]]:
+    parts = info.filename.split("/")
+    if len(parts) != 4 or parts[1] not in HUMANITARIAN_CODES:
+        raise ValueError(f"the image path {info.filename!r} has an unknown class")
+    which = HUMANITARIAN_CODES[parts[1]]
+    with archive.open(info) as source:
+        pixels, geometry = _humanitarian_image(source.read(), image_module)
+    text_name = info.filename.replace("/images/", "/text/").rsplit(".", 1)[0] + ".txt"
+    text_info = held.get(text_name)
+    caption = archive.read(text_info).strip() if text_info is not None else b""
+    return (
+        which,
+        {
+            "image": pixels,
+            "caption": _fixed_text(caption, 8192, text_name),
+            "caption_length": len(caption),
+            "source_width": geometry[0],
+            "source_height": geometry[1],
+            "resized_width": geometry[2],
+            "resized_height": geometry[3],
+            "left_padding": geometry[4],
+            "top_padding": geometry[5],
+            "label": which,
+            "index": index,
+        },
+    )
+
+
+def _humanitarian_entries(path: Path) -> Rows:
+    image_module = _humanitarian_module()
+    with zipfile.ZipFile(path) as archive:
         held = {info.filename: info for info in archive.infolist()}
-        images = sorted(
-            (
-                info
-                for info in archive.infolist()
-                if "/images/" in info.filename and info.filename.lower().endswith(".jpg")
-            ),
-            key=lambda item: item.filename,
-        )
-        for info in images:
-            parts = info.filename.split("/")
-            if len(parts) != 4 or parts[1] not in HUMANITARIAN_CODES:
-                raise ValueError(f"the image path {info.filename!r} has an unknown class")
-            which = HUMANITARIAN_CODES[parts[1]]
-            with archive.open(info) as source:
-                raw = source.read()
-            with image_module.open(io.BytesIO(raw)) as picture:
-                if picture.size != (640, 640):
-                    raise ValueError(f"{info.filename} is {picture.size}, not 640x640")
-                pixels = picture.convert("RGB").tobytes()
-            text_name = info.filename.replace("/images/", "/text/").rsplit(".", 1)[0] + ".txt"
-            text_info = held.get(text_name)
-            caption = archive.read(text_info) if text_info is not None else b""
-            caption = caption.strip()
-            yield (
-                which,
-                {
-                    "image": pixels,
-                    "caption": _fixed_text(caption, 8192, text_name),
-                    "caption_length": len(caption),
-                    "label": which,
-                    "index": index,
-                },
-            )
-            index += 1
-    finally:
-        archive.close()
+        for index, info in enumerate(_humanitarian_images(archive)):
+            yield _humanitarian_entry(archive, held, info, image_module, index)
 
 
 def _humanitarian(path: Path) -> Loaded:
@@ -1335,6 +1389,12 @@ def _humanitarian(path: Path) -> Loaded:
         "image": ("B", 640 * 640 * 3),
         "caption": ("B", 8192),
         "caption_length": "i",
+        "source_width": "i",
+        "source_height": "i",
+        "resized_width": "i",
+        "resized_height": "i",
+        "left_padding": "i",
+        "top_padding": "i",
         "label": "i",
         "index": "i",
     }
@@ -1414,7 +1474,70 @@ def _dicom_truth(
     return exact
 
 
-def _dicom_entries(path: Path) -> Rows:
+def _dicom_partition(split: str) -> tuple[int, int] | None:
+    if split == "all":
+        return None
+    matched = re.fullmatch(r"experiment_([12])_patients_([0-3])", split)
+    if matched is None:
+        raise ValueError(f"unknown medical deepfake shard {split!r}")
+    return int(matched.group(1)), int(matched.group(2))
+
+
+def _dicom_identity(info: zipfile.ZipInfo) -> tuple[int, int, int]:
+    parts = info.filename.split("/")
+    if len(parts) != 4:
+        raise ValueError(f"the DICOM path {info.filename!r} has an unknown layout")
+    experiment = 1 if "Experiment 1" in parts[1] else 2 if "Experiment 2" in parts[1] else 0
+    if not experiment:
+        raise ValueError(f"the DICOM path {info.filename!r} names no experiment")
+    return experiment, int(parts[2]), int(parts[3].removesuffix(".dcm"))
+
+
+def _dicom_location(
+    truth: Mapping[tuple[int, int, int], tuple[int, int, int]],
+    identity: tuple[int, int, int],
+) -> tuple[int, int, int]:
+    known = truth.get(identity)
+    return (0, -1, -1) if known is None else known
+
+
+def _dicom_selected(partition: tuple[int, int] | None, identity: tuple[int, int, int]) -> bool:
+    if partition is None:
+        return True
+    experiment, patient, _section = identity
+    return (experiment, patient % 4) == partition
+
+
+def _dicom_entry(
+    archive: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    truth: Mapping[tuple[int, int, int], tuple[int, int, int]],
+    identity: tuple[int, int, int],
+    index: int,
+) -> tuple[int, dict[str, Any]]:
+    experiment, patient, section = identity
+    which, x, y = _dicom_location(truth, identity)
+    with archive.open(info) as held:
+        pixels, intercept, slope = _dicom_pixels(held.read())
+    return (
+        which,
+        {
+            "image": pixels,
+            "experiment": experiment,
+            "patient": patient,
+            "slice": section,
+            "x": x,
+            "y": y,
+            "intercept": intercept,
+            "slope": slope,
+            "label": which,
+            "index": index,
+        },
+    )
+
+
+def _dicom_entries(path: Path, split: str) -> Rows:
+    partition = _dicom_partition(split)
     with _nested_zip(path) as archive:
         truth = _dicom_truth(archive)
         images = sorted(
@@ -1422,38 +1545,13 @@ def _dicom_entries(path: Path) -> Rows:
             key=lambda item: item.filename,
         )
         for index, info in enumerate(images):
-            parts = info.filename.split("/")
-            if len(parts) != 4:
-                raise ValueError(f"the DICOM path {info.filename!r} has an unknown layout")
-            experiment = 1 if "Experiment 1" in parts[1] else 2 if "Experiment 2" in parts[1] else 0
-            if not experiment:
-                raise ValueError(f"the DICOM path {info.filename!r} names no experiment")
-            patient, section = int(parts[2]), int(parts[3].removesuffix(".dcm"))
-            known = truth.get((experiment, patient, section))
-            if known is None:
-                which, x, y = 0, -1, -1
-            else:
-                which, x, y = known
-            with archive.open(info) as held:
-                pixels, intercept, slope = _dicom_pixels(held.read())
-            yield (
-                which,
-                {
-                    "image": pixels,
-                    "experiment": experiment,
-                    "patient": patient,
-                    "slice": section,
-                    "x": x,
-                    "y": y,
-                    "intercept": intercept,
-                    "slope": slope,
-                    "label": which,
-                    "index": index,
-                },
-            )
+            identity = _dicom_identity(info)
+            if not _dicom_selected(partition, identity):
+                continue
+            yield _dicom_entry(archive, info, truth, identity, index)
 
 
-def _dicom(path: Path) -> Loaded:
+def _dicom(path: Path, split: str) -> Loaded:
     columns: dict[str, Any] = {
         "image": ("h", 512 * 512),
         "experiment": "i",
@@ -1466,7 +1564,7 @@ def _dicom(path: Path) -> Loaded:
         "label": "i",
         "index": "i",
     }
-    return DICOM_LABELS, columns, _dicom_entries(path)
+    return DICOM_LABELS, columns, _dicom_entries(path, split)
 
 
 def _member_ending(archive: zipfile.ZipFile, ending: str) -> zipfile.ZipInfo:
@@ -1768,8 +1866,8 @@ def _twin_gas_file(
         finally:
             text.close()
     return label, {
-        "time": _padded(time, 60_000),
-        "sensors": _padded(sensors, 8 * 60_000),
+        "time": _padded(time, 60_001),
+        "sensors": _padded(sensors, 8 * 60_001),
         "length": len(time),
         "board": int(matched.group(1)),
         "concentration": int(matched.group(3)),
@@ -1781,8 +1879,8 @@ def _twin_gas_file(
 
 def _twin_gas(path: Path) -> Loaded:
     columns: dict[str, Any] = {
-        "time": ("f", 60_000),
-        "sensors": ("f", 8 * 60_000),
+        "time": ("f", 60_001),
+        "sensors": ("f", 8 * 60_001),
         "length": "i",
         "board": "i",
         "concentration": "i",
@@ -1870,14 +1968,22 @@ def _opportunity(path: Path) -> Loaded:
     return ("unlabelled", "stand", "walk", "sit", "lie"), columns, _opportunity_entries(path)
 
 
+def _p53_table(archive: zipfile.ZipFile) -> zipfile.ZipInfo:
+    """The complete table, whose current archive name drifted from K8 to K9."""
+    members = {
+        Path(info.filename).name.lower(): info
+        for info in archive.infolist()
+        if not info.is_dir()
+    }
+    for name in ("k9.data", "k8.data"):
+        if name in members:
+            return members[name]
+    raise ValueError("the p53 archive has no complete K9 or legacy K8 table")
+
+
 def _p53_entries(path: Path) -> Rows:
     with _nested_archive(path, "new_2012") as archive:
-        candidates = [
-            info for info in archive.infolist() if info.filename.lower().endswith("k8.data")
-        ]
-        if len(candidates) != 1:
-            raise ValueError(f"the p53 archive has {len(candidates)} complete K8 tables")
-        with archive.open(candidates[0]) as held:
+        with archive.open(_p53_table(archive)) as held:
             yield from _p53_rows(held)
 
 
@@ -2094,12 +2200,10 @@ def load(converter: str, path: Path, split: str) -> Loaded:
 
 
 _SIMPLE_CONVERTERS: dict[str, Callable[[Path], Loaded]] = {
-    "realdisp": _realdisp,
     "cuffless": _cuffless,
     "chipseq": _chipseq,
     "humanitarian": _humanitarian,
     "ppg": _ppg,
-    "dicom": _dicom,
     "daily": _daily,
     "gas_temperature": _gas_temperature,
     "twin_gas": _twin_gas,
@@ -2112,9 +2216,11 @@ _SIMPLE_CONVERTERS: dict[str, Callable[[Path], Loaded]] = {
 }
 
 _SPLIT_CONVERTERS: dict[str, Callable[[Path, str], Loaded]] = {
+    "realdisp": _realdisp,
     "gas": _gas,
     "hepmass": _hepmass,
     "pems": _pems,
     "puf": _puf,
     "year_prediction": _year_prediction,
+    "dicom": _dicom,
 }
