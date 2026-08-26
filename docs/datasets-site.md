@@ -162,7 +162,7 @@ $ xrd-datasets build /nfs/datasets --only 'hub_*' \
 Start the default-ceiling filesystem with at least 500 GiB free for the first full pass.
 That is a conservative working allowance, not a promised final site size: it
 holds the roughly 41.15 GB deduplicated source cache, partially written ROOT files, temporary nested
-members and the finished output together. TinySOL's padded ten-second audio,
+members and the finished output together. TinySOL's padded ten-second audio chunks,
 AudioMNIST's 48 kHz rows, ReefSet's 57,084 waveforms, long sensor streams and
 100 independently usable copies of the Alex-MP-20 structure representation are
 the main expansion risks; measured ROOT files from the first pass are the useful
@@ -384,21 +384,59 @@ sitemap.xml, robots.txt in /srv/datasets
 `--base-url` is where the directory answers to HTTP. The native endpoint is
 taken to be the same host — `root://data.example.org` — which is what a single
 BriX-Cache box serving both planes gives you; `--root-url` says otherwise when
-`root://` lives behind its own name or port.
+`root://` lives behind its own name or port. `--nginx-port` controls the stock
+nginx virtual host and defaults to 8080; its `server_name` is derived safely
+from `--base-url`.
+
+For the ScotGrid production host, regenerate the HTML whenever `index.json`
+changes and install the generated named virtual host:
+
+```console
+$ xrd-datasets site /datasets/site \
+    --base-url https://ai.edi.scotgrid.ac.uk \
+    --root-url root://ai.edi.scotgrid.ac.uk \
+    --nginx-port 80 \
+    --title "ScotGrid AI open science datasets"
+$ sudo install -m 0644 /datasets/site/nginx.conf \
+    /etc/nginx/conf.d/ai-datasets.conf
+$ sudo nginx -t
+$ sudo systemctl enable --now nginx
+$ sudo firewall-cmd --permanent --add-service=http
+$ sudo firewall-cmd --permanent --add-service=https
+$ sudo firewall-cmd --reload
+$ sudo certbot --nginx --domain ai.edi.scotgrid.ac.uk --redirect
+```
+
+On an enforcing SELinux host, label a local filesystem as public read-only
+content. If `/datasets` is NFS, enable nginx's narrowly scoped NFS read access
+instead:
+
+```console
+$ sudo semanage fcontext -a -t httpd_sys_content_t '/datasets/site(/.*)?'
+$ sudo restorecon -Rv /datasets/site
+# NFS mount only:
+$ sudo setsebool -P httpd_use_nfs 1
+```
+
+The stock config permits only `GET` and `HEAD`, denies dotfiles, supplies CORS
+and byte-range headers for training clients, disables recompression of ROOT
+files, and emits a restrictive browser security policy. Certbot adds the HTTPS
+listener and HTTP-to-HTTPS redirect after the port-80 virtual host answers.
 
 Everything lands next to the files, so *the directory is the deploy*:
 
-- `index.html` — a responsive, searchable, server-rendered catalogue with an
-  end-to-end venv/PyXRootD/PyTorch classifier at the top. Every card links to
+- `index.html` — a responsive, searchable, faceted and sortable server-rendered
+  catalogue with an end-to-end venv/PyXRootD/PyTorch classifier at the top.
+  Every card links to
   the original publisher, canonical licence, transformation summary and
   `.root` download. JSON-LD describes it as a Schema.org `DataCatalog`, so the
   content is usable before JavaScript by both people and search indexers.
 - `datasets/*.html`, `sitemap.xml`, `robots.txt` — one indexable detail page
   per result, a canonical URL map and crawler policy. Open Graph, description,
   canonical and structured-data metadata are emitted without external assets.
-- `nginx.conf` — static hosting for any stock nginx: drop it in
+- `nginx.conf` — hostname-aware static hosting for any stock nginx: drop it in
   `conf.d/`, and range requests (which `xrd.ml` reads by) come from nginx
-  itself.
+  itself. The generated listener uses `--nginx-port`.
 - `brix.conf` — the same directory over `root://` (1094), WebDAV (8008) and
   plain HTTP (8080) with a BriX (nginx-xrootd) build of nginx, read-only on
   every plane. This client's data-path probing speaks to BriX's

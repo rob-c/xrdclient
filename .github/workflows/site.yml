@@ -17,7 +17,10 @@ on:
         default: ""
       base-url:
         description: "where the site will be served from"
-        default: "https://data.example.org"
+        default: "https://ai.edi.scotgrid.ac.uk"
+      title:
+        description: "public catalogue title"
+        default: "ScotGrid AI open science datasets"
   push:
     tags: ["site-*"]
 
@@ -49,7 +52,8 @@ jobs:
       - name: site
         run: >-
           xrd-datasets site site
-          --base-url "${{ inputs.base-url || 'https://data.example.org' }}"
+          --base-url "${{ inputs.base-url || 'https://ai.edi.scotgrid.ac.uk' }}"
+          --title "${{ inputs.title || 'ScotGrid AI open science datasets' }}"
       - uses: actions/upload-artifact@v4
         with:
           name: datasets-site

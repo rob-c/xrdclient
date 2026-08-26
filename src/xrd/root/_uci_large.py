@@ -230,7 +230,8 @@ UCI_LARGE: tuple[dict[str, Any], ...] = (
         "transformation": (
             "decoded each JPEG to RGB unsigned-byte pixels, proportionally letterboxed variable "
             "source geometry to 640x640 while retaining the original and resized geometry, paired "
-            "it with the supplied caption and retained the damage class; wrote one ROOT TTree per "
+            "it with the supplied caption and retained the damage class; repaired publisher JPEGs "
+            "missing their terminal end marker and recorded that repair; wrote one ROOT TTree per "
             "class"
         ),
         "classes": HUMANITARIAN,
@@ -419,8 +420,9 @@ UCI_LARGE: tuple[dict[str, Any], ...] = (
         "converter": "p53",
         "transformation": (
             "streamed the complete K9 feature table from the current nested archive (accepting "
-            "the legacy K8 name), retained 5,408 features without scaling, mapped missing cells "
-            "to NaN and wrote active and inactive ROOT TTrees"
+            "the legacy K8 name), removed K9's delimiter-created empty field after its class, "
+            "retained 5,408 features without scaling, mapped missing cells to NaN and wrote "
+            "active and inactive ROOT TTrees"
         ),
         "classes": ("inactive", "active"),
         "modality": "molecular features",
@@ -1308,8 +1310,26 @@ def _fixed_text(raw: bytes, width: int, name: str) -> bytes:
     return raw + bytes(width - len(raw))
 
 
-def _humanitarian_image(raw: bytes, image_module: Any) -> tuple[bytes, tuple[int, ...]]:
+def _humanitarian_image(raw: bytes, image_module: Any) -> tuple[bytes, tuple[int, ...], bool]:
     """Decode and letterbox one publisher JPEG without distorting its aspect ratio."""
+    try:
+        pixels, geometry = _decoded_humanitarian_image(raw, image_module)
+    except OSError as exc:
+        if (
+            not raw.startswith(b"\xff\xd8")
+            or raw.endswith(b"\xff\xd9")
+            or "image file is truncated" not in str(exc)
+        ):
+            raise
+        pixels, geometry = _decoded_humanitarian_image(raw + b"\xff\xd9", image_module)
+        return pixels, geometry, True
+    return pixels, geometry, False
+
+
+def _decoded_humanitarian_image(
+    raw: bytes, image_module: Any
+) -> tuple[bytes, tuple[int, ...]]:
+    """Decode one complete JPEG and return its pixels and letterbox geometry."""
     with image_module.open(io.BytesIO(raw)) as picture:
         width, height = picture.size
         image = picture.convert("RGB")
@@ -1354,7 +1374,7 @@ def _humanitarian_entry(
         raise ValueError(f"the image path {info.filename!r} has an unknown class")
     which = HUMANITARIAN_CODES[parts[1]]
     with archive.open(info) as source:
-        pixels, geometry = _humanitarian_image(source.read(), image_module)
+        pixels, geometry, repaired = _humanitarian_image(source.read(), image_module)
     text_name = info.filename.replace("/images/", "/text/").rsplit(".", 1)[0] + ".txt"
     text_info = held.get(text_name)
     caption = archive.read(text_info).strip() if text_info is not None else b""
@@ -1370,6 +1390,7 @@ def _humanitarian_entry(
             "resized_height": geometry[3],
             "left_padding": geometry[4],
             "top_padding": geometry[5],
+            "jpeg_eoi_repaired": repaired,
             "label": which,
             "index": index,
         },
@@ -1395,6 +1416,7 @@ def _humanitarian(path: Path) -> Loaded:
         "resized_height": "i",
         "left_padding": "i",
         "top_padding": "i",
+        "jpeg_eoi_repaired": "?",
         "label": "i",
         "index": "i",
     }
@@ -1989,6 +2011,8 @@ def _p53_entries(path: Path) -> Rows:
 
 def _p53_rows(held: Any) -> Rows:
     for index, cells in enumerate(_csv_rows(held)):
+        if len(cells) == 5_410 and cells[-1] == "":
+            cells.pop()
         if len(cells) != 5_409:
             raise ValueError(f"p53 row {index} has {len(cells)} fields, not 5409")
         word = cells[-1].strip().lower()

@@ -1564,9 +1564,15 @@ below the default two-gigabyte source ceiling:
 | `speech_commands_v001` | 16,000 float32 values, official train/validation/test lists, 30 words plus one-second noise windows | 1.489 GB |
 | `audiomnist` | 48,000 float32 values with speaker, repetition, age, sex, accent and origin metadata | 1.907 GB |
 | `circor_heart_sound` | non-overlapping five-second 4 kHz windows with patient, auscultation, murmur and outcome labels | 471.3 MB |
-| `tinysol` | up to ten seconds per orchestral note, one tree per instrument | 1.027 GB |
+| `tinysol` | lossless ten-second chunks per orchestral note, one tree per instrument | 1.027 GB |
 | `reefset` | 30,720 values plus the source's acoustic and recorder provenance | 1.629 GB |
 | `biodcase_2025_task3` | up to 32,000 values with the official training/validation split | 224.7 MB |
+
+TinySOL's publisher describes clips as two to ten seconds, but the distributed
+archive contains longer valid PCM recordings. The converter never truncates
+them: `recording` identifies the original WAV, `recording_length` preserves its
+total frame count, and `chunk`, `chunks`, and `length` describe the contiguous
+ten-second ROOT rows needed to reconstruct it exactly.
 
 Build only the waveform shelf with one conversion job so archive inflation and
 ROOT compression do not compete for the same disk:

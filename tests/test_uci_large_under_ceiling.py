@@ -112,9 +112,13 @@ def test_nested_p53_pamap_and_hhar_archives(tmp_path):
     assert label == 1 and columns["features"] == ("f", 5408) and len(row["features"]) == 5408
 
     current_p53 = tmp_path / "current-p53.zip"
+    current_line = line.rstrip("\n") + ",\n"
     with zipfile.ZipFile(current_p53, "w") as archive:
-        archive.writestr("p53_new_2012.zip", nested_zip({"Data Sets/K9.data": line}))
-    assert next(load("p53", current_p53, "all")[2])[0] == 1
+        archive.writestr(
+            "p53_new_2012.zip", nested_zip({"Data Sets/K9.data": current_line})
+        )
+    current_label, current_row = next(load("p53", current_p53, "all")[2])
+    assert current_label == 1 and len(current_row["features"]) == 5408
 
     pamap = tmp_path / "pamap.zip"
     cells = ["0", "1", *(["nan"] * 52)]

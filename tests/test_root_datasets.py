@@ -4035,6 +4035,39 @@ def test_multimodal_damage_letterboxes_variable_publisher_geometry(tmp_path):
     assert (row["source_width"], row["source_height"]) == (480, 288)
     assert (row["resized_width"], row["resized_height"]) == (480, 288)
     assert (row["left_padding"], row["top_padding"]) == (80, 176)
+    assert row["jpeg_eoi_repaired"] is False
+
+
+def test_multimodal_damage_repairs_a_publisher_jpeg_missing_its_end_marker(tmp_path):
+    image_module = pytest.importorskip("PIL.Image")
+    encoded = io.BytesIO()
+    image_module.new("RGB", (32, 24), (20, 40, 60)).save(encoded, format="JPEG")
+    assert encoded.getvalue().endswith(b"\xff\xd9")
+    source = tmp_path / "multimodal-truncated.zip"
+    name = "multimodal/damaged_infrastructure/images/truncated.jpg"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr(name, encoded.getvalue()[:-2])
+
+    classes, columns, rows = large_module.load("humanitarian", source, "all")
+    tree, row = next(rows)
+
+    assert classes[tree] == "infrastructural_damage"
+    assert columns["jpeg_eoi_repaired"] == "?"
+    assert len(row["image"]) == 640 * 640 * 3
+    assert row["jpeg_eoi_repaired"] is True
+
+    output = io.BytesIO()
+    assert convert("multimodal_damage", output, parts={"archive": source}) == {
+        "fires": 0,
+        "floods": 0,
+        "human_damage": 0,
+        "infrastructural_damage": 1,
+        "natural_landscape": 0,
+        "non_damage": 0,
+    }
+    with open_root(io.BytesIO(output.getvalue())) as back:
+        repaired = back["infrastructural_damage"]["jpeg_eoi_repaired"].array()
+        assert repaired.tolist() == [True]
 
 
 def test_chipseq_splits_coverage_runs_at_weak_label_boundaries():

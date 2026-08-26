@@ -741,6 +741,9 @@ def _assert_site_catalogue(page):
     assert '"creator":[{"@type":"Person","name":"Ada Dataset"}]' in page
     assert '"publisher":{"@type":"Organization","name":"Example Science Lab"}' in page
     assert '<article class="dataset-card"' in page  # indexable without JavaScript
+    assert 'id="modality"' in page and 'id="licence"' in page and 'id="sort"' in page
+    assert 'id="shown"' in page and "streamable ROOT archive" in page
+    assert 'data-size="' in page and 'data-rows="' in page
 
 
 def _assert_site_dataset_content(page):
@@ -776,8 +779,10 @@ def _assert_site_indexing(out):
 def _assert_site_nginx(out):
     nginx = (out / "nginx.conf").read_text()
     assert str(out.resolve()) in nginx
+    assert "listen 8080" in nginx and "server_name data.example.org" in nginx
     assert "location ~ (^|/)\\." in nginx  # a source cache under the root stays private
     assert "application/x-root root" in nginx and "Accept-Ranges bytes" in nginx
+    assert "limit_except GET HEAD" in nginx and "Content-Security-Policy" in nginx
 
 
 def _assert_site_brix(out):
@@ -840,6 +845,41 @@ def test_the_root_endpoint_can_live_somewhere_else(registry, mirror, out, capsys
     page = (out / "index.html").read_text()
     assert "root://xrootd.example.org:1094//mnist.root" in page
     assert "root://data.example.org" not in page
+
+
+def test_site_generates_a_named_port_80_virtual_host_for_production(
+    registry, mirror, out, capsys
+):
+    built(out, mirror, capsys)
+    code, _, err = run(
+        [
+            "site",
+            str(out),
+            "--base-url",
+            "https://ai.edi.scotgrid.ac.uk",
+            "--nginx-port",
+            "80",
+            "--title",
+            "ScotGrid AI open datasets",
+        ],
+        capsys,
+    )
+
+    assert code == 0, err
+    page = (out / "index.html").read_text()
+    nginx = (out / "nginx.conf").read_text()
+    assert "ScotGrid AI open datasets" in page
+    assert 'rel="canonical" href="https://ai.edi.scotgrid.ac.uk/"' in page
+    assert "listen 80;" in nginx and "listen [::]:80;" in nginx
+    assert "server_name ai.edi.scotgrid.ac.uk;" in nginx
+
+
+@pytest.mark.parametrize(
+    "value", ["ftp://data.example.org", "https://user@data.example.org", "not a URL"]
+)
+def test_site_rejects_a_non_public_http_base_url(value):
+    with pytest.raises(ValueError, match="public base URL"):
+        datasets_cli._public_base_url(value)
 
 
 def test_the_readme_says_both_planes_and_the_cache(registry, mirror, out, capsys):

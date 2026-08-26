@@ -316,9 +316,9 @@ OPEN_LARGE: tuple[dict[str, Any], ...] = (
         "converter": "open:tinysol",
         "transformation": (
             "decoded each published PCM WAV without resampling; normalized signed 16-bit "
-            "samples to float32 in [-1, 1), retained up to ten seconds of mono audio, "
-            "zero-padded only the unused tail and recorded its true length and sample rate; "
-            "wrote one ROOT TTree per instrument"
+            "samples to float32 in [-1, 1), divided publisher recordings longer than ten seconds "
+            "into lossless contiguous chunks, zero-padded only each final unused tail and recorded "
+            "the chunk and original-recording lengths; wrote one ROOT TTree per instrument"
         ),
         "classes": TINYSOL_INSTRUMENTS,
         "modality": "audio",
@@ -913,20 +913,27 @@ def _tinysol_entries(path: Path) -> Rows:
     labels = {name: at for at, name in enumerate(TINYSOL_INSTRUMENTS)}
     archive = tarfile.open(path, mode="r:gz")
     index = 0
+    recording = 0
     try:
         for member in archive:
             if not member.isfile() or not member.name.lower().endswith(".wav"):
                 continue
-            yield _tinysol_entry(archive, member, labels, index)
-            index += 1
+            for row in _tinysol_recording(archive, member, labels, recording, index):
+                yield row
+                index += 1
+            recording += 1
     finally:
         archive.close()
 
 
-def _tinysol_entry(
-    archive: tarfile.TarFile, member: tarfile.TarInfo, labels: Mapping[str, int], index: int
-) -> tuple[int, dict[str, Any]]:
-    """Decode one named TinySOL PCM member."""
+def _tinysol_recording(
+    archive: tarfile.TarFile,
+    member: tarfile.TarInfo,
+    labels: Mapping[str, int],
+    recording_index: int,
+    first: int,
+) -> Rows:
+    """Decode one named TinySOL PCM member into lossless ten-second chunks."""
     code = Path(member.name).name.split("-")[0]
     if code not in TINYSOL_CODES:
         raise ValueError(f"TinySOL recording {member.name!r} names no known instrument")
@@ -936,25 +943,41 @@ def _tinysol_entry(
     with held:
         raw = held.read()
     with wave.open(io.BytesIO(raw), "rb") as recording:
-        samples, length, sample_rate = _tinysol_pcm(recording, member.name)
-    label = labels[TINYSOL_CODES[code]]
-    return label, {
-        "audio": samples,
-        "length": length,
-        "sample_rate": sample_rate,
-        "label": label,
-        "index": index,
-    }
+        chunks = _tinysol_pcm(recording, member.name)
+        for chunk, (samples, length, sample_rate, total, count) in enumerate(chunks):
+            label = labels[TINYSOL_CODES[code]]
+            yield label, {
+                "audio": samples,
+                "length": length,
+                "sample_rate": sample_rate,
+                "recording_length": total,
+                "recording": recording_index,
+                "chunk": chunk,
+                "chunks": count,
+                "label": label,
+                "index": first + chunk,
+            }
 
 
-def _tinysol_pcm(recording: Any, name: str) -> tuple[array.array[float], int, int]:
-    """Read TinySOL's mono PCM while retaining its source-specific diagnostics."""
+def _tinysol_pcm(
+    recording: Any, name: str
+) -> Iterator[tuple[array.array[float], int, int, int, int]]:
+    """Read every sample from one TinySOL recording in fixed-width chunks."""
     if recording.getnchannels() != 1 or recording.getsampwidth() != 2:
         raise ValueError(f"TinySOL recording {name!r} is not 16-bit mono PCM")
-    length = recording.getnframes()
-    if length > 441_000:
-        raise ValueError(f"TinySOL recording {name!r} exceeds ten seconds")
-    return _pcm16(recording, 441_000, name)
+    total = recording.getnframes()
+    count = max(1, (total + 440_999) // 441_000)
+    sample_rate = recording.getframerate()
+    for chunk in range(count):
+        wanted = min(441_000, total - chunk * 441_000)
+        pcm = array.array("h")
+        pcm.frombytes(recording.readframes(wanted))
+        if len(pcm) != wanted:
+            raise ValueError(
+                f"TinySOL recording {name!r} chunk {chunk} ends after "
+                f"{len(pcm)} of {wanted} samples"
+            )
+        yield _float_pcm(pcm, 441_000), wanted, sample_rate, total, count
 
 
 def _tinysol(path: Path) -> Loaded:
@@ -962,6 +985,10 @@ def _tinysol(path: Path) -> Loaded:
         "audio": ("f", 441_000),
         "length": "i",
         "sample_rate": "i",
+        "recording_length": "i",
+        "recording": "i",
+        "chunk": "i",
+        "chunks": "i",
         "label": "i",
         "index": "i",
     }

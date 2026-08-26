@@ -47,7 +47,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from .._log import get_logger
 from ..config import Config
@@ -197,6 +197,17 @@ def _diagnostic_seconds(text: str) -> float:
         raise argparse.ArgumentTypeError(f"not a number of seconds: {text!r}") from None
     if value <= 0:
         raise argparse.ArgumentTypeError("diagnostic interval must be positive")
+    return value
+
+
+def _tcp_port(text: str) -> int:
+    """A usable TCP port accepted by generated serving configurations."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a TCP port: {text!r}") from None
+    if not 1 <= value <= 65_535:
+        raise argparse.ArgumentTypeError("TCP port must be between 1 and 65535")
     return value
 
 
@@ -1000,6 +1011,30 @@ def _show_verification(
 # ---------------------------------------------------------------------------
 
 
+def _public_base_url(given: str | None) -> str:
+    """One canonical HTTP(S) origin suitable for links and server configuration."""
+    base = (given or "https://data.example.org").rstrip("/")
+    parsed = urlsplit(base)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(f"the public base URL {base!r} is not an HTTP(S) site origin")
+    return base
+
+
+def _site_host(base: str) -> str:
+    """Hostname used in generated web-server configuration."""
+    host = urlsplit(base).hostname
+    if host is None:  # _public_base_url establishes this invariant.
+        raise ValueError(f"the public base URL {base!r} has no hostname")
+    return host
+
+
 def _root_url(base: str, given: str | None) -> str:
     """Where the same directory answers to ``root://``.
 
@@ -1010,8 +1045,7 @@ def _root_url(base: str, given: str | None) -> str:
     """
     if given:
         return given.rstrip("/")
-    host = base.split("://", 1)[-1].split("/", 1)[0]
-    return f"root://{host}"
+    return f"root://{_site_host(base)}"
 
 
 def _human_decimal(size: int) -> str:
@@ -1082,6 +1116,15 @@ def _card_download(made: dict[str, Any], name: str, detail: str) -> str:
     return f'<a class="button primary" href="{download}" download>Download {name}.root</a>'
 
 
+def _filter_options(entries: Sequence[dict[str, Any]], key: str, fallback: str) -> str:
+    """Escaped select options for one catalogue facet."""
+    values = sorted({str(made.get(key) or fallback) for made in entries}, key=str.casefold)
+    return "".join(
+        f'<option value="{html.escape(value.lower(), quote=True)}">{html.escape(value)}</option>'
+        for value in values
+    )
+
+
 def _catalogue_cards(entries: Sequence[dict[str, Any]]) -> str:
     cards = []
     for made in entries:
@@ -1093,6 +1136,8 @@ def _catalogue_cards(entries: Sequence[dict[str, Any]]) -> str:
         detail = f"datasets/{quote(made['name'])}.html"
         modality = html.escape(made.get("modality", "dataset"))
         task = html.escape(made.get("task", "machine learning"))
+        facet_modality = html.escape(str(made.get("modality") or "dataset").lower(), quote=True)
+        facet_licence = html.escape(str(made.get("licence") or "unspecified").lower(), quote=True)
         searchable = html.escape(
             " ".join(
                 str(made.get(key, ""))
@@ -1114,7 +1159,7 @@ def _catalogue_cards(entries: Sequence[dict[str, Any]]) -> str:
             f'<a href="{terms}" rel="license">{licence}</a>' if terms else f"<span>{licence}</span>"
         )
         cards.append(
-            f'''<article class="dataset-card" data-search="{searchable}">
+            f'''<article class="dataset-card" data-search="{searchable}" data-name="{name.lower()}" data-modality="{facet_modality}" data-licence="{facet_licence}" data-size="{made["bytes"]}" data-rows="{made["rows"]}">
   <div class="card-top"><span class="pill">{modality}</span><span class="size">{_human_decimal(made["bytes"])}</span></div>
   <h3><a href="{detail}">{name}</a></h3>
   <p class="card-title">{title}</p>
@@ -1255,7 +1300,7 @@ python -c 'import xrd.ml; print({_load_example(made, name)})'</code></pre></sect
 def _site(args: argparse.Namespace, config: Config) -> int:
     out = Path(args.directory)
     index = json.loads((out / "index.json").read_text())
-    base = args.base_url.rstrip("/") if args.base_url else "https://data.example.org"
+    base = _public_base_url(args.base_url)
     entries = index["datasets"]
     description = (
         "Open machine-learning datasets converted to ROOT files, with canonical licences, "
@@ -1267,16 +1312,21 @@ def _site(args: argparse.Namespace, config: Config) -> int:
         "description": description,
         "base_url": base,
         "canonical": f"{base}/",
+        "server_name": _site_host(base),
+        "nginx_port": str(args.nginx_port),
         "root_url": _root_url(base, args.root_url),
         "built": index["built"],
         "count": str(len(entries)),
         "plural": "" if len(entries) == 1 else "s",
         "source_total": _human_decimal(sum(made.get("source_bytes", 0) for made in entries)),
+        "root_total": _human_decimal(sum(made.get("bytes", 0) for made in entries)),
         "size_policy_value": "No cap" if has_oversize else "&lt; 2 GB",
         "size_policy_label": (
             "explicit oversized build" if has_oversize else "default per-dataset ceiling"
         ),
         "cards": _catalogue_cards(entries),
+        "modality_options": _filter_options(entries, "modality", "dataset"),
+        "licence_options": _filter_options(entries, "licence", "unspecified"),
         "json_ld": _catalogue_json_ld(args.title, base, index["built"], entries),
         # ``</`` would end the page's own script block early if a title ever
         # contained it; JSON does not need the slash, so it goes.
@@ -1486,11 +1536,11 @@ _PAGE_V2 = """\
 <meta name="twitter:card" content="summary_large_image"><script type="application/ld+json">$json_ld</script>
 <style>
 :root{color-scheme:dark;--bg:#061416;--ink:#effffb;--muted:#96b8b3;--panel:#0d292c;--panel2:#103438;--line:#285255;--aqua:#51e5c3;--gold:#ffc857;--coral:#ff7869;--shadow:0 24px 80px #0008}
-*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:radial-gradient(circle at 76% -8%,#1a5e5b 0,transparent 32%),radial-gradient(circle at 5% 30%,#35244e 0,transparent 24%),var(--bg);color:var(--ink);font:16px/1.55 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif}a{color:inherit}header,main,footer{width:min(1240px,calc(100% - 2rem));margin-inline:auto}.nav{display:flex;align-items:center;justify-content:space-between;padding:1.2rem 0}.brand{font-weight:900;letter-spacing:-.03em;text-decoration:none}.brand i{color:var(--aqua);font-style:normal}.nav-links{display:flex;gap:1rem;color:var(--muted);font-size:.9rem}.nav-links a{text-decoration:none}.hero{padding:5rem 0 3rem;display:grid;grid-template-columns:1.08fr .92fr;gap:3rem;align-items:center}.eyebrow{text-transform:uppercase;letter-spacing:.2em;color:var(--gold);font-size:.77rem;font-weight:900}.hero h1{font-size:clamp(3.5rem,7.7vw,7.2rem);line-height:.86;letter-spacing:-.07em;margin:.7rem 0 1.5rem;max-width:9ch}.gradient{background:linear-gradient(100deg,var(--aqua),#8cbcff 56%,var(--gold));-webkit-background-clip:text;background-clip:text;color:transparent}.lede{max-width:62ch;color:#c3d9d5;font-size:1.13rem}.metrics{display:flex;gap:2rem;margin:2rem 0;flex-wrap:wrap}.metric strong{display:block;font-size:1.45rem}.metric span{color:var(--muted);font-size:.82rem}.hero-actions,.card-actions{display:flex;gap:.7rem;flex-wrap:wrap}.button{display:inline-flex;align-items:center;justify-content:center;padding:.75rem 1rem;border:1px solid var(--line);border-radius:999px;text-decoration:none;font-weight:800;font-size:.88rem;background:#ffffff08}.button.primary{background:var(--aqua);color:#03201b;border-color:var(--aqua)}.terminal{background:#051011d9;border:1px solid #3c6668;border-radius:24px;box-shadow:var(--shadow);overflow:hidden;transform:rotate(1deg)}.terminal-bar{padding:.8rem 1rem;background:#ffffff09;color:var(--muted);font-size:.78rem}.dots{color:var(--coral);letter-spacing:.25em}.terminal pre{margin:0;padding:1.3rem;max-height:540px;overflow:auto;font:12.5px/1.6 ui-monospace,SFMono-Regular,monospace;color:#d8fff6}.terminal .comment{color:#79a49e}.section{padding:5rem 0}.section-head{display:flex;justify-content:space-between;gap:2rem;align-items:end;margin-bottom:2rem}.section h2{font-size:clamp(2.2rem,5vw,4rem);line-height:1;letter-spacing:-.05em;margin:0}.section-copy{color:var(--muted);max-width:55ch}.protocols{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}.protocol{padding:1.4rem;border:1px solid var(--line);border-radius:20px;background:linear-gradient(145deg,#153638aa,#0b2426aa)}.protocol b{color:var(--aqua);font:800 1rem ui-monospace,monospace}.protocol p{color:var(--muted)}.protocol code{font-size:.78rem;word-break:break-all}.catalogue-tools{position:sticky;top:.7rem;z-index:3;padding:.7rem;background:#061416df;backdrop-filter:blur(15px);border:1px solid var(--line);border-radius:18px;margin:2rem 0}.catalogue-tools input{width:100%;padding:1rem 1.2rem;border:0;background:transparent;color:var(--ink);font:inherit;outline:none}.dataset-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}.dataset-card{display:flex;flex-direction:column;padding:1.25rem;border:1px solid var(--line);border-radius:22px;background:linear-gradient(155deg,#123438e8,#091d20e8);min-height:390px;transition:transform .2s,border-color .2s}.dataset-card:hover{transform:translateY(-4px);border-color:var(--aqua)}.card-top,.provenance{display:flex;justify-content:space-between;gap:.7rem;align-items:center}.pill,.tags span{padding:.27rem .55rem;border-radius:999px;background:#51e5c31b;color:var(--aqua);font-size:.73rem}.size{font-size:.75rem;color:var(--muted)}.dataset-card h3{font:800 1.15rem ui-monospace,monospace;margin:1.1rem 0 .25rem}.dataset-card h3 a{text-decoration:none}.card-title{font-weight:750;margin:.2rem 0 .8rem}.tags{display:flex;gap:.4rem;flex-wrap:wrap}.tags span{background:#fff1;color:#c7dcd8}.transform{color:var(--muted);font-size:.86rem;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}.provenance{font-size:.78rem;margin-top:auto;padding:1rem 0}.provenance a{color:var(--gold)}.card-actions .button{font-size:.75rem;padding:.58rem .72rem}.empty{display:none;text-align:center;color:var(--muted);padding:3rem}.index-note{font-size:.82rem;color:var(--muted);margin-top:2rem}footer{padding:4rem 0;border-top:1px solid var(--line);color:var(--muted);display:flex;justify-content:space-between;gap:2rem}code{font-family:ui-monospace,SFMono-Regular,monospace}@media(max-width:980px){.hero{grid-template-columns:1fr;padding-top:3rem}.terminal{transform:none}.dataset-grid{grid-template-columns:repeat(2,1fr)}.protocols{grid-template-columns:1fr}}@media(max-width:620px){.nav-links{display:none}.dataset-grid{grid-template-columns:1fr}.section-head,footer{display:block}.hero h1{font-size:4rem}.metrics{gap:1rem}.metric{min-width:42%}}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:radial-gradient(circle at 76% -8%,#1a5e5b 0,transparent 32%),radial-gradient(circle at 5% 30%,#35244e 0,transparent 24%),var(--bg);color:var(--ink);font:16px/1.55 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif}a{color:inherit}button,input,select{font:inherit}header,main,footer{width:min(1240px,calc(100% - 2rem));margin-inline:auto}.nav{display:flex;align-items:center;justify-content:space-between;padding:1.2rem 0}.brand{font-weight:900;letter-spacing:-.03em;text-decoration:none}.brand i{color:var(--aqua);font-style:normal}.nav-links{display:flex;gap:1rem;color:var(--muted);font-size:.9rem}.nav-links a{text-decoration:none}.hero{padding:5rem 0 3rem;display:grid;grid-template-columns:1.08fr .92fr;gap:3rem;align-items:center}.eyebrow{text-transform:uppercase;letter-spacing:.2em;color:var(--gold);font-size:.77rem;font-weight:900}.hero h1{font-size:clamp(3.5rem,7.7vw,7.2rem);line-height:.86;letter-spacing:-.07em;margin:.7rem 0 1.5rem;max-width:9ch}.gradient{background:linear-gradient(100deg,var(--aqua),#8cbcff 56%,var(--gold));-webkit-background-clip:text;background-clip:text;color:transparent}.lede{max-width:62ch;color:#c3d9d5;font-size:1.13rem}.metrics{display:flex;gap:2rem;margin:2rem 0;flex-wrap:wrap}.metric strong{display:block;font-size:1.45rem}.metric span{color:var(--muted);font-size:.82rem}.hero-actions,.card-actions{display:flex;gap:.7rem;flex-wrap:wrap}.button{display:inline-flex;align-items:center;justify-content:center;padding:.75rem 1rem;border:1px solid var(--line);border-radius:999px;text-decoration:none;font-weight:800;font-size:.88rem;background:#ffffff08;color:var(--ink)}.button.primary{background:var(--aqua);color:#03201b;border-color:var(--aqua)}.terminal{background:#051011d9;border:1px solid #3c6668;border-radius:24px;box-shadow:var(--shadow);overflow:hidden;transform:rotate(1deg)}.terminal-bar{padding:.8rem 1rem;background:#ffffff09;color:var(--muted);font-size:.78rem}.dots{color:var(--coral);letter-spacing:.25em}.terminal pre{margin:0;padding:1.3rem;max-height:540px;overflow:auto;font:12.5px/1.6 ui-monospace,SFMono-Regular,monospace;color:#d8fff6}.terminal .comment{color:#79a49e}.section{padding:5rem 0}.section-head{display:flex;justify-content:space-between;gap:2rem;align-items:end;margin-bottom:2rem}.section h2{font-size:clamp(2.2rem,5vw,4rem);line-height:1;letter-spacing:-.05em;margin:0}.section-copy{color:var(--muted);max-width:55ch}.protocols{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}.protocol{padding:1.4rem;border:1px solid var(--line);border-radius:20px;background:linear-gradient(145deg,#153638aa,#0b2426aa)}.protocol b{color:var(--aqua);font:800 1rem ui-monospace,monospace}.protocol p{color:var(--muted)}.protocol code{font-size:.78rem;word-break:break-all}.catalogue-tools{position:sticky;top:.7rem;z-index:3;display:grid;grid-template-columns:minmax(250px,2fr) repeat(3,minmax(130px,1fr)) auto;gap:.65rem;padding:.75rem;background:#061416ef;backdrop-filter:blur(15px);border:1px solid var(--line);border-radius:18px;margin:2rem 0}.control{display:grid;gap:.2rem}.control span{padding-left:.25rem;color:var(--muted);font-size:.68rem;text-transform:uppercase;letter-spacing:.08em}.control input,.control select{width:100%;height:44px;padding:.55rem .7rem;border:1px solid #315b5e;border-radius:11px;background:#0a2225;color:var(--ink);outline:none}.control input:focus,.control select:focus{border-color:var(--aqua);box-shadow:0 0 0 2px #51e5c326}.catalogue-tools .button{align-self:end;height:44px;cursor:pointer}.result-status{display:flex;justify-content:space-between;gap:1rem;color:var(--muted);font-size:.84rem;margin:-.8rem 0 1.2rem}.result-status strong{color:var(--ink)}.dataset-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}.dataset-card{display:flex;flex-direction:column;padding:1.25rem;border:1px solid var(--line);border-radius:22px;background:linear-gradient(155deg,#123438e8,#091d20e8);min-height:390px;transition:transform .2s,border-color .2s}.dataset-card:hover{transform:translateY(-4px);border-color:var(--aqua)}.card-top,.provenance{display:flex;justify-content:space-between;gap:.7rem;align-items:center}.pill,.tags span{padding:.27rem .55rem;border-radius:999px;background:#51e5c31b;color:var(--aqua);font-size:.73rem}.size{font-size:.75rem;color:var(--muted)}.dataset-card h3{font:800 1.15rem ui-monospace,monospace;margin:1.1rem 0 .25rem}.dataset-card h3 a{text-decoration:none}.card-title{font-weight:750;margin:.2rem 0 .8rem}.tags{display:flex;gap:.4rem;flex-wrap:wrap}.tags span{background:#fff1;color:#c7dcd8}.transform{color:var(--muted);font-size:.86rem;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}.provenance{font-size:.78rem;margin-top:auto;padding:1rem 0}.provenance a{color:var(--gold)}.card-actions .button{font-size:.75rem;padding:.58rem .72rem}.empty{display:none;text-align:center;color:var(--muted);padding:3rem}.index-note{font-size:.82rem;color:var(--muted);margin-top:2rem}footer{padding:4rem 0;border-top:1px solid var(--line);color:var(--muted);display:flex;justify-content:space-between;gap:2rem}code{font-family:ui-monospace,SFMono-Regular,monospace}@media(max-width:1100px){.catalogue-tools{grid-template-columns:2fr 1fr 1fr}.catalogue-tools .sort-control,.catalogue-tools .button{display:none}}@media(max-width:980px){.hero{grid-template-columns:1fr;padding-top:3rem}.terminal{transform:none}.dataset-grid{grid-template-columns:repeat(2,1fr)}.protocols{grid-template-columns:1fr}}@media(max-width:620px){.nav-links{display:none}.dataset-grid,.catalogue-tools{grid-template-columns:1fr}.catalogue-tools .sort-control,.catalogue-tools .button{display:grid}.section-head,footer,.result-status{display:block}.hero h1{font-size:4rem}.metrics{gap:1rem}.metric{min-width:42%}}
 </style>
 </head><body>
 <header><nav class="nav"><a class="brand" href="#top">Py<i>XRootD</i> / Open Data</a><div class="nav-links"><a href="#quickstart">Quick start</a><a href="#catalogue">Datasets</a><a href="index.json">JSON API</a><a href="sitemap.xml">Sitemap</a></div></nav>
-<section class="hero" id="top"><div><p class="eyebrow">Open science · streamed at physics scale</p><h1>Train on data <span class="gradient">without waiting.</span></h1><p class="lede">$count open machine-learning dataset$plural converted into provenance-rich ROOT files and served by PyXRootD. Start at the first minibatch, stream only the baskets you need, and keep the original source and canonical licence one click away.</p><div class="metrics"><div class="metric"><strong>$count</strong><span>ready-to-stream datasets</span></div><div class="metric"><strong>$source_total</strong><span>published source payload</span></div><div class="metric"><strong>$size_policy_value</strong><span>$size_policy_label</span></div></div><div class="hero-actions"><a class="button primary" href="#quickstart">Train a classifier</a><a class="button" href="#catalogue">Explore datasets</a></div></div>
+<section class="hero" id="top"><div><p class="eyebrow">Open science · streamed at physics scale</p><h1>Train on data <span class="gradient">without waiting.</span></h1><p class="lede">$count open machine-learning dataset$plural converted into provenance-rich ROOT files and served by PyXRootD. Start at the first minibatch, stream only the baskets you need, and keep the original source and canonical licence one click away.</p><div class="metrics"><div class="metric"><strong>$count</strong><span>ready-to-stream datasets</span></div><div class="metric"><strong>$root_total</strong><span>streamable ROOT archive</span></div><div class="metric"><strong>$source_total</strong><span>published source payload</span></div><div class="metric"><strong>$size_policy_value</strong><span>$size_policy_label</span></div></div><div class="hero-actions"><a class="button primary" href="#quickstart">Train a classifier</a><a class="button" href="#catalogue">Explore datasets</a></div></div>
 <div class="terminal" id="quickstart"><div class="terminal-bar"><span class="dots">● ● ●</span> &nbsp; from empty venv to a PyTorch classifier</div><pre><code><span class="comment"># 1. Create an isolated environment</span>
 python3 -m venv .venv
 source .venv/bin/activate
@@ -1523,25 +1573,27 @@ for images, labels in data.train.batches(256):
 print(f"last minibatch loss: {loss.item():.3f}")
 PY</code></pre></div></section></header>
 <main><section class="section"><div class="section-head"><div><p class="eyebrow">One archive, three routes</p><h2>Move less. Begin sooner.</h2></div><p class="section-copy">ROOT baskets let a training loop fetch selected columns and minibatches rather than copying a monolithic archive. XRootD is the wide-area data layer used across the WLCG and OSG; here PyXRootD points that machinery at ML. Add <code>cache=True</code> when repeated epochs should pull the file into <code>~/.cache/xrd</code> once.</p></div><div class="protocols"><article class="protocol"><b>root:// native</b><p>Parallel, resumable vector reads and checksums over the protocol built for globally distributed HEP analysis.</p><code>xrd.ml.load("$root_url//mnist.root")</code></article><article class="protocol"><b>https:// ranges</b><p>Works through browsers, notebooks and ordinary proxies, while nginx handles byte-range reads.</p><code>xrd.ml.load("$base_url/mnist.root")</code></article><article class="protocol"><b>catalogue lookup</b><p>Use a stable dataset name; <a href="index.json">index.json</a> resolves the file and records its checksum and provenance.</p><code>xrd.ml.load("mnist", cache=True)</code></article></div></section>
-<section class="section" id="catalogue"><div class="section-head"><div><p class="eyebrow">The catalogue</p><h2>Open data, inspectable lineage.</h2></div><p class="section-copy">Every result separates its canonical origin, or best available dataset record, and credited creators from the repository or mirror serving the registered bytes. It also links the canonical licence, exact transformation into ROOT, and direct download. The cards are rendered in HTML for people and indexers; search only hides what is already on the page.</p></div><div class="catalogue-tools"><input id="q" type="search" placeholder="Search name, creator, repository, task, licence or transformation…" aria-label="Filter datasets"></div><div class="dataset-grid" id="cards">$cards</div><p class="empty" id="empty">No dataset matches that search.</p><p class="index-note">Built $built · Machine-readable metadata: <a href="index.json">index.json</a> · Google-compatible <a href="sitemap.xml">sitemap</a> · every ROOT file includes the same provenance in its <code>about</code> key.</p></section></main>
+<section class="section" id="catalogue"><div class="section-head"><div><p class="eyebrow">The catalogue</p><h2>Open data, inspectable lineage.</h2></div><p class="section-copy">Every result separates its canonical origin, or best available dataset record, and credited creators from the repository or mirror serving the registered bytes. It also links the canonical licence, exact transformation into ROOT, and direct download. The cards are rendered in HTML for people and indexers; filters only hide what is already on the page.</p></div><div class="catalogue-tools"><label class="control"><span>Search</span><input id="q" type="search" placeholder="Name, creator, task or transformation…"></label><label class="control"><span>Modality</span><select id="modality"><option value="">All modalities</option>$modality_options</select></label><label class="control"><span>Licence</span><select id="licence"><option value="">All licences</option>$licence_options</select></label><label class="control sort-control"><span>Sort</span><select id="sort"><option value="name">Name A-Z</option><option value="size-desc">Largest ROOT file</option><option value="size-asc">Smallest ROOT file</option><option value="rows-desc">Most rows</option></select></label><button class="button" id="reset" type="button">Reset</button></div><div class="result-status" aria-live="polite"><span><strong id="shown">$count</strong> of $count datasets shown</span><span>All metadata is present in the page for people and indexers.</span></div><noscript><p class="result-status">JavaScript filters are optional; every dataset remains visible below.</p></noscript><div class="dataset-grid" id="cards">$cards</div><p class="empty" id="empty">No dataset matches those filters.</p><p class="index-note">Built $built · Machine-readable metadata: <a href="index.json">index.json</a> · Google-compatible <a href="sitemap.xml">sitemap</a> · every ROOT file includes the same provenance in its <code>about</code> key.</p></section></main>
 <footer><strong>PyXRootDClient</strong><span>Pure-Python access to XRootD, HTTPS ranges and ROOT data for training anywhere.</span><a href="https://github.com/rob-c/PyXRootDClient">Source on GitHub</a></footer>
-<script>const q=document.getElementById("q"),cards=[...document.querySelectorAll(".dataset-card")],empty=document.getElementById("empty");q.addEventListener("input",()=>{const wanted=q.value.trim().toLowerCase();let shown=0;cards.forEach(card=>{const yes=!wanted||card.dataset.search.includes(wanted);card.hidden=!yes;if(yes)shown+=1});empty.style.display=shown?"none":"block"});</script>
+<script>const q=document.getElementById("q"),modality=document.getElementById("modality"),licence=document.getElementById("licence"),sort=document.getElementById("sort"),reset=document.getElementById("reset"),grid=document.getElementById("cards"),cards=[...document.querySelectorAll(".dataset-card")],empty=document.getElementById("empty"),shown=document.getElementById("shown");function apply(){const wanted=q.value.trim().toLowerCase(),kind=modality.value,terms=licence.value;let count=0;cards.forEach(card=>{const yes=(!wanted||card.dataset.search.includes(wanted))&&(!kind||card.dataset.modality===kind)&&(!terms||card.dataset.licence===terms);card.hidden=!yes;if(yes)count+=1});const ordered=[...cards].sort((a,b)=>sort.value==="size-desc"?Number(b.dataset.size)-Number(a.dataset.size):sort.value==="size-asc"?Number(a.dataset.size)-Number(b.dataset.size):sort.value==="rows-desc"?Number(b.dataset.rows)-Number(a.dataset.rows):a.dataset.name.localeCompare(b.dataset.name));grid.append(...ordered);shown.textContent=String(count);empty.style.display=count?"none":"block"}q.addEventListener("input",apply);modality.addEventListener("change",apply);licence.addEventListener("change",apply);sort.addEventListener("change",apply);reset.addEventListener("click",()=>{q.value="";modality.value="";licence.value="";sort.value="name";apply();q.focus()});</script>
 </body></html>
 """
 
 _NGINX = """\
 # $title - static hosting for any stock nginx.
 #
-# Drop this into /etc/nginx/conf.d/ (adjust the port and server_name) and the
-# directory serves as it stands: the page, the index, and the files, with the
-# range requests xrd.ml relies on handled by nginx itself.
+# Drop this into /etc/nginx/conf.d/ and the directory serves as it stands: the
+# page, index and files, with the range requests xrd.ml relies on handled by
+# nginx itself. The host and port come from xrd-datasets site.
 server {
-    listen 8080;
-    server_name _;
+    listen $nginx_port;
+    listen [::]:$nginx_port;
+    server_name $server_name;
 
     root $root;
     index index.html;
     charset utf-8;
+    server_tokens off;
 
     types {
         text/html html;
@@ -1550,8 +1602,12 @@ server {
         text/plain txt;
         application/x-root root;
     }
-    add_header X-Content-Type-Options nosniff always;
+    add_header Access-Control-Allow-Origin * always;
+    add_header Accept-Ranges bytes always;
+    add_header Content-Security-Policy "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
     add_header Referrer-Policy strict-origin-when-cross-origin always;
+    add_header X-Content-Type-Options nosniff always;
 
     # Large source archives may be retained here for resumable rebuilds. They
     # are inputs, not published datasets, even when somebody guesses the path.
@@ -1559,19 +1615,17 @@ server {
 
     location / {
         # Training loops read from browsers, notebooks and batch nodes alike.
-        add_header Access-Control-Allow-Origin * always;
-        add_header X-Content-Type-Options nosniff always;
+        limit_except GET HEAD { deny all; }
         # ROOT files are already compressed; recompressing wastes the CPU.
         gzip off;
         try_files $$uri $$uri/ =404;
     }
 
     location ~ \\.root$$ {
-        add_header Access-Control-Allow-Origin * always;
-        add_header Accept-Ranges bytes always;
-        add_header X-Content-Type-Options nosniff always;
+        limit_except GET HEAD { deny all; }
         expires 7d;
         gzip off;
+        try_files $$uri =404;
     }
 }
 """
@@ -1700,7 +1754,7 @@ reads from disk after that.
 
 ## Serve it
 
-* `nginx.conf` - static hosting on any stock nginx, port 8080.
+* `nginx.conf` - named static hosting on stock nginx at the configured port.
 * `brix.conf` - the same directory over root:// (1094), WebDAV (8008) and
   plain HTTP (8080) with a BriX-built nginx.
 * `xrd-datasets.service` - the systemd unit that runs the BriX flavour.
@@ -1820,6 +1874,13 @@ def _parser() -> argparse.ArgumentParser:
         "--root-url",
         metavar="URL",
         help="the public root:// endpoint (default: the base URL's host)",
+    )
+    site.add_argument(
+        "--nginx-port",
+        type=_tcp_port,
+        default=8080,
+        metavar="PORT",
+        help="port in the stock nginx virtual host (default: 8080)",
     )
     site.add_argument(
         "--title", default="Open datasets, as ROOT files", help="what the page calls itself"

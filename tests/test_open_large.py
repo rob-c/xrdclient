@@ -115,7 +115,53 @@ def test_tinysol_reads_pcm_and_uses_the_instrument_code_in_the_filename(tmp_path
     assert classes[3] == "bassoon" and columns["audio"] == ("f", 441_000)
     label, row = next(entries)
     assert label == 3 and row["length"] == 2 and row["sample_rate"] == 44_100
+    assert row["recording_length"] == 2 and row["recording"] == 0
+    assert row["chunk"] == 0 and row["chunks"] == 1 and row["index"] == 0
     assert row["audio"][:3] == pytest.approx([1 / 32768, 2 / 32768, 0])
+
+
+def test_tinysol_losslessly_chunks_a_publisher_recording_over_ten_seconds(tmp_path):
+    frames = 693_632
+    source = tmp_path / "tinysol-long.tar.gz"
+    raw = _wav(b"\x01\x00" * frames, rate=44_100)
+    with tarfile.open(source, "w:gz") as archive:
+        info = tarfile.TarInfo(
+            "TinySOL2020/Keyboards/Accordion/ordinario/Acc-ord-G3-mf-alt3-N.wav"
+        )
+        info.size = len(raw)
+        archive.addfile(info, io.BytesIO(raw))
+
+    classes, columns, entries = load("tinysol", {"archive": source}, "all")
+    made = list(entries)
+
+    assert classes[0] == "accordion" and columns["audio"] == ("f", 441_000)
+    assert [
+        (
+            label,
+            row["length"],
+            row["recording_length"],
+            row["recording"],
+            row["chunk"],
+            row["chunks"],
+            row["index"],
+            len(row["audio"]),
+        )
+        for label, row in made
+    ] == [
+        (0, 441_000, frames, 0, 0, 2, 0, 441_000),
+        (0, 252_632, frames, 0, 1, 2, 1, 441_000),
+    ]
+    assert made[1][1]["audio"][252_631] == pytest.approx(1 / 32768)
+    assert made[1][1]["audio"][252_632] == 0
+
+    output = io.BytesIO()
+    assert convert("tinysol", output, parts={"archive": source})["accordion"] == 2
+    with open_root(io.BytesIO(output.getvalue())) as back:
+        tree = back["accordion"]
+        assert tree.num_entries == 2
+        assert tree["length"].array().tolist() == [441_000, 252_632]
+        assert tree["recording_length"].array().tolist() == [frames, frames]
+        assert tree["chunk"].array().tolist() == [0, 1]
 
 
 def test_speech_commands_preserves_lists_and_turns_noise_into_training_windows(tmp_path):
