@@ -70,7 +70,7 @@ def test_the_three_gas_formats_stream_raw_sensor_values(tmp_path):
 def test_open_sampling_gas_is_partitioned_losslessly_by_chemical(tmp_path):
     open_sampling = tmp_path / "open-sampling.zip"
     filename = "130101010101_board_setPoint_5V_fan_setPoint_50_mfc_setPoint_acetone_100ppm_p1"
-    cells = ["0", *(["1"] * 8), "20", "40", *(["1"] * 81)]
+    cells = ["\u200e74710", *(["1"] * 8), "20", "40", *(["1"] * 81)]
     with zipfile.ZipFile(open_sampling, "w") as archive:
         archive.writestr("dataset/run/L1/batch_execution", "publisher control metadata\n")
         archive.writestr(f"dataset/run/L1/{filename}", " ".join(cells) + "\n")
@@ -78,7 +78,20 @@ def test_open_sampling_gas_is_partitioned_losslessly_by_chemical(tmp_path):
     label, row = next(rows)
     assert classes == ("acetone",) and label == 0
     assert row["label"] == 1 and row["length"] == 1
+    assert row["time_ms"][0] == 74_710
     assert list(load("gas", open_sampling, "methane")[2]) == []
+
+
+def test_open_sampling_gas_reports_the_source_of_other_non_numeric_fields(tmp_path):
+    open_sampling = tmp_path / "bad-open-sampling.zip"
+    filename = "130101010101_board_setPoint_5V_fan_setPoint_50_mfc_setPoint_acetone_100ppm_p1"
+    cells = ["0", "not-a-number", *(["1"] * 7), "20", "40", *(["1"] * 81)]
+    member = f"dataset/run/L1/{filename}"
+    with zipfile.ZipFile(open_sampling, "w") as archive:
+        archive.writestr(member, " ".join(cells) + "\n")
+
+    with pytest.raises(ValueError, match=rf"row 0 field 1 of {member} is not numeric"):
+        next(load("gas", open_sampling, "acetone")[2])
 
 
 def test_electricity_and_opportunity_preserve_wide_rows(tmp_path):

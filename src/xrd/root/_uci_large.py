@@ -105,8 +105,9 @@ UCI_LARGE: tuple[dict[str, Any], ...] = (
         "transformation": (
             "parsed every wind-tunnel recording without sensor scaling; retained controls, "
             "temperature, humidity and 72 sensor series, padding each to 26,000 samples while "
-            "recording its true length; ignored publisher execution-control metadata and wrote "
-            "one ROOT file and TTree per chemical"
+            "recording its true length; removed publisher U+200E direction marks at numeric field "
+            "boundaries, ignored execution-control metadata and wrote one ROOT file and TTree per "
+            "chemical"
         ),
         "classes": GASES,
         "splits": GASES,
@@ -745,15 +746,33 @@ def _gas_line(
     """Validate and append one 92-field sensor reading."""
     if len(cells) != 92:
         raise ValueError(f"row {physical} of {filename} has {len(cells)} fields, not 92")
-    time.append(int(float(cells[0])))
-    controls.extend(float(value) for value in cells[1:9])
-    temperature.append(float(cells[9]))
-    humidity.append(float(cells[10]))
+    values = _gas_numbers(cells, physical, filename)
+    time.append(int(values[0]))
+    controls.extend(values[1:9])
+    temperature.append(values[9])
+    humidity.append(values[10])
     for board in range(9):
         marker = 11 + board * 9
-        if float(cells[marker]) != 1:
+        if values[marker] != 1:
             raise ValueError(f"row {physical} of {filename} has no board {board + 1} marker")
-        sensors.extend(float(value) for value in cells[marker + 1 : marker + 9])
+        sensors.extend(values[marker + 1 : marker + 9])
+
+
+def _gas_numbers(cells: Sequence[str], physical: int, filename: str) -> list[float]:
+    """Decode one gas row after removing the publisher's boundary direction marks."""
+    cleaned = [value.strip("\u200e") for value in cells]
+    try:
+        return [float(value) for value in cleaned]
+    except ValueError as error:
+        for field, value in enumerate(cleaned):
+            try:
+                float(value)
+            except ValueError:
+                raise ValueError(
+                    f"row {physical} field {field} of {filename} is not numeric: "
+                    f"{cells[field]!r}"
+                ) from error
+        raise
 
 
 def _gas_entry(
