@@ -180,8 +180,12 @@ $ xrd-datasets site /srv/datasets --base-url https://data.example.org
 ```
 
 `build` converts datasets to ROOT files and writes the `index.json` that
-makes the directory a catalogue; `verify` reopens every file and checks it
-against that index; `site` adds the browsable page and ready-to-serve nginx,
+makes the directory a catalogue. `verify` checks every size and checksum,
+compares every tree and branch type/shape with the build-time schema manifest,
+and then decodes every entry of every branch in bounded batches. It rejects
+unreadable branches, inconsistent row shapes, empty physical files, and files
+whose complete ML payload is only NULL/zero/non-finite or all-bits-set
+sentinels. `site` adds the browsable page and ready-to-serve nginx,
 BriX and systemd configuration. `--large` selects every disk-backed source,
 whether it comes from UCI, NIST or another publisher, whose complete declared
 source is between 100 MB and 2 GB. `--allow-oversize` (also spelled
@@ -197,6 +201,13 @@ and generated site expose every shard.
 and active-download heartbeats to stderr every 30 seconds by default. It also
 installs a `SIGUSR1` handler that dumps every Python thread without terminating
 the build; `-vvv` adds client and wire-level logs.
+
+The schema manifest is additive metadata in `index.json`. After upgrading an
+older catalogue, run its ordinary `build` command once before `verify`; valid
+ROOT files are kept and read back to refresh the manifest rather than being
+downloaded or converted again. A full verification intentionally reads and
+decompresses all ROOT baskets, so it is an integrity pass rather than a quick
+metadata check. Use `-vv` to log each tree as it is scanned.
 
 ## Scripting with `--json`
 

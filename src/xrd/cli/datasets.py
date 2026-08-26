@@ -13,7 +13,9 @@ where it came from, its canonical licence terms, what was transformed, and
 what its checksum is. ``verify`` reopens every file and refuses to bless a
 directory that no longer matches its index. ``site`` puts a browsable page
 and ready-to-serve nginx and BriX configuration next to the files, so the
-directory can go on the web as it stands.
+directory can go on the web as it stands. Verification checks the recorded
+branch schemas and decodes every entry of every readable branch in bounded
+batches; an empty or wholly NULL/non-finite/all-bits-set payload is a failure.
 
 The index is what makes the directory a catalogue: point ``XRD_CATALOGUE``
 at wherever it is served and ``xrd.ml.load("mnist")`` finds the file by
@@ -32,6 +34,7 @@ import faulthandler
 import fnmatch
 import html
 import json
+import math
 import os
 import signal
 import string
@@ -39,12 +42,14 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from .._log import get_logger
 from ..config import Config
 from ..crypto import checksum_file
 from ..errors import XRootDError
@@ -64,6 +69,13 @@ from . import ERROR, OK, common_flags, config_from, dumps, fail
 __all__ = ["main"]
 
 PROGRAM = "xrd-datasets"
+_log = get_logger(__name__)
+
+_VERIFY_BATCH_BYTES = 8 * 1024 * 1024
+_VERIFY_MAX_ENTRIES = 10_000
+_ALL_BITS_SET = frozenset((-1, 0xFF, 0xFFF, 0xFFFF, 0xFFFFFF, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF))
+_NULL_TEXT = frozenset(("", "null", "none", "nan", "n/a"))
+_FF_TEXT = frozenset(("fff", "0xff", "0xfff", "0xffff", "-1"))
 
 
 # ---------------------------------------------------------------------------
@@ -359,12 +371,37 @@ def _chunks(path: Path) -> Iterator[bytes]:
 
 def _trees_in(path: Path) -> dict[str, int]:
     """Tree name to row count, read back out of a finished file."""
+    trees, _schemas = _root_layout(path)
+    return trees
+
+
+def _root_layout(path: Path) -> tuple[dict[str, int], dict[str, dict[str, Any]]]:
+    """Read the row counts and exact branch schemas from one finished ROOT file."""
     with open_root(str(path)) as back:
-        return {
-            name: back[name].num_entries
-            for name in back.keys()
-            if name != "about" and not name.endswith("_about")
+        names = back.trees()
+        trees = {name: back[name].num_entries for name in names}
+        schemas = {name: _tree_schema(back[name]) for name in names}
+    return trees, schemas
+
+
+def _tree_schema(tree: Any) -> dict[str, Any]:
+    """The type and shape contract every branch advertises to readers."""
+    return {
+        name: {
+            "type": branch.typename,
+            "length": branch.length,
+            "jagged": branch.is_jagged,
         }
+        for name, branch in tree.branches.items()
+    }
+
+
+def _checked_layout(path: Path, expected: Mapping[str, int]) -> dict[str, dict[str, Any]]:
+    """Read back a new output and reject row counts unlike those just written."""
+    trees, schemas = _root_layout(path)
+    if trees != expected:
+        raise ValueError(f"{path.name} wrote trees {trees}, not the recorded {dict(expected)}")
+    return schemas
 
 
 def _entry(name: str, path: Path, trees: dict[str, int]) -> dict[str, Any]:
@@ -387,6 +424,7 @@ def _entry(name: str, path: Path, trees: dict[str, int]) -> dict[str, Any]:
         "adler32": checksum_file("adler32", _chunks(path)),
         "splits": list(spec.splits),
         "trees": trees,
+        "schemas": _checked_layout(path, trees),
         "rows": sum(trees.values()),
     }
 
@@ -410,6 +448,7 @@ def _sharded_entry(
             "bytes": path.stat().st_size,
             "adler32": checksum_file("adler32", _chunks(path)),
             "trees": trees,
+            "schemas": _checked_layout(path, trees),
             "rows": sum(trees.values()),
         }
         for split, path, trees in parts
@@ -723,9 +762,221 @@ def _verify_file(out: Path, made: dict[str, Any]) -> str | None:
         return f"{size} bytes on disk, {made['bytes']} in the index"
     if checksum_file("adler32", _chunks(path)) != made["adler32"]:
         return "the checksum does not match the index"
-    if _trees_in(path) != made["trees"]:
-        return "the trees do not match the index"
+    try:
+        return _verify_root_payload(path, made)
+    except Exception as exc:
+        return f"the ROOT payload cannot be loaded ({type(exc).__name__}: {exc})"
+
+
+@dataclass
+class _PayloadHealth:
+    """Whether a decoded branch contains anything beyond common missing sentinels."""
+
+    values: int = 0
+    nulls: int = 0
+    all_bits_set: int = 0
+    ordinary: int = 0
+
+    def observe(self, value: Any) -> None:
+        self.values += 1
+        kind = _sentinel_kind(value)
+        if kind == "null":
+            self.nulls += 1
+        elif kind == "ff":
+            self.all_bits_set += 1
+        else:
+            self.ordinary += 1
+
+    def problem(self) -> str | None:
+        if self.ordinary:
+            return None
+        if self.nulls and not self.all_bits_set:
+            return "only NULL, zero or non-finite values"
+        if self.all_bits_set and not self.nulls:
+            return "only 0xff/all-bits-set values"
+        return "only NULL/non-finite and all-bits-set sentinels"
+
+
+def _sentinel_kind(value: Any) -> str | None:
+    """Classify one scalar as ordinary, null-like, or an all-bits-set sentinel."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return None if value else "null"
+    if isinstance(value, float):
+        return _float_sentinel(value)
+    if isinstance(value, int):
+        return _integer_sentinel(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return _byte_sentinel(value)
+    if isinstance(value, str):
+        return _text_sentinel(value)
     return None
+
+
+def _float_sentinel(value: float) -> str | None:
+    """Finite nonzero floats are payload; zero and non-finite values are null-like."""
+    return None if math.isfinite(value) and value != 0 else "null"
+
+
+def _integer_sentinel(value: int) -> str | None:
+    """Recognize zero and common all-bits-set integer widths."""
+    if value == 0:
+        return "null"
+    return "ff" if value in _ALL_BITS_SET else None
+
+
+def _text_sentinel(value: str) -> str | None:
+    """Recognize conventional textual missing and hexadecimal sentinel spellings."""
+    normalized = value.strip().lower()
+    if normalized in _NULL_TEXT:
+        return "null"
+    return "ff" if normalized in _FF_TEXT else None
+
+
+def _byte_sentinel(value: bytes | bytearray | memoryview) -> str | None:
+    """Classify one byte string without materializing a second copy."""
+    if not value or all(byte == 0 for byte in value):
+        return "null"
+    return "ff" if all(byte == 0xFF for byte in value) else None
+
+
+def _observe_values(health: _PayloadHealth, values: Any) -> None:
+    """Walk nested decoded values into one branch-health summary."""
+    nested: Sequence[Any]
+    if isinstance(values, Mapping):
+        nested = list(values.values())
+    elif isinstance(values, Sequence) and not isinstance(
+        values, (str, bytes, bytearray, memoryview)
+    ):
+        nested = values
+    else:
+        health.observe(values)
+        return
+    if not nested:
+        health.observe(None)
+        return
+    for value in nested:
+        _observe_values(health, value)
+        if health.ordinary:
+            return
+
+
+def _payload_branches(tree: Any) -> list[str]:
+    """Prefer tensor-like data branches over labels and bookkeeping scalars."""
+    readable = tree.readable()
+    wide = [name for name in readable if tree[name].length > 1 or tree[name].is_jagged]
+    if wide:
+        return wide
+    payload = [name for name in readable if name.rsplit(".", 1)[-1] not in {"index", "label"}]
+    return payload or readable
+
+
+def _verification_step(branch: Any) -> int:
+    """Entries per read, capped so a wide image or waveform stays bounded in memory."""
+    kind = getattr(branch.column, "kind", "")
+    if kind == "values":
+        return 256
+    if branch.is_jagged:
+        return 1024
+    itemsize = max(int(getattr(branch.column, "itemsize", 1)), 1)
+    entry_bytes = max(itemsize * int(branch.length), 1)
+    return max(1, min(_VERIFY_MAX_ENTRIES, _VERIFY_BATCH_BYTES // entry_bytes))
+
+
+def _decoded_length(branch: Any, values: Any, entries: int) -> tuple[int, int]:
+    """Actual and expected decoded scalar counts for one branch batch."""
+    actual = len(values)
+    kind = getattr(branch.column, "kind", "")
+    expected = entries if branch.is_jagged or kind == "values" else entries * branch.length
+    return actual, expected
+
+
+def _scan_branch(branch: Any, entries: int, health: _PayloadHealth | None) -> None:
+    """Decode every entry of one branch and validate each returned batch shape."""
+    step = _verification_step(branch)
+    for start in range(0, entries, step):
+        stop = min(start + step, entries)
+        values = branch.array(start, stop)
+        actual, expected = _decoded_length(branch, values, stop - start)
+        if actual != expected:
+            raise ValueError(
+                f"decoded {actual} values for entries {start}:{stop}, expected {expected}"
+            )
+        if health is not None and not health.ordinary:
+            _observe_values(health, values)
+
+
+def _schema_problem(tree: Any, expected: Any) -> str | None:
+    """Describe a branch type/shape disagreement against the build-time manifest."""
+    actual = _tree_schema(tree)
+    if actual == expected:
+        return None
+    return f"schema is {actual}, not the indexed {expected}"
+
+
+def _scan_tree(tree: Any, payload: set[str]) -> list[tuple[str, _PayloadHealth]]:
+    """Decode all branches in a tree and return health for its payload branches."""
+    if tree.unreadable:
+        raise ValueError(f"has unreadable branches {tree.unreadable}")
+    health: list[tuple[str, _PayloadHealth]] = []
+    for name in tree.readable():
+        branch = tree[name]
+        if branch.num_entries != tree.num_entries:
+            raise ValueError(
+                f"branch {name} has {branch.num_entries} entries, tree has {tree.num_entries}"
+            )
+        state = _PayloadHealth() if name in payload and tree.num_entries else None
+        _scan_branch(branch, tree.num_entries, state)
+        if state is not None:
+            health.append((name, state))
+    return health
+
+
+def _sentinel_problem(health: Sequence[tuple[str, _PayloadHealth]]) -> str | None:
+    """Reject a physical file in which every ML payload branch is sentinel-only."""
+    bad = [(name, state.problem()) for name, state in health]
+    if any(problem is None for _name, problem in bad):
+        return None
+    details = ", ".join(f"{name}: {problem}" for name, problem in bad[:4])
+    suffix = f", and {len(bad) - 4} more" if len(bad) > 4 else ""
+    return f"every payload branch is sentinel-only ({details}{suffix})"
+
+
+def _scan_indexed_trees(
+    path: Path, back: Any, names: Sequence[str], expected: Mapping[str, Any]
+) -> tuple[str | None, list[tuple[str, _PayloadHealth]]]:
+    """Schema-check and exhaustively decode the indexed trees in one open file."""
+    health: list[tuple[str, _PayloadHealth]] = []
+    for name in names:
+        tree = back[name]
+        problem = _schema_problem(tree, expected.get(name))
+        if problem is not None:
+            return f"tree {name} {problem}", health
+        _log.info("verifying %s tree %s: %d entries", path.name, name, tree.num_entries)
+        for branch, state in _scan_tree(tree, set(_payload_branches(tree))):
+            health.append((f"{name}.{branch}", state))
+    return None, health
+
+
+def _verify_root_payload(path: Path, made: Mapping[str, Any]) -> str | None:
+    """Check schemas, decode every basket, and reject an empty or sentinel-only file."""
+    expected_schemas = made.get("schemas")
+    if expected_schemas is None:
+        return "the index has no branch schemas; rerun xrd-datasets build once to refresh it"
+    with open_root(str(path)) as back:
+        names = back.trees()
+        actual_trees = {name: back[name].num_entries for name in names}
+        if actual_trees != made["trees"]:
+            return f"the trees are {actual_trees}, not the indexed {made['trees']}"
+        problem, health = _scan_indexed_trees(path, back, names, expected_schemas)
+        if problem is not None:
+            return problem
+    if not sum(actual_trees.values()):
+        return "the ROOT file contains no data rows"
+    if not health:
+        return "the ROOT file contains no readable payload branches"
+    return _sentinel_problem(health)
 
 
 def _show_verification(
@@ -738,7 +989,10 @@ def _show_verification(
     for name, what in problems.items():
         print(f"{name}: {what}", file=sys.stderr)
     if not args.quiet:
-        print(f"{len(entries) - len(problems)} of {len(entries)} files match the index")
+        print(
+            f"{len(entries) - len(problems)} of {len(entries)} files match the index "
+            "and load completely"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1554,7 +1808,9 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
 
-    verify = command("verify", _verify, "check every file against the index")
+    verify = command(
+        "verify", _verify, "checksum, schema-check and fully decode every indexed ROOT file"
+    )
     verify.add_argument("directory", help="a directory that build wrote")
 
     site = command("site", _site, "write the page and the server configuration")

@@ -358,14 +358,20 @@ author.
 
 ```console
 $ xrd-datasets verify /srv/datasets
-1272 of 1272 files match the index
+1272 of 1272 files match the index and load completely
 ```
 
-`verify` reopens every file, compares size and checksum with the index, and
-reads the trees back to check the row counts. It refuses — exit `1`, one
-line per problem — to bless a directory that no longer matches what its
-index claims, which is the check to run after any deploy and in CI before
-one.
+`verify` reopens every file, compares size, checksum and branch schema with the
+index, then decodes every entry in every branch using bounded-memory batches.
+It rejects unreadable or inconsistent branches, empty physical files, and a
+file whose entire ML payload is only NULL/zero/non-finite or all-bits-set
+sentinel values. This deliberately reads and decompresses every ROOT basket;
+use `-vv` to name each tree as the long integrity pass reaches it. Catalogues
+built before the schema manifest was introduced need one ordinary `build`
+rerun first; completed ROOT outputs are retained and merely re-indexed. It
+refuses — exit `1`, one line per problem — to bless a directory that no longer
+matches what its index claims, which is the check to run after any deploy and
+in CI before one.
 
 ## Serve it
 

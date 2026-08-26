@@ -16,7 +16,7 @@ import pytest
 
 from xrd.cli import datasets as datasets_cli
 from xrd.config import Config
-from xrd.root import open_root
+from xrd.root import Branch, open_root
 from xrd.root._alex_mp20 import ALEX_MP20
 from xrd.root._hub_tables import HUB_OPEN
 from xrd.root._the_well import THE_WELL
@@ -305,6 +305,15 @@ def _assert_built_payload(entry, out):
     assert entry["trees"] == {"red": 2, "blue": 1}
     assert entry["rows"] == 3
     assert entry["bytes"] == (out / "flowers.root").stat().st_size
+    assert entry["schemas"] == {
+        tree: {
+            "width": {"type": "float64", "length": 1, "jagged": False},
+            "count": {"type": "int32", "length": 1, "jagged": False},
+            "label": {"type": "int32", "length": 1, "jagged": False},
+            "index": {"type": "int32", "length": 1, "jagged": False},
+        }
+        for tree in ("red", "blue")
+    }
     assert f"{entry['adler32']}" in (out / "MANIFEST").read_text()
     assert "flowers.root" in (out / "MANIFEST").read_text()
 
@@ -408,7 +417,9 @@ def test_oversized_multi_split_outputs_are_catalogued_as_root_shards(
 ):
     def convert_without_fetch(_name, target, *, split, **_options):
         target["about"] = f"HEPMASS {split}"
-        return {}
+        tree = target.tree("rows", {"features": ("f", 2), "label": "i", "index": "i"})
+        tree.fill(features=[1.0, 2.0], label=0, index=0)
+        return {"rows": 1}
 
     monkeypatch.setattr(datasets_cli, "convert", convert_without_fetch)
     code, _, err = run(
@@ -518,6 +529,155 @@ def test_verify_blesses_a_directory_that_matches_its_index(registry, mirror, out
     code, output, _ = run(["verify", str(out)], capsys)
     assert code == 0
     assert "1 of 1 files match the index" in output
+    assert "load completely" in output
+
+
+def test_verify_decodes_every_entry_of_every_branch(
+    registry, mirror, out, capsys, monkeypatch
+):
+    built(out, mirror, capsys)
+    reached = {}
+    original = Branch.array
+
+    def tracked(self, entry_start=0, entry_stop=None):
+        stop = self.num_entries if entry_stop is None else entry_stop
+        previous = reached.get(id(self), (0, self.num_entries))[0]
+        reached[id(self)] = (max(previous, stop), self.num_entries)
+        return original(self, entry_start, entry_stop)
+
+    monkeypatch.setattr(Branch, "array", tracked)
+
+    code, _, err = run(["verify", str(out), "-q"], capsys)
+
+    assert code == 0, err
+    assert len(reached) == 8
+    assert all(stop == entries for stop, entries in reached.values())
+
+
+def test_verify_rejects_a_branch_schema_unlike_the_build_manifest(
+    registry, mirror, out, capsys
+):
+    index = built(out, mirror, capsys)
+    index["datasets"][0]["schemas"]["red"]["width"]["type"] = "float32"
+    (out / "index.json").write_text(json.dumps(index))
+
+    code, _, err = run(["verify", str(out), "-q"], capsys)
+
+    assert code == 1
+    assert "schema" in err and "float32" in err
+
+
+def test_verify_requires_an_index_with_branch_schemas(registry, mirror, out, capsys):
+    index = built(out, mirror, capsys)
+    del index["datasets"][0]["schemas"]
+    (out / "index.json").write_text(json.dumps(index))
+
+    code, _, err = run(["verify", str(out), "-q"], capsys)
+
+    assert code == 1
+    assert "no branch schemas" in err and "rerun xrd-datasets build" in err
+
+
+def test_build_refreshes_schema_metadata_without_reconverting_an_old_catalogue(
+    registry, mirror, out, capsys
+):
+    index = built(out, mirror, capsys)
+    del index["datasets"][0]["schemas"]
+    (out / "index.json").write_text(json.dumps(index))
+    before = (out / "flowers.root").stat().st_mtime_ns
+
+    code, output, err = run(
+        ["build", str(out), "--only", "flowers", "--base", mirror], capsys
+    )
+
+    assert code == 0, err
+    assert "kept" in output and (out / "flowers.root").stat().st_mtime_ns == before
+    refreshed = json.loads((out / "index.json").read_text())
+    assert refreshed["datasets"][0]["schemas"]["red"]["width"]["type"] == "float64"
+
+
+def _replace_with_sentinel_payload(out, values, typecode):
+    target = out / "flowers.root"
+    with datasets_cli.create(str(target)) as root:
+        tree = root.tree(
+            "rows", {"features": (typecode, len(values)), "label": "i", "index": "i"}
+        )
+        for index in range(3):
+            tree.fill(features=values, label=0, index=index)
+    document = json.loads((out / "index.json").read_text())
+    document["datasets"] = [datasets_cli._entry("flowers", target, {"rows": 3})]
+    (out / "index.json").write_text(json.dumps(document))
+
+
+@pytest.mark.parametrize(
+    ("values", "typecode", "message"),
+    [
+        ([0, 0, 0, 0], "B", "NULL"),
+        ([255, 255, 255, 255], "B", "0xff"),
+        ([float("nan")] * 4, "f", "non-finite"),
+    ],
+)
+def test_verify_rejects_a_root_file_whose_payload_is_only_sentinels(
+    registry, mirror, out, capsys, values, typecode, message
+):
+    built(out, mirror, capsys)
+    _replace_with_sentinel_payload(out, values, typecode)
+
+    code, _, err = run(["verify", str(out), "-q"], capsys)
+
+    assert code == 1
+    assert "sentinel-only" in err and message in err
+
+
+def test_verify_accepts_a_zero_mask_beside_real_image_data(registry, mirror, out, capsys):
+    built(out, mirror, capsys)
+    target = out / "flowers.root"
+    with datasets_cli.create(str(target)) as root:
+        tree = root.tree(
+            "rows", {"image": ("B", 4), "mask": ("B", 4), "label": "i", "index": "i"}
+        )
+        tree.fill(image=[0, 17, 31, 0], mask=[0, 0, 0, 0], label=0, index=0)
+    document = json.loads((out / "index.json").read_text())
+    document["datasets"] = [datasets_cli._entry("flowers", target, {"rows": 1})]
+    (out / "index.json").write_text(json.dumps(document))
+
+    code, _, err = run(["verify", str(out), "-q"], capsys)
+
+    assert code == 0, err
+
+
+def test_verify_reports_an_unloadable_root_payload_without_crashing(
+    registry, mirror, out, capsys
+):
+    index = built(out, mirror, capsys)
+    target = out / "flowers.root"
+    target.write_bytes(b"not a ROOT file")
+    entry = index["datasets"][0]
+    entry["bytes"] = target.stat().st_size
+    entry["adler32"] = datasets_cli.checksum_file("adler32", datasets_cli._chunks(target))
+    (out / "index.json").write_text(json.dumps(index))
+
+    code, _, err = run(["verify", str(out), "-q"], capsys)
+
+    assert code == 1
+    assert "ROOT payload cannot be loaded" in err
+
+
+def test_verify_rejects_a_structured_root_file_with_no_data_rows(
+    registry, mirror, out, capsys
+):
+    built(out, mirror, capsys)
+    target = out / "flowers.root"
+    with datasets_cli.create(str(target)) as root:
+        root.tree("rows", {"features": ("f", 4), "label": "i", "index": "i"})
+    document = json.loads((out / "index.json").read_text())
+    document["datasets"] = [datasets_cli._entry("flowers", target, {"rows": 0})]
+    (out / "index.json").write_text(json.dumps(document))
+
+    code, _, err = run(["verify", str(out), "-q"], capsys)
+
+    assert code == 1
+    assert "contains no data rows" in err
 
 
 def test_verify_catches_a_missing_file(registry, mirror, out, capsys):
