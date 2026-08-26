@@ -1156,7 +1156,9 @@ def _catalogue_cards(entries: Sequence[dict[str, Any]]) -> str:
             quote=True,
         )
         licence_link = (
-            f'<a href="{terms}" rel="license">{licence}</a>' if terms else f"<span>{licence}</span>"
+            f'<a class="licence" href="{terms}" rel="license">{licence}</a>'
+            if terms
+            else f'<span class="licence">{licence}</span>'
         )
         cards.append(
             f'''<article class="dataset-card" data-search="{searchable}" data-name="{name.lower()}" data-modality="{facet_modality}" data-licence="{facet_licence}" data-size="{made["bytes"]}" data-rows="{made["rows"]}">
@@ -1165,9 +1167,9 @@ def _catalogue_cards(entries: Sequence[dict[str, Any]]) -> str:
   <p class="card-title">{title}</p>
   <p class="credit">{_credit(made)}</p>
   <div class="tags"><span>{task}</span><span>{made["rows"]:,} rows</span></div>
-  <p class="transform">{transformation}</p>
-  <div class="provenance"><span>{_provenance_links(made, parent=" · ")}</span>{licence_link}</div>
-  <div class="card-actions">{_card_download(made, name, detail)}<a class="button" href="{detail}">Details</a></div>
+  <p class="transform"><span>ROOT transformation</span>{transformation}</p>
+  <div class="provenance"><div class="origin-links">{_provenance_links(made, parent=" · ")}</div>{licence_link}</div>
+  <div class="card-actions">{_card_download(made, name, detail)}<a class="button details" href="{detail}">View details <span aria-hidden="true">→</span></a></div>
 </article>'''
         )
     return "\n".join(cards)
@@ -1281,13 +1283,15 @@ def _detail_page(title: str, base: str, made: dict[str, Any]) -> str:
 <style>{_DETAIL_STYLE}</style></head><body><main>
 <a class="back" href="../index.html">← All datasets</a><p class="eyebrow">PyXRootD dataset archive</p>
 <h1>{heading}</h1><p class="name">Catalogue name: <code>{name}</code></p>
-<dl><div><dt>Modality</dt><dd>{html.escape(made.get("modality", "dataset"))}</dd></div>
-<div><dt>ML task</dt><dd>{html.escape(made.get("task", "machine learning"))}</dd></div>
-<div><dt>Published source payload</dt><dd>{_human_decimal(made.get("source_bytes", 0))}</dd></div>
-<div><dt>ROOT result</dt><dd>{_human_decimal(made["bytes"])}, {made["rows"]:,} rows</dd></div>
-<div><dt>Creator credit</dt><dd>{_credit(made)}</dd></div>
-<div><dt>Source repository</dt><dd>{html.escape(made.get("repository") or "See source")}</dd></div>
-<div><dt>Canonical licence</dt><dd>{terms}</dd></div></dl>
+<div class="facts" aria-label="Dataset facts">
+<div><span class="fact-label">Modality</span><span class="fact-value">{html.escape(made.get("modality", "dataset"))}</span></div>
+<div><span class="fact-label">ML task</span><span class="fact-value">{html.escape(made.get("task", "machine learning"))}</span></div>
+<div><span class="fact-label">Published source payload</span><span class="fact-value">{_human_decimal(made.get("source_bytes", 0))}</span></div>
+<div><span class="fact-label">ROOT result</span><span class="fact-value">{_human_decimal(made["bytes"])}, {made["rows"]:,} rows</span></div>
+<div><span class="fact-label">Creator credit</span><span class="fact-value">{_credit(made)}</span></div>
+<div><span class="fact-label">Source repository</span><span class="fact-value">{html.escape(made.get("repository") or "See source")}</span></div>
+<div><span class="fact-label">Canonical licence</span><span class="fact-value">{terms}</span></div>
+</div>
 <section><h2>Transformation into ROOT</h2><p>{transformation}</p></section>
 <div class="actions">{_detail_downloads(made, name)}
 {_provenance_links(made)}</div>
@@ -1327,6 +1331,8 @@ def _site(args: argparse.Namespace, config: Config) -> int:
         "cards": _catalogue_cards(entries),
         "modality_options": _filter_options(entries, "modality", "dataset"),
         "licence_options": _filter_options(entries, "licence", "unspecified"),
+        "page_style": _PAGE_STYLE,
+        "page_script": _PAGE_SCRIPT,
         "json_ld": _catalogue_json_ld(args.title, base, index["built"], entries),
         # ``</`` would end the page's own script block early if a title ever
         # contained it; JSON does not need the slash, so it goes.
@@ -1517,9 +1523,695 @@ show("");
 """
 
 _DETAIL_STYLE = """
-:root{color-scheme:dark;--ink:#ecfdf9;--muted:#9bb8b4;--panel:#102a2d;--line:#31575a;--aqua:#52e4c4;--gold:#ffc857}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 80% 0,#17494c 0,transparent 38%),#071719;color:var(--ink);font:16px/1.65 Inter,ui-sans-serif,system-ui,sans-serif}
-main{width:min(920px,calc(100% - 2rem));margin:0 auto;padding:4rem 0 6rem}.back,a{color:var(--aqua)}.eyebrow{text-transform:uppercase;letter-spacing:.18em;color:var(--gold);font-weight:800;margin-top:4rem}h1{font-size:clamp(2.4rem,7vw,5.5rem);line-height:.96;margin:.4rem 0 1rem;letter-spacing:-.05em}.name{color:var(--muted)}code,pre{font:14px/1.6 ui-monospace,SFMono-Regular,monospace}pre{padding:1.2rem;border:1px solid var(--line);border-radius:18px;background:#061214;overflow:auto}dl{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:18px;overflow:hidden;margin:3rem 0}dl div{background:var(--panel);padding:1rem}dt{color:var(--muted);font-size:.78rem;text-transform:uppercase;letter-spacing:.1em}dd{margin:.3rem 0 0;font-weight:700}section{margin:3rem 0}.actions{display:flex;gap:1rem;align-items:center;flex-wrap:wrap}.download{background:var(--aqua);color:#03201b;text-decoration:none;font-weight:900;padding:.9rem 1.2rem;border-radius:99px}
+:root {
+  color-scheme: dark;
+  --bg: #061315;
+  --surface: #0b2427;
+  --surface-raised: #102e31;
+  --ink: #f2fffc;
+  --muted: #91ada8;
+  --line: #285154;
+  --aqua: #53e6c5;
+  --gold: #ffc65a;
+}
+* { box-sizing: border-box; }
+body {
+  min-width: 280px;
+  margin: 0;
+  background:
+    radial-gradient(circle at 84% 2%, rgba(34, 119, 115, .34), transparent 30rem),
+    linear-gradient(180deg, #07191b, #030b0d);
+  color: var(--ink);
+  font: 16px/1.65 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+body::before {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background-image: linear-gradient(rgba(126, 208, 194, .03) 1px, transparent 1px), linear-gradient(90deg, rgba(126, 208, 194, .03) 1px, transparent 1px);
+  background-size: 64px 64px;
+  content: "";
+  pointer-events: none;
+}
+main { width: min(1080px, calc(100% - 3rem)); margin: 0 auto; padding: 2rem 0 7rem; }
+a { color: var(--aqua); }
+.back {
+  display: inline-flex;
+  align-items: center;
+  margin-bottom: 3.5rem;
+  padding: .6rem .8rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, .025);
+  font-size: .78rem;
+  font-weight: 800;
+  text-decoration: none;
+}
+.eyebrow { margin: 0 0 1rem; color: var(--gold); font-size: .72rem; font-weight: 900; letter-spacing: .21em; text-transform: uppercase; }
+h1 { max-width: 18ch; margin: 0; font-size: clamp(3rem, 6.5vw, 5.8rem); line-height: .96; letter-spacing: -.06em; overflow-wrap: anywhere; }
+.name { margin-top: 1.2rem; color: var(--muted); }
+code, pre { font: 13px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 250px), 1fr)); gap: .75rem; margin: 3.5rem 0; }
+.facts > div { min-width: 0; padding: 1.15rem; border: 1px solid var(--line); border-radius: 14px; background: rgba(11, 36, 39, .9); }
+.fact-label { display: block; color: var(--muted); font-size: .66rem; font-weight: 850; letter-spacing: .12em; text-transform: uppercase; }
+.fact-value { display: block; margin-top: .42rem; overflow-wrap: anywhere; font-weight: 720; }
+section { margin: 1rem 0; padding: 1.35rem; border: 1px solid var(--line); border-radius: 17px; background: rgba(8, 28, 30, .82); }
+section h2 { margin: 0 0 .65rem; font-size: 1.05rem; letter-spacing: -.02em; }
+section p { margin: 0; color: #bdd2ce; }
+pre { margin: .9rem 0 0; overflow: auto; padding: 1rem; border: 1px solid #234649; border-radius: 12px; background: #030d0f; color: #d9fff6; }
+.actions { display: flex; align-items: center; flex-wrap: wrap; gap: .65rem; margin: 1.25rem 0; }
+.actions > a:not(.download) { font-size: .76rem; }
+.download { padding: .75rem 1rem; border-radius: 11px; background: linear-gradient(135deg, var(--aqua), #3bd5b3); color: #03201b; font-size: .8rem; font-weight: 900; text-decoration: none; }
+a:focus-visible { outline: 3px solid rgba(83, 230, 197, .35); outline-offset: 3px; }
+@media (max-width: 640px) {
+  main { width: calc(100% - 2rem); padding-top: 1rem; }
+  .back { margin-bottom: 2.5rem; }
+  h1 { font-size: clamp(2.8rem, 14vw, 4.25rem); }
+  .facts { margin: 2.5rem 0; }
+  section { padding: 1rem; }
+  .download { width: 100%; text-align: center; }
+}
+"""
+
+_PAGE_STYLE = """
+:root {
+  color-scheme: dark;
+  --bg: #061315;
+  --bg-deep: #030b0d;
+  --surface: #0a2023;
+  --surface-raised: #0e292c;
+  --surface-soft: #123236;
+  --ink: #f2fffc;
+  --ink-soft: #cae0dc;
+  --muted: #8eaaa6;
+  --line: #24494c;
+  --line-bright: #397075;
+  --aqua: #53e6c5;
+  --aqua-deep: #13b995;
+  --gold: #ffc65a;
+  --coral: #ff7468;
+  --blue: #77aefb;
+  --container: 1320px;
+  --shadow-lg: 0 32px 100px rgba(0, 0, 0, .42);
+  --shadow-md: 0 20px 55px rgba(0, 0, 0, .28);
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 96px; }
+body {
+  min-width: 280px;
+  margin: 0;
+  overflow-x: hidden;
+  background:
+    radial-gradient(circle at 82% 2%, rgba(33, 121, 116, .38), transparent 28rem),
+    radial-gradient(circle at 4% 34%, rgba(67, 46, 96, .22), transparent 25rem),
+    linear-gradient(180deg, #07191b 0, var(--bg) 48rem, var(--bg-deep) 100%);
+  color: var(--ink);
+  font: 16px/1.58 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  text-rendering: optimizeLegibility;
+}
+body::before {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background-image:
+    linear-gradient(rgba(126, 208, 194, .032) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(126, 208, 194, .032) 1px, transparent 1px);
+  background-size: 64px 64px;
+  mask-image: linear-gradient(to bottom, black, transparent 72%);
+  content: "";
+  pointer-events: none;
+}
+::selection { background: var(--aqua); color: #03201b; }
+a { color: inherit; }
+button, input, select { font: inherit; }
+button, select { cursor: pointer; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+.skip-link {
+  position: fixed;
+  top: .5rem;
+  left: .5rem;
+  z-index: 100;
+  padding: .7rem 1rem;
+  transform: translateY(-150%);
+  border-radius: 10px;
+  background: var(--aqua);
+  color: #03201b;
+  font-weight: 850;
+}
+.skip-link:focus { transform: translateY(0); }
+
+.nav, .hero, main, .site-footer {
+  width: min(var(--container), calc(100% - 3rem));
+  margin-inline: auto;
+}
+.nav {
+  position: sticky;
+  top: 14px;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  min-height: 66px;
+  margin-top: 14px;
+  padding: .6rem .7rem .6rem .65rem;
+  border: 1px solid rgba(83, 230, 197, .18);
+  border-radius: 19px;
+  background: rgba(5, 18, 20, .88);
+  box-shadow: 0 16px 45px rgba(0, 0, 0, .24);
+  backdrop-filter: blur(18px) saturate(130%);
+}
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: .72rem;
+  min-width: 0;
+  text-decoration: none;
+}
+.brand-mark {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  flex: 0 0 42px;
+  place-items: center;
+  border: 1px solid rgba(83, 230, 197, .5);
+  border-radius: 13px;
+  background: linear-gradient(145deg, rgba(83, 230, 197, .22), rgba(119, 174, 251, .08));
+  color: var(--aqua);
+  font: 900 .83rem/1 ui-monospace, SFMono-Regular, monospace;
+  letter-spacing: -.07em;
+}
+.brand-copy { display: grid; line-height: 1.05; }
+.brand-copy strong { font-size: .93rem; letter-spacing: -.02em; }
+.brand-copy small { margin-top: .28rem; color: var(--muted); font-size: .68rem; }
+.nav-status {
+  display: inline-flex;
+  align-items: center;
+  gap: .55rem;
+  margin-left: 1.15rem;
+  color: var(--muted);
+  font-size: .74rem;
+}
+.status-dot {
+  width: 7px;
+  height: 7px;
+  overflow: hidden;
+  border-radius: 50%;
+  background: var(--aqua);
+  box-shadow: 0 0 0 5px rgba(83, 230, 197, .1), 0 0 18px var(--aqua);
+  font-size: 0;
+}
+.nav-links { display: flex; align-items: center; gap: .15rem; margin-left: auto; }
+.nav-links a {
+  padding: .62rem .78rem;
+  border-radius: 10px;
+  color: var(--muted);
+  font-size: .78rem;
+  font-weight: 700;
+  text-decoration: none;
+  transition: color .18s, background .18s;
+}
+.nav-links a:hover { background: rgba(255, 255, 255, .055); color: var(--ink); }
+.nav .nav-cta {
+  margin-left: .4rem;
+  padding-inline: 1rem;
+  background: var(--aqua);
+  color: #03201b;
+}
+.nav .nav-cta:hover { background: #72edd2; color: #03201b; }
+
+.hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1.03fr) minmax(420px, .97fr);
+  gap: clamp(2.5rem, 5vw, 5.5rem);
+  align-items: center;
+  padding: clamp(5rem, 9vw, 8rem) 0 6rem;
+}
+.hero-copy { min-width: 0; }
+.eyebrow {
+  margin: 0 0 1rem;
+  color: var(--gold);
+  font-size: .72rem;
+  font-weight: 900;
+  letter-spacing: .22em;
+  text-transform: uppercase;
+}
+.hero h1 {
+  margin: 0;
+  max-width: 12ch;
+  font-size: clamp(4rem, 6.1vw, 6.6rem);
+  font-weight: 850;
+  line-height: .92;
+  letter-spacing: -.068em;
+}
+.gradient {
+  display: block;
+  padding-bottom: .08em;
+  background: linear-gradient(100deg, var(--aqua), #7fb8ff 58%, var(--gold));
+  background-clip: text;
+  color: transparent;
+}
+.lede {
+  max-width: 60ch;
+  margin: 1.65rem 0 0;
+  color: var(--ink-soft);
+  font-size: clamp(1rem, 1.3vw, 1.16rem);
+}
+.hero-actions, .card-actions { display: flex; flex-wrap: wrap; gap: .65rem; }
+.hero-actions { margin-top: 1.7rem; }
+.button {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+  padding: .72rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, .025);
+  color: var(--ink);
+  font-size: .83rem;
+  font-weight: 800;
+  text-decoration: none;
+  transition: transform .18s, border-color .18s, background .18s, box-shadow .18s;
+}
+.button:hover { transform: translateY(-1px); border-color: var(--line-bright); background: rgba(255, 255, 255, .055); }
+.button.primary {
+  border-color: var(--aqua);
+  background: linear-gradient(135deg, var(--aqua), #38d4b1);
+  box-shadow: 0 10px 30px rgba(38, 211, 174, .13);
+  color: #03201b;
+}
+.button.primary:hover { background: linear-gradient(135deg, #72edd2, var(--aqua)); box-shadow: 0 14px 35px rgba(38, 211, 174, .2); }
+.button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible {
+  outline: 3px solid rgba(83, 230, 197, .35);
+  outline-offset: 3px;
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  margin-top: 2rem;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 17px;
+  background: var(--line);
+}
+.metric { min-width: 0; padding: .9rem 1rem; background: rgba(7, 24, 26, .88); }
+.metric strong { display: block; font-size: 1.32rem; line-height: 1.2; letter-spacing: -.03em; }
+.metric span { display: block; margin-top: .28rem; color: var(--muted); font-size: .7rem; }
+
+.terminal {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid rgba(102, 171, 169, .38);
+  border-radius: 22px;
+  background: rgba(3, 13, 15, .94);
+  box-shadow: var(--shadow-lg);
+}
+.terminal-bar {
+  display: flex;
+  align-items: center;
+  min-height: 48px;
+  padding: .75rem 1rem;
+  border-bottom: 1px solid rgba(255, 255, 255, .055);
+  background: rgba(255, 255, 255, .035);
+  color: var(--muted);
+  font-size: .73rem;
+}
+.dots { margin-right: .75rem; color: var(--coral); font-size: .7rem; letter-spacing: .3em; }
+.terminal-label { margin-left: auto; color: #688b86; font: .64rem/1 ui-monospace, monospace; text-transform: uppercase; }
+.terminal pre {
+  max-height: 505px;
+  margin: 0;
+  overflow: auto;
+  padding: 1.25rem 1.35rem 1.5rem;
+  color: #d9fff6;
+  font: 12px/1.62 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  scrollbar-color: var(--line-bright) transparent;
+}
+.terminal .comment { color: #6f9d96; }
+
+main { position: relative; }
+.section { padding: 6.5rem 0; scroll-margin-top: 82px; }
+.section + .section { border-top: 1px solid rgba(83, 230, 197, .1); }
+.section-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, .8fr);
+  gap: clamp(2rem, 6vw, 6rem);
+  align-items: end;
+  margin-bottom: 2.5rem;
+}
+.section h2 {
+  max-width: 14ch;
+  margin: 0;
+  font-size: clamp(2.6rem, 4.7vw, 4.7rem);
+  line-height: .98;
+  letter-spacing: -.058em;
+}
+.section-copy { max-width: 58ch; margin: 0; color: var(--muted); }
+
+.protocols { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+.protocol {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  padding: 1.5rem;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: linear-gradient(145deg, rgba(16, 49, 52, .9), rgba(6, 23, 25, .92));
+  box-shadow: var(--shadow-md);
+}
+.protocol::after {
+  position: absolute;
+  right: -3rem;
+  bottom: -4rem;
+  width: 9rem;
+  height: 9rem;
+  border-radius: 50%;
+  background: rgba(83, 230, 197, .07);
+  content: "";
+}
+.protocol-index { display: block; margin-bottom: 2.5rem; color: #527873; font: .68rem/1 ui-monospace, monospace; }
+.protocol b { color: var(--aqua); font: 800 .93rem/1.3 ui-monospace, monospace; }
+.protocol p { min-height: 5em; color: var(--muted); font-size: .9rem; }
+.protocol code { display: block; overflow-wrap: anywhere; color: var(--ink-soft); font-size: .72rem; }
+
+#catalogue { padding-bottom: 4rem; }
+.catalogue-tools {
+  position: sticky;
+  top: 94px;
+  z-index: 20;
+  margin: 2.4rem 0 1.15rem;
+  padding: .85rem;
+  border: 1px solid rgba(83, 230, 197, .22);
+  border-radius: 18px;
+  background: rgba(4, 17, 19, .94);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, .28);
+  backdrop-filter: blur(18px) saturate(125%);
+}
+.toolbar-head { display: flex; align-items: center; justify-content: space-between; padding: .1rem .25rem .75rem; }
+.toolbar-head strong { font-size: .8rem; }
+.toolbar-head span { color: var(--muted); font-size: .67rem; }
+kbd {
+  display: inline-grid;
+  min-width: 22px;
+  height: 22px;
+  margin-right: .3rem;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-bottom-color: var(--line-bright);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink-soft);
+  font: .65rem/1 ui-monospace, monospace;
+}
+.toolbar-controls {
+  display: grid;
+  grid-template-columns: minmax(260px, 2fr) repeat(3, minmax(145px, 1fr)) auto;
+  gap: .65rem;
+}
+.control { display: grid; min-width: 0; gap: .28rem; }
+.control span { padding-left: .2rem; color: #75938f; font-size: .61rem; font-weight: 850; letter-spacing: .11em; text-transform: uppercase; }
+.control input, .control select {
+  width: 100%;
+  min-width: 0;
+  height: 46px;
+  padding: .55rem .75rem;
+  border: 1px solid #285256;
+  border-radius: 11px;
+  outline: 0;
+  background: #092124;
+  color: var(--ink);
+}
+.control input::placeholder { color: #64827e; }
+.control input:hover, .control select:hover { border-color: var(--line-bright); }
+.catalogue-tools .button { align-self: end; height: 46px; padding-inline: 1.1rem; }
+.catalogue-tools .button:disabled { cursor: default; opacity: .42; transform: none; }
+
+.result-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  min-height: 38px;
+  margin-bottom: 1.15rem;
+  color: var(--muted);
+  font-size: .78rem;
+}
+.result-count { display: inline-flex; align-items: baseline; gap: .28rem; }
+.result-count strong { color: var(--ink); font-size: 1rem; }
+.result-note { text-align: right; }
+.dataset-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
+  grid-auto-rows: 1fr;
+  gap: 1rem;
+  align-items: stretch;
+}
+.dataset-card {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  min-width: 0;
+  min-height: 440px;
+  overflow: hidden;
+  flex-direction: column;
+  padding: 1.25rem;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: linear-gradient(155deg, rgba(15, 47, 50, .96), rgba(6, 24, 26, .98));
+  box-shadow: 0 16px 45px rgba(0, 0, 0, .17);
+  transition: transform .2s ease, border-color .2s ease, box-shadow .2s ease;
+}
+.dataset-card[hidden] { display: none; }
+.dataset-card:hover { transform: translateY(-3px); border-color: #397376; box-shadow: var(--shadow-md); }
+.dataset-card::before {
+  position: absolute;
+  top: 0;
+  left: 1.2rem;
+  width: 5.5rem;
+  height: 2px;
+  background: linear-gradient(90deg, var(--aqua), var(--blue), transparent);
+  box-shadow: 0 0 18px rgba(83, 230, 197, .42);
+  content: "";
+}
+.card-top { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: .7rem; }
+.pill, .tags span, .licence {
+  max-width: 100%;
+  padding: .3rem .55rem;
+  overflow: hidden;
+  border: 1px solid rgba(83, 230, 197, .09);
+  border-radius: 999px;
+  background: rgba(83, 230, 197, .09);
+  color: var(--aqua);
+  font-size: .66rem;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.size { flex: 0 0 auto; color: var(--muted); font: .66rem/1 ui-monospace, monospace; }
+.dataset-card h3 {
+  min-width: 0;
+  margin: 1.05rem 0 .38rem;
+  overflow-wrap: anywhere;
+  color: #b9d4cf;
+  font: 750 .78rem/1.35 ui-monospace, SFMono-Regular, monospace;
+  letter-spacing: .015em;
+}
+.dataset-card h3 a { text-decoration: none; }
+.dataset-card h3 a::after { position: absolute; inset: 0; z-index: -1; content: ""; }
+.card-title {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  font-size: 1.05rem;
+  font-weight: 780;
+  line-height: 1.38;
+  letter-spacing: -.018em;
+}
+.credit {
+  min-width: 0;
+  margin: .75rem 0 0;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  color: var(--muted);
+  font-size: .74rem;
+}
+.tags { display: flex; min-width: 0; flex-wrap: wrap; gap: .35rem; margin-top: .8rem; }
+.tags span { max-width: 70%; border-color: rgba(255, 255, 255, .04); background: rgba(255, 255, 255, .045); color: #bdd3cf; }
+.transform {
+  min-width: 0;
+  margin: .9rem 0 0;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+  color: var(--muted);
+  font-size: .73rem;
+}
+.transform > span { display: block; margin-bottom: .3rem; color: #628984; font-size: .57rem; font-weight: 900; letter-spacing: .12em; text-transform: uppercase; }
+.provenance {
+  display: flex;
+  min-width: 0;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: .65rem;
+  margin-top: auto;
+  padding: 1rem 0 .9rem;
+  font-size: .68rem;
+}
+.origin-links {
+  min-width: 0;
+  max-height: 3.35em;
+  overflow: hidden;
+  color: var(--gold);
+  line-height: 1.62;
+}
+.origin-links a { position: relative; z-index: 1; }
+.licence { position: relative; z-index: 1; flex: 0 0 auto; border-color: rgba(255, 198, 90, .12); background: rgba(255, 198, 90, .08); color: var(--gold); text-decoration: none; }
+.card-actions { position: relative; z-index: 1; flex-wrap: nowrap; }
+.card-actions .button { min-height: 39px; padding: .55rem .72rem; font-size: .68rem; }
+.card-actions .primary { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-actions .details { flex: 0 0 auto; gap: .3rem; }
+.empty { display: none; margin: 2rem 0; padding: 5rem 1rem; border: 1px dashed var(--line); border-radius: 18px; color: var(--muted); text-align: center; }
+.index-note { margin: 2rem 0 0; color: #668681; font-size: .72rem; }
+.index-note a { color: var(--ink-soft); }
+
+.site-footer {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 2rem;
+  align-items: center;
+  margin-top: 3rem;
+  padding: 2.5rem 0 3rem;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: .78rem;
+}
+.site-footer strong { color: var(--ink); }
+.site-footer a { color: var(--aqua); text-decoration: none; }
+
+@media (max-width: 1080px) {
+  .hero { grid-template-columns: 1fr; }
+  .hero-copy { max-width: 760px; }
+  .terminal { max-width: 820px; }
+  .toolbar-controls { grid-template-columns: minmax(240px, 2fr) repeat(2, minmax(140px, 1fr)); }
+  .sort-control { grid-column: 2; }
+  .catalogue-tools .button { grid-column: 3; }
+}
+
+@media (max-width: 820px) {
+  .nav-status { display: none; }
+  .section-head { grid-template-columns: 1fr; gap: 1.25rem; }
+  .protocols { grid-template-columns: 1fr; }
+  .protocol p { min-height: 0; }
+  .protocol-index { margin-bottom: 1.3rem; }
+  .catalogue-tools { position: static; }
+  .toolbar-head span { display: none; }
+  .toolbar-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .search-control, .sort-control { grid-column: 1 / -1; }
+  .catalogue-tools .button { grid-column: 1 / -1; }
+}
+
+@media (max-width: 640px) {
+  .nav, .hero, main, .site-footer { width: min(100% - 2rem, var(--container)); }
+  .nav { top: 8px; min-height: 58px; margin-top: 8px; border-radius: 16px; }
+  .brand-mark { width: 38px; height: 38px; flex-basis: 38px; }
+  .brand-copy small, .nav-links a:not(.nav-cta) { display: none; }
+  .nav .nav-cta { padding: .55rem .72rem; font-size: .7rem; }
+  .hero { gap: 2.5rem; padding: 4.5rem 0 4rem; }
+  .hero h1 { max-width: none; font-size: clamp(3.35rem, 16vw, 4.35rem); }
+  .lede { font-size: 1rem; }
+  .metrics { border-radius: 14px; }
+  .metric { padding: .78rem; }
+  .metric strong { font-size: 1.15rem; }
+  .terminal-bar { font-size: .68rem; }
+  .terminal-label { display: none; }
+  .terminal pre { max-height: 430px; padding: 1rem; font-size: 11px; }
+  .section { padding: 4.5rem 0; }
+  .section h2 { font-size: clamp(2.55rem, 13vw, 3.5rem); }
+  .toolbar-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .catalogue-tools { margin-top: 1.7rem; padding: .75rem; }
+  .result-status { align-items: flex-start; }
+  .result-note { display: none; }
+  .dataset-card { min-height: 420px; padding: 1.05rem; }
+  .provenance { align-items: flex-start; flex-direction: column; }
+  .origin-links { max-height: 3.4em; }
+  .card-actions { flex-direction: column; }
+  .card-actions .button { width: 100%; }
+  .site-footer { grid-template-columns: 1fr; gap: .55rem; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; }
+}
+"""
+
+_PAGE_SCRIPT = """
+const q = document.getElementById("q");
+const modality = document.getElementById("modality");
+const licence = document.getElementById("licence");
+const sort = document.getElementById("sort");
+const reset = document.getElementById("reset");
+const grid = document.getElementById("cards");
+const cards = [...document.querySelectorAll(".dataset-card")];
+const empty = document.getElementById("empty");
+const shown = document.getElementById("shown");
+
+function compareCards(a, b) {
+  if (sort.value === "size-desc") return Number(b.dataset.size) - Number(a.dataset.size);
+  if (sort.value === "size-asc") return Number(a.dataset.size) - Number(b.dataset.size);
+  if (sort.value === "rows-desc") return Number(b.dataset.rows) - Number(a.dataset.rows);
+  return a.dataset.name.localeCompare(b.dataset.name);
+}
+
+function apply() {
+  const wanted = q.value.trim().toLowerCase();
+  const kind = modality.value;
+  const terms = licence.value;
+  let count = 0;
+  cards.forEach((card) => {
+    const matches = (!wanted || card.dataset.search.includes(wanted))
+      && (!kind || card.dataset.modality === kind)
+      && (!terms || card.dataset.licence === terms);
+    card.hidden = !matches;
+    if (matches) count += 1;
+  });
+  grid.append(...[...cards].sort(compareCards));
+  shown.textContent = count.toLocaleString();
+  empty.style.display = count ? "none" : "block";
+  reset.disabled = !wanted && !kind && !terms && sort.value === "name";
+}
+
+[modality, licence, sort].forEach((control) => control.addEventListener("change", apply));
+q.addEventListener("input", apply);
+reset.addEventListener("click", () => {
+  q.value = "";
+  modality.value = "";
+  licence.value = "";
+  sort.value = "name";
+  apply();
+  q.focus();
+});
+document.addEventListener("keydown", (event) => {
+  const editing = /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName);
+  if (event.key === "/" && !editing) {
+    event.preventDefault();
+    q.focus();
+  }
+  if (event.key === "Escape" && document.activeElement === q && q.value) {
+    q.value = "";
+    apply();
+  }
+});
+apply();
 """
 
 _PAGE_V2 = """\
@@ -1530,18 +2222,36 @@ _PAGE_V2 = """\
 <title>$title | Open ML datasets streamed as ROOT</title>
 <meta name="description" content="$description"><meta name="robots" content="index,follow,max-image-preview:large">
 <meta name="keywords" content="machine learning datasets, ROOT files, XRootD, PyTorch, open science, physics datasets">
-<link rel="canonical" href="$canonical"><meta name="theme-color" content="#071719">
+<link rel="canonical" href="$canonical"><meta name="theme-color" content="#061315">
 <meta property="og:type" content="website"><meta property="og:title" content="$title">
 <meta property="og:description" content="$description"><meta property="og:url" content="$canonical">
 <meta name="twitter:card" content="summary_large_image"><script type="application/ld+json">$json_ld</script>
-<style>
-:root{color-scheme:dark;--bg:#061416;--ink:#effffb;--muted:#96b8b3;--panel:#0d292c;--panel2:#103438;--line:#285255;--aqua:#51e5c3;--gold:#ffc857;--coral:#ff7869;--shadow:0 24px 80px #0008}
-*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:radial-gradient(circle at 76% -8%,#1a5e5b 0,transparent 32%),radial-gradient(circle at 5% 30%,#35244e 0,transparent 24%),var(--bg);color:var(--ink);font:16px/1.55 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif}a{color:inherit}button,input,select{font:inherit}header,main,footer{width:min(1240px,calc(100% - 2rem));margin-inline:auto}.nav{display:flex;align-items:center;justify-content:space-between;padding:1.2rem 0}.brand{font-weight:900;letter-spacing:-.03em;text-decoration:none}.brand i{color:var(--aqua);font-style:normal}.nav-links{display:flex;gap:1rem;color:var(--muted);font-size:.9rem}.nav-links a{text-decoration:none}.hero{padding:5rem 0 3rem;display:grid;grid-template-columns:1.08fr .92fr;gap:3rem;align-items:center}.eyebrow{text-transform:uppercase;letter-spacing:.2em;color:var(--gold);font-size:.77rem;font-weight:900}.hero h1{font-size:clamp(3.5rem,7.7vw,7.2rem);line-height:.86;letter-spacing:-.07em;margin:.7rem 0 1.5rem;max-width:9ch}.gradient{background:linear-gradient(100deg,var(--aqua),#8cbcff 56%,var(--gold));-webkit-background-clip:text;background-clip:text;color:transparent}.lede{max-width:62ch;color:#c3d9d5;font-size:1.13rem}.metrics{display:flex;gap:2rem;margin:2rem 0;flex-wrap:wrap}.metric strong{display:block;font-size:1.45rem}.metric span{color:var(--muted);font-size:.82rem}.hero-actions,.card-actions{display:flex;gap:.7rem;flex-wrap:wrap}.button{display:inline-flex;align-items:center;justify-content:center;padding:.75rem 1rem;border:1px solid var(--line);border-radius:999px;text-decoration:none;font-weight:800;font-size:.88rem;background:#ffffff08;color:var(--ink)}.button.primary{background:var(--aqua);color:#03201b;border-color:var(--aqua)}.terminal{background:#051011d9;border:1px solid #3c6668;border-radius:24px;box-shadow:var(--shadow);overflow:hidden;transform:rotate(1deg)}.terminal-bar{padding:.8rem 1rem;background:#ffffff09;color:var(--muted);font-size:.78rem}.dots{color:var(--coral);letter-spacing:.25em}.terminal pre{margin:0;padding:1.3rem;max-height:540px;overflow:auto;font:12.5px/1.6 ui-monospace,SFMono-Regular,monospace;color:#d8fff6}.terminal .comment{color:#79a49e}.section{padding:5rem 0}.section-head{display:flex;justify-content:space-between;gap:2rem;align-items:end;margin-bottom:2rem}.section h2{font-size:clamp(2.2rem,5vw,4rem);line-height:1;letter-spacing:-.05em;margin:0}.section-copy{color:var(--muted);max-width:55ch}.protocols{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}.protocol{padding:1.4rem;border:1px solid var(--line);border-radius:20px;background:linear-gradient(145deg,#153638aa,#0b2426aa)}.protocol b{color:var(--aqua);font:800 1rem ui-monospace,monospace}.protocol p{color:var(--muted)}.protocol code{font-size:.78rem;word-break:break-all}.catalogue-tools{position:sticky;top:.7rem;z-index:3;display:grid;grid-template-columns:minmax(250px,2fr) repeat(3,minmax(130px,1fr)) auto;gap:.65rem;padding:.75rem;background:#061416ef;backdrop-filter:blur(15px);border:1px solid var(--line);border-radius:18px;margin:2rem 0}.control{display:grid;gap:.2rem}.control span{padding-left:.25rem;color:var(--muted);font-size:.68rem;text-transform:uppercase;letter-spacing:.08em}.control input,.control select{width:100%;height:44px;padding:.55rem .7rem;border:1px solid #315b5e;border-radius:11px;background:#0a2225;color:var(--ink);outline:none}.control input:focus,.control select:focus{border-color:var(--aqua);box-shadow:0 0 0 2px #51e5c326}.catalogue-tools .button{align-self:end;height:44px;cursor:pointer}.result-status{display:flex;justify-content:space-between;gap:1rem;color:var(--muted);font-size:.84rem;margin:-.8rem 0 1.2rem}.result-status strong{color:var(--ink)}.dataset-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}.dataset-card{display:flex;flex-direction:column;padding:1.25rem;border:1px solid var(--line);border-radius:22px;background:linear-gradient(155deg,#123438e8,#091d20e8);min-height:390px;transition:transform .2s,border-color .2s}.dataset-card:hover{transform:translateY(-4px);border-color:var(--aqua)}.card-top,.provenance{display:flex;justify-content:space-between;gap:.7rem;align-items:center}.pill,.tags span{padding:.27rem .55rem;border-radius:999px;background:#51e5c31b;color:var(--aqua);font-size:.73rem}.size{font-size:.75rem;color:var(--muted)}.dataset-card h3{font:800 1.15rem ui-monospace,monospace;margin:1.1rem 0 .25rem}.dataset-card h3 a{text-decoration:none}.card-title{font-weight:750;margin:.2rem 0 .8rem}.tags{display:flex;gap:.4rem;flex-wrap:wrap}.tags span{background:#fff1;color:#c7dcd8}.transform{color:var(--muted);font-size:.86rem;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}.provenance{font-size:.78rem;margin-top:auto;padding:1rem 0}.provenance a{color:var(--gold)}.card-actions .button{font-size:.75rem;padding:.58rem .72rem}.empty{display:none;text-align:center;color:var(--muted);padding:3rem}.index-note{font-size:.82rem;color:var(--muted);margin-top:2rem}footer{padding:4rem 0;border-top:1px solid var(--line);color:var(--muted);display:flex;justify-content:space-between;gap:2rem}code{font-family:ui-monospace,SFMono-Regular,monospace}@media(max-width:1100px){.catalogue-tools{grid-template-columns:2fr 1fr 1fr}.catalogue-tools .sort-control,.catalogue-tools .button{display:none}}@media(max-width:980px){.hero{grid-template-columns:1fr;padding-top:3rem}.terminal{transform:none}.dataset-grid{grid-template-columns:repeat(2,1fr)}.protocols{grid-template-columns:1fr}}@media(max-width:620px){.nav-links{display:none}.dataset-grid,.catalogue-tools{grid-template-columns:1fr}.catalogue-tools .sort-control,.catalogue-tools .button{display:grid}.section-head,footer,.result-status{display:block}.hero h1{font-size:4rem}.metrics{gap:1rem}.metric{min-width:42%}}
-</style>
-</head><body>
-<header><nav class="nav"><a class="brand" href="#top">Py<i>XRootD</i> / Open Data</a><div class="nav-links"><a href="#quickstart">Quick start</a><a href="#catalogue">Datasets</a><a href="index.json">JSON API</a><a href="sitemap.xml">Sitemap</a></div></nav>
-<section class="hero" id="top"><div><p class="eyebrow">Open science · streamed at physics scale</p><h1>Train on data <span class="gradient">without waiting.</span></h1><p class="lede">$count open machine-learning dataset$plural converted into provenance-rich ROOT files and served by PyXRootD. Start at the first minibatch, stream only the baskets you need, and keep the original source and canonical licence one click away.</p><div class="metrics"><div class="metric"><strong>$count</strong><span>ready-to-stream datasets</span></div><div class="metric"><strong>$root_total</strong><span>streamable ROOT archive</span></div><div class="metric"><strong>$source_total</strong><span>published source payload</span></div><div class="metric"><strong>$size_policy_value</strong><span>$size_policy_label</span></div></div><div class="hero-actions"><a class="button primary" href="#quickstart">Train a classifier</a><a class="button" href="#catalogue">Explore datasets</a></div></div>
-<div class="terminal" id="quickstart"><div class="terminal-bar"><span class="dots">● ● ●</span> &nbsp; from empty venv to a PyTorch classifier</div><pre><code><span class="comment"># 1. Create an isolated environment</span>
+<style>$page_style</style>
+</head>
+<body>
+<a class="skip-link" href="#catalogue">Skip to catalogue</a>
+<nav class="nav" aria-label="Primary navigation">
+  <a class="brand" href="#top"><span class="brand-mark" aria-hidden="true">PX</span><span class="brand-copy"><strong>PyXRootD</strong><small>Open science data infrastructure</small></span></a>
+  <span class="nav-status"><span class="status-dot" aria-hidden="true">&nbsp;</span>$count datasets online</span>
+  <div class="nav-links"><a href="#quickstart">Quick start</a><a href="index.json">JSON API</a><a href="sitemap.xml">Sitemap</a><a class="nav-cta" href="#catalogue">Browse data</a></div>
+</nav>
+<header id="top">
+  <section class="hero">
+    <div class="hero-copy">
+      <p class="eyebrow">Open science · streamed at physics scale</p>
+      <h1>Train on data <span class="gradient">without waiting.</span></h1>
+      <p class="lede">$count open machine-learning dataset$plural converted into provenance-rich ROOT files and served by PyXRootD. Start at the first minibatch, stream only the baskets you need, and keep the original source and canonical licence one click away.</p>
+      <div class="hero-actions"><a class="button primary" href="#quickstart">Run the quick start</a><a class="button" href="#catalogue">Explore $count datasets</a></div>
+      <div class="metrics" aria-label="Catalogue statistics">
+        <div class="metric"><strong>$count</strong><span>ready-to-stream datasets</span></div>
+        <div class="metric"><strong>$root_total</strong><span>streamable ROOT archive</span></div>
+        <div class="metric"><strong>$source_total</strong><span>published source payload</span></div>
+        <div class="metric"><strong>$size_policy_value</strong><span>$size_policy_label</span></div>
+      </div>
+    </div>
+    <div class="terminal" id="quickstart">
+      <div class="terminal-bar"><span class="dots" aria-hidden="true">● ● ●</span><span>From empty venv to a PyTorch classifier</span><span class="terminal-label">Python · PyTorch · ROOT</span></div>
+      <pre><code><span class="comment"># 1. Create an isolated environment</span>
 python3 -m venv .venv
 source .venv/bin/activate
 
@@ -1571,12 +2281,42 @@ for images, labels in data.train.batches(256):
     optimizer.step()
 
 print(f"last minibatch loss: {loss.item():.3f}")
-PY</code></pre></div></section></header>
-<main><section class="section"><div class="section-head"><div><p class="eyebrow">One archive, three routes</p><h2>Move less. Begin sooner.</h2></div><p class="section-copy">ROOT baskets let a training loop fetch selected columns and minibatches rather than copying a monolithic archive. XRootD is the wide-area data layer used across the WLCG and OSG; here PyXRootD points that machinery at ML. Add <code>cache=True</code> when repeated epochs should pull the file into <code>~/.cache/xrd</code> once.</p></div><div class="protocols"><article class="protocol"><b>root:// native</b><p>Parallel, resumable vector reads and checksums over the protocol built for globally distributed HEP analysis.</p><code>xrd.ml.load("$root_url//mnist.root")</code></article><article class="protocol"><b>https:// ranges</b><p>Works through browsers, notebooks and ordinary proxies, while nginx handles byte-range reads.</p><code>xrd.ml.load("$base_url/mnist.root")</code></article><article class="protocol"><b>catalogue lookup</b><p>Use a stable dataset name; <a href="index.json">index.json</a> resolves the file and records its checksum and provenance.</p><code>xrd.ml.load("mnist", cache=True)</code></article></div></section>
-<section class="section" id="catalogue"><div class="section-head"><div><p class="eyebrow">The catalogue</p><h2>Open data, inspectable lineage.</h2></div><p class="section-copy">Every result separates its canonical origin, or best available dataset record, and credited creators from the repository or mirror serving the registered bytes. It also links the canonical licence, exact transformation into ROOT, and direct download. The cards are rendered in HTML for people and indexers; filters only hide what is already on the page.</p></div><div class="catalogue-tools"><label class="control"><span>Search</span><input id="q" type="search" placeholder="Name, creator, task or transformation…"></label><label class="control"><span>Modality</span><select id="modality"><option value="">All modalities</option>$modality_options</select></label><label class="control"><span>Licence</span><select id="licence"><option value="">All licences</option>$licence_options</select></label><label class="control sort-control"><span>Sort</span><select id="sort"><option value="name">Name A-Z</option><option value="size-desc">Largest ROOT file</option><option value="size-asc">Smallest ROOT file</option><option value="rows-desc">Most rows</option></select></label><button class="button" id="reset" type="button">Reset</button></div><div class="result-status" aria-live="polite"><span><strong id="shown">$count</strong> of $count datasets shown</span><span>All metadata is present in the page for people and indexers.</span></div><noscript><p class="result-status">JavaScript filters are optional; every dataset remains visible below.</p></noscript><div class="dataset-grid" id="cards">$cards</div><p class="empty" id="empty">No dataset matches those filters.</p><p class="index-note">Built $built · Machine-readable metadata: <a href="index.json">index.json</a> · Google-compatible <a href="sitemap.xml">sitemap</a> · every ROOT file includes the same provenance in its <code>about</code> key.</p></section></main>
-<footer><strong>PyXRootDClient</strong><span>Pure-Python access to XRootD, HTTPS ranges and ROOT data for training anywhere.</span><a href="https://github.com/rob-c/PyXRootDClient">Source on GitHub</a></footer>
-<script>const q=document.getElementById("q"),modality=document.getElementById("modality"),licence=document.getElementById("licence"),sort=document.getElementById("sort"),reset=document.getElementById("reset"),grid=document.getElementById("cards"),cards=[...document.querySelectorAll(".dataset-card")],empty=document.getElementById("empty"),shown=document.getElementById("shown");function apply(){const wanted=q.value.trim().toLowerCase(),kind=modality.value,terms=licence.value;let count=0;cards.forEach(card=>{const yes=(!wanted||card.dataset.search.includes(wanted))&&(!kind||card.dataset.modality===kind)&&(!terms||card.dataset.licence===terms);card.hidden=!yes;if(yes)count+=1});const ordered=[...cards].sort((a,b)=>sort.value==="size-desc"?Number(b.dataset.size)-Number(a.dataset.size):sort.value==="size-asc"?Number(a.dataset.size)-Number(b.dataset.size):sort.value==="rows-desc"?Number(b.dataset.rows)-Number(a.dataset.rows):a.dataset.name.localeCompare(b.dataset.name));grid.append(...ordered);shown.textContent=String(count);empty.style.display=count?"none":"block"}q.addEventListener("input",apply);modality.addEventListener("change",apply);licence.addEventListener("change",apply);sort.addEventListener("change",apply);reset.addEventListener("click",()=>{q.value="";modality.value="";licence.value="";sort.value="name";apply();q.focus()});</script>
-</body></html>
+PY</code></pre>
+    </div>
+  </section>
+</header>
+<main>
+  <section class="section routes">
+    <div class="section-head"><div><p class="eyebrow">One archive, three routes</p><h2>Move less. Begin sooner.</h2></div><p class="section-copy">ROOT baskets let a training loop fetch selected columns and minibatches rather than copying a monolithic archive. XRootD is the wide-area data layer used across the WLCG and OSG; here PyXRootD points that machinery at ML. Add <code>cache=True</code> when repeated epochs should pull the file into <code>~/.cache/xrd</code> once.</p></div>
+    <div class="protocols">
+      <article class="protocol"><span class="protocol-index">ROUTE 01</span><b>root:// native</b><p>Parallel, resumable vector reads and checksums over the protocol built for globally distributed HEP analysis.</p><code>xrd.ml.load("$root_url//mnist.root")</code></article>
+      <article class="protocol"><span class="protocol-index">ROUTE 02</span><b>HTTP(S) byte ranges</b><p>Works through browsers, notebooks and ordinary proxies, while nginx serves efficient partial reads.</p><code>xrd.ml.load("$base_url/mnist.root")</code></article>
+      <article class="protocol"><span class="protocol-index">ROUTE 03</span><b>catalogue lookup</b><p>Use a stable dataset name; <a href="index.json">index.json</a> resolves its file and records checksum and provenance.</p><code>xrd.ml.load("mnist", cache=True)</code></article>
+    </div>
+  </section>
+  <section class="section" id="catalogue">
+    <div class="section-head"><div><p class="eyebrow">The catalogue</p><h2>Open data. Inspectable lineage.</h2></div><p class="section-copy">Every entry separates canonical origin and credited creators from the repository or mirror serving the bytes. The licence, exact transformation into ROOT, and direct download remain one click away—and every card is server-rendered for people and indexers.</p></div>
+    <div class="catalogue-tools" role="search" aria-label="Filter and sort datasets">
+      <div class="toolbar-head"><strong>Refine the catalogue</strong><span><kbd>/</kbd>Focus search · Esc clears it</span></div>
+      <div class="toolbar-controls">
+        <label class="control search-control"><span>Search</span><input id="q" type="search" autocomplete="off" placeholder="Name, creator, task or transformation…"></label>
+        <label class="control"><span>Modality</span><select id="modality"><option value="">All modalities</option>$modality_options</select></label>
+        <label class="control"><span>Licence</span><select id="licence"><option value="">All licences</option>$licence_options</select></label>
+        <label class="control sort-control"><span>Sort</span><select id="sort"><option value="name">Name A-Z</option><option value="size-desc">Largest ROOT file</option><option value="size-asc">Smallest ROOT file</option><option value="rows-desc">Most rows</option></select></label>
+        <button class="button" id="reset" type="button">Reset</button>
+      </div>
+    </div>
+    <div class="result-status" aria-live="polite"><span class="result-count"><strong id="shown">$count</strong><span>of $count datasets</span></span><span class="result-note">Complete provenance and machine-readable metadata in every result.</span></div>
+    <noscript><p class="result-status">JavaScript filters are optional; every dataset remains visible below.</p></noscript>
+    <div class="dataset-grid" id="cards">$cards</div>
+    <p class="empty" id="empty">No dataset matches those filters. Clear one or more filters and try again.</p>
+    <p class="index-note">Built $built · Machine-readable metadata: <a href="index.json">index.json</a> · Google-compatible <a href="sitemap.xml">sitemap</a> · every ROOT file includes the same provenance in its <code>about</code> key.</p>
+  </section>
+</main>
+<footer class="site-footer"><strong>PyXRootDClient</strong><span>Pure-Python access to XRootD, HTTP ranges and ROOT data for training anywhere.</span><a href="https://github.com/rob-c/PyXRootDClient" rel="noopener">Source on GitHub →</a></footer>
+<script>$page_script</script>
+</body>
+</html>
 """
 
 _NGINX = """\

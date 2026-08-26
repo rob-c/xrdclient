@@ -778,9 +778,10 @@ def load(
     ``source`` is a URL of any scheme this library speaks, a local path, or an
     open binary file. A bare name - no scheme, no slash, no file where one
     would be - is looked up in the catalogue named by
-    :attr:`~xrd.Config.catalogue` (usually the ``XRD_CATALOGUE`` environment
-    variable), which is the ``index.json`` an ``xrd-datasets`` site serves;
-    that is how the second line above finds the same file as the first.
+    :attr:`~xrd.Config.catalogue`, which defaults to the ScotGrid AI catalogue
+    and is overridable with the ``XRD_CATALOGUE`` environment variable. It is
+    the ``index.json`` an ``xrd-datasets`` site serves; that is how the second
+    line above finds the same file as the first.
     A catalogue dataset split into physical ROOT shards requires
     ``split="train"`` (or another split named in its index entry); this keeps
     a multi-gigabyte logical dataset streamable without an ambiguous default.

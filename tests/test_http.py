@@ -26,13 +26,18 @@ from xrd.errors import (
 )
 from xrd.flags import LocateFlags, PrepareFlags, QueryCode
 from xrd.http import HTTPClient, HTTPFileSystem, bearer_token, digest, macaroon, open_http, tape
-from xrd.http.client import request_target
+from xrd.http.client import check_status, request_target
 from xrd.http.dav import _parse, _pick_digest
 from xrd.http.tpc import _follow, _remote_url
 from xrd.testing import FakeDAVServer
 from xrd.url import parse
 
 BODY = b"hello world"
+
+
+def test_an_http_gateway_timeout_is_a_retryable_error():
+    with pytest.raises(TransientError, match="HTTP 504 Gateway Time-out"):
+        check_status(504, "Gateway Time-out", parse("https://data.example/file"), (), None)
 
 
 @pytest.fixture

@@ -2,11 +2,8 @@
 
 One directory that holds the open datasets people learn machine learning
 with, pre-converted to ROOT files, indexed, checksummed, and ready to serve —
-so that on any laptop:
-
-```bash
-export XRD_CATALOGUE=https://data.example.org
-```
+so that on any laptop, using the built-in
+`http://ai.edi.scotgrid.ac.uk` catalogue by default:
 
 ```python
 import xrd.ml

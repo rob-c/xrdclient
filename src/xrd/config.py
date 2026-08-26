@@ -44,6 +44,10 @@ CONFIG_PATHS = ("~/.config/xrd/config.ini", "~/.xrdrc")
 #: The section every configuration file may have, applied before any alias.
 DEFAULTS_SECTION = "defaults"
 
+#: Public catalogue used by :mod:`xrd.ml` when neither code nor the
+#: environment selects another one.
+DEFAULT_CATALOGUE = "http://ai.edi.scotgrid.ac.uk"
+
 #: Settings a file has no business carrying: a callable cannot be spelled in
 #: INI, and a literal token in a dotfile is a secret in every backup of it -
 #: ``token_file`` says the same thing without copying the bearer around.
@@ -279,7 +283,9 @@ class Config:
     s3_folder_markers: bool = False
     #: Where :func:`xrd.ml.load` resolves bare dataset names: a URL or local
     #: directory holding the ``index.json`` an ``xrd-datasets build`` wrote.
-    catalogue: str | None = field(default_factory=lambda: os.environ.get("XRD_CATALOGUE"))
+    catalogue: str | None = field(
+        default_factory=lambda: os.environ.get("XRD_CATALOGUE", DEFAULT_CATALOGUE)
+    )
     #: Where :func:`xrd.ml.download` keeps a file it has already pulled, so
     #: that a second run reads the local copy instead of the network. Having a
     #: directory here does not turn caching on - nothing is written until a

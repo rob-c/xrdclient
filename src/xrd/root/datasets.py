@@ -39,6 +39,7 @@ import struct
 import tarfile
 import tempfile
 import threading
+import time
 import wave
 import xml.etree.ElementTree as ET
 import zipfile
@@ -361,8 +362,25 @@ def fetch(source: Any, *, config: Any = None) -> bytes:
             return handle.read()
     from ..io import open_url
 
-    with open_url(url, "rb", config=config) as handle:
-        return bytes(handle.read())
+    settings = config or Config()
+    for attempt in range(settings.connect_retries + 1):
+        try:
+            with open_url(url, "rb", config=settings) as handle:
+                return bytes(handle.read())
+        except TransientError:
+            if attempt >= settings.connect_retries:
+                raise
+            number = attempt + 1
+            _log.info(
+                "source fetch from %s failed transiently; retrying %d/%d",
+                url,
+                number,
+                settings.connect_retries,
+            )
+            delay = min(settings.retry_backoff * 2**attempt, settings.wait_cap)
+            if delay:
+                time.sleep(delay)
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 _SOURCE_LOCKS: dict[Path, threading.Lock] = {}
@@ -1581,6 +1599,10 @@ class Large(Dataset):
     sources: Mapping[str, str] = field(default_factory=dict)
     #: Published size of each shard, used to validate retained downloads.
     source_sizes: Mapping[str, int] = field(default_factory=dict)
+    #: Enforce those sizes as immutable publisher promises.  Dataset-viewer
+    #: exports are moving derived artefacts, so their recorded sizes remain
+    #: useful capacity estimates but their Parquet structure is the authority.
+    enforce_source_sizes: bool = True
     #: Optional cache names shared by logical tasks backed by an identical source.
     cache_names: Mapping[str, str] = field(default_factory=dict)
     #: Write each publisher split as its own ROOT file in catalogue builds.
@@ -1611,6 +1633,8 @@ class Large(Dataset):
         return dict(self.sources) if self.sources else {"archive": self.url}
 
     def expected_source_bytes(self, role: str) -> int:
+        if not self.enforce_source_sizes:
+            return 0
         if self.sources:
             return self.source_sizes.get(role, 0)
         return self.source_bytes if role == "archive" else 0
@@ -12009,13 +12033,13 @@ DATASETS: dict[str, Images | CIFAR | Audio | Matrix | Table | Large] = {
         ),
         publisher="Free Spoken Digit Dataset project",
         origin="https://github.com/Jakobovski/free-spoken-digit-dataset/tree/v1.0.8",
-        repository="Zenodo",
+        repository="GitHub",
         mirrors=(("Zenodo archived release v1.0.8", "https://zenodo.org/records/1342401"),),
         citation="https://doi.org/10.5281/zenodo.1342401",
         basket_size=IMAGE_BASKET,
         archive=(
-            "https://zenodo.org/api/records/1342401/files/"
-            "Jakobovski/free-spoken-digit-dataset-v1.0.8.zip/content"
+            "https://codeload.github.com/Jakobovski/free-spoken-digit-dataset/"
+            "zip/refs/tags/v1.0.8"
         ),
         folder="recordings",
         labels={str(digit): digit for digit in range(10)},
@@ -12023,7 +12047,7 @@ DATASETS: dict[str, Images | CIFAR | Audio | Matrix | Table | Large] = {
         splits=("train", "test"),
         rate=8000,
         samples=20000,
-        archive_bytes=7_273_063,
+        archive_bytes=7_233_673,
         test_repetitions=5,
     ),
     "adult": Table(
@@ -22279,6 +22303,7 @@ def _hub_large(item: Mapping[str, Any]) -> Large:
         layout_note="one rows TTree per publisher split",
         sources=item["sources"],
         source_sizes=item["source_sizes"],
+        enforce_source_sizes=False,
     )
 
 

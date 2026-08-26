@@ -1,10 +1,15 @@
 """Bounded-memory conversion of explicitly licensed Hub Parquet datasets.
 
-The generated :mod:`._hub_tables` declarations fix every source shard, byte
-count, split and scalar feature.  This reader scans text columns once to choose
-lossless fixed-width ROOT branches, then streams Arrow record batches into one
-TTree per publisher split.  Nested media features never reach this module;
-the catalogue generator refuses those until they have purpose-built adapters.
+The generated :mod:`._hub_tables` declarations record every source shard,
+discovery-time byte estimate, split and scalar feature.  Hugging Face's
+``refs/convert/parquet`` exports are publisher-managed derived artefacts and
+may be regenerated without changing their URL, so this reader treats the
+Parquet footer and recorded schema as the integrity boundary rather than
+mistaking an old byte count for an immutable checksum.  It scans text columns
+once to choose lossless fixed-width ROOT branches, then streams Arrow record
+batches into one TTree per publisher split.  Nested media features never reach
+this module; the catalogue generator refuses those until they have
+purpose-built adapters.
 """
 
 from __future__ import annotations

@@ -63,6 +63,8 @@ def _assert_hub_source(item):
     assert spec.source_payload_bytes() < 2_000_000_000
     assert set(spec.sources) == set(spec.source_sizes)
     assert sum(spec.source_sizes.values()) == spec.source_bytes
+    assert not spec.enforce_source_sizes
+    assert all(spec.expected_source_bytes(role) == 0 for role in spec.sources)
 
 
 def _assert_hub_metadata(item):

@@ -744,6 +744,10 @@ def _assert_site_catalogue(page):
     assert 'id="modality"' in page and 'id="licence"' in page and 'id="sort"' in page
     assert 'id="shown"' in page and "streamable ROOT archive" in page
     assert 'data-size="' in page and 'data-rows="' in page
+    assert 'class="skip-link"' in page and 'aria-label="Primary navigation"' in page
+    assert 'role="search" aria-label="Filter and sort datasets"' in page
+    assert ".dataset-card::before" in page and "ROOT transformation" in page
+    assert "prefers-reduced-motion" in page and 'event.key === "/"' in page
 
 
 def _assert_site_dataset_content(page):

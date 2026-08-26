@@ -161,7 +161,11 @@ clear is a token anyone on the path can replay. Prefer `roots://`.
 | `verify_checksums` | `True` | compare checksums after a copy |
 | `preferred_checksum` | `"adler32"` | algorithm asked for first |
 | `s3_folder_markers` | `False` | make `mkdir` on S3 write a zero-length `dir/` marker object |
-| `catalogue` | `None` (`$XRD_CATALOGUE`) | where `xrd.ml.load("name")` looks a bare name up |
+| `catalogue` | `http://ai.edi.scotgrid.ac.uk` (`$XRD_CATALOGUE`) | where `xrd.ml.load("name")` looks a bare name up |
+
+Set `XRD_CATALOGUE` to another datasets site to override the public default.
+An explicit `Config(catalogue=None)` disables bare-name catalogue lookup for
+one client configuration.
 
 `recover_handles=False` turns a lost data server into a `TransientError` at the
 call that hit it, which is what you want when your job would rather fail than

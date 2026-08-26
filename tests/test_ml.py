@@ -572,8 +572,8 @@ def test_a_catalogue_is_read_over_http(digits):
             assert len(data) == 18
 
 
-def test_a_name_with_no_catalogue_set_says_how_to_set_one(monkeypatch):
-    monkeypatch.delenv("XRD_CATALOGUE", raising=False)
+def test_a_name_with_catalogue_lookup_disabled_says_how_to_enable_it(monkeypatch):
+    monkeypatch.setenv("XRD_CATALOGUE", "")
     with pytest.raises(ValueError, match="XRD_CATALOGUE"):
         load("digits")
 

@@ -1810,7 +1810,12 @@ def test_the_spoken_digits_name_each_of_their_speakers_once():
     assert len(set(spec.speakers)) == len(spec.speakers) == 6
     assert spec.urls("train") == spec.urls("test") == {"archive": spec.archive}
     assert spec.splits == ("train", "test") and spec.test_repetitions == 5
-    assert spec.source_payload_bytes() == 7_273_063
+    assert spec.archive == (
+        "https://codeload.github.com/Jakobovski/free-spoken-digit-dataset/"
+        "zip/refs/tags/v1.0.8"
+    )
+    assert spec.repository == "GitHub"
+    assert spec.source_payload_bytes() == 7_233_673
     assert spec.rate == 8000
     assert spec.samples > 18262  # the longest recording in the set
 
@@ -3857,6 +3862,39 @@ def test_a_large_source_cache_is_atomic_reusable_and_size_checked(tmp_path):
             expected=len(payload) + 1,
             config=None,
         )
+
+
+def test_a_whole_source_fetch_retries_a_transient_gateway_failure(monkeypatch):
+    attempts = []
+
+    class Remote:
+        def __init__(self, failure):
+            self.failure = failure
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_error):
+            return None
+
+        def read(self):
+            if self.failure:
+                raise TransientError("HTTP 504 Gateway Time-out")
+            return b"complete archive"
+
+    def open_url(*_args, **_kwargs):
+        attempts.append(None)
+        return Remote(len(attempts) == 1)
+
+    monkeypatch.setattr("xrd.io.open_url", open_url)
+
+    raw = datasets_module.fetch(
+        "https://publisher.example/archive",
+        config=Config(connect_retries=1, retry_backoff=0),
+    )
+
+    assert raw == b"complete archive"
+    assert len(attempts) == 2
 
 
 def test_a_cached_remote_source_resumes_a_part_and_recovers_a_dropped_read(

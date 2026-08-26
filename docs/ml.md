@@ -357,10 +357,6 @@ explicitly with `xrd-datasets build ... --allow-oversize` or Python's
 
 ## Loading by name
 
-```bash
-export XRD_CATALOGUE=https://data.example.org
-```
-
 ```python
 data = xrd.ml.load("mnist")
 ```
@@ -369,8 +365,13 @@ A bare name — no scheme, no slash, no file of that name here — is looked up
 in the catalogue: the `index.json` a [datasets site](datasets-site.md)
 serves, which maps names to files. Anything that could be a place is treated
 as one, so a real path or URL is never shadowed by a catalogue entry. The
-catalogue can also be set per call with `Config(catalogue=...)`, and can be a
-local directory as easily as a URL.
+default catalogue is `http://ai.edi.scotgrid.ac.uk`. Override it globally
+with `XRD_CATALOGUE`, or per call with `Config(catalogue=...)`; a local
+directory works as well as a URL.
+
+```bash
+export XRD_CATALOGUE=https://datasets.example.org
+```
 
 When one logical dataset is published as several physical ROOT files, choose
 the publisher split recorded in the catalogue:

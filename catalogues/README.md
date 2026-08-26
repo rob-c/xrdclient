@@ -111,13 +111,19 @@ python tools/hub_catalogue.py \
   src/xrd/root/_hub_tables.py catalogues/hub-open.json
 ```
 
-Runtime builds do not call the inventory APIs. They use the fixed source URLs,
-byte counts, schemas and split map in `_hub_tables.py`; downloaded bytes are
-checked before Arrow reads one record batch at a time. Text is preserved as
-UTF-8 bytes plus an explicit length, `ClassLabel` metadata becomes an integer,
-missing floats become NaN, and each official split becomes its own TTree. The
-origin, canonical licence URL and exact transformation summary travel in the
-ROOT file's `about` key and in the generated website.
+Runtime builds do not call the inventory APIs. They use the recorded source
+URLs, discovery-time byte estimates, schemas and split map in `_hub_tables.py`.
+The Hub's `refs/convert/parquet` files are moving derived exports: their URLs
+and valid schemas can stay the same when the service regenerates their Parquet
+encoding and changes the compressed byte count. Runtime conversion therefore
+uses the recorded total for capacity planning, then validates the current
+Parquet footer and every required source column instead of rejecting a valid
+regeneration solely because its byte count moved. Arrow reads one record batch
+at a time. Text is preserved as UTF-8 bytes plus an explicit length,
+`ClassLabel` metadata becomes an integer, missing floats become NaN, and each
+official split becomes its own TTree. The origin, canonical licence URL and
+exact transformation summary travel in the ROOT file's `about` key and in the
+generated website.
 
 ## The Well visual physics shelf
 

@@ -35,6 +35,13 @@ def test_bearer_token_file_is_picked_up(monkeypatch):
     assert Config().token_file == "/run/tok"
 
 
+def test_catalogue_has_a_public_default_and_an_environment_override(monkeypatch):
+    monkeypatch.delenv("XRD_CATALOGUE", raising=False)
+    assert Config().catalogue == "http://ai.edi.scotgrid.ac.uk"
+    monkeypatch.setenv("XRD_CATALOGUE", "https://catalogue.example.org")
+    assert Config().catalogue == "https://catalogue.example.org"
+
+
 def test_evolve_is_a_copy():
     base = Config(username="a")
     other = base.evolve(username="b")

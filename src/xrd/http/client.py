@@ -35,6 +35,7 @@ from ..errors import (
     kXR_NoSpace,
     kXR_NotAuthorized,
     kXR_NotFound,
+    kXR_ReqTimedOut,
     kXR_ServerError,
     kXR_Unsupported,
     raise_for_status,
@@ -79,6 +80,7 @@ _ERRORS: dict[int, int] = {
     429: kXR_FileLocked,
     501: kXR_Unsupported,
     503: kXR_FileLocked,
+    504: kXR_ReqTimedOut,
     507: kXR_NoSpace,
 }
 
