@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -63,8 +64,10 @@ def _assert_hub_source(item):
     assert spec.source_payload_bytes() < 2_000_000_000
     assert set(spec.sources) == set(spec.source_sizes)
     assert sum(spec.source_sizes.values()) == spec.source_bytes
-    assert not spec.enforce_source_sizes
-    assert all(spec.expected_source_bytes(role) == 0 for role in spec.sources)
+    enforced = bool(item.get("enforce_source_sizes", False))
+    assert spec.enforce_source_sizes is enforced
+    expected = spec.source_sizes if enforced else dict.fromkeys(spec.sources, 0)
+    assert all(spec.expected_source_bytes(role) == expected[role] for role in spec.sources)
 
 
 def _assert_hub_metadata(item):
@@ -301,6 +304,60 @@ def test_hub_oceantaco_schema_revision_uses_the_current_istac_field_name():
     ocean_plan, _derived = hub_module._schema_plan(ocean, [*ocean_names, "istac:time_start"])
 
     assert ocean_plan["stac:time_start"] == "istac:time_start"
+
+
+class _OceanTimestampBook:
+    def __init__(self, _path):
+        self.schema_arrow = SimpleNamespace(names=["istac:time_start", "internal:parent_id"])
+
+    def iter_batches(self, *, batch_size, columns):
+        assert batch_size == 4096
+        values = {
+            "istac:time_start": [datetime(2023, 3, 28, 23, 10, 7, 593194)],
+            "internal:parent_id": [17],
+        }
+        yield _Batch({name: values[name] for name in columns})
+
+
+def test_hub_oceantaco_serializes_arrow_timestamps_as_iso_text(monkeypatch, tmp_path):
+    name = "hub_nilsleh_oceantaco"
+    item = {
+        "name": name,
+        "label": "nilsleh/OceanTACO",
+        "features": [
+            {"source": "stac:time_start", "branch": "stac_time_start", "dtype": "string"},
+            {"source": "internal:parent_id", "branch": "parent", "dtype": "int64"},
+        ],
+        "target": 1,
+        "split_roles": {"train": ["train_001"]},
+    }
+    monkeypatch.setitem(hub_module._BY_NAME, name, item)
+    monkeypatch.setattr(
+        hub_module.importlib,
+        "import_module",
+        lambda _name: SimpleNamespace(ParquetFile=_OceanTimestampBook),
+    )
+
+    _classes, columns, entries = load(
+        name, {"train_001": tmp_path / "level1.parquet"}, "train"
+    )
+    row = next(entries)[1]
+
+    expected = b"2023-03-28T23:10:07.593194"
+    assert columns["stac_time_start"] == ("B", len(expected))
+    assert row["stac_time_start"] == expected
+    assert row["stac_time_start_length"] == len(expected)
+
+
+def test_hub_unstable_exports_with_publisher_parquet_are_revision_pinned():
+    nbroad = _hub_item("hub_nbroad_hf_inference_providers_data")
+    ocean = _hub_item("hub_nilsleh_oceantaco")
+
+    assert nbroad["enforce_source_sizes"]
+    assert f"/resolve/{nbroad['revision']}/data/" in nbroad["sources"]["train_000"]
+    assert ocean["enforce_source_sizes"]
+    prefix = f"/resolve/{ocean['revision']}/METADATA/"
+    assert all(prefix in url for url in ocean["sources"].values())
 
 
 def test_hub_forceflow_schema_revision_explicitly_defaults_omitted_delta_fields():

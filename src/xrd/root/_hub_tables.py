@@ -941,8 +941,9 @@ HUB_OPEN: tuple[dict[str, Any], ...] = ({'name': 'hub_bdsqlsz_tom_and_jerry_capt
   'source': 'https://huggingface.co/datasets/nbroad/hf-inference-providers-data',
   'revision': 'c27d3592a6f7e636de51f361c8d9b7a297a08eb1',
   'source_bytes': 8948,
-  'sources': {'train_000': 'https://huggingface.co/datasets/nbroad/hf-inference-providers-data/resolve/refs%2Fconvert%2Fparquet/default/train/0000.parquet'},
+  'sources': {'train_000': 'https://huggingface.co/datasets/nbroad/hf-inference-providers-data/resolve/c27d3592a6f7e636de51f361c8d9b7a297a08eb1/data/train-00000-of-00001.parquet'},
   'source_sizes': {'train_000': 8948},
+  'enforce_source_sizes': True,
   'splits': ['train'],
   'split_roles': {'train': ['train_000']},
   'features': [{'source': 'provider', 'branch': 'provider', 'dtype': 'string'},
@@ -956,11 +957,10 @@ HUB_OPEN: tuple[dict[str, Any], ...] = ({'name': 'hub_bdsqlsz_tom_and_jerry_capt
   'modality': 'text',
   'task': 'regression',
   'downloads': 1708,
-  'transformation': "read the Hub dataset viewer's complete Parquet conversion one record batch at "
-                    'a time; preserved every scalar source field and official split without '
-                    'scaling; encoded ClassLabel metadata as integers, retained text with explicit '
-                    'byte lengths, and exposed monthly_requests_int as the label or numeric target '
-                    'in one ROOT TTree per split'},
+  'transformation': 'read the immutable publisher Parquet file at the recorded repository revision '
+                    'one record batch at a time; preserved every scalar source field without '
+                    'scaling, retained text with explicit byte lengths, and exposed '
+                    'monthly_requests_int as the numeric target in one ROOT TTree'},
  {'name': 'hub_imageomics_questfish2024',
   'label': 'imageomics/questFish2024',
   'title': 'imageomics/questFish2024: 15 published scalar fields with Ratio_headLenByBodyLen '
@@ -11044,10 +11044,11 @@ HUB_OPEN: tuple[dict[str, Any], ...] = ({'name': 'hub_bdsqlsz_tom_and_jerry_capt
   'source': 'https://huggingface.co/datasets/nilsleh/OceanTACO',
   'revision': '878befc437a49cbf584353efc7346ebe705e743c',
   'source_bytes': 719713,
-  'sources': {'train_000': 'https://huggingface.co/datasets/nilsleh/OceanTACO/resolve/refs%2Fconvert%2Fparquet/default/train/0000.parquet',
-              'train_001': 'https://huggingface.co/datasets/nilsleh/OceanTACO/resolve/refs%2Fconvert%2Fparquet/default/train/0001.parquet',
-              'train_002': 'https://huggingface.co/datasets/nilsleh/OceanTACO/resolve/refs%2Fconvert%2Fparquet/default/train/0002.parquet'},
+  'sources': {'train_000': 'https://huggingface.co/datasets/nilsleh/OceanTACO/resolve/878befc437a49cbf584353efc7346ebe705e743c/METADATA/level0.parquet',
+              'train_001': 'https://huggingface.co/datasets/nilsleh/OceanTACO/resolve/878befc437a49cbf584353efc7346ebe705e743c/METADATA/level1.parquet',
+              'train_002': 'https://huggingface.co/datasets/nilsleh/OceanTACO/resolve/878befc437a49cbf584353efc7346ebe705e743c/METADATA/level2.parquet'},
   'source_sizes': {'train_000': 3486, 'train_001': 25655, 'train_002': 690572},
+  'enforce_source_sizes': True,
   'splits': ['train'],
   'split_roles': {'train': ['train_000', 'train_001', 'train_002']},
   'features': [{'source': 'id', 'branch': 'id', 'dtype': 'string'},
@@ -11060,11 +11061,11 @@ HUB_OPEN: tuple[dict[str, Any], ...] = ({'name': 'hub_bdsqlsz_tom_and_jerry_capt
   'modality': 'tabular, text',
   'task': 'regression',
   'downloads': 5439,
-  'transformation': "read the Hub dataset viewer's complete Parquet conversion one record batch at "
-                    'a time; preserved every scalar source field and official split without '
-                    'scaling; encoded ClassLabel metadata as integers, retained text with explicit '
-                    'byte lengths, and exposed internal:parent_id as the label or numeric target '
-                    'in one ROOT TTree per split'},
+  'transformation': 'read the three immutable publisher metadata Parquet levels at the recorded '
+                    'repository revision one record batch at a time; preserved every selected '
+                    'scalar field without scaling, retained text with explicit byte lengths, '
+                    'serialized level-1 and level-2 Arrow timestamps as ISO 8601 text, and exposed '
+                    'internal:parent_id as the numeric target in one ROOT TTree'},
  {'name': 'hub_tasksource_patent_phrase_similarity',
   'label': 'tasksource/patent-phrase-similarity',
   'title': 'tasksource/patent-phrase-similarity: 6 published scalar fields with score designated '

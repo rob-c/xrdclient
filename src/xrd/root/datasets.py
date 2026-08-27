@@ -22303,7 +22303,7 @@ def _hub_large(item: Mapping[str, Any]) -> Large:
         layout_note=item.get("layout", "one rows TTree per publisher split"),
         sources=item["sources"],
         source_sizes=item["source_sizes"],
-        enforce_source_sizes=False,
+        enforce_source_sizes=bool(item.get("enforce_source_sizes", False)),
         split_files=bool(item.get("split_files", False)),
     )
 

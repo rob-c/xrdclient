@@ -18,6 +18,7 @@ import importlib
 import math
 import re
 from collections.abc import Iterator, Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,7 @@ _DERIVED_LENGTHS: dict[str, frozenset[str]] = {
 _MISSING_VALUES: dict[str, frozenset[str]] = {
     "hub_jokeresc_forceflow": frozenset(f"delta_force_{axis}" for axis in range(6)),
 }
+_DATETIME_TEXT_FIELDS = frozenset({("nilsleh/OceanTACO", "stac:time_start")})
 
 
 def _safe_branches(features: Sequence[Mapping[str, Any]]) -> list[str]:
@@ -220,11 +222,15 @@ def _source_batches(
 def _encoded(value: Any, *, dataset: str, field: str, index: int) -> bytes:
     if value is None:
         return b""
-    if not isinstance(value, str):
+    if isinstance(value, str):
+        text = value
+    elif (dataset, field) in _DATETIME_TEXT_FIELDS and isinstance(value, datetime):
+        text = value.isoformat()
+    else:
         raise ValueError(
             f"row {index} of {dataset} has a non-text value in recorded string field {field}"
         )
-    raw = value.encode("utf-8")
+    raw = text.encode("utf-8")
     if len(raw) > TEXT_LIMIT:
         raise ValueError(
             f"row {index} of {dataset} has {len(raw)} bytes in {field}, above the "
