@@ -1179,14 +1179,16 @@ yields, and how many people live off it; where a chart measures a band as well
 as a value — the temperature anomaly and its low and high — the value is the
 number to predict and the band is carried beside it.
 
-Another 500 entries are generated from explicitly licensed, public Hugging
+Another 499 entries are generated from explicitly licensed, public Hugging
 Face dataset repositories with complete scalar Parquet conversions. They add
-783 publisher splits in 1,236 shards and 12.13 GB of source data; 24 expose a
-published `ClassLabel`, while 476 expose a named or explicitly designated
+805 bounded output splits from 1,235 shards and 12.13 GB of source data; 24 expose a
+published `ClassLabel`, while 475 expose a named or explicitly designated
 numeric teaching target. Every scalar source field is retained. Text becomes
 fixed-width UTF-8 bytes with a companion length, missing floats become NaN,
 `ClassLabel` metadata becomes an integer, and one `rows` TTree is written per
-official split. The generated [selection manifest](https://github.com/rob-c/PyXRootDClient/blob/main/catalogues/hub-open.json)
+official split. The crowd-code corpus is additionally partitioned by power-of-two
+UTF-8 text length so outlier source rows cannot force a multi-gigabyte fixed-width
+ROOT file. The generated [selection manifest](https://github.com/rob-c/PyXRootDClient/blob/main/catalogues/hub-open.json)
 records every repository, revision, canonical licence URL, source size and
 split. Ambiguous `public` metadata, gated repositories, incomplete conversions
 and nested schemas are rejected rather than guessed.

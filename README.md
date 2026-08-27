@@ -175,8 +175,8 @@ Lahman baseball records, the NYC flights, the survival studies, Arbuthnot's
 christenings, Snow's cholera deaths and what the archaeologists dug up, and
 sixty-eight country-year tables charted by Our World in Data, from CO2
 emissions and energy use to child mortality, the warming sea and the ice
-sheets, and 500 explicitly licensed, public Hub repositories whose complete
-scalar Parquet conversions preserve 783 publisher splits across 1,236 shards —
+sheets, and 499 explicitly licensed, public Hub repositories whose complete
+scalar Parquet conversions produce 805 bounded output splits across 1,235 shards —
 into ROOT files a tree per
 class, or one tree of every row where what is predicted is a number rather
 than a class, fetched from whoever publishes them and carrying their licence

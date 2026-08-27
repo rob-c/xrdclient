@@ -1089,6 +1089,16 @@ def test_realdisp_uses_one_bounded_root_shard_per_subject():
     assert realdisp.splits == tuple(f"subject_{subject:02d}" for subject in range(1, 18))
 
 
+def test_multimodal_damage_uses_bounded_deterministic_root_shards():
+    damage = DATASETS["multimodal_damage"]
+    assert isinstance(damage, Large) and damage.split_files
+    assert damage.splits == tuple(f"shard_{shard:02d}" for shard in range(16))
+
+
+def test_internet_users_entity_branch_holds_current_publisher_names():
+    assert DATASETS["internet_users"].text_size == 64
+
+
 def test_the_non_uci_large_archives_have_canonical_terms_and_record_the_ceiling():
     assert {item["name"] for item in OPEN_LARGE} == {
         "adrenalmnist3d",
@@ -4095,7 +4105,13 @@ def test_multimodal_damage_repairs_a_publisher_jpeg_missing_its_end_marker(tmp_p
     assert row["jpeg_eoi_repaired"] is True
 
     output = io.BytesIO()
-    assert convert("multimodal_damage", output, parts={"archive": source}) == {
+    assert convert(
+        "multimodal_damage",
+        output,
+        split="shard_00",
+        prefix="",
+        parts={"archive": source},
+    ) == {
         "fires": 0,
         "floods": 0,
         "human_damage": 0,

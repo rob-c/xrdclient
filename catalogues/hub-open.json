@@ -9,9 +9,9 @@
   "statistics": {
     "candidates": 6000,
     "accepted_before_ranking": 509,
-    "selected": 500,
-    "source_bytes": 12132339034,
-    "permissive": 401,
+    "selected": 499,
+    "source_bytes": 12132322064,
+    "permissive": 400,
     "licences": {
       "Apache-2.0": 96,
       "BSD-2-Clause": 1,
@@ -20,7 +20,7 @@
       "CC BY 4.0": 135,
       "CC BY-SA 3.0": 13,
       "CC BY-SA 4.0": 78,
-      "CC0": 42,
+      "CC0": 41,
       "MIT": 114,
       "MPL-2.0": 1,
       "ODbL-1.0": 7,
@@ -761,21 +761,6 @@
       ],
       "task": "regression",
       "modality": "tabular"
-    },
-    {
-      "name": "hub_rl123321_tb_science_stereo_dem_icesat2",
-      "label": "rl123321/tb-science-stereo-dem-icesat2",
-      "source": "https://huggingface.co/datasets/rl123321/tb-science-stereo-dem-icesat2",
-      "revision": "a623677e9b9a27e1b991b58a8c3c897fbc4a3097",
-      "licence": "CC0",
-      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
-      "permissive": true,
-      "source_bytes": 16970,
-      "splits": [
-        "validation"
-      ],
-      "task": "regression",
-      "modality": "geospatial, tabular"
     },
     {
       "name": "hub_lee1o21k21_dialnav_results",
@@ -6955,8 +6940,32 @@
       "permissive": true,
       "source_bytes": 57677666,
       "splits": [
-        "train"
+        "text_bytes_00",
+        "text_bytes_01",
+        "text_bytes_02",
+        "text_bytes_03",
+        "text_bytes_04",
+        "text_bytes_05",
+        "text_bytes_06",
+        "text_bytes_07",
+        "text_bytes_08",
+        "text_bytes_09",
+        "text_bytes_10",
+        "text_bytes_11",
+        "text_bytes_12",
+        "text_bytes_13",
+        "text_bytes_14",
+        "text_bytes_15",
+        "text_bytes_16",
+        "text_bytes_17",
+        "text_bytes_18",
+        "text_bytes_19",
+        "text_bytes_20",
+        "text_bytes_21",
+        "text_bytes_22",
+        "text_bytes_23"
       ],
+      "runtime_partition": "power-of-two UTF-8 byte length of Text; one bounded ROOT file per bucket",
       "task": "regression",
       "modality": "tabular, text"
     },

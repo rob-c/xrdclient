@@ -1599,34 +1599,6 @@ HUB_OPEN: tuple[dict[str, Any], ...] = ({'name': 'hub_bdsqlsz_tom_and_jerry_capt
                     'scaling; encoded ClassLabel metadata as integers, retained text with explicit '
                     'byte lengths, and exposed elapsed_s as the label or numeric target in one '
                     'ROOT TTree per split'},
- {'name': 'hub_rl123321_tb_science_stereo_dem_icesat2',
-  'label': 'rl123321/tb-science-stereo-dem-icesat2',
-  'title': 'rl123321/tb-science-stereo-dem-icesat2: 3 published scalar fields with h_ellipsoid '
-           'designated as the teaching target',
-  'licence': 'CC0',
-  'licence_url': 'https://creativecommons.org/publicdomain/zero/1.0/',
-  'licence_slug': 'cc0-1.0',
-  'permissive': True,
-  'source': 'https://huggingface.co/datasets/rl123321/tb-science-stereo-dem-icesat2',
-  'revision': 'a623677e9b9a27e1b991b58a8c3c897fbc4a3097',
-  'source_bytes': 16970,
-  'sources': {'validation_000': 'https://huggingface.co/datasets/rl123321/tb-science-stereo-dem-icesat2/resolve/refs%2Fconvert%2Fparquet/default/validation/0000.parquet'},
-  'source_sizes': {'validation_000': 16970},
-  'splits': ['validation'],
-  'split_roles': {'validation': ['validation_000']},
-  'features': [{'source': 'lat', 'branch': 'lat', 'dtype': 'float64'},
-               {'source': 'lon', 'branch': 'lon', 'dtype': 'float64'},
-               {'source': 'h_ellipsoid', 'branch': 'h_ellipsoid', 'dtype': 'float32'}],
-  'target': 2,
-  'requires': ['pyarrow'],
-  'modality': 'geospatial, tabular',
-  'task': 'regression',
-  'downloads': 315,
-  'transformation': "read the Hub dataset viewer's complete Parquet conversion one record batch at "
-                    'a time; preserved every scalar source field and official split without '
-                    'scaling; encoded ClassLabel metadata as integers, retained text with explicit '
-                    'byte lengths, and exposed h_ellipsoid as the label or numeric target in one '
-                    'ROOT TTree per split'},
  {'name': 'hub_lee1o21k21_dialnav_results',
   'label': 'lee1o21k21/dialnav-results',
   'title': 'lee1o21k21/dialnav-results: 23 published scalar fields with count_seen designated as '
@@ -19320,7 +19292,8 @@ HUB_OPEN: tuple[dict[str, Any], ...] = ({'name': 'hub_bdsqlsz_tom_and_jerry_capt
                     'a time; preserved every scalar source field and official split without '
                     'scaling; encoded ClassLabel metadata as integers, retained text with explicit '
                     'byte lengths, and exposed delta_force_5 as the label or numeric target in one '
-                    'ROOT TTree per split'},
+                    'ROOT TTree per split; stored NaN for delta_force_0 through delta_force_5 only '
+                    'in publisher shards that omit those six fields'},
  {'name': 'hub_nobodyexistsontheinternet_xlam_function_calling_60k',
   'label': 'NobodyExistsOnTheInternet/xlam-function-calling-60k',
   'title': 'NobodyExistsOnTheInternet/xlam-function-calling-60k: 4 published scalar fields with id '
@@ -20779,8 +20752,57 @@ HUB_OPEN: tuple[dict[str, Any], ...] = ({'name': 'hub_bdsqlsz_tom_and_jerry_capt
   'source_bytes': 57677666,
   'sources': {'train_000': 'https://huggingface.co/datasets/p-doom/crowd-code-dataset-0.1/resolve/refs%2Fconvert%2Fparquet/default/train/0000.parquet'},
   'source_sizes': {'train_000': 57677666},
-  'splits': ['train'],
-  'split_roles': {'train': ['train_000']},
+  'splits': ['text_bytes_00',
+             'text_bytes_01',
+             'text_bytes_02',
+             'text_bytes_03',
+             'text_bytes_04',
+             'text_bytes_05',
+             'text_bytes_06',
+             'text_bytes_07',
+             'text_bytes_08',
+             'text_bytes_09',
+             'text_bytes_10',
+             'text_bytes_11',
+             'text_bytes_12',
+             'text_bytes_13',
+             'text_bytes_14',
+             'text_bytes_15',
+             'text_bytes_16',
+             'text_bytes_17',
+             'text_bytes_18',
+             'text_bytes_19',
+             'text_bytes_20',
+             'text_bytes_21',
+             'text_bytes_22',
+             'text_bytes_23'],
+  'split_roles': {'text_bytes_00': ['train_000'],
+                  'text_bytes_01': ['train_000'],
+                  'text_bytes_02': ['train_000'],
+                  'text_bytes_03': ['train_000'],
+                  'text_bytes_04': ['train_000'],
+                  'text_bytes_05': ['train_000'],
+                  'text_bytes_06': ['train_000'],
+                  'text_bytes_07': ['train_000'],
+                  'text_bytes_08': ['train_000'],
+                  'text_bytes_09': ['train_000'],
+                  'text_bytes_10': ['train_000'],
+                  'text_bytes_11': ['train_000'],
+                  'text_bytes_12': ['train_000'],
+                  'text_bytes_13': ['train_000'],
+                  'text_bytes_14': ['train_000'],
+                  'text_bytes_15': ['train_000'],
+                  'text_bytes_16': ['train_000'],
+                  'text_bytes_17': ['train_000'],
+                  'text_bytes_18': ['train_000'],
+                  'text_bytes_19': ['train_000'],
+                  'text_bytes_20': ['train_000'],
+                  'text_bytes_21': ['train_000'],
+                  'text_bytes_22': ['train_000'],
+                  'text_bytes_23': ['train_000']},
+  'partition': {'kind': 'utf8_power2', 'source': 'Text', 'max_bucket': 23},
+  'split_files': True,
+  'layout': 'one rows TTree in each power-of-two UTF-8 Text-length ROOT shard',
   'features': [{'source': 'Sequence', 'branch': 'sequence', 'dtype': 'int64'},
                {'source': 'Time', 'branch': 'time', 'dtype': 'int64'},
                {'source': 'File', 'branch': 'file', 'dtype': 'string'},
@@ -20797,8 +20819,9 @@ HUB_OPEN: tuple[dict[str, Any], ...] = ({'name': 'hub_bdsqlsz_tom_and_jerry_capt
   'transformation': "read the Hub dataset viewer's complete Parquet conversion one record batch at "
                     'a time; preserved every scalar source field and official split without '
                     'scaling; encoded ClassLabel metadata as integers, retained text with explicit '
-                    'byte lengths, and exposed RangeLength as the label or numeric target in one '
-                    'ROOT TTree per split'},
+                    'byte lengths, and exposed RangeLength as the label or numeric target; '
+                    'partitioned rows by power-of-two UTF-8 Text length so every ROOT file uses '
+                    'split-local fixed-width branches and remains bounded'},
  {'name': 'hub_argilla_apigen_function_calling',
   'label': 'argilla/apigen-function-calling',
   'title': 'argilla/apigen-function-calling: 9 published scalar fields with id designated as the '

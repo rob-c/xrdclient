@@ -42,7 +42,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -854,10 +854,10 @@ def _byte_sentinel(value: bytes | bytearray | memoryview) -> str | None:
 
 def _observe_values(health: _PayloadHealth, values: Any) -> None:
     """Walk nested decoded values into one branch-health summary."""
-    nested: Sequence[Any]
+    nested: Collection[Any]
     if isinstance(values, Mapping):
         nested = list(values.values())
-    elif isinstance(values, Sequence) and not isinstance(
+    elif isinstance(values, Collection) and not isinstance(
         values, (str, bytes, bytearray, memoryview)
     ):
         nested = values

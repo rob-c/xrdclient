@@ -84,6 +84,7 @@ HUMANITARIAN_CODES = {
     "human_damage": 4,
     "non_damage": 5,
 }
+HUMANITARIAN_SPLITS = tuple(f"shard_{shard:02d}" for shard in range(16))
 WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 DAILY_ACTIVITIES = tuple(f"activity_{at:02d}" for at in range(1, 20))
 PAMAP_ACTIVITIES = tuple(
@@ -232,10 +233,12 @@ UCI_LARGE: tuple[dict[str, Any], ...] = (
             "decoded each JPEG to RGB unsigned-byte pixels, proportionally letterboxed variable "
             "source geometry to 640x640 while retaining the original and resized geometry, paired "
             "it with the supplied caption and retained the damage class; repaired publisher JPEGs "
-            "missing their terminal end marker and recorded that repair; wrote one ROOT TTree per "
-            "class"
+            "missing their terminal end marker and recorded that repair; partitioned publisher "
+            "image indices modulo 16 into bounded ROOT files, each with one TTree per class"
         ),
         "classes": HUMANITARIAN,
+        "splits": HUMANITARIAN_SPLITS,
+        "split_files": True,
         "requires": ("Pillow",),
         "modality": "image and text",
         "task": "damage classification",
@@ -1416,15 +1419,17 @@ def _humanitarian_entry(
     )
 
 
-def _humanitarian_entries(path: Path) -> Rows:
+def _humanitarian_entries(path: Path, split: str) -> Rows:
     image_module = _humanitarian_module()
+    shard = None if split == "all" else HUMANITARIAN_SPLITS.index(split)
     with zipfile.ZipFile(path) as archive:
         held = {info.filename: info for info in archive.infolist()}
         for index, info in enumerate(_humanitarian_images(archive)):
-            yield _humanitarian_entry(archive, held, info, image_module, index)
+            if shard is None or index % len(HUMANITARIAN_SPLITS) == shard:
+                yield _humanitarian_entry(archive, held, info, image_module, index)
 
 
-def _humanitarian(path: Path) -> Loaded:
+def _humanitarian(path: Path, split: str) -> Loaded:
     columns: dict[str, Any] = {
         "image": ("B", 640 * 640 * 3),
         "caption": ("B", 8192),
@@ -1439,7 +1444,7 @@ def _humanitarian(path: Path) -> Loaded:
         "label": "i",
         "index": "i",
     }
-    return HUMANITARIAN, columns, _humanitarian_entries(path)
+    return HUMANITARIAN, columns, _humanitarian_entries(path, split)
 
 
 _LONG_VR = {b"OB", b"OD", b"OF", b"OL", b"OV", b"OW", b"SQ", b"UC", b"UR", b"UT", b"UN"}
@@ -2245,7 +2250,6 @@ def load(converter: str, path: Path, split: str) -> Loaded:
 _SIMPLE_CONVERTERS: dict[str, Callable[[Path], Loaded]] = {
     "cuffless": _cuffless,
     "chipseq": _chipseq,
-    "humanitarian": _humanitarian,
     "ppg": _ppg,
     "daily": _daily,
     "gas_temperature": _gas_temperature,
@@ -2266,4 +2270,5 @@ _SPLIT_CONVERTERS: dict[str, Callable[[Path, str], Loaded]] = {
     "puf": _puf,
     "year_prediction": _year_prediction,
     "dicom": _dicom,
+    "humanitarian": _humanitarian,
 }

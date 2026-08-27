@@ -74,9 +74,10 @@ key alongside the licence and exact transformation.
 
 ## Explicitly licensed Hub Parquet shelf
 
-`hub-open.json` fixes another 500 public dataset repositories discovered
-through the Hugging Face Hub API. Together they expose 783 publisher splits
-in 1,236 Parquet shards and declare 12,132,339,034 source bytes (11.30 GiB).
+`hub-open.json` fixes another 499 public dataset repositories discovered
+through the Hugging Face Hub API. Together they produce 805 bounded output
+splits from 1,235 Parquet shards and declare 12,132,322,064 source bytes
+(11.30 GiB).
 Every selected logical dataset is strictly below the normal two-gigabyte
 ceiling; 37 are at least 100 MB and therefore join `xrd-datasets --large`.
 The counted unit is a unique publisher repository ID. The inventory does not

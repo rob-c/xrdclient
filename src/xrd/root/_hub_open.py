@@ -34,9 +34,14 @@ TEXT_LIMIT = 16 * 1024 * 1024
 _BY_NAME = {item["name"]: item for item in HUB_OPEN}
 _COLUMN_ALIASES: dict[str, dict[str, str]] = {
     "hub_alexandrainst_nordjylland_news_summarization": {"text": "document"},
+    "hub_eoa_team_swisscrop25": {"BPA_QI": "BPA_QI "},
+    "hub_nilsleh_oceantaco": {"stac:time_start": "istac:time_start"},
 }
 _DERIVED_LENGTHS: dict[str, frozenset[str]] = {
     "hub_alexandrainst_nordjylland_news_summarization": frozenset({"text_len", "summary_len"}),
+}
+_MISSING_VALUES: dict[str, frozenset[str]] = {
+    "hub_jokeresc_forceflow": frozenset(f"delta_force_{axis}" for axis in range(6)),
 }
 
 
@@ -82,10 +87,13 @@ def _resolved_source(
     available: set[str],
     aliases: Mapping[str, str],
     derivable: frozenset[str],
+    defaultable: frozenset[str],
 ) -> tuple[str | None, bool]:
     actual = _existing_source(source, available, aliases)
     if actual is not None:
         return actual, False
+    if source in defaultable:
+        return "", True
     if source not in derivable:
         return None, False
     base = source.removesuffix("_len")
@@ -105,10 +113,13 @@ def _resolved_sources(
     available: set[str],
     aliases: Mapping[str, str],
     derivable: frozenset[str],
+    defaultable: frozenset[str],
 ) -> list[tuple[str, str | None, bool]]:
     resolved = []
     for source in sources:
-        resolved.append((source, *_resolved_source(source, available, aliases, derivable)))
+        resolved.append(
+            (source, *_resolved_source(source, available, aliases, derivable, defaultable))
+        )
     return resolved
 
 
@@ -138,8 +149,9 @@ def _schema_plan(
     """Resolve registered fields against a compatible publisher schema revision."""
     aliases = _COLUMN_ALIASES.get(item["name"], {})
     derivable = _DERIVED_LENGTHS.get(item["name"], frozenset())
+    defaultable = _MISSING_VALUES.get(item["name"], frozenset())
     available = set(names)
-    resolved = _resolved_sources(_schema_sources(item), available, aliases, derivable)
+    resolved = _resolved_sources(_schema_sources(item), available, aliases, derivable, defaultable)
     missing = _missing_sources(resolved)
     if missing:
         raise ValueError(
@@ -184,17 +196,24 @@ def _source_batches(
     plan: Mapping[str, str],
     derived: frozenset[str],
 ) -> Iterator[tuple[Any, dict[str, Sequence[Any]]]]:
-    columns = list(dict.fromkeys(plan[source] for source in sources))
+    requested = list(sources)
+    partition_source = item.get("partition", {}).get("source")
+    if partition_source and partition_source not in requested:
+        requested.append(partition_source)
+    columns = list(dict.fromkeys(plan[source] for source in requested if plan[source]))
     for batch in book.iter_batches(batch_size=4096, columns=columns):
         raw = batch.to_pydict()
         values: dict[str, Sequence[Any]] = {}
-        for source in sources:
+        for source in requested:
             actual = plan[source]
-            values[source] = (
-                _derived_text_lengths(raw[actual], dataset=item["label"], field=source)
-                if source in derived
-                else raw[actual]
-            )
+            if not actual:
+                values[source] = [None] * batch.num_rows
+            elif source in derived:
+                values[source] = _derived_text_lengths(
+                    raw[actual], dataset=item["label"], field=source
+                )
+            else:
+                values[source] = raw[actual]
         yield batch, values
 
 
@@ -229,15 +248,38 @@ def _initial_widths(sources: Sequence[str]) -> dict[str, int]:
     return result
 
 
+def _partition_offsets(
+    item: Mapping[str, Any], split: str, values: Mapping[str, Sequence[Any]], first: int
+) -> range | list[int]:
+    """Select a deterministic subset while retaining publisher row indices."""
+    partition = item.get("partition")
+    if not partition:
+        return range(len(next(iter(values.values()))))
+    if partition.get("kind") != "utf8_power2":
+        raise ValueError(f"the Hub dataset {item['label']} has an unknown partition strategy")
+    source = str(partition["source"])
+    result = []
+    for offset, value in enumerate(values[source]):
+        width = len(_encoded(value, dataset=item["label"], field=source, index=first + offset))
+        bucket = 0 if width == 0 else (width - 1).bit_length()
+        bucket = min(bucket, int(partition.get("max_bucket", bucket)))
+        if split == f"text_bytes_{bucket:02d}":
+            result.append(offset)
+    return result
+
+
 def _update_text_widths(
     item: Mapping[str, Any],
     columns: Sequence[str],
     widths: dict[str, int],
     values: Mapping[str, Sequence[Any]],
     first: int,
+    offsets: Sequence[int],
 ) -> None:
     for name in columns:
-        widths[name] = max(widths[name], _batch_text_width(item, name, values[name], first))
+        widths[name] = max(
+            widths[name], _batch_text_width(item, name, values[name], first, offsets)
+        )
 
 
 def _book_text_widths(
@@ -248,9 +290,11 @@ def _book_text_widths(
     plan: Mapping[str, str],
     derived: frozenset[str],
     first: int,
+    split: str,
 ) -> int:
     for batch, values in _source_batches(item, book, columns, plan, derived):
-        _update_text_widths(item, columns, widths, values, first)
+        offsets = _partition_offsets(item, split, values, first)
+        _update_text_widths(item, columns, widths, values, first, offsets)
         first += batch.num_rows
     return first
 
@@ -262,16 +306,20 @@ def _text_widths(item: Mapping[str, Any], paths: Mapping[str, Path], split: str)
         return widths
     index = 0
     for _role, book, plan, derived in _books(item, paths, split):
-        index = _book_text_widths(item, book, columns, widths, plan, derived, index)
+        index = _book_text_widths(item, book, columns, widths, plan, derived, index, split)
     return widths
 
 
 def _batch_text_width(
-    item: Mapping[str, Any], name: str, values: Sequence[Any], first: int
+    item: Mapping[str, Any],
+    name: str,
+    values: Sequence[Any],
+    first: int,
+    offsets: Sequence[int],
 ) -> int:
     width = 1
-    for offset, value in enumerate(values):
-        raw = _encoded(value, dataset=item["label"], field=name, index=first + offset)
+    for offset in offsets:
+        raw = _encoded(values[offset], dataset=item["label"], field=name, index=first + offset)
         width = max(width, len(raw))
     return width
 
@@ -294,7 +342,7 @@ def _class(value: Any, feature: Mapping[str, Any], dataset: str, index: int) -> 
         raise ValueError(
             f"row {index} of {dataset} has an invalid ClassLabel in {feature['source']}"
         ) from None
-    if result < 0 or result >= len(classes):
+    if result < -1 or result >= len(classes):
         raise ValueError(
             f"row {index} of {dataset} labels {feature['source']} as {result}, and there are "
             f"{len(classes)} recorded classes"
@@ -378,23 +426,22 @@ def _entries(
     index = 0
     for _role, book, plan, derived in _books(item, paths, split):
         for batch, values in _source_batches(item, book, sources, plan, derived):
-            for row in _batch_rows(item, batch, values, branches, widths, target_at, index):
-                yield row
-                index += 1
+            offsets = _partition_offsets(item, split, values, index)
+            yield from _batch_rows(item, values, branches, widths, target_at, index, offsets)
+            index += batch.num_rows
 
 
 def _batch_rows(
     item: Mapping[str, Any],
-    batch: Any,
     values: Mapping[str, Sequence[Any]],
     branches: Sequence[str],
     widths: Mapping[str, int],
     target_at: int,
     first: int,
+    offsets: Sequence[int],
 ) -> Rows:
-    for offset in range(batch.num_rows):
-        yield 0, _converted_row(item, values, offset, branches, widths, target_at, first)
-        first += 1
+    for offset in offsets:
+        yield 0, _converted_row(item, values, offset, branches, widths, target_at, first + offset)
 
 
 def _converted_row(

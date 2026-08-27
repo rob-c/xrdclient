@@ -18612,7 +18612,7 @@ DATASETS: dict[str, Images | CIFAR | Audio | Matrix | Table | Large] = {
         classes=(),
         url="https://ourworldindata.org/grapher/number-of-internet-users.csv?v=1&csvType=full&useColumnShortNames=true",
         header=True,
-        text_size=32,
+        text_size=64,
         fields=_INTERNET_USERS_FIELDS,
     ),
     "co2_emissions": Table(
@@ -22300,10 +22300,11 @@ def _hub_large(item: Mapping[str, Any]) -> Large:
         converter=f"open:hub:{item['name']}",
         requires=tuple(item["requires"]),
         transformation_note=item["transformation"],
-        layout_note="one rows TTree per publisher split",
+        layout_note=item.get("layout", "one rows TTree per publisher split"),
         sources=item["sources"],
         source_sizes=item["source_sizes"],
         enforce_source_sizes=False,
+        split_files=bool(item.get("split_files", False)),
     )
 
 
