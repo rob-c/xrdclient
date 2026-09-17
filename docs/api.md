@@ -186,97 +186,11 @@ call's keyword arguments into them.
 
 ::: xrd.s3.sign
 
-## ROOT files
+## The packages above this one
 
-::: xrd.root.open_root
-
-::: xrd.root.ROOTFile
-
-::: xrd.root.Directory
-
-::: xrd.root.TTree
-
-::: xrd.root.Branch
-
-::: xrd.root.Group
-
-::: xrd.root.Jagged
-
-::: xrd.root.Histogram
-
-::: xrd.root.Axis
-
-::: xrd.root.Graph
-
-### Writing
-
-::: xrd.root.create
-
-::: xrd.root.WritableFile
-
-::: xrd.root.WritableTree
-
-### Datasets
-
-::: xrd.root.datasets.convert
-
-::: xrd.root.datasets.describe
-
-::: xrd.root.datasets.Dataset
-
-::: xrd.root.datasets.Images
-
-::: xrd.root.datasets.CIFAR
-
-::: xrd.root.datasets.Audio
-
-::: xrd.root.datasets.Matrix
-
-::: xrd.root.datasets.Table
-
-::: xrd.root.datasets.read_idx
-
-::: xrd.root.datasets.read_table
-
-::: xrd.root.datasets.read_arff
-
-::: xrd.root.datasets.read_xlsx
-
-::: xrd.root.datasets.fetch
-
-::: xrd.root.mnist.convert
-
-## Machine learning
-
-::: xrd.ml.load
-
-::: xrd.ml.load_image_2d
-
-::: xrd.ml.visualize_2d
-
-::: xrd.ml.Image2D
-
-::: xrd.ml.Dataset
-
-::: xrd.ml.Split
-
-::: xrd.ml.Column
-
-### Into a framework
-
-::: xrd.root.ml.to_tensor
-
-::: xrd.root.ml.iter_tensors
-
-::: xrd.root.ml.dataset
-
-::: xrd.root.ml.mixed
-
-::: xrd.root.ml.to_tf_tensor
-
-::: xrd.root.ml.tf_dataset
-
-::: xrd.root.ml.numeric
+[`xrdroot`](https://github.com/rob-c/xrdroot), [`xrdml`](https://github.com/rob-c/xrdml) and
+[`xrddatasets`](https://github.com/rob-c/xrddatasets) are installed separately and document their
+own surfaces.
 
 ## Diagnosing
 

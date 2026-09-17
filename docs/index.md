@@ -53,12 +53,6 @@ live KDC.
 - **[Files and paths](files.md)**, **[Namespaces](filesystem.md)**,
   **[Copying](copying.md)** - the three halves of the API.
 - **[S3 object storage](s3.md)** - the same three entry points over a bucket.
-- **[ROOT files](root.md)** - trees, C++ objects split and unsplit,
-  and STL containers read in pure Python, member by member or whole, streamed
-  into PyTorch or TensorFlow a basket at a time; histograms and graphs that
-  draw themselves; new files written, compression and all.
-- **[Machine learning](ml.md)** - a URL in, minibatches of
-  `(inputs, answers)` out, and nothing downloaded in between.
 - **[Authentication](auth.md)** - proxies, tokens, keytabs, and what to do
   when the ladder refuses everything.
 - **[Coming from pyxrootd](migrating.md)** - a translation table.
@@ -67,16 +61,29 @@ live KDC.
 - **[Safety](safety.md)** - the guard rails the stock clients do not have.
 - **[Security](security.md)** - the threat model and what is enforced.
 
+## Built on this
+
+Three packages of their own, installed separately, each depending on the one
+before it:
+
+- **[`xrdroot`](https://github.com/rob-c/xrdroot)** - the ROOT file format in pure Python: trees,
+  C++ objects split and unsplit, STL containers, histograms and graphs that
+  draw themselves, and a writer.
+- **[`xrdml`](https://github.com/rob-c/xrdml)** - a URL in, minibatches of `(inputs, answers)` out,
+  and nothing downloaded in between.
+- **[`xrddatasets`](https://github.com/rob-c/xrddatasets)** - open data converted into streamable
+  ROOT files, and the site that serves the catalogue.
+
 ## Status
 
 The wire protocol, the session state machine, the whole authentication ladder,
 file and namespace APIs, `pathlib` bindings, the async facade, HTTP/WebDAV,
-S3, the copy engine, the CLI, the fsspec bindings and the pure-Python ROOT
-reader and writer are implemented and tested - 3014 tests, the great majority of which need no network, no KDC and no
+S3, the copy engine, the bulk data plane, the CLI and the fsspec bindings are
+implemented and tested - 2,815 tests, the great majority of which need no network, no KDC and no
 `openssl`, plus [interoperability and parity suites](interop.md) that run
 against a real `xrootd` daemon and the official bindings side by side.
 Coverage is 100% of statements and branches across the package, and `proto/`,
-`crypto/`, `client/`, `s3/` and `root/` are gated at 100%;
+`crypto/`, `client/` and `s3/` are gated at 100%;
 `ruff` and `mypy --strict` pass clean over the package, which ships
 `py.typed` ([Typing](typing.md)).
 

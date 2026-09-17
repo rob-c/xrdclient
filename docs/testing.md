@@ -128,7 +128,7 @@ Python, and takes the same arguments:
 from xrd.testing import from_directory
 
 with from_directory("datasets", port=21094, pattern="*.root") as server:
-    with xrd.root.open_root(f"{server.url}mnist.root") as f:
+    with xrdroot.open_root(f"{server.url}mnist.root") as f:   # pip install xrdroot
         print(f["train_7"])
 ```
 

@@ -1,9 +1,9 @@
 # Command line
 
-Three commands: `xrd-fs` and `xrd-cp` take whole URLs, and `xrd-datasets`
-builds a directory of ML datasets worth serving. All understand `--json`,
-and all use the same three exit codes: `0` success, `1` a runtime failure,
-`2` a usage error.
+Two commands, `xrd-fs` and `xrd-cp`, both taking whole URLs. Both understand
+`--json`, and both use the same three exit codes: `0` success, `1` a runtime
+failure, `2` a usage error. A third, `xrd-datasets`, is installed by a package
+above this one and shares the same flags - see below.
 
 Common options on every subcommand:
 
@@ -165,49 +165,10 @@ time, which is what makes `--sync` and `--delete` idempotent.
 
 ## `xrd-datasets`
 
-```console
-$ xrd-datasets list
-$ xrd-datasets build /srv/datasets --only "mnist*" --only iris --jobs 4
-$ xrd-datasets build /nfs/datasets --large --jobs 1 \
-    --source-cache /nfs/dataset-sources
-$ xrd-datasets list --large --allow-oversize
-$ xrd-datasets build /nfs/datasets --large --allow-oversize --jobs 1 \
-    --source-cache /nfs/dataset-sources
-$ xrd-datasets build /nfs/datasets --large --allow-oversize --jobs 1 \
-    --source-cache /nfs/dataset-sources --diagnostics 30 -vvv
-$ xrd-datasets verify /srv/datasets
-$ xrd-datasets site /srv/datasets --base-url https://data.example.org
-```
-
-`build` converts datasets to ROOT files and writes the `index.json` that
-makes the directory a catalogue. `verify` checks every size and checksum,
-compares every tree and branch type/shape with the build-time schema manifest,
-and then decodes every entry of every branch in bounded batches. It rejects
-unreadable branches, inconsistent row shapes, empty physical files, and files
-whose complete ML payload is only NULL/zero/non-finite or all-bits-set
-sentinels. `site` adds the browsable page and ready-to-serve nginx,
-BriX and systemd configuration. `--large` selects every disk-backed source,
-whether it comes from UCI, NIST or another publisher, whose complete declared
-source is between 100 MB and 2 GB. `--allow-oversize` (also spelled
-`--no-size-limit`) removes that upper *source-selection* ceiling for registered
-converters. It is deliberately opt-in because the source cache, extraction
-workspace and converted output all need production-sized storage. Published
-source byte counts are still checked after every download. The whole story,
-including what the licences allow, is in [A datasets site](datasets-site.md).
-HEPMASS and Gas Sensor Arrays use checksummed per-split ROOT files so no
-physical output crosses the writer's 2 GB ROOT-layout boundary; the catalogue
-and generated site expose every shard.
-`--diagnostics [SECONDS]` writes timestamped phase, row-count, partial-output
-and active-download heartbeats to stderr every 30 seconds by default. It also
-installs a `SIGUSR1` handler that dumps every Python thread without terminating
-the build; `-vvv` adds client and wire-level logs.
-
-The schema manifest is additive metadata in `index.json`. After upgrading an
-older catalogue, run its ordinary `build` command once before `verify`; valid
-ROOT files are kept and read back to refresh the manifest rather than being
-downloaded or converted again. A full verification intentionally reads and
-decompresses all ROOT baskets, so it is an integrity pass rather than a quick
-metadata check. Use `-vv` to log each tree as it is scanned.
+Installed by [`xrddatasets`](https://github.com/rob-c/xrddatasets), not by this package, and
+documented [there](https://github.com/rob-c/xrddatasets/blob/main/docs/datasets-site.md). It builds
+a directory of open datasets as ROOT files and the catalogue that serves them,
+using the copies and checksums here to do it.
 
 ## Scripting with `--json`
 

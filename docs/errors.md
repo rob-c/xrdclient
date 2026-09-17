@@ -34,9 +34,6 @@ Exception
     ├── ChecksumMismatchError
     ├── PageIntegrityError            a page kept arriving corrupt on a pgwrite
     ├── TooLargeError                 a whole-file read that would not fit
-    ├── ROOTError                     reading a ROOT file (xrd.root)
-    │   ├── FormatError               these bytes are not the format they claim
-    │   └── UnsupportedFeatureError   a valid file this reader does not decode
     └── ServerError                   a kXR_error response
         ├── NotFoundError             + FileNotFoundError   ENOENT
         ├── ExistsError               + FileExistsError     EEXIST
@@ -161,3 +158,11 @@ Raised *before* the allocation, by a read that never said how much it wanted
 of a file larger than `config.max_read_size`. The message says how to stream
 it instead. `read(n)` is a caller who knows, and never raises this; nor does
 anything at all once `max_read_size` is `0`. See [Safety](safety.md).
+
+## Errors from the packages above this one
+
+[`xrdroot`](https://github.com/rob-c/xrdroot) raises `ROOTError` for a file it cannot read -
+`FormatError` when the bytes are not the format they claim, and
+`UnsupportedFeatureError` for a valid file using something that reader does
+not decode. Both are `XRootDError` subclasses from here, so an `except
+xrd.errors.XRootDError` catches them too.

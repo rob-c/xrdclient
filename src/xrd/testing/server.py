@@ -1230,7 +1230,7 @@ def from_directory(
 
         >>> server = from_directory("datasets", port=21094)   # doctest: +SKIP
         >>> with server:                                      # doctest: +SKIP
-        ...     xrd.root.open_root(f"{server.url}mnist.root")
+        ...     xrdroot.open_root(f"{server.url}mnist.root")  # a separate package
 
     Each file is offered twice: under its name alone, and under the absolute
     path it has on this machine - so both ``root://host:port//mnist.root`` and

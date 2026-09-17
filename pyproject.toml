@@ -27,16 +27,6 @@ dependencies = []
 [project.optional-dependencies]
 krb5 = ["gssapi>=1.8"]
 fsspec = ["fsspec>=2024.2.0"]
-plot = ["matplotlib>=3.5"]
-datasets = [
-  "h5py>=3.8",
-  "igor2>=0.5.12",
-  "imagecodecs>=2023.3",
-  "numpy>=1.23",
-  "Pillow>=9",
-  "pyarrow>=10",
-  "tifffile>=2023.4",
-]
 dev = [
   "complexipy>=6,<7",
   "mypy>=1.10",
@@ -51,7 +41,6 @@ docs = ["mkdocs>=1.6", "mkdocs-material>=9.5", "mkdocstrings[python]>=0.25"]
 
 [project.scripts]
 xrd-cp = "xrd.cli.cp:main"
-xrd-datasets = "xrd.cli.datasets:main"
 xrd-fs = "xrd.cli.fs:main"
 
 [project.entry-points."fsspec.specs"]
@@ -91,7 +80,7 @@ exclude_also = [
 # gated at the full line-and-branch mark; the optional adapters (fsspec,
 # asyncio, CLI) are not, because their coverage depends on which extras are
 # installed - the suite covers those too, but only when they are there.
-include = ["*/xrd/proto/*", "*/xrd/crypto/*", "*/xrd/client/*", "*/xrd/s3/*", "*/xrd/root/*"]
+include = ["*/xrd/proto/*", "*/xrd/crypto/*", "*/xrd/client/*", "*/xrd/s3/*"]
 fail_under = 100
 show_missing = true
 skip_covered = true
@@ -121,15 +110,7 @@ mypy_path = "src"
 # through narrow, guarded imports, so untyped is the honest description of
 # them rather than a hole in our own checking.
 [[tool.mypy.overrides]]
-module = ["gssapi.*", "google_crc32c.*", "fsspec.*", "igor2.*", "zstandard.*", "tensorflow.*"]
-ignore_missing_imports = true
-
-# matplotlib drags numpy in, whose stubs use syntax newer than the floor this
-# package is checked against; neither is followed into.
-[[tool.mypy.overrides]]
-module = ["matplotlib", "matplotlib.*", "numpy", "numpy.*"]
-follow_imports = "skip"
-follow_imports_for_stubs = true
+module = ["gssapi.*", "google_crc32c.*", "fsspec.*"]
 ignore_missing_imports = true
 
 # ``AbstractFileSystem`` is therefore ``Any``, and subclassing it is the whole

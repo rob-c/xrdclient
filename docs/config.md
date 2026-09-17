@@ -51,7 +51,6 @@ minute at a time. Both take `0` to wait forever.
 | `data_streams` | `1` | `XRD_SUBSTREAMSPERCHANNEL` |
 | `data_stream_timeout` | 2 s | `XRD_SUBSTREAMTIMEOUT` |
 | `max_read_size` | 1 GiB | `XRD_MAXREADSIZE` |
-| `cache_dir` | `~/.cache/xrd` | `XRD_CACHE` |
 
 `parallel_chunks` is how many connections one large copy is spread over, a
 span of the file each; `1` keeps the single stream. See
@@ -79,12 +78,6 @@ first file pays the timeout, and every later file on the same connection goes
 straight to the split that works.
 From the command line the field is `xrd-cp --streams N`, where `0` asks for
 the control link alone.
-`cache_dir` is where [`xrd.ml.download`](ml.md#keeping-a-local-copy) puts a
-dataset it has pulled. Naming a directory does not turn caching on: nothing is
-written there until a caller asks for it with `download(...)` or
-`load(..., cache=True)`, because streaming the file is the ordinary case and a
-copy on disk is the exception you opt into.
-
 `max_read_size` is the ceiling on a read that never said how much it wanted -
 `read()` with no argument, `read_bytes()`, `read_text()` - so that a file
 bigger than memory raises [`TooLargeError`](errors.md#too-much-at-once)
@@ -161,12 +154,6 @@ clear is a token anyone on the path can replay. Prefer `roots://`.
 | `verify_checksums` | `True` | compare checksums after a copy |
 | `preferred_checksum` | `"adler32"` | algorithm asked for first |
 | `s3_folder_markers` | `False` | make `mkdir` on S3 write a zero-length `dir/` marker object |
-| `catalogue` | `http://ai.edi.scotgrid.ac.uk` (`$XRD_CATALOGUE`) | where `xrd.ml.load("name")` looks a bare name up |
-
-Set `XRD_CATALOGUE` to another datasets site to override the public default.
-An explicit `Config(catalogue=None)` disables bare-name catalogue lookup for
-one client configuration.
-
 `recover_handles=False` turns a lost data server into a `TransientError` at the
 call that hit it, which is what you want when your job would rather fail than
 re-read.
@@ -244,3 +231,11 @@ If you set nothing, the defaults above already read the `XRD_*` variables the
 official client uses, so an existing site environment keeps working unchanged.
 Environment values are read when the `Config` is constructed, not when it is
 used.
+
+## Settings the packages above this one add
+
+[`xrdml`](https://github.com/rob-c/xrdml) subclasses `Config` to add `catalogue` - where
+`xrdml.load("name")` looks a bare name up, `$XRD_CATALOGUE` - and `cache_dir`,
+where a pulled dataset is kept, `$XRD_CACHE`. Both are set in code or through
+the environment; a file read here knows this package's settings only, and
+names an unknown one as an error rather than ignoring it.

@@ -394,17 +394,6 @@ def _use_aio(srv, tmp_path):
     return asyncio.run(go())
 
 
-def _use_ml(srv, tmp_path):
-    from xrd.root import create
-
-    url = srv.url.with_path("/store/rows.root")
-    with create(url, config=CONFIG) as out:
-        rows = [{"x": float(n), "label": n % 2} for n in range(4)]
-        out.tree("train", {"x": "f", "label": "i"}).extend(rows)
-    with xrd.ml.load(url, config=CONFIG) as data:
-        return data.head(1)
-
-
 def _one_file(srv):
     """The URL the one-line verbs below ask their questions about."""
     return srv.url.with_path("/store/f.root")
@@ -466,7 +455,6 @@ NAMES = {
     "XRootDURL": lambda srv, tmp: xrd.XRootDURL(host="a", port=1094).endpoint,
     "__version__": lambda srv, tmp: xrd.__version__.split(".")[0],
     "aio": _use_aio,
-    "ml": _use_ml,
     "configure": _use_config,
     "copy": _use_copy,
     "copy_tree": _use_copy_tree,

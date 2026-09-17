@@ -21,8 +21,12 @@ The five levels of the API, from most to least convenient:
 :mod:`xrd.proto`
     The sans-io protocol machinery.
 
-:mod:`xrd.ml` sits beside all of them: a ROOT file of rows on a server,
-handed to PyTorch a minibatch at a time.
+Three packages build on this one and are installed separately:
+`xrdroot <https://github.com/rob-c/xrdroot>`_ reads and writes the ROOT file
+format over any URL here, `xrdml <https://github.com/rob-c/xrdml>`_ hands a
+file of rows to PyTorch a minibatch at a time, and
+`xrddatasets <https://github.com/rob-c/xrddatasets>`_ converts open data into
+ROOT files and publishes the catalogue they are served from.
 """
 
 from __future__ import annotations
@@ -114,18 +118,17 @@ _LAZY = {"Check": "doctor", "Report": "doctor", "diagnose": "doctor"}
 
 
 def __getattr__(name: str) -> object:
-    """Expose ``xrd.aio``, ``xrd.ml`` and the diagnostics lazily.
+    """Expose ``xrd.aio`` and the diagnostics lazily.
 
-    Each is one attribute access away and none costs anything until it is
+    Each is one attribute access away and neither costs anything until it is
     asked for: nothing under ``xrd`` imports :mod:`asyncio` until someone
-    reaches for ``xrd.aio``, the ROOT reader until someone reaches for
-    ``xrd.ml``, or the environment checks until someone runs
+    reaches for ``xrd.aio``, or the environment checks until someone runs
     :func:`~xrd.doctor.diagnose`. A transfer is the common case and pays for
-    none of them.
+    neither.
     """
     import importlib
 
-    if name in ("aio", "ml", "doctor"):
+    if name in ("aio", "doctor"):
         # Not ``from . import aio``: the import system resolves that by asking
         # this very function for the attribute, and the recursion is infinite.
         return importlib.import_module(f"{__name__}.{name}")
@@ -140,7 +143,6 @@ __all__ = [
     "__version__",
     # the facades that are imported on first use
     "aio",
-    "ml",
     # configuration
     "Config",
     "configure",

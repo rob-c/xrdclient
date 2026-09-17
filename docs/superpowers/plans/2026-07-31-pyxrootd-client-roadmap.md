@@ -48,7 +48,8 @@ before they meet the protocol: a ceiling on reads that named no size, an
 ([Safety](../../safety.md)). Newest is `xrd.root`: a pure-Python ROOT and
 TTree reader that streams baskets off a storage element straight into PyTorch
 tensors, with every column it cannot decode named and refused rather than
-guessed at ([Reading ROOT files](../../root.md)).
+guessed at - since split out as [xrdroot](https://github.com/rob-c/xrdroot),
+which is where that work now lives.
 
 | Phase | State | Shipped as |
 |---|---|---|
