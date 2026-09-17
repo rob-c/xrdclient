@@ -136,10 +136,11 @@ class XRootDRawIO(io.RawIOBase):
         view = memoryview(buffer).cast("B")
         if not view:
             return 0
-        data = self._file.read(len(view), self._pos)
-        view[: len(data)] = data
-        self._pos += len(data)
-        return len(data)
+        # Straight into the caller's buffer: for a read worth pipelining this
+        # is the whole transfer with nothing copied behind it.
+        count = self._file.readinto(view, self._pos)
+        self._pos += count
+        return count
 
     def readall(self) -> bytes:
         self._check_readable()

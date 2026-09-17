@@ -25,6 +25,7 @@ from .._log import get_logger
 from ..config import Config
 from ..crypto import new as new_checksum
 from ..errors import ChecksumMismatchError, UnsupportedError, kXR_Unsupported
+from ..session.bulk import BulkUnsupported
 from ..types import ChecksumInfo
 from ..url import XRootDURL, parse
 
@@ -318,6 +319,100 @@ def _server_checksum(url: XRootDURL, config: Config, algorithm: str) -> Checksum
 
 
 # ---------------------------------------------------------------------------
+# The fast path
+# ---------------------------------------------------------------------------
+
+
+def _bulk_usable(source: XRootDURL | None, target: XRootDURL | None, config: Config) -> bool:
+    """Whether this pair can go over the bulk data plane.
+
+    It reads ``root://`` and writes either a local file, which every worker
+    fills at its own offset, or an open stream, which one worker feeds in
+    order. Anything else - an upload, a remote target, a resume - keeps the
+    general pump.
+    """
+    return bool(
+        config.bulk
+        and source is not None
+        and source.is_root
+        and (target is None or target.is_local)
+    )
+
+
+def _bulk_to_file(
+    source: XRootDURL,
+    target: XRootDURL,
+    config: Config,
+    progress: Progress | None,
+    *,
+    overwrite: bool,
+) -> int:
+    """Download to a local path with every connection writing its own span."""
+    from ..client import bulk
+
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if overwrite else os.O_EXCL)
+    fd = os.open(target.path, flags, 0o644)
+    try:
+        return bulk.download(source, fd, config=config, progress=progress).size
+    except BulkUnsupported:
+        # Nothing was transferred, and the caller is about to try again the
+        # ordinary way: leave the destination as it was found, so an
+        # exclusive create is still exclusive on the second attempt.
+        if not overwrite:
+            with suppress(OSError):
+                os.remove(target.path)
+        raise
+    finally:
+        os.close(fd)
+
+
+def _descriptor_of(writer: IO[bytes]) -> int | None:
+    """``writer``'s file descriptor, with its buffer flushed, or ``None``.
+
+    ``None`` covers everything that is not a real file: an in-memory buffer, a
+    compressing wrapper, anything that only implements ``write``.
+    """
+    try:
+        writer.flush()
+        fd = writer.fileno()
+    except (AttributeError, OSError, ValueError):
+        return None
+    return fd if isinstance(fd, int) and fd >= 0 else None
+
+
+def _bulk_to_stream(
+    source: XRootDURL,
+    writer: IO[bytes],
+    config: Config,
+    progress: Progress | None,
+    digest: Any | None,
+) -> int:
+    """Stream to an open file object, in file order, digesting on the way."""
+    from ..client import bulk
+
+    write = writer.write
+    # A buffered writer copies a multi-megabyte chunk through its own buffer
+    # and takes its lock to do it. When the object is backed by a descriptor,
+    # the bytes can go straight there instead - after flushing whatever the
+    # caller had already put in the buffer, so the file stays in order.
+    fd = _descriptor_of(writer)
+
+    def emit(view: memoryview) -> None:
+        if digest is not None:
+            digest.update(view)
+        if fd is None:
+            write(view)
+            return
+        written = 0
+        while written < len(view):
+            written += os.write(fd, view[written:])
+
+    # One connection: the writer is the serialisation point, so a second would
+    # only wait its turn. Depth, not width, is what hides the round trip here.
+    return bulk.stream(source, emit, config=config, progress=progress, workers=1).size
+
+
+# ---------------------------------------------------------------------------
 # The pump
 # ---------------------------------------------------------------------------
 
@@ -504,18 +599,58 @@ def copy(
         )
 
     resuming = _continue_from(src_url, dst_url, cfg, overwrite=overwrite) if resume else None
-    spread = None if resuming is not None else _spread(src_url, dst_url, cfg, chunk)
+    # The bulk data plane takes every download it can: pipelined, landed
+    # straight in the destination, and several connections wide when the
+    # target is a file that can be written at an offset.
+    bulking = resuming is None and _bulk_usable(src_url, dst_url, cfg)
+    spread = None if resuming is not None or bulking else _spread(src_url, dst_url, cfg, chunk)
     # Only a transfer that reads the file from the beginning, in order, can
     # digest it on the way past; the other two ask both ends afterwards.
     ends: _Ends | None = resuming if resuming is not None else spread
+    if bulking and dst_url is not None and src_url is not None:
+        # Workers fill the file in whatever order the network answers, so
+        # there is no stream to digest; the two ends are compared instead,
+        # exactly as a spread transfer's are.
+        ends = _Ends(src_url, dst_url)
     wanted = cfg.verify_checksums if verify is None else verify
     # And a digest is only worth taking at all if some server can be asked to
     # compare it with what it holds.
     checkable = next((u for u in (dst_url, src_url) if u is not None and not u.is_local), None)
     digest = new_checksum(algo) if wanted and checkable is not None and ends is None else None
+    # Reading a remote file, the answer to compare against exists before the
+    # transfer does, so ask for it now: a server that cannot checksum is worth
+    # finding out about before digesting a gigabyte that nothing will read.
+    expected: ChecksumInfo | None = None
+    if (
+        digest is not None
+        and src_url is not None
+        and checkable is src_url
+        # Only the two schemes that can answer a checksum, and only ones the
+        # reader will accept: asking anything else would reach for a server
+        # before the scheme itself has been rejected.
+        and (src_url.is_root or src_url.is_http)
+    ):
+        expected = _ask_first(src_url, cfg, algo, strict=verify is True)
+        if expected is None:
+            digest = None
 
     started = time.monotonic()
-    if spread is not None:
+    moved: int | None = None
+    if bulking and src_url is not None:
+        try:
+            moved = (
+                _bulk_to_file(src_url, dst_url, cfg, progress, overwrite=overwrite)
+                if dst_url is not None
+                else _bulk_to_stream(src_url, cast("IO[bytes]", target), cfg, progress, digest)
+            )
+        except BulkUnsupported as exc:
+            # A server that answers a read with a conversation rather than
+            # bytes; the general pump knows how to hold that conversation.
+            _log.debug("%s declined the bulk path (%s); using the pump", src_url, exc)
+            moved = None
+    if moved is not None:
+        size = moved
+    elif spread is not None:
         size = _in_parallel(spread, cfg, chunk, progress, overwrite=overwrite)
     else:
         with ExitStack() as stack:
@@ -536,7 +671,11 @@ def copy(
         if wanted:
             checksum = _compare_ends(ends.source, ends.target, cfg, algo, strict=verify is True)
     elif digest is not None and checkable is not None:
-        checksum = _compare(checkable, cfg, algo, digest.hexdigest(), strict=verify is True)
+        checksum = (
+            _matched(expected, algo, digest.hexdigest())
+            if expected is not None
+            else _compare(checkable, cfg, algo, digest.hexdigest(), strict=verify is True)
+        )
 
     if remove_source and src_url is not None:
         _remove(src_url, cfg)  # only now: a failed verification kept the original
@@ -549,6 +688,32 @@ def copy(
         checksum=checksum,
         resumed_at=resuming.offset if resuming is not None else 0,
     )
+
+
+def _ask_first(
+    url: XRootDURL, config: Config, algorithm: str, *, strict: bool
+) -> ChecksumInfo | None:
+    """The source's checksum, before the transfer, or ``None`` if it has none.
+
+    Asking first is what lets an unverifiable copy skip the digest entirely
+    rather than compute one over the whole file and then discover there is
+    nothing to compare it with. It costs one query on a server that answers
+    and one refusal on a server that does not.
+    """
+    try:
+        return _server_checksum(url, config, algorithm)
+    except OSError:
+        if strict:
+            raise
+        _log.debug("%s will not checksum with %s; the copy goes unverified", url, algorithm)
+        return None
+
+
+def _matched(theirs: ChecksumInfo, algorithm: str, ours: str) -> ChecksumInfo:
+    """Check the digest taken on the way past against the one asked for first."""
+    if theirs.value.lower() != ours.lower():
+        raise ChecksumMismatchError(algorithm, theirs.value, ours)
+    return theirs
 
 
 def _compare(

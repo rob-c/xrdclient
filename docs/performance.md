@@ -43,6 +43,91 @@ whose counterpart is not installed, and reports both best-of-N and the median
 so a single unlucky run is visible rather than averaged away. Metadata cases
 are reported in operations per second, data cases in MiB/s.
 
+## The bulk data plane
+
+A download does not go through the event path at all. `xrd.copy` from a
+`root://` URL to a local file, `xrd.open(...).readinto(buf)` for a buffer worth
+pipelining, and `xrd.client.bulk.download` / `.stream` directly all run on a
+reader that does three things differently:
+
+**It keeps several reads in flight.** One request at a time means one round
+trip per chunk and a socket that is idle for the length of it.
+`config.bulk_depth` requests are outstanding at once, so the server is
+answering the next chunk while this one is still being written out.
+
+**It receives into the destination.** `recv_into` lands each reply in the
+buffer it will be used from - a slice of the caller's own buffer for
+`readinto`, or a rotating scratch buffer that is handed straight to the
+writer. The ordinary path copies a body four times between the kernel and the
+caller; this copies it none.
+
+**It spreads across connections.** `config.bulk_workers` connections each take
+one span of the file and write it at its own offset with `pwrite`. Both
+`recv_into` and `pwrite` release the GIL, so the workers genuinely overlap.
+
+Measured against a stock `xrootd` 5.9.7 in Docker, 1 GiB, warm cache, client
+and server on the same bridge network:
+
+| | this client | `xrdcp` 5.6.9 |
+| --- | --- | --- |
+| copy to a local file | **1506 MiB/s** | 368 MiB/s |
+| stream to a pipe | **1986 MiB/s** | 128 MiB/s |
+
+The settings are `bulk_workers` (2), `bulk_chunk` (4 MiB) and `bulk_depth`
+(4), each with an `XRD_BULK*` environment variable, and `config.bulk = False`
+- or `XRD_BULK=0` - puts everything back on the event path, which is the
+comparison to make when a result looks wrong.
+
+None of this changes what a transfer means. A short read is still end of
+file, and a transfer that ends short of the file's length is an error rather
+than a quiet truncation. A server that answers a read with a wait or a
+redirect rather than bytes puts that transfer back on the general pump, which
+knows how to hold the conversation.
+
+Losing the server is survivable. A worker that loses its connection re-opens
+the file and resumes from its own high-water mark, so an outage costs the time
+it lasts rather than the bytes already moved. What bounds the retrying is
+`config.bulk_recovery` - two minutes by default - and it is a span of time
+rather than a count of attempts, because what decides whether a job survives
+is whether the server comes back before the client gives up. Every chunk that
+arrives refills it, so a long transfer is never killed by the sum of the
+outages it already survived, and the wait between attempts doubles up to five
+seconds so that a server which has come back is used promptly.
+
+The budget deliberately does not cover first contact. Until one request has
+been answered there is nothing to distinguish a server that is restarting from
+a host that does not exist, so a name that does not resolve fails at once
+instead of spending the whole budget on it.
+
+Measured against the same 1 GiB file, with the server stopped for ten seconds
+part way through the transfer and then started again:
+
+| | finished correctly | wall clock |
+| --- | --- | --- |
+| this client | yes | 21-23 s |
+| brix-cache `xrdcp` | yes | 20 s |
+| `xrdcp` 5.6.9 | yes | 127 s |
+
+A mistyped host name, by contrast, fails in 0.4 s.
+
+## What a transfer no longer pays for
+
+Two costs were being paid by every caller and used by almost none.
+
+**Importing the library.** `import xrd` used to load every cryptographic
+primitive the protocol can need - AES, Blowfish, RSA, X.509 and the DER reader
+- because one import of the request signer pulled in the whole `xrd.crypto`
+package, and it loaded the in-memory test transport alongside the socket one.
+Both packages now bind their names on first use, so a download loads what a
+download uses. On this machine that is 121 modules imported where it was 146.
+
+**Digesting a file nobody will check.** Verification compares a digest taken
+while streaming against the server's own checksum. When the source is remote
+that answer exists before the transfer does, so it is asked for first: a
+server that cannot checksum is found out in one query rather than after a
+gigabyte has been hashed for a comparison that cannot happen. Where the server
+does answer, the digest is taken and compared exactly as before.
+
 ## Where the time goes
 
 Three things carry the load:

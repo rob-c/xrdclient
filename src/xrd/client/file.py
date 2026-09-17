@@ -31,8 +31,9 @@ from ..proto import constants as c
 from ..proto import requests as r
 from ..proto import responses as rp
 from ..proto.frames import Request
+from ..session.bulk import BulkUnsupported
 from ..session.router import Router
-from ..session.sync import Result
+from ..session.sync import Result, Session
 from ..types import (
     CheckpointInfo,
     ChecksumInfo,
@@ -60,6 +61,15 @@ CLONE_MAX_RANGES = 1024
 #: or re-truncate the file, and a re-opened writer would have lost whatever the
 #: dead connection had not yet flushed.
 _WRITING = OpenFlags.WRITE | OpenFlags.UPDATE | OpenFlags.NEW | OpenFlags.DELETE | OpenFlags.APPEND
+
+#: Smallest read worth taking off the event path. Below this the pipeline
+#: cannot pay for the connection it borrows, and one request is one request
+#: either way.
+_MIN_BULK_READ = 1 << 20
+
+#: Floor on a bulk request, so dividing a buffer across the pipeline never
+#: turns one read into a burst of tiny ones.
+_MIN_BULK_CHUNK = 1 << 18
 
 
 class File:
@@ -113,6 +123,16 @@ class File:
     @property
     def endpoint(self) -> str:
         return self._router.endpoint
+
+    @property
+    def session(self) -> Session:
+        """The live connection this handle is open on.
+
+        Bulk transfer borrows it outright - see
+        :meth:`xrd.session.sync.Session.bulk` - which is the one thing in the
+        library that needs the connection rather than the request API.
+        """
+        return self._router.session
 
     @property
     def data_path(self) -> int:
@@ -418,6 +438,17 @@ class File:
             self.config.check_whole_read(size, self.url.path)
         if size == 0:
             return b""
+        if self.config.bulk and size >= _MIN_BULK_READ:
+            # One allocation, filled by the pipeline. The ordinary path below
+            # builds the same bytes out of a list of chunks and a join, which
+            # is two more copies of every byte than this needs.
+            buffer = bytearray(size)
+            try:
+                got = self._bulk_readinto(memoryview(buffer), offset)
+            except BulkUnsupported as exc:
+                _log.debug("bulk read declined for %s (%s); using the event path", self.url, exc)
+            else:
+                return bytes(buffer) if got == size else bytes(buffer[:got])
         limit = self.config.chunk_size
         if size <= limit:
             return self._read_one(offset, size)
@@ -445,11 +476,37 @@ class File:
         return self.read(size, offset)
 
     def readinto(self, buffer: bytearray | memoryview, offset: int = 0) -> int:
-        """Read into a pre-allocated buffer; returns the byte count."""
+        """Read into a pre-allocated buffer; returns the byte count.
+
+        A request big enough to be worth it is served by the bulk data plane:
+        several reads in flight at once, each landing straight in its own
+        slice of ``buffer``, so the bytes are never copied between the socket
+        and the caller. Anything smaller, or a server that answers a read with
+        something other than bytes, takes the ordinary path.
+        """
         view = memoryview(buffer).cast("B")
+        if not view:
+            return 0
+        if self.config.bulk and len(view) >= _MIN_BULK_READ:
+            try:
+                return self._bulk_readinto(view, offset)
+            except BulkUnsupported as exc:
+                _log.debug("bulk read declined for %s (%s); using the event path", self.url, exc)
         data = self.read(len(view), offset)
         view[: len(data)] = data
         return len(data)
+
+    def _bulk_readinto(self, view: memoryview, offset: int) -> int:
+        """One pipelined, zero-copy fill of ``view``, on this file's connection.
+
+        The request size is whatever divides this buffer into a full pipeline:
+        a caller asking for exactly one chunk would otherwise get one read at a
+        time, which is the round trip the pipeline exists to hide.
+        """
+        depth = self.config.bulk_depth
+        chunk = max(_MIN_BULK_CHUNK, min(self.config.bulk_chunk, -(-len(view) // depth)))
+        with self.session.bulk(self.handle, chunk=chunk, depth=depth) as reader:
+            return reader.into(view, offset)
 
     def readv(self, ranges: Iterable[ReadRange | tuple[int, int]]) -> list[bytes]:
         """``kXR_readv`` - many scattered ranges in as few round trips as possible.

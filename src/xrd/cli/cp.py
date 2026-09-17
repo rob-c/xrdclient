@@ -308,13 +308,32 @@ def _transfers(
         return _run(sources, dest, args, config, into=into, show=show)
 
 
+#: Destinations that mean "the bytes come out of this command", where a
+#: summary line on stdout would be spliced into the file itself.
+_STDOUT_NAMES = frozenset({"-", "/dev/stdout", "/dev/fd/1", "/proc/self/fd/1"})
+
+
+def _writes_to_stdout(results: Sequence[CopyResult]) -> bool:
+    """Whether any transfer here put a file on standard output."""
+    return any(
+        r.target in _STDOUT_NAMES or r.target.removeprefix("file://") in _STDOUT_NAMES
+        for r in results
+    )
+
+
 def _show_results(results: Sequence[CopyResult], args: argparse.Namespace) -> None:
-    """Render completed transfers in the requested command-line format."""
+    """Render completed transfers in the requested command-line format.
+
+    A copy whose destination *is* standard output reports on standard error
+    instead: the alternative is a summary line glued onto the end of the file,
+    which is a corrupt download that looks like a successful one.
+    """
+    where = sys.stderr if _writes_to_stdout(results) else sys.stdout
     if args.json:
-        print(dumps([_record(r) for r in results]))
+        print(dumps([_record(r) for r in results]), file=where)
     elif not args.quiet:
         for result in results:
-            print(result)
+            print(result, file=where)
 
 
 def _run(

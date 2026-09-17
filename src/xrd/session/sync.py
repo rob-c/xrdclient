@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from .._compat import SLOTS
@@ -28,6 +29,7 @@ from ..proto.frames import Request
 from ..transport.base import Transport
 from ..transport.sync import SocketTransport
 from ..url import XRootDURL, parse
+from .bulk import BulkReader
 
 __all__ = ["Session", "Result", "RedirectRequired"]
 
@@ -80,6 +82,13 @@ class Session:
         self._inbox: dict[int, list[m.Event]] = {}
         self._notices: list[rp.AttnInfo] = []
         self._paths: dict[int, Transport] = {}
+        #: Whether a :meth:`bulk` reader currently owns this connection.
+        self._bulk_active = False
+        #: Set the moment this connection fails on the wire. A socket whose
+        #: peer went away still has a file descriptor, so ``closed`` alone
+        #: cannot tell a live connection from a dead one - and a dead one
+        #: handed back out of the pool fails the *next* caller instead.
+        self._broken = False
         #: Whether this server answers a request that *arrived* on a data
         #: path. ``None`` until one has been tried - see :attr:`arrives_on_path`.
         self._arrives_on_path: bool | None = None
@@ -164,6 +173,16 @@ class Session:
     @property
     def is_tls(self) -> bool:
         return self._m.tls_active
+
+    @property
+    def broken(self) -> bool:
+        """Whether this connection has failed and must not be reused.
+
+        True once a send or a receive raised, or the protocol gave up. The
+        pool asks before keeping a connection, so a server that restarted
+        costs the transfer that found out and nothing after it.
+        """
+        return self._broken or self._m.state in (m.State.FAILED, m.State.CLOSED)
 
     @property
     def closed(self) -> bool:
@@ -474,8 +493,12 @@ class Session:
 
     def _pump(self, pathid: int = 0, deadline: float | None = None) -> list[m.Event]:
         """One send/receive turn; returns whatever events it produced."""
-        self._flush()
-        self._m.receive_data(self._receive(pathid, deadline), pathid=pathid)
+        try:
+            self._flush()
+            self._m.receive_data(self._receive(pathid, deadline), pathid=pathid)
+        except (XrdConnectionError, XrdTimeoutError):
+            self._broken = True
+            raise
         return list(self._m.events())
 
     def _events_for(
@@ -516,6 +539,56 @@ class Session:
     # ------------------------------------------------------------------
     # Teardown
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Bulk data plane
+    # ------------------------------------------------------------------
+
+    @property
+    def transport(self) -> Transport:
+        """The control link itself, for the bulk reader that borrows it."""
+        return self._t
+
+    @property
+    def machine(self) -> m.SessionMachine:
+        """The protocol state, for framing a bulk request on a leased stream."""
+        return self._m
+
+    @contextmanager
+    def bulk(self, handle: bytes, *, chunk: int, depth: int) -> Iterator[BulkReader]:
+        """Lend this connection to a :class:`~xrd.session.bulk.BulkReader`.
+
+        The session lock is held throughout, and the machine must be idle: a
+        reader that framed its own requests while an ordinary one was in
+        flight would take the other's reply off the wire. Nothing else may use
+        this session until the block ends, which is why the reader is given
+        out by a context manager rather than returned.
+        """
+        with self._lock:
+            # The lock is reentrant, so it alone would let one thread open a
+            # second reader inside the first; two readers would then take each
+            # other's replies off the wire. This flag is the real invariant.
+            if self._bulk_active:
+                raise ProtocolError(
+                    "this connection is already lent to a bulk read; "
+                    "one reader owns the wire at a time"
+                )
+            if not self._m.idle():
+                raise ProtocolError(
+                    "a bulk read needs the connection to itself, and this one "
+                    "still has requests outstanding"
+                )
+            self._flush()
+            self._bulk_active = True
+            try:
+                yield BulkReader(self, handle, chunk=chunk, depth=depth)
+            except (XrdConnectionError, XrdTimeoutError):
+                # The reader drives the socket itself, so this is where its
+                # failures reach the session that owns it.
+                self._broken = True
+                raise
+            finally:
+                self._bulk_active = False
 
     def close(self) -> None:
         """End the session and drop the connection."""

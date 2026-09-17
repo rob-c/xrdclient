@@ -219,6 +219,7 @@ FILE = {
     "compression": lambda fh: fh.compression,
     "data_path": lambda fh: fh.data_path,
     "endpoint": lambda fh: fh.endpoint,
+    "session": lambda fh: fh.session,
     "flush": lambda fh: fh.flush(),
     "getxattr": _file_xattr,
     "handle": lambda fh: fh.handle,

@@ -43,7 +43,7 @@ from . import responses as rp
 from .frames import HANDSHAKE, Request, ResponseHeader, decode_header, encode
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterable, Iterator
 
     from ..auth.base import Credential
 
@@ -271,6 +271,9 @@ class SessionMachine:
         self._events: list[Event] = []
         self._pending: dict[int, _Pending] = {}
         self._free: list[int] = []
+        #: Ids handed to the bulk reader, which frames its own requests; held
+        #: out of the pool until it gives them back.
+        self._leased: set[int] = set()
         self._next_sid = _FIRST_SID
 
         # Inbound framing cursor, one per link.
@@ -353,6 +356,60 @@ class SessionMachine:
 
     # -- internals ------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Bulk data plane
+    # ------------------------------------------------------------------
+
+    def idle(self) -> bool:
+        """Whether nothing is outstanding, so a caller may take the wire.
+
+        The bulk reader frames and parses its own requests to keep a gigabyte
+        out of the event path, which is only safe while this machine is not
+        waiting for an answer of its own.
+        """
+        return self.state is State.READY and not self._pending
+
+    def lease_sids(self, count: int) -> list[int]:
+        """Reserve ``count`` stream ids for a caller that frames its own requests.
+
+        The ids are taken out of circulation exactly as a submitted request's
+        would be, so nothing this machine sends later can collide with a bulk
+        read still in flight. Give them back with :meth:`release_sids`.
+        """
+        if count < 1:
+            raise ValueError("lease_sids needs a positive count")
+        leased = []
+        for _ in range(count):
+            sid = self._acquire_sid()
+            self._leased.add(sid)
+            leased.append(sid)
+        return leased
+
+    def release_sids(self, sids: Iterable[int]) -> None:
+        """Return ids from :meth:`lease_sids` to the pool."""
+        for sid in sids:
+            self._leased.discard(sid)
+            self._free.append(sid)
+
+    def frame_for(self, request: Request, sid: int) -> bytes:
+        """The exact bytes ``request`` would go out as on ``sid``.
+
+        Signing is applied here when the server asked for it, so a bulk read
+        that bypasses :meth:`submit` is still signed the way the session
+        negotiated. Nothing is recorded as pending: the caller is reading the
+        answer itself.
+        """
+        if sid not in self._leased:
+            raise ProtocolError(f"stream id {sid} was not leased for bulk use")
+        frame = encode(request, sid)
+        if self.signer is not None:
+            signed = self.signer.sign(frame)
+            if signed is not None:
+                seqno, signature, nodata = signed
+                sigver = r.Sigver(request.opcode, seqno, signature, nodata=nodata)
+                frame = encode(sigver, sid) + frame
+        return frame
+
     def _acquire_sid(self) -> int:
         if self._free:
             return self._free.pop()
@@ -360,7 +417,7 @@ class SessionMachine:
         self._next_sid += 1
         if self._next_sid > 0xFFFF:
             self._next_sid = _FIRST_SID
-        if sid in self._pending:
+        if sid in self._pending or sid in self._leased:
             raise ProtocolError("stream id space exhausted")
         return sid
 

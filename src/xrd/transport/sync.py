@@ -64,6 +64,15 @@ class SocketTransport(Transport):
         except OSError as exc:
             raise XrdConnectionError(f"read from {self.host}:{self.port} failed: {exc}") from exc
 
+    def receive_into(self, view: memoryview) -> int:
+        """``recv`` straight into ``view``, with no intermediate ``bytes``."""
+        try:
+            return self._sock.recv_into(view, len(view))
+        except TIMEOUTS as exc:
+            raise XrdTimeoutError(f"read from {self.host}:{self.port} timed out") from exc
+        except OSError as exc:
+            raise XrdConnectionError(f"read from {self.host}:{self.port} failed: {exc}") from exc
+
     def start_tls(self, hostname: str, config: Config) -> None:
         ctx = tls_context(config)
         try:

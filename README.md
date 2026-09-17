@@ -106,6 +106,14 @@ and a file long enough to be worth it is moved by `config.parallel_chunks`
 connections at once, one span of the file each. A tree of small files copies
 `workers=` of them in parallel, `xrd-cp -r --parallel N`.
 
+A download runs on the bulk data plane: several reads in flight per
+connection, each received straight into the buffer it will be written from,
+across `config.bulk_workers` connections. On a stock `xrootd` that is
+1.5 GiB/s to a local file where `xrdcp` does 0.37 GiB/s, with no C extension
+involved — see [docs/performance.md](docs/performance.md). A worker that loses
+its server re-opens and resumes from where it got to, and a transfer that ends
+short of the file's length is an error rather than a truncated file.
+
 **Objects.** A bucket is one more endpoint: `s3://bucket/key` reads, writes,
 lists and copies through the same `xrd.open`, `xrd.FileSystem` and `xrd.copy`,
 signed with AWS SigV4 out of `hmac` and `hashlib` — no `boto3`, in the

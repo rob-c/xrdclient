@@ -53,6 +53,21 @@ class Transport(ABC):
     def receive(self, size: int = 65536) -> bytes:
         """Read up to ``size`` bytes; ``b""`` at end of stream."""
 
+    def receive_into(self, view: memoryview) -> int:
+        """Read up to ``len(view)`` bytes *into* ``view``; 0 at end of stream.
+
+        The bulk reader uses this to land a file's bytes straight in their
+        final buffer, so a gigabyte crosses the interpreter without being
+        copied into an intermediate ``bytes`` first. The default implementation
+        goes through :meth:`receive` for transports that cannot do better; a
+        socket overrides it with ``recv_into``.
+        """
+        chunk = self.receive(len(view))
+        if not chunk:
+            return 0
+        view[: len(chunk)] = chunk
+        return len(chunk)
+
     @abstractmethod
     def start_tls(self, hostname: str, config: Config) -> None:
         """Upgrade the live connection in place."""

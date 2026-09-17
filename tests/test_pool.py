@@ -26,8 +26,12 @@ def logins(server) -> int:
 class FakeSession:
     """Enough of a :class:`~xrd.session.Session` to be pooled and closed."""
 
-    def __init__(self, closed: bool = False) -> None:
+    def __init__(self, closed: bool = False, broken: bool = False) -> None:
         self.closed = closed
+        #: Set on a connection that failed on the wire. A socket whose peer
+        #: went away still has a descriptor, so the pool asks this as well as
+        #: ``closed`` before keeping or handing out a connection.
+        self.broken = broken
         self.endpoint = "example.org:1094"
         self.closes = 0
 
@@ -361,3 +365,23 @@ def test_where_the_question_is_asked_is_not_who_is_answering():
     """
     url, base = parse("root://example.org/"), Config()
     assert _identity(url, base.evolve(prompter=lambda ask: None)) == _identity(url, base)
+
+
+def test_a_connection_that_failed_on_the_wire_is_not_kept():
+    """A dead socket still has a descriptor; pooling one fails the next caller."""
+    pool = SessionPool()
+    config = Config(pool_size=4)
+    url = parse("root://example.org//store/f")
+    assert not pool.release(pooled(FakeSession(broken=True)), url, config)
+    assert len(pool) == 0
+
+
+def test_a_connection_that_broke_while_idle_is_skipped():
+    """It got into the pool healthy and died there; the next caller must not get it."""
+    pool = SessionPool()
+    config = Config(pool_size=4)
+    url = parse("root://example.org//store/f")
+    session = FakeSession()
+    assert pool.release(pooled(session), url, config)
+    session.broken = True
+    assert pool.acquire(url, config) is None

@@ -212,6 +212,35 @@ class Config:
     keepalive_interval: float = 60.0
 
     # -- transfer tuning ----------------------------------------------
+    #: Connections a bulk read fans out over. Each carries one span of the
+    #: file, pipelined and landed straight in its destination buffer, so this
+    #: is the setting that decides whether a download is network-bound or
+    #: interpreter-bound. Two is enough to saturate a fast link while leaving
+    #: the machine to everything else; one keeps the transfer on a single
+    #: connection. A file too short to give every worker a whole
+    #: :attr:`bulk_chunk` uses fewer.
+    bulk_workers: int = field(default_factory=lambda: _env_int("XRD_BULKWORKERS", 2))
+    #: How much one bulk request asks for. Large enough that the round trip
+    #: disappears into the transfer, small enough that ``bulk_workers *
+    #: bulk_depth`` of them is a sane amount of memory.
+    bulk_chunk: int = field(default_factory=lambda: _env_int("XRD_BULKCHUNK", 1 << 22))
+    #: Bulk requests in flight per connection. The point of the pipeline: the
+    #: server is answering the next one while this one is being written out.
+    bulk_depth: int = field(default_factory=lambda: _env_int("XRD_BULKDEPTH", 4))
+    #: How long a bulk worker keeps trying to get its span back after losing
+    #: the server, in seconds. The budget is spent on waiting, not on a number
+    #: of attempts, because what matters is whether the server comes back
+    #: before the job gives up - a restarting data server is commonly away for
+    #: tens of seconds. It refills whenever bytes arrive, so a transfer that
+    #: keeps making progress is never killed by the sum of old outages; the
+    #: whole operation is still bounded by :attr:`stall_deadline`.
+    bulk_recovery: float = field(
+        default_factory=lambda: _env_float("XRD_BULKRECOVERY", 120.0)
+    )
+    #: Whether a transfer that *can* use the bulk data plane does. Turning it
+    #: off puts every read back through the ordinary event path, which is the
+    #: comparison to make when something looks wrong.
+    bulk: bool = field(default_factory=lambda: _env_flag("XRD_BULK") is not False)
     chunk_size: int = field(default_factory=lambda: _env_int("XRD_CPCHUNKSIZE", 1 << 22))
     readahead: int = field(default_factory=lambda: _env_int("XRD_READAHEAD", 1 << 20))
     parallel_chunks: int = field(default_factory=lambda: _env_int("XRD_CPPARALLELCHUNKS", 4))

@@ -84,7 +84,7 @@ def _key(url: XRootDURL, config: Config) -> Key:
 
 
 def _cannot_pool(session: Session, config: Config) -> bool:
-    return config.pool_size <= 0 or session.closed
+    return config.pool_size <= 0 or session.closed or session.broken
 
 
 def _prune(bucket: list[tuple[float, Session]], cutoff: float) -> list[tuple[float, Session]]:
@@ -136,7 +136,7 @@ class SessionPool:
             bucket = self._idle.get(key, [])
             while bucket:
                 when, session = bucket.pop()
-                if session.closed:
+                if session.closed or session.broken:
                     continue
                 if when < cutoff:
                     stale.append(session)
