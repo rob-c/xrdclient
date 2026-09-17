@@ -56,6 +56,10 @@ packages = ["src/xrd"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# ``tests/test_maintainability.py`` imports ``tools.maintainability``, and a
+# bare ``pytest`` - which is what CI runs - does not put the working directory
+# on the path the way ``python -m pytest`` does.
+pythonpath = ["."]
 timeout = 120
 filterwarnings = ["error::ResourceWarning"]
 markers = [
