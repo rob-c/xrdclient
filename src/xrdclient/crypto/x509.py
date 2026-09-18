@@ -144,6 +144,15 @@ class Certificate:
         return bool(self.subject.rdns) and self.subject.rdns[:-1] == self.issuer.rdns
 
     @property
+    def is_anchor(self) -> bool:
+        """True for a self-signed certificate: a trust anchor, not a link.
+
+        A CA that signed itself is where verification *stops*, which is why a
+        verifier keeps its own copy and never takes one from the wire.
+        """
+        return self.subject == self.issuer
+
+    @property
     def expired(self) -> bool:
         return self.not_after <= time.time()
 
@@ -290,8 +299,17 @@ class ProxyCredential:
         return min(certificate.remaining() for certificate in self.chain)
 
     def pem(self) -> bytes:
-        """The chain as concatenated PEM, which is what GSI puts on the wire."""
-        return b"".join(certificate.pem() for certificate in self.chain)
+        """The chain as concatenated PEM, which is what GSI puts on the wire.
+
+        The trust anchor is left out. Some tools write the CA into the proxy
+        file beside the certificates it signed, and a server handed a chain
+        that carries its own anchor refuses the login as inconsistent - it
+        looks anchors up in its certificate directory by hash, so one arriving
+        over the wire is neither needed nor believed. A file holding nothing
+        but an anchor is sent as it is, so the server can say so itself.
+        """
+        chain = [link for link in self.chain if not link.is_anchor] or list(self.chain)
+        return b"".join(certificate.pem() for certificate in chain)
 
     def __repr__(self) -> str:
         return f"ProxyCredential(subject={str(self.subject)!r}, key=<redacted>)"

@@ -56,6 +56,31 @@ def test_a_proxy_file_loads_as_a_chain(proxy_file, key):
     assert proxy.certificate is proxy.chain[0]
 
 
+def test_the_anchor_in_a_proxy_file_is_not_put_on_the_wire(proxy_file):
+    """A server refuses a chain carrying the CA it is meant to verify against.
+
+    ``proxy_chain`` writes the CA into the file, as some proxy tools do. It is
+    loaded - the chain is what the file holds - but what GSI sends is the
+    proxy and the certificate that signed it, because the far end looks its
+    own anchors up rather than believing one that arrives.
+    """
+    proxy = load_proxy(str(proxy_file))
+    assert [link.is_anchor for link in proxy.chain] == [False, False, True]
+    assert proxy.pem() == proxy.chain[0].pem() + proxy.chain[1].pem()
+    assert proxy.pem().count(b"BEGIN CERTIFICATE") == 2
+
+
+def test_a_file_of_nothing_but_an_anchor_is_sent_as_it_is(tmp_path, key):
+    """Sending nothing at all would make the server's refusal a mystery."""
+    ca_name = name(("2.5.4.3", "Only A CA"))
+    only = pem("CERTIFICATE", make_certificate(ca_name, ca_name, key.public, key))
+    path = tmp_path / "anchor-only"
+    path.write_bytes(only + private_key_pem(key))
+    proxy = load_proxy(str(path))
+    assert [link.is_anchor for link in proxy.chain] == [True]
+    assert proxy.pem() == proxy.chain[0].pem()
+
+
 def test_the_subject_reads_like_openssl(proxy_file):
     proxy = load_proxy(str(proxy_file))
     assert str(proxy.subject) == "/DC=org/DC=example/CN=Jane Doe/CN=1234567890"
@@ -137,10 +162,15 @@ def test_a_certificate_round_trips_through_pem(proxy_file):
 
 
 def test_the_chain_pem_is_what_goes_on_the_wire(proxy_file):
-    """GSI echoes the chain verbatim, so concatenation order must hold."""
+    """GSI echoes the chain verbatim, so concatenation order must hold.
+
+    Everything the file holds except the anchor, which the test above is
+    about, and in the order the file holds it.
+    """
     proxy = load_proxy(str(proxy_file))
-    assert proxy.pem() == b"".join(c.pem() for c in proxy.chain)
-    assert load_certificates(proxy.pem()) == list(proxy.chain)
+    sent = [link for link in proxy.chain if not link.is_anchor]
+    assert proxy.pem() == b"".join(c.pem() for c in sent)
+    assert load_certificates(proxy.pem()) == sent
 
 
 def test_serials_and_issuers_are_decoded(proxy_file):
