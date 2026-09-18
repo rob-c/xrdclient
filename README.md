@@ -116,7 +116,10 @@ short of the file's length is an error rather than a truncated file.
 
 A second measurement, further from the ideal case: the same download against
 a GSI-authenticated `xrootd` 5.9.7 in a container rather than a bare daemon on
-loopback, 1 GiB, median of seven runs each.
+loopback, 1 GiB, median of seven runs each. The harness is
+[`examples/gsi_copy_benchmark.py`](examples/gsi_copy_benchmark.py), which mints
+its own CA and proxy, starts the server, and times whichever clients this
+machine has.
 
 | Client | Median | Range | vs `xrdcp` |
 | --- | --- | --- | --- |

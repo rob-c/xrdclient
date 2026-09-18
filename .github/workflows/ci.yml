@@ -23,7 +23,7 @@ jobs:
           python-version: "3.12"
       - run: pip install -e ".[dev,fsspec]"
       - name: ruff
-        run: ruff check src tests benchmarks tools
+        run: ruff check src tests benchmarks tools examples
       - name: mypy --strict
         run: mypy
       - name: maintainability burn-down (must reach zero)
