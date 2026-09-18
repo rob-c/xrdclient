@@ -114,6 +114,28 @@ involved — see [docs/performance.md](docs/performance.md). A worker that loses
 its server re-opens and resumes from where it got to, and a transfer that ends
 short of the file's length is an error rather than a truncated file.
 
+A second measurement, further from the ideal case: the same download against
+a GSI-authenticated `xrootd` 5.9.7 in a container rather than a bare daemon on
+loopback, 1 GiB, median of seven runs each.
+
+| Client | Median | Range | vs `xrdcp` |
+| --- | --- | --- | --- |
+| **`xrdclient`, bulk data plane** | **305.8 MiB/s** | 296–320 | **1.56×** |
+| `brix-xrdcp`, BriX, pure C | 292.1 MiB/s | 266–322 | 1.49× |
+| `xrdclient`, one connection | 259.7 MiB/s | 218–276 | 1.32× |
+| XRootD Python bindings, official | 205.0 MiB/s | 156–210 | 1.04× |
+| `xrdcp`, official C++ v6.1.1 | 196.2 MiB/s | 159–204 | 1.00× |
+
+Read that as two findings and one caveat. Pure Python is level with a pure-C
+client — 5% apart, with overlapping ranges, because neither is bound by the
+language on a copy: both are bound by how many reads they keep in flight.
+And the official client's own ceiling is about two thirds of either, which is
+a pipelining difference rather than a language one; its Python bindings sit
+with it, as the same engine underneath should. The caveat is that this was
+loopback through a container's NAT on one laptop, so it measures a client's
+protocol efficiency and not a network — on a link with real latency the
+pipelining matters more, not less, but the numbers would be that link's.
+
 **Objects.** A bucket is one more endpoint: `s3://bucket/key` reads, writes,
 lists and copies through the same `xrdclient.open`, `xrdclient.FileSystem` and `xrdclient.copy`,
 signed with AWS SigV4 out of `hmac` and `hashlib` — no `boto3`, in the
