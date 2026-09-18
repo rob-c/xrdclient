@@ -23,9 +23,9 @@ from _pki import (
     utctime,
     utf8,
 )
-from xrd.crypto import Certificate, Name, ProxyCredential, load_certificates, load_proxy
-from xrd.crypto.der import DERError, Element
-from xrd.crypto.x509 import (
+from xrdclient.crypto import Certificate, Name, ProxyCredential, load_certificates, load_proxy
+from xrdclient.crypto.der import DERError, Element
+from xrdclient.crypto.x509 import (
     LEGACY_PROXY_OID,
     _decode_time,
     _parse_certificate,
@@ -183,7 +183,7 @@ def test_the_proxy_path_follows_the_grid_convention(monkeypatch, tmp_path):
 
 
 def test_an_explicit_config_beats_the_environment(monkeypatch, tmp_path):
-    from xrd.config import Config
+    from xrdclient.config import Config
 
     monkeypatch.setenv("X509_USER_PROXY", "/tmp/from-env")
     assert default_proxy_path(Config(proxy=str(tmp_path / "cfg.pem"))) == str(tmp_path / "cfg.pem")
@@ -213,8 +213,8 @@ def test_malformed_times_are_refused(tag, text):
 def test_bmp_strings_in_a_subject_are_decoded():
     """A DirectoryString may be UTF-16BE; a mojibake CN is a support ticket."""
     from _pki import oid, sequence, setof, tlv
-    from xrd.crypto.der import parse
-    from xrd.crypto.x509 import _decode_name
+    from xrdclient.crypto.der import parse
+    from xrdclient.crypto.x509 import _decode_name
 
     encoded = sequence(setof(sequence(oid(CN), tlv(0x1E, "Jané".encode("utf-16-be")))))
     assert _decode_name(parse(encoded)[0]).cn == "Jané"

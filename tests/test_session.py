@@ -1,6 +1,6 @@
 """The blocking driver and the router that moves it around.
 
-These tests run against a real loopback server (:class:`xrd.testing.FakeServer`)
+These tests run against a real loopback server (:class:`xrdclient.testing.FakeServer`)
 rather than a mocked transport, so the socket, the session machine and the
 router are all exercised together.
 """
@@ -9,15 +9,15 @@ from __future__ import annotations
 
 import pytest
 
-from xrd.config import Config
-from xrd.errors import ConnectionError as XrdConnectionError
-from xrd.errors import NoMechanismError, ProtocolError, RedirectLimitError, TransientError
-from xrd.proto import constants as c
-from xrd.proto import machine
-from xrd.proto import requests as r
-from xrd.session.router import Router, _retarget
-from xrd.session.sync import RedirectRequired, Result, Session
-from xrd.testing import FakeServer
+from xrdclient.config import Config
+from xrdclient.errors import ConnectionError as XrdConnectionError
+from xrdclient.errors import NoMechanismError, ProtocolError, RedirectLimitError, TransientError
+from xrdclient.proto import constants as c
+from xrdclient.proto import machine
+from xrdclient.proto import requests as r
+from xrdclient.session.router import Router, _retarget
+from xrdclient.session.sync import RedirectRequired, Result, Session
+from xrdclient.testing import FakeServer
 
 # ---------------------------------------------------------------------------
 # Session
@@ -179,10 +179,10 @@ def test_an_eos_capability_reaches_the_target_as_one_parameter(config):
 
 def test_the_redirect_token_is_folded_into_the_path():
     request = r.Stat("/data/a.root")
-    _retarget(request, "xrd.k=1")
-    assert request.path == "/data/a.root?xrd.k=1"
-    _retarget(request, "xrd.j=2")
-    assert request.path == "/data/a.root?xrd.k=1&xrd.j=2"
+    _retarget(request, "xrdclient.k=1")
+    assert request.path == "/data/a.root?xrdclient.k=1"
+    _retarget(request, "xrdclient.j=2")
+    assert request.path == "/data/a.root?xrdclient.k=1&xrdclient.j=2"
 
 
 def test_a_redirect_without_a_token_leaves_the_path_alone():

@@ -6,7 +6,7 @@ import pytest
 
 fsspec = pytest.importorskip("fsspec")
 
-from xrd.fsspec_impl import HTTPXRootDFileSystem, XRootDFileSystem  # noqa: E402
+from xrdclient.fsspec_impl import HTTPXRootDFileSystem, XRootDFileSystem  # noqa: E402
 
 BODY = b"hello world"
 
@@ -118,7 +118,7 @@ def test_touch_and_rename(server, xfs):
 
 def test_a_fully_qualified_path_to_another_server_is_honoured(xfs):
     """And the connection it opens is kept, not leaked once per call."""
-    from xrd.testing import FakeServer
+    from xrdclient.testing import FakeServer
 
     with FakeServer(files={"/other/f.bin": b"elsewhere"}) as other:
         assert xfs.cat_file(str(other.url) + "other/f.bin") == b"elsewhere"

@@ -5,14 +5,14 @@ The same three entry points cover both, dispatching on the URL scheme, so an
 application changes a URL and nothing else.
 
 ```python
-with xrd.open("davs://dav.example.org/store/f.root", "rb") as fh:
+with xrdclient.open("davs://dav.example.org/store/f.root", "rb") as fh:
     header = fh.read(1024)
 
-fs = xrd.FileSystem("https://dav.example.org")
+fs = xrdclient.FileSystem("https://dav.example.org")
 for entry in fs.scandir("/store/user/me"):
     print(entry.name, entry.stat.st_size)
 
-xrd.copy("root://a.example.org//store/f.root", "davs://b.example.org/store/f.root")
+xrdclient.copy("root://a.example.org//store/f.root", "davs://b.example.org/store/f.root")
 ```
 
 Schemes: `http`, `https`, `dav`, `davs`, `webdav`. Nothing here needs a wheel
@@ -54,7 +54,7 @@ rooted at `/api/v1` - the one FTS and Rucio drive. The method names are the
 same on both schemes, so a caller that knows one knows the other:
 
 ```python
-fs = xrd.FileSystem("davs://tape.example.org")
+fs = xrdclient.FileSystem("davs://tape.example.org")
 handle = fs.prepare(["/store/a.root"])       # POST /api/v1/stage
 while not all(fs.query_prepare(handle, ["/store/a.root"])):
     time.sleep(60)                           # GET /api/v1/stage/{id}
@@ -77,7 +77,7 @@ which arrives as a `NotFoundError` naming the API path.
 
 ## Ranged reads
 
-`GET` with a `Range` header is how a seek is served, so an `xrd.open` over
+`GET` with a `Range` header is how a seek is served, so an `xrdclient.open` over
 `https://` is still a real seekable file object. Servers that ignore `Range`
 are detected (a `200` where a `206` was asked for) and reported rather than
 silently returning the whole file.
@@ -96,12 +96,12 @@ same `Config` drives both protocols.
 ## Macaroons
 
 ```python
-from xrd.http import macaroon
+from xrdclient.http import macaroon
 
 token = macaroon("davs://dav.example.org/store/user/me",
                  caveats=["activity:DOWNLOAD"], validity="PT10M")
-xrd.copy("davs://dav.example.org/store/user/me/f.root", "/tmp/f.root",
-         config=xrd.Config(token=token))
+xrdclient.copy("davs://dav.example.org/store/user/me/f.root", "/tmp/f.root",
+         config=xrdclient.Config(token=token))
 ```
 
 `validity` is an ISO 8601 duration, the spelling dCache and XRootD both use.
@@ -111,7 +111,7 @@ goes wherever `Config.token` goes.
 ## Third-party copy
 
 ```python
-xrd.third_party("davs://a.example.org/store/f.root",
+xrdclient.third_party("davs://a.example.org/store/f.root",
                 "davs://b.example.org/store/f.root")
 ```
 
@@ -125,11 +125,11 @@ the header set, the push mode, and how the far side's token travels.
 ## Lower-level pieces
 
 ```python
-from xrd.http import HTTPClient, propfind, digest, open_http, status_code
+from xrdclient.http import HTTPClient, propfind, digest, open_http, status_code
 
-client = HTTPClient(xrd.Config())
+client = HTTPClient(xrdclient.Config())
 response = client.request("HEAD", url)
-props = propfind(xrd.parse(url), depth=1, config=cfg)   # [(path, StatInfo)]
+props = propfind(xrdclient.parse(url), depth=1, config=cfg)   # [(path, StatInfo)]
 info = digest(url, "adler32", config=cfg)               # ChecksumInfo
 status_code(403)                                        # the kXR_* code it means
 ```

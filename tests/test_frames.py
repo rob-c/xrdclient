@@ -4,11 +4,11 @@ import struct
 
 import pytest
 
-from xrd.errors import ProtocolError
-from xrd.proto import constants as c
-from xrd.proto import requests as r
-from xrd.proto.buffer import Writer
-from xrd.proto.frames import HANDSHAKE, Request, decode_header, encode
+from xrdclient.errors import ProtocolError
+from xrdclient.proto import constants as c
+from xrdclient.proto import requests as r
+from xrdclient.proto.buffer import Writer
+from xrdclient.proto.frames import HANDSHAKE, Request, decode_header, encode
 
 
 def test_handshake_is_the_documented_20_bytes():
@@ -222,8 +222,8 @@ def test_query_encodes_the_infotype_and_the_handle():
 
 def test_every_query_code_the_protocol_defines_has_a_name():
     """``fs.query`` takes the enum, so a missing member is a subrequest no
-    caller can ask for without reaching into ``xrd.proto``."""
-    from xrd.flags import QueryCode
+    caller can ask for without reaching into ``xrdclient.proto``."""
+    from xrdclient.flags import QueryCode
 
     defined = {value for name, value in vars(c).items() if name.startswith("kXR_Q")}
     assert {int(code) for code in QueryCode} == defined
@@ -277,7 +277,7 @@ def test_every_locate_option_the_protocol_defines_has_a_name():
     is a question no caller can ask. ``kXR_4dirlist`` was one: XProtocol packs
     the locate options into the open-option numbers, and it is the bit that
     tells a redirector the locate is the prelude to a listing."""
-    from xrd.flags import LocateFlags
+    from xrdclient.flags import LocateFlags
 
     assert {int(flag) for flag in LocateFlags if flag} == {
         c.kXR_addPeers,

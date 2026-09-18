@@ -5,7 +5,7 @@ import pickle
 
 import pytest
 
-from xrd import errors as e
+from xrdclient import errors as e
 
 
 @pytest.mark.parametrize(

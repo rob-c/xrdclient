@@ -3,7 +3,7 @@
 Everything a server can send that is *not* the answer to the question asked:
 unsolicited notices, an answer smuggled inside one, a TLS upgrade in the
 middle of the bring-up, and a connection that is already gone by the time
-someone closes it. The paper-server tests drive :class:`~xrd.session.sync.Session`
+someone closes it. The paper-server tests drive :class:`~xrdclient.session.sync.Session`
 over an in-memory pipe, which is the only way to reach the TLS branch without
 a certificate and a real handshake.
 """
@@ -17,14 +17,14 @@ from collections import deque
 import pytest
 
 from conftest import handshake_reply, login_body, ok, protocol_body
-from xrd.config import Config
-from xrd.errors import ConnectionError as XrdConnectionError
-from xrd.proto import constants as c
-from xrd.proto import machine as m
-from xrd.proto import requests as r
-from xrd.session.sync import Session
-from xrd.testing import FakeServer, frame
-from xrd.transport.memory import MemoryTransport
+from xrdclient.config import Config
+from xrdclient.errors import ConnectionError as XrdConnectionError
+from xrdclient.proto import constants as c
+from xrdclient.proto import machine as m
+from xrdclient.proto import requests as r
+from xrdclient.session.sync import Session
+from xrdclient.testing import FakeServer, frame
+from xrdclient.transport.memory import MemoryTransport
 
 # ---------------------------------------------------------------------------
 # Unsolicited server chatter

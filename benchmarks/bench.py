@@ -34,10 +34,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
 
-import xrd
-from xrd.client.file import File
-from xrd.config import Config
-from xrd.flags import OpenFlags
+import xrdclient
+from xrdclient.client.file import File
+from xrdclient.config import Config
+from xrdclient.flags import OpenFlags
 
 CONFIG = Config(auth_order=("unix", "host"))
 
@@ -100,9 +100,9 @@ class Timer:
 def endpoint(url: str | None) -> Iterator[tuple[str, str]]:
     """Yield ``(server_url, directory)``, starting a daemon if none was given."""
     if url:
-        parsed = xrd.parse(url)
+        parsed = xrdclient.parse(url)
         base = f"{parsed.scheme}://{parsed.host}:{parsed.port}/"
-        with xrd.FileSystem(base, CONFIG) as fs:
+        with xrdclient.FileSystem(base, CONFIG) as fs:
             fs.mkdir(parsed.path, parents=True, exist_ok=True)
         yield base, parsed.path
         return
@@ -113,7 +113,7 @@ def endpoint(url: str | None) -> Iterator[tuple[str, str]]:
     root = tempfile.mkdtemp(prefix="xrdbench-")
     try:
         with _xrootd.RealServer(root) as server:
-            with xrd.FileSystem(server.url, CONFIG) as fs:
+            with xrdclient.FileSystem(server.url, CONFIG) as fs:
                 fs.mkdir(server.path("bench"))
             yield server.url, server.path("bench")
     finally:
@@ -133,7 +133,7 @@ def bench_read(timer: Timer, base: str, remote: str, size: int) -> None:
     url = full_url(base, remote)
 
     def ours() -> int:
-        with xrd.open(url, "rb", config=CONFIG) as fh:
+        with xrdclient.open(url, "rb", config=CONFIG) as fh:
             return len(fh.read())
 
     timer.run("read whole file", "xrd", ours)
@@ -169,7 +169,7 @@ def bench_chunked_read(timer: Timer, base: str, remote: str, size: int) -> None:
     chunk, count = 64 << 10, 256
 
     def ours() -> int:
-        with File(xrd.parse(url), CONFIG) as handle:
+        with File(xrdclient.parse(url), CONFIG) as handle:
             return sum(len(handle.read(chunk, i * chunk)) for i in range(count))
 
     timer.run(f"{count} x {chunk >> 10}KiB reads", "xrd", ours)
@@ -192,7 +192,7 @@ def bench_vector_read(timer: Timer, base: str, remote: str) -> None:
     ranges = [(i * (1 << 20), 128 << 10) for i in range(8)]
 
     def ours() -> int:
-        with File(xrd.parse(url), CONFIG) as handle:
+        with File(xrdclient.parse(url), CONFIG) as handle:
             return sum(len(piece) for piece in handle.readv(ranges))
 
     timer.run("vector read 8x128KiB", "xrd", ours)
@@ -214,7 +214,8 @@ def bench_vector_read(timer: Timer, base: str, remote: str) -> None:
 
 def bench_write(timer: Timer, base: str, directory: str, payload: bytes) -> None:
     def ours() -> int:
-        with xrd.open(full_url(base, f"{directory}/w-xrd.root"), "wb", config=CONFIG) as fh:
+        target = full_url(base, f"{directory}/w-xrd.root")
+        with xrdclient.open(target, "wb", config=CONFIG) as fh:
             fh.write(payload)
         return len(payload)
 
@@ -243,7 +244,7 @@ def bench_write(timer: Timer, base: str, directory: str, payload: bytes) -> None
 def bench_metadata(timer: Timer, base: str, directory: str, remote: str) -> None:
     url = full_url(base, remote)
 
-    with xrd.FileSystem(base, CONFIG) as fs:
+    with xrdclient.FileSystem(base, CONFIG) as fs:
         timer.run("stat", "xrd", lambda: (fs.stat(remote), 0)[1])
         timer.run("listdir", "xrd", lambda: (fs.listdir(directory), 0)[1])
 
@@ -267,7 +268,7 @@ def bench_copy(timer: Timer, base: str, remote: str, size: int, scratch: Path) -
     url = full_url(base, remote)
 
     def ours() -> int:
-        result = xrd.copy(url, str(scratch / "xrd.root"), config=CONFIG, verify=False)
+        result = xrdclient.copy(url, str(scratch / "xrdclient.root"), config=CONFIG, verify=False)
         return result.size
 
     timer.run("copy to local disk", "xrd", ours)
@@ -315,7 +316,7 @@ def main(argv: list[str] | None = None) -> int:
     with endpoint(args.url) as (base, directory), tempfile.TemporaryDirectory() as scratch:
         remote = f"{directory}/bench.root"
         print(f"endpoint {base}, {_mib(size)} in {remote}\n")
-        handle = File(xrd.parse(full_url(base, remote)), CONFIG)
+        handle = File(xrdclient.parse(full_url(base, remote)), CONFIG)
         handle.open(OpenFlags.NEW | OpenFlags.DELETE | OpenFlags.UPDATE | OpenFlags.MAKEPATH)
         with handle:
             handle.write(payload, 0)

@@ -6,9 +6,9 @@ import os
 
 import pytest
 
-from xrd.config import Config
-from xrd.path import XRootDPath
-from xrd.url import parse
+from xrdclient.config import Config
+from xrdclient.path import XRootDPath
+from xrdclient.url import parse
 
 BASE = "root://eos.example.org:1094//store/user/me"
 
@@ -277,8 +277,8 @@ def test_a_path_is_a_context_manager(server, config):
 
 
 def test_the_package_spells_it_both_ways():
-    """``xrd.Path`` is the name people reach for; it is the same class."""
-    import xrd
+    """``xrdclient.Path`` is the name people reach for; it is the same class."""
+    import xrdclient
 
-    assert xrd.Path is xrd.XRootDPath is XRootDPath
-    assert "Path" in xrd.__all__ and "XRootDPath" in xrd.__all__
+    assert xrdclient.Path is xrdclient.XRootDPath is XRootDPath
+    assert "Path" in xrdclient.__all__ and "XRootDPath" in xrdclient.__all__

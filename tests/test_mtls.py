@@ -11,9 +11,9 @@ import ssl
 import pytest
 
 from _pki import pem, private_key_pem, proxy_chain, throwaway_key
-from xrd.config import Config
-from xrd.http.client import _context as http_context
-from xrd.transport.base import tls_context
+from xrdclient.config import Config
+from xrdclient.http.client import _context as http_context
+from xrdclient.transport.base import tls_context
 
 #: The two context builders. They are separate functions because the two
 #: stacks are separate; they must not drift apart.

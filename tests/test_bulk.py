@@ -1,6 +1,6 @@
 """The bulk data plane: the fast read path and the transfer built on it.
 
-Everything here runs against :class:`~xrd.testing.FakeServer`, so what is
+Everything here runs against :class:`~xrdclient.testing.FakeServer`, so what is
 being checked is the client's framing and accounting rather than any one
 server's generosity. The point of these tests is that the fast path and the
 ordinary path are indistinguishable in their results - same bytes, same
@@ -16,15 +16,15 @@ import time
 
 import pytest
 
-import xrd
-from xrd.client.bulk import BulkResult, download, stream
-from xrd.client.file import File
-from xrd.config import Config
-from xrd.errors import ProtocolError, XRootDError
-from xrd.proto import requests as r
-from xrd.proto.machine import SessionMachine, State
-from xrd.session.bulk import BulkReader
-from xrd.testing import FakeServer
+import xrdclient
+from xrdclient.client.bulk import BulkResult, download, stream
+from xrdclient.client.file import File
+from xrdclient.config import Config
+from xrdclient.errors import ProtocolError, XRootDError
+from xrdclient.proto import requests as r
+from xrdclient.proto.machine import SessionMachine, State
+from xrdclient.session.bulk import BulkReader
+from xrdclient.testing import FakeServer
 
 #: Big enough that the transfer splits into several requests at the chunk
 #: sizes these tests use, small enough to stay instant.
@@ -292,13 +292,13 @@ def test_readinto_matches_the_event_path(bulk_server, cfg):
 
 
 def test_open_read_is_unchanged_by_the_fast_path(bulk_server, cfg):
-    with xrd.open(_url(bulk_server), "rb", buffering=0, config=cfg) as fh:
+    with xrdclient.open(_url(bulk_server), "rb", buffering=0, config=cfg) as fh:
         assert fh.read() == PAYLOAD
 
 
 def test_copy_to_a_local_file_uses_the_fast_path(tmp_path, bulk_server, cfg):
     target = tmp_path / "copied.bin"
-    result = xrd.copy(_url(bulk_server), target, config=cfg)
+    result = xrdclient.copy(_url(bulk_server), target, config=cfg)
     assert result.size == len(PAYLOAD)
     assert target.read_bytes() == PAYLOAD
 
@@ -306,7 +306,7 @@ def test_copy_to_a_local_file_uses_the_fast_path(tmp_path, bulk_server, cfg):
 def test_copy_into_a_stream_is_ordered(tmp_path, bulk_server, cfg):
     target = tmp_path / "streamed.bin"
     with open(target, "wb") as fh:
-        xrd.copy(_url(bulk_server), fh, config=cfg)
+        xrdclient.copy(_url(bulk_server), fh, config=cfg)
     assert target.read_bytes() == PAYLOAD
 
 
@@ -314,13 +314,13 @@ def test_copy_respects_no_overwrite(tmp_path, bulk_server, cfg):
     target = tmp_path / "there.bin"
     target.write_bytes(b"keep me")
     with pytest.raises(FileExistsError):
-        xrd.copy(_url(bulk_server), target, config=cfg, overwrite=False)
+        xrdclient.copy(_url(bulk_server), target, config=cfg, overwrite=False)
     assert target.read_bytes() == b"keep me"
 
 
 def test_turning_the_fast_path_off_still_copies(tmp_path, bulk_server):
     target = tmp_path / "slow.bin"
-    xrd.copy(_url(bulk_server), target, config=_plain())
+    xrdclient.copy(_url(bulk_server), target, config=_plain())
     assert hashlib.sha256(target.read_bytes()).digest() == hashlib.sha256(PAYLOAD).digest()
 
 
@@ -427,7 +427,7 @@ def test_an_outage_longer_than_the_old_retry_count_is_survived(tmp_path, bulk_se
 def test_a_verified_copy_compares_both_ends(tmp_path, bulk_server, cfg):
     """The fast path is an out-of-order transfer, so it verifies by comparison."""
     target = tmp_path / "verified.bin"
-    result = xrd.copy(_url(bulk_server), target, config=cfg, verify=True, algorithm="adler32")
+    result = xrdclient.copy(_url(bulk_server), target, config=cfg, verify=True, algorithm="adler32")
     assert target.read_bytes() == PAYLOAD
     assert result.checksum is not None
     assert result.verified
@@ -435,13 +435,13 @@ def test_a_verified_copy_compares_both_ends(tmp_path, bulk_server, cfg):
 
 def test_verification_catches_a_target_that_does_not_match(tmp_path, bulk_server, cfg):
     """A destination that is not what the server holds must not pass."""
-    from xrd.errors import ChecksumMismatchError
+    from xrdclient.errors import ChecksumMismatchError
 
     target = tmp_path / "tampered.bin"
-    xrd.copy(_url(bulk_server), target, config=cfg)
+    xrdclient.copy(_url(bulk_server), target, config=cfg)
     target.write_bytes(PAYLOAD[:-1] + b"\x00")  # one byte different, same length
     with pytest.raises(ChecksumMismatchError):
-        xrd.copy(
+        xrdclient.copy(
             _url(bulk_server),
             target,
             config=cfg,
@@ -495,7 +495,7 @@ def test_an_unverifiable_copy_does_not_digest_the_file(tmp_path, bulk_server, cf
     for that answer first is what lets the transfer skip the hashing entirely
     rather than do it and throw it away.
     """
-    from xrd.copy import engine
+    from xrdclient.copy import engine
 
     hashed = 0
     real = engine.new_checksum
@@ -524,7 +524,7 @@ def test_an_unverifiable_copy_does_not_digest_the_file(tmp_path, bulk_server, cf
     monkeypatch.setattr(engine, "_server_checksum", refuses)
     target = tmp_path / "unverifiable.bin"
     with open(target, "wb") as fh:
-        result = xrd.copy(_url(bulk_server), fh, config=cfg)  # verification on by default
+        result = xrdclient.copy(_url(bulk_server), fh, config=cfg)  # verification on by default
     assert target.read_bytes() == PAYLOAD
     assert result.checksum is None
     assert hashed == 0, f"{hashed} bytes were digested for a comparison that cannot happen"
@@ -534,7 +534,7 @@ def test_a_verifiable_stream_is_still_digested(tmp_path, bulk_server, cfg):
     """Where the server does answer, the digest is taken and compared."""
     target = tmp_path / "verified-stream.bin"
     with open(target, "wb") as fh:
-        result = xrd.copy(
+        result = xrdclient.copy(
             _url(bulk_server), fh, config=cfg, verify=True, algorithm="adler32"
         )
     assert target.read_bytes() == PAYLOAD

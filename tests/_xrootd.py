@@ -1,6 +1,6 @@
 """A real ``xrootd`` daemon, started by the test that needs one.
 
-Everything else in this suite runs against :class:`~xrd.testing.FakeServer`,
+Everything else in this suite runs against :class:`~xrdclient.testing.FakeServer`,
 which is faithful about the wire format because it was written from the same
 specification the client was. That is exactly why it cannot be the last word:
 a shared misreading would pass. So where the binary is installed, the interop
@@ -28,7 +28,7 @@ XROOTD = shutil.which("xrootd")
 #: on (so ``kXR_Qcksum`` answers rather than saying "not supported"), and
 #: extended attributes so ``kXR_fattr`` has somewhere to put them.
 CONFIG = """\
-xrd.port {port}
+xrdclient.port {port}
 all.export {root}
 all.adminpath {admin}
 all.pidpath {admin}
@@ -52,7 +52,7 @@ class RealServer:
     """A running ``xrootd``, exporting ``root``.
 
         with RealServer(tmp_path) as server:
-            xrd.FileSystem(server.url).write_bytes(server.path("a.root"), b"hi")
+            xrdclient.FileSystem(server.url).write_bytes(server.path("a.root"), b"hi")
 
     Paths are absolute and real, because that is what the daemon exports; use
     :meth:`path` rather than assuming a prefix.

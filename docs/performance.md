@@ -45,9 +45,9 @@ are reported in operations per second, data cases in MiB/s.
 
 ## The bulk data plane
 
-A download does not go through the event path at all. `xrd.copy` from a
-`root://` URL to a local file, `xrd.open(...).readinto(buf)` for a buffer worth
-pipelining, and `xrd.client.bulk.download` / `.stream` directly all run on a
+A download does not go through the event path at all. `xrdclient.copy` from a
+`root://` URL to a local file, `xrdclient.open(...).readinto(buf)` for a buffer worth
+pipelining, and `xrdclient.client.bulk.download` / `.stream` directly all run on a
 reader that does three things differently:
 
 **It keeps several reads in flight.** One request at a time means one round
@@ -114,9 +114,9 @@ A mistyped host name, by contrast, fails in 0.4 s.
 
 Two costs were being paid by every caller and used by almost none.
 
-**Importing the library.** `import xrd` used to load every cryptographic
+**Importing the library.** `import xrdclient` used to load every cryptographic
 primitive the protocol can need - AES, Blowfish, RSA, X.509 and the DER reader
-- because one import of the request signer pulled in the whole `xrd.crypto`
+- because one import of the request signer pulled in the whole `xrdclient.crypto`
 package, and it loaded the in-memory test transport alongside the socket one.
 Both packages now bind their names on first use, so a download loads what a
 download uses. On this machine that is 121 modules imported where it was 146.
@@ -155,7 +155,7 @@ ranges; `pgread` gets per-page CRC32C from the server for free.
 ## Making it faster
 
 ```python
-cfg = xrd.Config(
+cfg = xrdclient.Config(
     chunk_size=8 << 20,        # bigger writes, fewer round trips
     readahead=4 << 20,         # buffered reads pull more per request
     parallel_chunks=8,         # spans of a copy moved at once, one connection each
@@ -182,7 +182,7 @@ hide.
 For many ranges from one file, ask once:
 
 ```python
-with xrd.open(url, "rb") as fh:
+with xrdclient.open(url, "rb") as fh:
     blocks = fh.raw.file.readv([(off, 128 << 10) for off in offsets])
 ```
 
@@ -205,7 +205,7 @@ single session serialises its own calls.
 Turn off what you are not using:
 
 ```python
-xrd.copy(src, dst, config=cfg.evolve(verify_checksums=False))
+xrdclient.copy(src, dst, config=cfg.evolve(verify_checksums=False))
 ```
 
 Checksum verification costs a server-side digest per file. It is on by default

@@ -1,14 +1,14 @@
 # Asynchronous use
 
-`xrd.aio` mirrors the whole synchronous surface: same names, same arguments,
+`xrdclient.aio` mirrors the whole synchronous surface: same names, same arguments,
 same exceptions, with `await` in front and `async for` over what used to be a
 generator.
 
 ```python
-import asyncio, xrd.aio
+import asyncio, xrdclient.aio
 
 async def main():
-    async with xrd.aio.FileSystem("root://eos.example.org") as fs:
+    async with xrdclient.aio.FileSystem("root://eos.example.org") as fs:
         info = await fs.stat("/store/f.root")
         async for entry in fs.iterdir("/store"):
             print(entry.name)
@@ -18,7 +18,7 @@ async def main():
 asyncio.run(main())
 ```
 
-`import xrd` does not import `asyncio`; the facade is resolved on first use.
+`import xrdclient` does not import `asyncio`; the facade is resolved on first use.
 
 ## How it runs
 
@@ -34,7 +34,7 @@ open four handles:
 ```python
 async def read_all(urls):
     async def one(url):
-        async with xrd.aio.open(url, "rb") as fh:
+        async with xrdclient.aio.open(url, "rb") as fh:
             return await fh.read()
     return await asyncio.gather(*(one(u) for u in urls))
 ```
@@ -54,15 +54,15 @@ Everything: `FileSystem` and all of its methods, `File`, `open`, `copy`,
 `davs://` works here exactly as it does synchronously.
 
 ```python
-result = await xrd.aio.copy("root://a//store/f.root", "/scratch/f.root")
-results = await xrd.aio.copy_tree("root://a//store/run7", "/scratch/run7",
+result = await xrdclient.aio.copy("root://a//store/f.root", "/scratch/f.root")
+results = await xrdclient.aio.copy_tree("root://a//store/run7", "/scratch/run7",
                                   exclude=("*.log",), sync="size", delete=True)
 ```
 
 Checkpoints are an `async with`, and the link family is there too:
 
 ```python
-async with xrd.aio.open(url, "r+b") as fh:
+async with xrdclient.aio.open(url, "r+b") as fh:
     async with fh.checkpoint() as cp:
         await fh.write(header)
         await fh.flush()           # the journal only sees what was sent
@@ -79,7 +79,7 @@ await fs.extensions()                    # which of these the server has
 ```
 
 So are server-side range copies, which take either an `AsyncFile` or the
-`xrd.File` under one:
+`xrdclient.File` under one:
 
 ```python
 async with fs.open("/store/dst.root", "r+b") as dst, \
@@ -92,7 +92,7 @@ So is the second data connection, which is a coroutine here because opening
 it is a round trip:
 
 ```python
-async with xrd.aio.open(url, "rb") as fh:
+async with xrdclient.aio.open(url, "rb") as fh:
     await fh.bind_data_path()      # kXR_bind; see Files -> a second connection
     print(fh.data_path)            # 1, and 0 on an http(s) endpoint
     blob = await fh.read()
@@ -107,7 +107,7 @@ so is not part of the transaction.
 Sizes for a whole directory, with the listing and the stats overlapped:
 
 ```python
-async with xrd.aio.FileSystem("root://host") as fs:
+async with xrdclient.aio.FileSystem("root://host") as fs:
     names = await fs.listdir("/store")
     sizes = await asyncio.gather(*(fs.getsize(f"/store/{n}") for n in names))
 ```
@@ -116,7 +116,7 @@ For genuinely parallel transfers, one filesystem per worker:
 
 ```python
 async def fetch(name):
-    async with xrd.aio.FileSystem("root://host") as fs:
+    async with xrdclient.aio.FileSystem("root://host") as fs:
         return await fs.read_bytes(f"/store/{name}")
 
 blobs = await asyncio.gather(*(fetch(n) for n in names))

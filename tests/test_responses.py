@@ -4,11 +4,11 @@ import struct
 
 import pytest
 
-from xrd.errors import ProtocolError
-from xrd.flags import StatInfoFlags
-from xrd.proto import constants as c
-from xrd.proto import responses as rp
-from xrd.types import ChecksumInfo
+from xrdclient.errors import ProtocolError
+from xrdclient.flags import StatInfoFlags
+from xrdclient.proto import constants as c
+from xrdclient.proto import responses as rp
+from xrdclient.types import ChecksumInfo
 
 
 def test_parse_error():
@@ -17,9 +17,9 @@ def test_parse_error():
 
 
 def test_parse_redirect_splits_the_cgi_token():
-    body = struct.pack(">i", 1095) + b"newhost.example.org?xrd.k=abc\x00"
+    body = struct.pack(">i", 1095) + b"newhost.example.org?xrdclient.k=abc\x00"
     info = rp.parse_redirect(body)
-    assert (info.host, info.port, info.token) == ("newhost.example.org", 1095, "xrd.k=abc")
+    assert (info.host, info.port, info.token) == ("newhost.example.org", 1095, "xrdclient.k=abc")
     assert info.url == "root://newhost.example.org:1095/"
 
 
@@ -438,7 +438,7 @@ def test_parse_fattr_tree_ignores_an_entry_that_is_not_one():
 
 
 def test_stat_flags_are_readable_as_questions():
-    from xrd.types import StatInfo
+    from xrdclient.types import StatInfo
 
     info = StatInfo(
         flags=StatInfoFlags.IS_READABLE | StatInfoFlags.IS_WRITABLE | StatInfoFlags.OFFLINE
@@ -452,7 +452,7 @@ def test_stat_flags_are_readable_as_questions():
 
 
 def test_a_location_says_whether_it_may_be_written_to():
-    from xrd.types import LocationInfo
+    from xrdclient.types import LocationInfo
 
     assert LocationInfo(address="h:1094", type="S", access="w").is_writable
     assert not LocationInfo(address="h:1094", type="S", access="r").is_writable
@@ -460,7 +460,7 @@ def test_a_location_says_whether_it_may_be_written_to():
 
 
 def test_protocol_flags_are_readable_as_questions():
-    from xrd.types import ProtocolInfo
+    from xrdclient.types import ProtocolInfo
 
     manager = ProtocolInfo(version=0x310, flags=c.kXR_isManager | c.kXR_haveTLS)
     assert manager.is_manager and manager.has_tls and not manager.is_server
@@ -484,7 +484,7 @@ def test_protocol_flags_are_readable_as_questions():
     ],
 )
 def test_every_capability_the_server_announces_is_one_property(flag, question):
-    from xrd.types import ProtocolInfo
+    from xrdclient.types import ProtocolInfo
 
     assert getattr(ProtocolInfo(flags=flag), question)
     assert not getattr(ProtocolInfo(flags=~flag & 0xFFFFFFFF), question)
@@ -500,7 +500,7 @@ def test_the_tls_qualifier_bits_are_the_ones_xprotocol_defines():
 
 
 def test_a_page_result_measures_the_data_it_carries():
-    from xrd.types import PageResult
+    from xrdclient.types import PageResult
 
     clean = PageResult(data=b"x" * 4096)
     assert len(clean) == 4096 and clean.ok
@@ -522,14 +522,14 @@ def test_a_location_token_too_short_to_hold_an_address_is_skipped():
 
 
 def test_a_file_nobody_may_read_has_no_read_bits():
-    from xrd.types import StatInfo
+    from xrdclient.types import StatInfo
 
     assert StatInfo(flags=StatInfoFlags.IS_WRITABLE).st_mode & 0o444 == 0
     assert StatInfo(flags=StatInfoFlags.IS_WRITABLE).st_mode & 0o222 == 0o222
 
 
 def test_a_space_reply_is_read_key_by_key():
-    from xrd.types import SpaceInfo
+    from xrdclient.types import SpaceInfo
 
     assert rp.parse_space(b"\x00") == SpaceInfo()
     info = rp.parse_space(
@@ -548,7 +548,7 @@ def test_a_space_reply_ignores_what_is_not_a_pair():
     Skipping it rather than failing is the difference between reading a real
     reply and refusing one that is merely wordier than the specification.
     """
-    from xrd.types import SpaceInfo
+    from xrdclient.types import SpaceInfo
 
     info = rp.parse_space(b"oss.cgroup=public&statistics&oss.free=7&oss.quota=\x00")
     assert (info.name, info.free) == ("public", 7)
@@ -605,7 +605,7 @@ def test_a_readlink_answer_is_the_target_up_to_the_first_nul():
 
 
 def test_a_readlink_answer_naming_nothing_is_a_protocol_error():
-    from xrd.errors import ProtocolError
+    from xrdclient.errors import ProtocolError
 
     with pytest.raises(ProtocolError, match="named no target"):
         rp.parse_readlink(b"   \x00")

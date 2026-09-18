@@ -22,7 +22,7 @@ the message is the fix:
 ```
 /store/dataset.root is 96636764160 bytes, over the 1073741824 byte ceiling on
 reading a whole file into memory: read it in pieces (for block in file: ...),
-copy it to disk with xrd.copy(), or raise config.max_read_size
+copy it to disk with xrdclient.copy(), or raise config.max_read_size
 ```
 
 The ceiling is `config.max_read_size`, 1 GiB by default and `$XRD_MAXREADSIZE`
@@ -34,18 +34,18 @@ chunked response does not say how long it is.
 It never applies to a read that named one:
 
 ```python
-with xrd.open(url, "rb") as fh:
+with xrdclient.open(url, "rb") as fh:
     header = fh.read(1 << 20)       # a size is a decision, and is honoured
     for block in fh:                # so is streaming, at any length
         ...
-xrd.copy(url, "/scratch/f.root")    # and so is a copy, which never buffers
+xrdclient.copy(url, "/scratch/f.root")    # and so is a copy, which never buffers
 ```
 
 To lift it, say so once:
 
 ```python
-xrd.configure(max_read_size=0)                       # process-wide
-fs = xrd.FileSystem(url, xrd.Config(max_read_size=0))  # or for one endpoint
+xrdclient.configure(max_read_size=0)                       # process-wide
+fs = xrdclient.FileSystem(url, xrdclient.Config(max_read_size=0))  # or for one endpoint
 ```
 
 ## A copy does not overwrite what is already there
@@ -61,7 +61,7 @@ something. `-c`, `--continue` implies it, because carrying on from a partial
 file is the one case where the destination is meant to be written into.
 
 In the library the same switch is `overwrite=`, and it defaults to `True`
-there: `xrd.copy(src, dst, overwrite=False)` is a program spelling out what
+there: `xrdclient.copy(src, dst, overwrite=False)` is a program spelling out what
 the command line asks of a person. The asymmetry is deliberate - a script
 that says `copy(...)` has already decided, and a hand at a keyboard has not.
 
@@ -95,7 +95,7 @@ the shallow-path refusal survives into a script, and `--yes` overrules it.
 `root://host//store/f.root` and `root://host/store/f.root` name the same file.
 The stock tools treat the second as a different, usually missing, path, and
 the resulting `[3011] no such file or directory` is the single most common
-first hour of XRootD. [`xrd.parse`](api.md) normalises both to `/store/f.root`
+first hour of XRootD. [`xrdclient.parse`](api.md) normalises both to `/store/f.root`
 before anything is sent.
 
 ## The first failure is named, rather than the last one
@@ -116,7 +116,7 @@ in force, every authentication mechanism with what is missing and the command
 that would produce it, DNS, the port, the login, and how far down the path
 actually exists. The first `!!` is the thing to fix; everything below it is a
 consequence. It never prompts, changes nothing, and exits `1` if any line
-failed, so it belongs in a script and in a ticket. `xrd.diagnose()` is the
+failed, so it belongs in a script and in a ticket. `xrdclient.diagnose()` is the
 same thing from Python, and returns the report rather than printing it.
 
 One detail is there for beginners specifically: `unix` and `host` are marked

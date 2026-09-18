@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "pyxrootdclient"
+name = "xrdclient"
 version = "0.1.0"
 description = "A pure-Python, Pythonic client for XRootD (root://, roots://) and HEP WebDAV"
 readme = "README.md"
@@ -40,19 +40,19 @@ dev = [
 docs = ["mkdocs>=1.6", "mkdocs-material>=9.5", "mkdocstrings[python]>=0.25"]
 
 [project.scripts]
-xrd-cp = "xrd.cli.cp:main"
-xrd-fs = "xrd.cli.fs:main"
+xrd-cp = "xrdclient.cli.cp:main"
+xrd-fs = "xrdclient.cli.fs:main"
 
 [project.entry-points."fsspec.specs"]
-root = "xrd.fsspec_impl:XRootDFileSystem"
-roots = "xrd.fsspec_impl:XRootDFileSystem"
-xroot = "xrd.fsspec_impl:XRootDFileSystem"
-dav = "xrd.fsspec_impl:HTTPXRootDFileSystem"
-davs = "xrd.fsspec_impl:HTTPXRootDFileSystem"
-webdav = "xrd.fsspec_impl:HTTPXRootDFileSystem"
+root = "xrdclient.fsspec_impl:XRootDFileSystem"
+roots = "xrdclient.fsspec_impl:XRootDFileSystem"
+xroot = "xrdclient.fsspec_impl:XRootDFileSystem"
+dav = "xrdclient.fsspec_impl:HTTPXRootDFileSystem"
+davs = "xrdclient.fsspec_impl:HTTPXRootDFileSystem"
+webdav = "xrdclient.fsspec_impl:HTTPXRootDFileSystem"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/xrd"]
+packages = ["src/xrdclient"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -69,7 +69,7 @@ markers = [
 
 [tool.coverage.run]
 branch = true
-source = ["xrd"]
+source = ["xrdclient"]
 parallel = true
 
 [tool.coverage.report]
@@ -84,7 +84,7 @@ exclude_also = [
 # gated at the full line-and-branch mark; the optional adapters (fsspec,
 # asyncio, CLI) are not, because their coverage depends on which extras are
 # installed - the suite covers those too, but only when they are there.
-include = ["*/xrd/proto/*", "*/xrd/crypto/*", "*/xrd/client/*", "*/xrd/s3/*"]
+include = ["*/xrdclient/proto/*", "*/xrdclient/crypto/*", "*/xrdclient/client/*", "*/xrdclient/s3/*"]
 fail_under = 100
 show_missing = true
 skip_covered = true
@@ -107,7 +107,7 @@ ignore = ["E741", "RUF022", "RUF023"]
 # package under a real 3.9 if one is installed, and CI runs the suite on it.
 python_version = "3.10"
 strict = true
-packages = ["xrd"]
+packages = ["xrdclient"]
 mypy_path = "src"
 
 # The optional accelerators and adapters ship no stubs. They are reached
@@ -120,5 +120,5 @@ ignore_missing_imports = true
 # ``AbstractFileSystem`` is therefore ``Any``, and subclassing it is the whole
 # point of the adapter.
 [[tool.mypy.overrides]]
-module = "xrd.fsspec_impl"
+module = "xrdclient.fsspec_impl"
 disallow_subclassing_any = false

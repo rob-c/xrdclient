@@ -1,6 +1,6 @@
 """A DER *writer*, so the X.509 and GSI tests mint their own material.
 
-:mod:`xrd.crypto.der` deliberately only reads. The tests need bytes to read,
+:mod:`xrdclient.crypto.der` deliberately only reads. The tests need bytes to read,
 and fixture files checked into a repository expire, drift, and are impossible
 to review. So this builds certificates in process: a few dozen lines of
 encoder, and every test gets a chain that is valid *today*.
@@ -15,7 +15,7 @@ import calendar
 import textwrap
 import time
 
-from xrd.crypto.rsa import RSAPrivateKey, RSAPublicKey
+from xrdclient.crypto.rsa import RSAPrivateKey, RSAPublicKey
 
 #: The RFC 2409 first Oakley group. A real group, small enough that a pure
 #: Python ``pow`` over it is instant.
@@ -227,7 +227,7 @@ def _cached_key(slot: int) -> RSAPrivateKey:
     """
     if slot not in _KEYS:
         from _keys import KEYS
-        from xrd.crypto.rsa import load_private_key
+        from xrdclient.crypto.rsa import load_private_key
 
         _KEYS[slot] = load_private_key(KEYS[slot % len(KEYS)])
     return _KEYS[slot]

@@ -1,9 +1,9 @@
 """The public surface, every name of it, against a real server.
 
 The other modules test what each operation *means*. This one tests that the
-surface is whole: every public method of :class:`~xrd.FileSystem`,
-:class:`~xrd.File` and :class:`~xrd.XRootDPath`, and every name in
-``xrd.__all__``, is called here at least once and comes back.
+surface is whole: every public method of :class:`~xrdclient.FileSystem`,
+:class:`~xrdclient.File` and :class:`~xrdclient.XRootDPath`, and every name in
+``xrdclient.__all__``, is called here at least once and comes back.
 
 The point is the gate at the end of each section. It compares the table of
 exercises against the class's actual public attributes, so a method added
@@ -22,11 +22,11 @@ import sys
 
 import pytest
 
-import xrd
-from xrd.client.file import File
-from xrd.client.filesystem import FileSystem
-from xrd.config import Config
-from xrd.flags import (
+import xrdclient
+from xrdclient.client.file import File
+from xrdclient.client.filesystem import FileSystem
+from xrdclient.config import Config
+from xrdclient.flags import (
     Access,
     DirListFlags,
     LocateFlags,
@@ -36,9 +36,9 @@ from xrd.flags import (
     QueryCode,
     StatInfoFlags,
 )
-from xrd.path import XRootDPath
-from xrd.testing import FakeServer
-from xrd.types import ReadRange, WriteChunk
+from xrdclient.path import XRootDPath
+from xrdclient.testing import FakeServer
+from xrdclient.types import ReadRange, WriteChunk
 
 CONFIG = Config(username="tester", auth_order=("host",), require_tls=False)
 
@@ -78,7 +78,7 @@ def fh(fs):
 
 @pytest.fixture
 def path(srv):
-    p = xrd.Path(srv.url.with_path("/store/f.root"), config=CONFIG)
+    p = xrdclient.Path(srv.url.with_path("/store/f.root"), config=CONFIG)
     try:
         yield p
     finally:
@@ -326,42 +326,42 @@ def test_every_public_path_method_is_exercised():
 # ---------------------------------------------------------------------------
 
 
-ERRORS = sorted(name for name in xrd.__all__ if name.endswith("Error"))
+ERRORS = sorted(name for name in xrdclient.__all__ if name.endswith("Error"))
 
 
 @pytest.mark.parametrize("name", ERRORS)
 def test_this_error_is_catchable_as_this_packages_error(name):
-    """One ``except xrd.XRootDError`` catches everything this package raises."""
-    exception = getattr(xrd, name)
-    assert issubclass(exception, xrd.XRootDError)
+    """One ``except xrdclient.XRootDError`` catches everything this package raises."""
+    exception = getattr(xrdclient, name)
+    assert issubclass(exception, xrdclient.XRootDError)
     assert issubclass(exception, Exception)
 
 
 def test_the_errors_python_already_has_names_for_are_those(fs):
     """A missing file is a ``FileNotFoundError`` before it is anything else."""
-    assert issubclass(xrd.NotFoundError, FileNotFoundError)
-    assert issubclass(xrd.TimeoutError, TimeoutError)
-    assert issubclass(xrd.ConnectionError, ConnectionError)
+    assert issubclass(xrdclient.NotFoundError, FileNotFoundError)
+    assert issubclass(xrdclient.TimeoutError, TimeoutError)
+    assert issubclass(xrdclient.ConnectionError, ConnectionError)
 
 
 def _use_config(srv):
-    with xrd.override(username="other"):
-        assert xrd.current().username == "other"
-    xrd.configure(username=CONFIG.username)
-    return xrd.current()
+    with xrdclient.override(username="other"):
+        assert xrdclient.current().username == "other"
+    xrdclient.configure(username=CONFIG.username)
+    return xrdclient.current()
 
 
 def _use_copy(srv, tmp_path):
-    return xrd.copy(srv.url.with_path("/store/f.root"), tmp_path / "out.root", config=CONFIG)
+    return xrdclient.copy(srv.url.with_path("/store/f.root"), tmp_path / "out.root", config=CONFIG)
 
 
 def _use_copy_tree(srv, tmp_path):
-    return xrd.copy_tree(srv.url.with_path("/store"), tmp_path / "tree", config=CONFIG)
+    return xrdclient.copy_tree(srv.url.with_path("/store"), tmp_path / "tree", config=CONFIG)
 
 
 def _use_third_party(srv, tmp_path):
     with FakeServer() as destination:
-        return xrd.third_party(
+        return xrdclient.third_party(
             srv.url.with_path("/store/f.root"),
             destination.url.with_path("/pushed.root"),
             config=CONFIG,
@@ -369,12 +369,12 @@ def _use_third_party(srv, tmp_path):
 
 
 def _use_file(srv, tmp_path):
-    with xrd.File(srv.url.with_path("/store/f.root"), CONFIG) as fh:
+    with xrdclient.File(srv.url.with_path("/store/f.root"), CONFIG) as fh:
         return fh.read()
 
 
 def _use_checkpoint(srv, tmp_path):
-    fh = xrd.File(srv.url.with_path("/store/f.root"), CONFIG)
+    fh = xrdclient.File(srv.url.with_path("/store/f.root"), CONFIG)
     fh.open(OpenFlags.UPDATE)
     try:
         with fh.checkpoint() as checkpoint:
@@ -388,7 +388,7 @@ def _use_aio(srv, tmp_path):
     import asyncio
 
     async def go():
-        async with xrd.aio.FileSystem(srv.url.with_path("/store"), CONFIG) as fs:
+        async with xrdclient.aio.FileSystem(srv.url.with_path("/store"), CONFIG) as fs:
             return await fs.listdir(".")
 
     return asyncio.run(go())
@@ -401,86 +401,88 @@ def _one_file(srv):
 
 def _use_mkdir(srv, tmp):
     url = srv.url.with_path("/store/made/deeper")
-    xrd.mkdir(url, config=CONFIG)
-    return xrd.exists(url, config=CONFIG)
+    xrdclient.mkdir(url, config=CONFIG)
+    return xrdclient.exists(url, config=CONFIG)
 
 
 def _use_remove(srv, tmp):
     url = srv.url.with_path("/store/doomed.txt")
-    xrd.write_text(url, "x", config=CONFIG)
-    xrd.remove(url, config=CONFIG)
-    return not xrd.exists(url, config=CONFIG)
+    xrdclient.write_text(url, "x", config=CONFIG)
+    xrdclient.remove(url, config=CONFIG)
+    return not xrdclient.exists(url, config=CONFIG)
 
 
 def _use_move(srv, tmp):
     source, target = srv.url.with_path("/store/from.txt"), srv.url.with_path("/store/to.txt")
-    xrd.write_text(source, "moved", config=CONFIG)
-    xrd.move(source, target, config=CONFIG)
-    return xrd.read_text(target, config=CONFIG)
+    xrdclient.write_text(source, "moved", config=CONFIG)
+    xrdclient.move(source, target, config=CONFIG)
+    return xrdclient.read_text(target, config=CONFIG)
 
 
 NAMES = {
     "Access": lambda srv, tmp: int(Access.OWNER_READ | Access.OWNER_WRITE) > 0,
     "Checkpoint": _use_checkpoint,
-    "CheckpointInfo": lambda srv, tmp: xrd.CheckpointInfo(capacity=8, used=2).free,
-    "ChecksumInfo": lambda srv, tmp: xrd.ChecksumInfo("adler32", "00010203").value,
+    "CheckpointInfo": lambda srv, tmp: xrdclient.CheckpointInfo(capacity=8, used=2).free,
+    "ChecksumInfo": lambda srv, tmp: xrdclient.ChecksumInfo("adler32", "00010203").value,
     "Config": lambda srv, tmp: CONFIG.evolve(username="someone").username,
     "CopyResult": lambda srv, tmp: _use_copy(srv, tmp).size,
-    "Check": lambda srv, tmp: str(xrd.Check("a", "ok", "fine")),
-    "Report": lambda srv, tmp: xrd.Report().ok,
-    "diagnose": lambda srv, tmp: xrd.diagnose(str(srv.url) + "store/f.root").ok,
-    "DirEntry": lambda srv, tmp: xrd.DirEntry(name="f.root", parent="/store").path,
+    "Check": lambda srv, tmp: str(xrdclient.Check("a", "ok", "fine")),
+    "Report": lambda srv, tmp: xrdclient.Report().ok,
+    "diagnose": lambda srv, tmp: xrdclient.diagnose(str(srv.url) + "store/f.root").ok,
+    "DirEntry": lambda srv, tmp: xrdclient.DirEntry(name="f.root", parent="/store").path,
     "DirListFlags": lambda srv, tmp: DirListFlags.STAT | DirListFlags.NONE,
     "File": _use_file,
-    "FileSystem": lambda srv, tmp: xrd.FileSystem(srv.url, CONFIG).close(),
-    "LocationInfo": lambda srv, tmp: xrd.LocationInfo(address="a:1094").address,
+    "FileSystem": lambda srv, tmp: xrdclient.FileSystem(srv.url, CONFIG).close(),
+    "LocationInfo": lambda srv, tmp: xrdclient.LocationInfo(address="a:1094").address,
     "LocateFlags": lambda srv, tmp: LocateFlags.FOR_DIRLIST | LocateFlags.NONE,
     "MkDirFlags": lambda srv, tmp: MkDirFlags.MAKEPATH | MkDirFlags.NONE,
     "OpenFlags": lambda srv, tmp: OpenFlags.READ | OpenFlags.UPDATE,
-    "PageResult": lambda srv, tmp: xrd.PageResult(data=b"x", offset=0).data,
+    "PageResult": lambda srv, tmp: xrdclient.PageResult(data=b"x", offset=0).data,
     "PrepareFlags": lambda srv, tmp: PrepareFlags.STAGE | PrepareFlags.NONE,
-    "Path": lambda srv, tmp: xrd.Path(srv.url.with_path("/store"), config=CONFIG).close(),
-    "ProtocolInfo": lambda srv, tmp: xrd.ProtocolInfo(version=0x310).version,
+    "Path": lambda srv, tmp: xrdclient.Path(srv.url.with_path("/store"), config=CONFIG).close(),
+    "ProtocolInfo": lambda srv, tmp: xrdclient.ProtocolInfo(version=0x310).version,
     "QueryCode": lambda srv, tmp: int(QueryCode.CHECKSUM),
-    "CloneRange": lambda srv, tmp: xrd.CloneRange(0, 4).destination,
-    "ReadRange": lambda srv, tmp: xrd.ReadRange(0, 4).length,
-    "PrepareStatus": lambda srv, tmp: str(xrd.PrepareStatus(path="/a", online=True)),
-    "SpaceInfo": lambda srv, tmp: xrd.SpaceInfo(free=1).unlimited,
-    "StatInfo": lambda srv, tmp: xrd.StatInfo(st_size=1).st_size,
-    "SyncMode": lambda srv, tmp: xrd.copy_tree.__doc__ and "size" in str(xrd.SyncMode),
+    "CloneRange": lambda srv, tmp: xrdclient.CloneRange(0, 4).destination,
+    "ReadRange": lambda srv, tmp: xrdclient.ReadRange(0, 4).length,
+    "PrepareStatus": lambda srv, tmp: str(xrdclient.PrepareStatus(path="/a", online=True)),
+    "SpaceInfo": lambda srv, tmp: xrdclient.SpaceInfo(free=1).unlimited,
+    "StatInfo": lambda srv, tmp: xrdclient.StatInfo(st_size=1).st_size,
+    "SyncMode": lambda srv, tmp: xrdclient.copy_tree.__doc__ and "size" in str(xrdclient.SyncMode),
     "StatInfoFlags": lambda srv, tmp: StatInfoFlags.IS_READABLE | StatInfoFlags.NONE,
-    "VFSInfo": lambda srv, tmp: xrd.VFSInfo(nodes_rw=1).nodes_rw,
-    "WriteChunk": lambda srv, tmp: xrd.WriteChunk(0, b"x").data,
+    "VFSInfo": lambda srv, tmp: xrdclient.VFSInfo(nodes_rw=1).nodes_rw,
+    "WriteChunk": lambda srv, tmp: xrdclient.WriteChunk(0, b"x").data,
     "XRootDPath": lambda srv, tmp: XRootDPath(srv.url.with_path("/store/f.root")).name,
-    "XRootDURL": lambda srv, tmp: xrd.XRootDURL(host="a", port=1094).endpoint,
-    "__version__": lambda srv, tmp: xrd.__version__.split(".")[0],
+    "XRootDURL": lambda srv, tmp: xrdclient.XRootDURL(host="a", port=1094).endpoint,
+    "__version__": lambda srv, tmp: xrdclient.__version__.split(".")[0],
     "aio": _use_aio,
     "configure": _use_config,
     "copy": _use_copy,
     "copy_tree": _use_copy_tree,
-    "current": lambda srv, tmp: xrd.current().username,
-    "find_config_file": lambda srv, tmp: xrd.find_config_file(),
-    "open": lambda srv, tmp: xrd.open(srv.url.with_path("/store/f.root"), config=CONFIG).read(),
+    "current": lambda srv, tmp: xrdclient.current().username,
+    "find_config_file": lambda srv, tmp: xrdclient.find_config_file(),
+    "open": lambda srv, tmp: xrdclient.open(
+        srv.url.with_path("/store/f.root"), config=CONFIG
+    ).read(),
     "override": _use_config,
-    "parse": lambda srv, tmp: xrd.parse("root://host:1094//store/f.root").path,
+    "parse": lambda srv, tmp: xrdclient.parse("root://host:1094//store/f.root").path,
     "third_party": _use_third_party,
     # the one-line verbs
-    "ls": lambda srv, tmp: xrd.ls(srv.url.with_path("/store"), config=CONFIG),
-    "glob": lambda srv, tmp: xrd.glob(srv.url.with_path("/store/*.root"), config=CONFIG),
-    "stat": lambda srv, tmp: xrd.stat(_one_file(srv), config=CONFIG),
-    "exists": lambda srv, tmp: xrd.exists(_one_file(srv), config=CONFIG),
-    "size": lambda srv, tmp: xrd.size(_one_file(srv), config=CONFIG),
-    "checksum": lambda srv, tmp: xrd.checksum(_one_file(srv), config=CONFIG),
-    "read_bytes": lambda srv, tmp: xrd.read_bytes(_one_file(srv), config=CONFIG),
-    "read_text": lambda srv, tmp: xrd.read_text(_one_file(srv), config=CONFIG),
-    "write_bytes": lambda srv, tmp: xrd.write_bytes(srv.url / "w.bin", b"x", config=CONFIG),
-    "write_text": lambda srv, tmp: xrd.write_text(srv.url / "w.txt", "x", config=CONFIG),
+    "ls": lambda srv, tmp: xrdclient.ls(srv.url.with_path("/store"), config=CONFIG),
+    "glob": lambda srv, tmp: xrdclient.glob(srv.url.with_path("/store/*.root"), config=CONFIG),
+    "stat": lambda srv, tmp: xrdclient.stat(_one_file(srv), config=CONFIG),
+    "exists": lambda srv, tmp: xrdclient.exists(_one_file(srv), config=CONFIG),
+    "size": lambda srv, tmp: xrdclient.size(_one_file(srv), config=CONFIG),
+    "checksum": lambda srv, tmp: xrdclient.checksum(_one_file(srv), config=CONFIG),
+    "read_bytes": lambda srv, tmp: xrdclient.read_bytes(_one_file(srv), config=CONFIG),
+    "read_text": lambda srv, tmp: xrdclient.read_text(_one_file(srv), config=CONFIG),
+    "write_bytes": lambda srv, tmp: xrdclient.write_bytes(srv.url / "w.bin", b"x", config=CONFIG),
+    "write_text": lambda srv, tmp: xrdclient.write_text(srv.url / "w.txt", "x", config=CONFIG),
     "mkdir": _use_mkdir,
     "remove": _use_remove,
     "move": _use_move,
-    "stage": lambda srv, tmp: xrd.stage(_one_file(srv), config=CONFIG),
-    "is_online": lambda srv, tmp: xrd.is_online(_one_file(srv), config=CONFIG),
-    "human_bytes": lambda srv, tmp: xrd.human_bytes(1536),
+    "stage": lambda srv, tmp: xrdclient.stage(_one_file(srv), config=CONFIG),
+    "is_online": lambda srv, tmp: xrdclient.is_online(_one_file(srv), config=CONFIG),
+    "human_bytes": lambda srv, tmp: xrdclient.human_bytes(1536),
 }
 
 
@@ -492,8 +494,8 @@ def test_this_public_name_is_usable(srv, tmp_path, name):
 
 
 def test_every_public_name_is_exercised():
-    """``xrd.__all__`` is the promise; this is the receipt."""
-    assert set(NAMES) | set(ERRORS) == set(xrd.__all__)
+    """``xrdclient.__all__`` is the promise; this is the receipt."""
+    assert set(NAMES) | set(ERRORS) == set(xrdclient.__all__)
 
 
 def test_nothing_public_is_missing_from_dunder_all():
@@ -502,18 +504,18 @@ def test_nothing_public_is_missing_from_dunder_all():
 
     exported = {
         name
-        for name, value in vars(xrd).items()
+        for name, value in vars(xrdclient).items()
         if not name.startswith("_")
         and not isinstance(value, types.ModuleType)  # submodules are not the API
         and name != "annotations"  # ``from __future__``, not ours
     }
-    assert exported <= set(xrd.__all__)
+    assert exported <= set(xrdclient.__all__)
 
 
 def _imports(source: pathlib.Path) -> list[tuple[str, bool]]:
     """Every module ``source`` imports, and whether the import can fail safely.
 
-    Safe means the import cannot break ``import xrd`` on a bare interpreter:
+    Safe means the import cannot break ``import xrdclient`` on a bare interpreter:
     either an ``ImportError`` is caught (or turned into a better one), or it
     only runs when the function around it is called.
     """
@@ -561,10 +563,10 @@ def test_the_package_needs_nothing_but_the_standard_library():
     ``fsspec``, ``gssapi``, ``google_crc32c`` - may be named, but only where a
     missing one cannot stop the package from importing.
     """
-    stdlib = set(sys.stdlib_module_names) | {"xrd", "_typeshed"}
+    stdlib = set(sys.stdlib_module_names) | {"xrdclient", "_typeshed"}
     offenders = {
         f"{source.name}: {name}"
-        for source in pathlib.Path(xrd.__file__).parent.rglob("*.py")
+        for source in pathlib.Path(xrdclient.__file__).parent.rglob("*.py")
         for name, guarded in _imports(source)
         if name not in stdlib and not guarded
     }
@@ -575,11 +577,11 @@ def test_the_package_needs_nothing_but_the_standard_library():
 def test_importing_the_package_pulls_in_no_third_party_module():
     """The receipt for the test above, from an interpreter of its own."""
     script = (
-        "import sys; import xrd; "
+        "import sys; import xrdclient; "
         "print(sorted({n.split('.')[0] for n in sys.modules} "
-        "- set(sys.stdlib_module_names) - {'xrd', '__main__', '_distutils_hack'}))"
+        "- set(sys.stdlib_module_names) - {'xrdclient', '__main__', '_distutils_hack'}))"
     )
-    env = {**os.environ, "PYTHONPATH": str(pathlib.Path(xrd.__file__).parent.parent)}
+    env = {**os.environ, "PYTHONPATH": str(pathlib.Path(xrdclient.__file__).parent.parent)}
     out = subprocess.run(
         [sys.executable, "-S", "-c", script],
         capture_output=True,
@@ -602,8 +604,8 @@ def test_the_working_directory_is_not_needed_to_use_the_package(srv, tmp_path):
 
 
 def test_the_async_facade_is_one_attribute_away(monkeypatch):
-    """``xrd.aio`` resolves lazily, and nothing else does."""
-    monkeypatch.delattr(xrd, "aio", raising=False)  # as it is before anyone asks
-    assert xrd.aio is importlib.import_module("xrd.aio")
+    """``xrdclient.aio`` resolves lazily, and nothing else does."""
+    monkeypatch.delattr(xrdclient, "aio", raising=False)  # as it is before anyone asks
+    assert xrdclient.aio is importlib.import_module("xrdclient.aio")
     with pytest.raises(AttributeError, match="has no attribute 'nonesuch'"):
-        _ = xrd.nonesuch
+        _ = xrdclient.nonesuch

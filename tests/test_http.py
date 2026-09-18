@@ -8,29 +8,37 @@ import os
 
 import pytest
 
-import xrd
-from xrd.config import Config
-from xrd.crypto import checksum_bytes
-from xrd.errors import (
+import xrdclient
+from xrdclient.config import Config
+from xrdclient.crypto import checksum_bytes
+from xrdclient.errors import (
     ConnectionError as XRDConnectionError,
 )
-from xrd.errors import (
+from xrdclient.errors import (
     NotFoundError,
     ProtocolError,
     RedirectLimitError,
     TransientError,
     UnsupportedError,
 )
-from xrd.errors import (
+from xrdclient.errors import (
     TimeoutError as XRDTimeoutError,
 )
-from xrd.flags import LocateFlags, PrepareFlags, QueryCode
-from xrd.http import HTTPClient, HTTPFileSystem, bearer_token, digest, macaroon, open_http, tape
-from xrd.http.client import check_status, request_target
-from xrd.http.dav import _parse, _pick_digest
-from xrd.http.tpc import _follow, _remote_url
-from xrd.testing import FakeDAVServer
-from xrd.url import parse
+from xrdclient.flags import LocateFlags, PrepareFlags, QueryCode
+from xrdclient.http import (
+    HTTPClient,
+    HTTPFileSystem,
+    bearer_token,
+    digest,
+    macaroon,
+    open_http,
+    tape,
+)
+from xrdclient.http.client import check_status, request_target
+from xrdclient.http.dav import _parse, _pick_digest
+from xrdclient.http.tpc import _follow, _remote_url
+from xrdclient.testing import FakeDAVServer
+from xrdclient.url import parse
 
 BODY = b"hello world"
 
@@ -49,7 +57,7 @@ def dav():
 
 @pytest.fixture
 def fs(dav):
-    filesystem = xrd.FileSystem(dav.url)
+    filesystem = xrdclient.FileSystem(dav.url)
     try:
         yield filesystem
     finally:
@@ -63,24 +71,24 @@ def fs(dav):
 
 @pytest.mark.parametrize("scheme", ["http", "https", "dav", "davs", "webdav"])
 def test_every_http_spelling_reaches_the_webdav_implementation(scheme):
-    with xrd.FileSystem(f"{scheme}://dav.example.org/store") as fs:
+    with xrdclient.FileSystem(f"{scheme}://dav.example.org/store") as fs:
         assert isinstance(fs, HTTPFileSystem)
 
 
 def test_a_root_url_still_gets_the_binary_implementation():
-    with xrd.FileSystem("root://eos.example.org") as fs:
+    with xrdclient.FileSystem("root://eos.example.org") as fs:
         assert not isinstance(fs, HTTPFileSystem)
 
 
 def test_open_dispatches_on_the_scheme(dav):
-    with xrd.open(dav.url / "d/a.root") as fh:
+    with xrdclient.open(dav.url / "d/a.root") as fh:
         assert fh.read() == BODY
-    with xrd.open(dav.url / "d/a.root", "r") as text:
+    with xrdclient.open(dav.url / "d/a.root", "r") as text:
         assert text.read() == BODY.decode()
 
 
 def test_a_path_object_works_over_webdav(dav):
-    path = xrd.XRootDPath(dav.url / "d/a.root")
+    path = xrdclient.XRootDPath(dav.url / "d/a.root")
     assert path.name == "a.root"
     assert path.read_bytes() == BODY
     assert path.parent.is_dir()
@@ -131,15 +139,15 @@ def test_the_request_target_preserves_a_signed_query_byte_for_byte():
 
 def test_a_token_is_presented_as_a_bearer_header(dav):
     dav.require_token = "s3cr3t"
-    with xrd.FileSystem(dav.url) as anonymous, pytest.raises(PermissionError):
+    with xrdclient.FileSystem(dav.url) as anonymous, pytest.raises(PermissionError):
         anonymous.stat("/d/a.root")
-    with xrd.FileSystem(dav.url, Config(token="s3cr3t")) as authorised:
+    with xrdclient.FileSystem(dav.url, Config(token="s3cr3t")) as authorised:
         assert authorised.stat("/d/a.root").st_size == len(BODY)
 
 
 def test_a_url_query_token_authenticates_too(dav):
     dav.require_token = "s3cr3t"
-    with xrd.open(dav.url.evolve(path="/d/a.root", query={"authz": "s3cr3t"}), "rb") as fh:
+    with xrdclient.open(dav.url.evolve(path="/d/a.root", query={"authz": "s3cr3t"}), "rb") as fh:
         assert fh.read() == BODY
 
 
@@ -156,7 +164,7 @@ def test_statuses_become_the_exceptions_python_programmers_expect(dav):
 def test_a_redirect_is_followed(dav):
     dav.add_file("/d/b.root", b"redirected")
     dav.redirects["/d/a.root"] = str(dav.url / "d/b.root")
-    with xrd.FileSystem(dav.url) as fs:
+    with xrdclient.FileSystem(dav.url) as fs:
         assert fs.read_bytes("/d/a.root") == b"redirected"
     assert ("GET", "/d/b.root") in dav.seen
 
@@ -262,7 +270,7 @@ def test_a_cut_stream_recovers_with_a_ranged_get(dav):
 
 def test_text_mode_iterates_lines(dav):
     dav.add_file("/d/lines.txt", b"one\ntwo\n")
-    with xrd.open(dav.url / "d/lines.txt", "r") as fh:
+    with xrdclient.open(dav.url / "d/lines.txt", "r") as fh:
         assert list(fh) == ["one\n", "two\n"]
 
 
@@ -538,7 +546,7 @@ def test_an_unrelated_digest_in_the_header_is_not_mistaken_for_ours():
 
 
 def test_a_copy_over_webdav_verifies_itself(dav, tmp_path):
-    result = xrd.copy(dav.url / "d/a.root", tmp_path / "a.root")
+    result = xrdclient.copy(dav.url / "d/a.root", tmp_path / "a.root")
     assert (tmp_path / "a.root").read_bytes() == BODY
     assert result.checksum.value == checksum_bytes("adler32", BODY)
 
@@ -546,11 +554,11 @@ def test_a_copy_over_webdav_verifies_itself(dav, tmp_path):
 def test_a_copy_into_webdav_verifies_itself(dav, tmp_path):
     source = tmp_path / "up.bin"
     source.write_bytes(b"uploaded")
-    result = xrd.copy(source, dav.url / "d/up.bin")
+    result = xrdclient.copy(source, dav.url / "d/up.bin")
     assert dav.contents("/d/up.bin") == b"uploaded"
     assert result.verified
     with pytest.raises(FileExistsError):
-        xrd.copy(source, dav.url / "d/up.bin", overwrite=False)
+        xrdclient.copy(source, dav.url / "d/up.bin", overwrite=False)
 
 
 # ---------------------------------------------------------------------------
@@ -562,7 +570,7 @@ def test_a_macaroon_is_minted_and_usable_as_a_token(dav):
     token = macaroon(dav.url / "d", caveats=["activity:DOWNLOAD"], validity="PT10M")
     assert token == dav.macaroon
     dav.require_token = token
-    with xrd.FileSystem(dav.url, Config(token=token)) as fs:
+    with xrdclient.FileSystem(dav.url, Config(token=token)) as fs:
         assert fs.stat("/d/a.root").st_size == len(BODY)
 
 
@@ -606,7 +614,7 @@ def elsewhere():
 
 def test_a_pull_moves_the_bytes_without_them_passing_through_us(dav, elsewhere):
     """The whole point: one COPY from us, and the data goes server to server."""
-    result = xrd.third_party(dav.url / "d/a.root", elsewhere.url / "d/copy.root")
+    result = xrdclient.third_party(dav.url / "d/a.root", elsewhere.url / "d/copy.root")
     assert elsewhere.contents("/d/copy.root") == BODY
     assert elsewhere.seen == [("COPY", "/d/copy.root")]
     assert ("GET", "/d/a.root") in dav.seen
@@ -614,7 +622,7 @@ def test_a_pull_moves_the_bytes_without_them_passing_through_us(dav, elsewhere):
 
 
 def test_the_copy_asks_for_it_the_way_the_wlcg_dialect_says(dav, elsewhere):
-    xrd.third_party(dav.url / "d/a.root", elsewhere.url / "d/copy.root")
+    xrdclient.third_party(dav.url / "d/a.root", elsewhere.url / "d/copy.root")
     headers = elsewhere.copies[-1]
     assert headers["Source"] == f"http://{dav.url.netloc}/d/a.root"
     assert headers["Overwrite"] == "T"
@@ -626,7 +634,7 @@ def test_the_copy_asks_for_it_the_way_the_wlcg_dialect_says(dav, elsewhere):
 
 def test_a_push_hands_the_destination_to_the_source_instead(dav, elsewhere):
     """For a destination that cannot open outbound connections."""
-    from xrd.http import third_party
+    from xrdclient.http import third_party
 
     third_party(dav.url / "d/a.root", elsewhere.url / "d/pushed.root", mode="push")
     assert elsewhere.contents("/d/pushed.root") == BODY
@@ -636,21 +644,21 @@ def test_a_push_hands_the_destination_to_the_source_instead(dav, elsewhere):
 
 def test_a_failure_after_the_202_is_still_a_failure(dav, elsewhere):
     """The status line says Accepted; only the body says what happened."""
-    with pytest.raises(xrd.errors.NotFoundError, match="third-party copy failed"):
-        xrd.third_party(dav.url / "d/missing.root", elsewhere.url / "d/copy.root")
+    with pytest.raises(xrdclient.errors.NotFoundError, match="third-party copy failed"):
+        xrdclient.third_party(dav.url / "d/missing.root", elsewhere.url / "d/copy.root")
     assert "/d/copy.root" not in elsewhere.files
 
 
 def test_a_failure_that_quotes_no_status_is_still_raised(dav, elsewhere):
     elsewhere.tpc_failure = "the pool node went away"
     with pytest.raises(OSError, match="the pool node went away"):
-        xrd.third_party(dav.url / "d/a.root", elsewhere.url / "d/copy.root")
+        xrdclient.third_party(dav.url / "d/a.root", elsewhere.url / "d/copy.root")
 
 
 def test_refusing_to_overwrite_reaches_the_destination(dav, elsewhere):
     elsewhere.add_file("/d/taken.root", b"mine")
-    with pytest.raises(xrd.errors.ExistsError):
-        xrd.third_party(dav.url / "d/a.root", elsewhere.url / "d/taken.root", overwrite=False)
+    with pytest.raises(xrdclient.errors.ExistsError):
+        xrdclient.third_party(dav.url / "d/a.root", elsewhere.url / "d/taken.root", overwrite=False)
     assert elsewhere.contents("/d/taken.root") == b"mine"
     assert elsewhere.copies[-1]["Overwrite"] == "F"
 
@@ -659,7 +667,7 @@ def test_the_source_token_travels_in_a_transfer_header(dav, elsewhere):
     """A pre-signed source URL is how a grid transfer is usually authorised."""
     dav.require_token = "src-token"
     source = f"{dav.url / 'd/a.root'}?authz=src-token"
-    xrd.third_party(source, elsewhere.url / "d/copy.root")
+    xrdclient.third_party(source, elsewhere.url / "d/copy.root")
     headers = elsewhere.copies[-1]
     assert headers["TransferHeaderAuthorization"] == "Bearer src-token"
     # The token authorises the far side's GET, so it belongs in that header
@@ -670,7 +678,7 @@ def test_the_source_token_travels_in_a_transfer_header(dav, elsewhere):
 
 def test_the_ambient_token_is_used_when_the_url_carries_none(dav, elsewhere):
     dav.require_token = elsewhere.require_token = "ambient"
-    xrd.third_party(
+    xrdclient.third_party(
         dav.url / "d/a.root",
         elsewhere.url / "d/copy.root",
         config=Config(token="ambient"),
@@ -679,7 +687,7 @@ def test_the_ambient_token_is_used_when_the_url_carries_none(dav, elsewhere):
 
 
 def test_the_optional_knobs_reach_the_wire(dav, elsewhere):
-    from xrd.http import third_party
+    from xrdclient.http import third_party
 
     third_party(
         dav.url / "d/a.root",
@@ -697,19 +705,19 @@ def test_the_optional_knobs_reach_the_wire(dav, elsewhere):
 
 
 def test_saying_nothing_about_checksums_leaves_the_server_policy_alone(dav, elsewhere):
-    xrd.third_party(dav.url / "d/a.root", elsewhere.url / "d/copy.root")
+    xrdclient.third_party(dav.url / "d/a.root", elsewhere.url / "d/copy.root")
     assert "RequireChecksumVerification" not in elsewhere.copies[-1]
 
 
 def test_an_endpoint_without_third_party_copy_says_so(dav, elsewhere):
     elsewhere.no_tpc = True
     with pytest.raises(UnsupportedError):
-        xrd.third_party(dav.url / "d/a.root", elsewhere.url / "d/copy.root")
+        xrdclient.third_party(dav.url / "d/a.root", elsewhere.url / "d/copy.root")
 
 
 def test_the_http_dialect_refuses_a_url_it_cannot_send_as_a_header(dav):
-    """``xrd.third_party`` dispatches; this one is reached directly."""
-    from xrd.http import third_party
+    """``xrdclient.third_party`` dispatches; this one is reached directly."""
+    from xrdclient.http import third_party
 
     with pytest.raises(ValueError, match="not root"):
         third_party("root://a.example//store/f", dav.url / "d/copy.root")
@@ -717,7 +725,7 @@ def test_the_http_dialect_refuses_a_url_it_cannot_send_as_a_header(dav):
 
 def test_a_borrowed_client_is_used_and_left_open(dav, elsewhere):
     """The caller owns what the caller passed, connections included."""
-    from xrd.http import third_party
+    from xrdclient.http import third_party
 
     with HTTPClient(Config()) as client:
         third_party(
@@ -729,7 +737,7 @@ def test_a_borrowed_client_is_used_and_left_open(dav, elsewhere):
 
 
 def test_progress_follows_the_performance_markers(dav, elsewhere):
-    from xrd.http import third_party
+    from xrdclient.http import third_party
 
     elsewhere.tpc_markers = 4
     seen = []
@@ -795,8 +803,8 @@ def test_a_marker_with_unreadable_numbers_keeps_its_byte_count():
 @pytest.mark.parametrize(
     ("line", "expected"),
     [
-        ("failure: rejected: HTTP 403 not yours", xrd.errors.PermissionError_),
-        ("failure: HTTP 507 no space left", xrd.errors.NoSpaceError),
+        ("failure: rejected: HTTP 403 not yours", xrdclient.errors.PermissionError_),
+        ("failure: HTTP 507 no space left", xrdclient.errors.NoSpaceError),
         ("failure: something broke", OSError),
         ("failed: the source hung up", OSError),
     ],
@@ -864,7 +872,7 @@ def test_discarding_a_connection_nobody_pooled_is_quiet():
 
 def test_a_timeout_is_reported_as_a_timeout_not_a_connection_failure():
 
-    from xrd.http.client import _wrap
+    from xrdclient.http.client import _wrap
 
     wrapped = _wrap(TimeoutError("slow"), "GET", parse("http://h.example/f"))
     assert isinstance(wrapped, XRDTimeoutError)
@@ -872,7 +880,7 @@ def test_a_timeout_is_reported_as_a_timeout_not_a_connection_failure():
 
 
 def test_a_digest_that_is_neither_hex_nor_base64_is_passed_through():
-    from xrd.http.dav import _as_hex, _is_hex
+    from xrdclient.http.dav import _as_hex, _is_hex
 
     assert _as_hex("Not-A-Digest!", "md5") == "not-a-digest!"
     assert _is_hex("abcd", "no-such-algorithm") is False
@@ -886,7 +894,7 @@ def test_a_macaroon_can_be_minted_over_a_connection_that_is_already_open(dav):
 
 
 def test_a_relative_path_is_resolved_against_the_endpoint(dav):
-    with xrd.FileSystem(dav.url / "d") as fs:
+    with xrdclient.FileSystem(dav.url / "d") as fs:
         assert fs.stat("a.root").st_size == len(BODY)
         assert os.fspath(fs) == "/d"
 
@@ -897,7 +905,7 @@ def test_iterdir_is_scandir_one_at_a_time(fs):
 
 def test_a_read_only_http_file_refuses_to_write(dav):
     """The raw layer says so itself; the buffer above it never gets the chance."""
-    from xrd.http.file import HTTPRawIO
+    from xrdclient.http.file import HTTPRawIO
 
     with HTTPRawIO(dav.url / "d/a.root", "rb", config=Config()) as raw:
         with pytest.raises(io.UnsupportedOperation, match="not writable"):
@@ -906,7 +914,7 @@ def test_a_read_only_http_file_refuses_to_write(dav):
 
 def test_writes_after_the_stream_has_started_go_down_the_wire(dav):
     """Once the ``PUT`` is open there is no buffer left to grow."""
-    from xrd.http.file import HTTPRawIO
+    from xrdclient.http.file import HTTPRawIO
 
     raw = HTTPRawIO(dav.url / "d/forced.bin", "wb", config=Config())
     raw._begin_upload()  # nothing buffered yet: the empty flush is a no-op
@@ -1015,7 +1023,7 @@ def test_a_site_with_no_tape_answers_the_api_with_a_not_found(fs, dav):
 
 
 def test_staging_nothing_is_refused_by_the_server(fs):
-    with pytest.raises(xrd.errors.XRootDError):
+    with pytest.raises(xrdclient.errors.XRootDError):
         fs.prepare([])
 
 
@@ -1037,7 +1045,7 @@ def test_a_body_that_is_not_json_is_refused_at_both_ends(fs, dav):
     with pytest.raises(ProtocolError, match="did not answer with JSON"):
         fs.archive_info(["/d/a.root"])
     del dav.handlers["POST"]
-    with pytest.raises(xrd.errors.XRootDError):
+    with pytest.raises(xrdclient.errors.XRootDError):
         fs.client.request(
             "POST", fs.url.with_path("/api/v1/stage"), body=b"{oops", expect=(200, 201)
         )

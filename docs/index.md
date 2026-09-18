@@ -1,19 +1,19 @@
-# PyXRootDClient
+# xrdclient
 
 A pure-Python client for XRootD. `root://`, `roots://`, `https://`, HEP
 WebDAV and `s3://`, spoken by the same objects, with no compiled extension, no
 `libXrdCl`, and no third-party import in the core.
 
 ```python
-import xrd
+import xrdclient
 
-for path in xrd.ls("root://eos.example.org//store/user/me"):
-    print(path.name, xrd.human_bytes(xrd.size(path)))
+for path in xrdclient.ls("root://eos.example.org//store/user/me"):
+    print(path.name, xrdclient.human_bytes(xrdclient.size(path)))
 
-with xrd.open("root://eos.example.org//store/data.root", "rb") as fh:
+with xrdclient.open("root://eos.example.org//store/data.root", "rb") as fh:
     header = fh.read(1024)
 
-xrd.copy("root://a.example.org//store/f.root", "davs://b.example.org/store/f.root")
+xrdclient.copy("root://a.example.org//store/f.root", "davs://b.example.org/store/f.root")
 ```
 
 It is a Python library first and an XRootD binding second.
@@ -22,20 +22,20 @@ It is a Python library first and an XRootD binding second.
 
 | A Python programmer expects | and gets |
 | --- | --- |
-| `open()` to return a file object | `xrd.open()` returns one from the `io` stack - buffered, seekable, iterable, text mode on request |
+| `open()` to return a file object | `xrdclient.open()` returns one from the `io` stack - buffered, seekable, iterable, text mode on request |
 | a missing file to raise `FileNotFoundError` | it does; every error is an `OSError` or `XRootDError` subclass with the right `errno` |
-| paths to behave like `pathlib` | `xrd.Path` is `PurePosixPath` shaped and knows its endpoint |
+| paths to behave like `pathlib` | `xrdclient.Path` is `PurePosixPath` shaped and knows its endpoint |
 | `with` to clean up | every handle, filesystem and session is a context manager |
 | no status codes to check | nothing returns `(status, result)` - see [Coming from pyxrootd](migrating.md) |
-| `async` to be `await` in front | `xrd.aio` mirrors the whole surface |
+| `async` to be `await` in front | `xrdclient.aio` mirrors the whole surface |
 | never to add up bit flags | you never do - `fh.open("r")`, `fs.prepare(paths, evict=True)`, `fs.chmod(path, "rw-r-----")` |
 
 ## Install
 
 ```console
-$ pip install pyxrootdclient                 # the whole library
-$ pip install pyxrootdclient[fsspec]         # pandas / dask / pyarrow URLs
-$ pip install pyxrootdclient[krb5]           # the Kerberos mechanism
+$ pip install xrdclient                 # the whole library
+$ pip install xrdclient[fsspec]         # pandas / dask / pyarrow URLs
+$ pip install xrdclient[krb5]           # the Kerberos mechanism
 ```
 
 Python 3.9 or newer - the version RHEL 9 and AlmaLinux 9 ship, so a grid
@@ -87,7 +87,7 @@ Coverage is 100% of statements and branches across the package, and `proto/`,
 `ruff` and `mypy --strict` pass clean over the package, which ships
 `py.typed` ([Typing](typing.md)).
 
-Third-party copy works in both dialects from one call: `xrd.third_party` sends
+Third-party copy works in both dialects from one call: `xrdclient.third_party` sends
 the `XrdOucTPC` rendezvous to a `root://` pair and the WLCG `COPY` dialect to
 an `http(s)`/`dav(s)` one, so the bytes move server to server either way.
 

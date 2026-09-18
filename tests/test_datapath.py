@@ -12,19 +12,19 @@ import struct
 
 import pytest
 
-import xrd
+import xrdclient
 from conftest import error, handshake_reply, login_body, ok, protocol_body
-from xrd.config import Config
-from xrd.errors import ConnectionError as XrdConnectionError
-from xrd.errors import ProtocolError, ServerError
-from xrd.flags import OpenFlags
-from xrd.proto import constants as c
-from xrd.proto import machine as m
-from xrd.proto import requests as r
-from xrd.proto import responses as rp
-from xrd.proto.frames import encode
-from xrd.session import Session
-from xrd.testing import FakeServer
+from xrdclient.config import Config
+from xrdclient.errors import ConnectionError as XrdConnectionError
+from xrdclient.errors import ProtocolError, ServerError
+from xrdclient.flags import OpenFlags
+from xrdclient.proto import constants as c
+from xrdclient.proto import machine as m
+from xrdclient.proto import requests as r
+from xrdclient.proto import responses as rp
+from xrdclient.proto.frames import encode
+from xrdclient.session import Session
+from xrdclient.testing import FakeServer
 
 _HDR = struct.Struct(">HH16sI")
 
@@ -289,7 +289,7 @@ def test_a_vector_read_over_a_path_comes_back_on_it(session):
 
 
 def test_a_paged_read_over_a_path_comes_back_on_it(session):
-    from xrd.crypto.crc32c import unpack_pages
+    from xrdclient.crypto.crc32c import unpack_pages
 
     pathid = session.bind_data_path()
     handle = _open(session, "/data/a.root")
@@ -311,7 +311,7 @@ def test_a_closed_session_binds_nothing(server, config):
 
 def test_a_session_with_no_id_binds_nothing(session):
     session._m.session_id = b""
-    with pytest.raises(xrd.errors.XRootDError, match=r"gave this session no id"):
+    with pytest.raises(xrdclient.errors.XRootDError, match=r"gave this session no id"):
         session.bind_data_path()
 
 
@@ -325,7 +325,7 @@ def test_a_server_that_hands_out_the_same_path_twice_is_refused(server, session)
     session.bind_data_path()
 
     def one_path(conn, sid, params, body):
-        yield xrd.testing.server.frame(sid, c.kXR_ok, b"\x01")
+        yield xrdclient.testing.server.frame(sid, c.kXR_ok, b"\x01")
 
     server.handlers[c.kXR_bind] = one_path
     with pytest.raises(ProtocolError, match="twice"):
@@ -335,7 +335,7 @@ def test_a_server_that_hands_out_the_same_path_twice_is_refused(server, session)
 
 def test_a_server_that_answers_a_bind_with_zero_is_refused(server, session):
     def no_path(conn, sid, params, body):
-        yield xrd.testing.server.frame(sid, c.kXR_ok, b"\x00")
+        yield xrdclient.testing.server.frame(sid, c.kXR_ok, b"\x00")
 
     server.handlers[c.kXR_bind] = no_path
     with pytest.raises(ProtocolError, match="control link"):
@@ -370,7 +370,7 @@ def test_losing_a_path_leaves_the_session_usable(server, session):
 
 
 def test_a_file_moves_its_reads_onto_a_path(server, config):
-    with xrd.File(f"{server.url}//data/a.root", config) as fh:
+    with xrdclient.File(f"{server.url}//data/a.root", config) as fh:
         assert fh.data_path == 0
         assert fh.bind_data_path() == 1
         assert fh.data_path == 1
@@ -382,7 +382,7 @@ def test_a_file_moves_its_reads_onto_a_path(server, config):
 
 
 def test_a_file_moves_its_writes_onto_a_path(server, config):
-    fh = xrd.File(f"{server.url}//data/w.root", config)
+    fh = xrdclient.File(f"{server.url}//data/w.root", config)
     fh.open(OpenFlags.NEW | OpenFlags.UPDATE)
     try:
         fh.bind_data_path()
@@ -394,7 +394,7 @@ def test_a_file_moves_its_writes_onto_a_path(server, config):
 
 
 def test_a_re_opened_file_does_not_believe_in_its_old_path(server, config):
-    with xrd.File(f"{server.url}//data/a.root", config) as fh:
+    with xrdclient.File(f"{server.url}//data/a.root", config) as fh:
         fh.bind_data_path()
         server.disconnect()
         assert fh.read(5, 0) == b"hello"
@@ -403,16 +403,16 @@ def test_a_re_opened_file_does_not_believe_in_its_old_path(server, config):
 
 
 def test_an_opened_file_reaches_the_path_through_the_facade(server, config):
-    with xrd.open(f"{server.url}//data/a.root", "rb", config=config) as fh:
+    with xrdclient.open(f"{server.url}//data/a.root", "rb", config=config) as fh:
         assert fh.raw.file.bind_data_path() == 1
         assert fh.read() == b"hello world"
 
 
 def test_the_async_facade_binds_a_path_too(server, config):
-    import xrd.aio
+    import xrdclient.aio
 
     async def go():
-        async with xrd.aio.open(f"{server.url}//data/a.root", "rb", config=config) as fh:
+        async with xrdclient.aio.open(f"{server.url}//data/a.root", "rb", config=config) as fh:
             assert fh.data_path == 0
             assert await fh.bind_data_path() == 1
             assert fh.data_path == 1
@@ -422,13 +422,13 @@ def test_the_async_facade_binds_a_path_too(server, config):
 
 
 def test_an_http_file_has_no_data_path():
-    import xrd.aio
-    from xrd.testing import FakeDAVServer
+    import xrdclient.aio
+    from xrdclient.testing import FakeDAVServer
 
     async def go(url):
-        async with xrd.aio.open(url, "rb") as fh:
+        async with xrdclient.aio.open(url, "rb") as fh:
             assert fh.data_path == 0
-            with pytest.raises(xrd.errors.UnsupportedError, match="bind_data_path"):
+            with pytest.raises(xrdclient.errors.UnsupportedError, match="bind_data_path"):
                 await fh.bind_data_path()
 
     with FakeDAVServer(files={"/f.txt": b"body"}) as dav:
@@ -437,8 +437,8 @@ def test_an_http_file_has_no_data_path():
 
 def test_a_second_file_on_the_same_server_gets_its_own_path(server, config):
     with FakeServer(files={"/d/a": b"a" * 16}) as other:
-        with xrd.File(f"{other.url}//d/a", config) as first:
-            with xrd.File(f"{other.url}//d/a", config) as second:
+        with xrdclient.File(f"{other.url}//d/a", config) as first:
+            with xrdclient.File(f"{other.url}//d/a", config) as second:
                 assert first.bind_data_path() == 1
                 assert second.bind_data_path() == 1  # its own session, its own numbering
                 assert first.read(4, 0) == b"aaaa"

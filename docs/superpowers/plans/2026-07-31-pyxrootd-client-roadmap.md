@@ -1,4 +1,4 @@
-# PyXRootDClient — implementation roadmap
+# xrdclient — implementation roadmap
 
 **Date:** 2026-07-31
 **Design:** [`../specs/2026-07-31-pyxrootd-client-design.md`](../specs/2026-07-31-pyxrootd-client-design.md)
@@ -25,7 +25,7 @@ schedulable and several can run in parallel.
 
 ## Status — as built
 
-Phases 0–10 are **implemented**: 18 kLOC under `src/xrd/` against 18 kLOC of
+Phases 0–10 are **implemented**: 18 kLOC under `src/xrdclient/` against 18 kLOC of
 tests, **2510 tests green in ~50 s** with no third-party import anywhere —
 `root://` and `davs://` are peers, any endpoint copies to any other, both are
 awaitable, both are a URL scheme in pandas and a command in a shell, and the
@@ -41,11 +41,11 @@ Landed since Phase 10, from the same reading of the reference clients: the
 WLCG tape API and `kXR_QPrep` staging, `archive_info`, `kXR_clone` server-side
 range copies, read-ahead in the copy engine, credential prompting, and
 **S3** — `s3://bucket/key` as one more scheme, with SigV4 out of `hmac`,
-multipart uploads, and `xrd.testing.FakeS3Server` to test against
+multipart uploads, and `xrdclient.testing.FakeS3Server` to test against
 ([S3 object storage](../../s3.md)) - and the guard rails a beginner meets
 before they meet the protocol: a ceiling on reads that named no size, an
 `xrd-cp` that will not overwrite without `-f`, and an `xrd-fs rm -r` that asks
-([Safety](../../safety.md)). Newest is `xrd.root`: a pure-Python ROOT and
+([Safety](../../safety.md)). Newest is `xrdclient.root`: a pure-Python ROOT and
 TTree reader that streams baskets off a storage element straight into PyTorch
 tensors, with every column it cannot decode named and refused rather than
 guessed at - since split out as [xrdroot](https://github.com/rob-c/xrdroot),
@@ -76,10 +76,10 @@ which is where that work now lives.
 - **`FileSystem.query_config`, not `config`.** `fs.config` is the
   filesystem's own `Config`; the `kXR_query`/`kXR_Qconfig` lookup could not
   share the name.
-- **`xrd.FileSystem(url)`, not `xrd.connect(url)`.** The class is already a
+- **`xrdclient.FileSystem(url)`, not `xrdclient.connect(url)`.** The class is already a
   context manager and connects lazily, so a factory function would add a name
   without adding a capability.
-- **The reference server is `xrd.testing.FakeServer`**, written fresh rather
+- **The reference server is `xrdclient.testing.FakeServer`**, written fresh rather
   than grown from `pyxrdcp/tests/_refserver.py`, and is tested in its own
   right (`tests/test_testing.py`) because it is public API.
 - **The `(status, result)` compat shim is dropped.** It is the one piece of
@@ -88,7 +88,7 @@ which is where that work now lives.
   Phase 6 needs — keep-alive, ranged `GET`, chunked `PUT`, arbitrary verbs for
   WebDAV — so taking a dependency would buy HTTP/2 at the cost of the property
   that makes this package worth having. The extra was declared, never used, and
-  is now removed: `pip install pyxrootdclient` is all `davs://` takes.
+  is now removed: `pip install xrdclient` is all `davs://` takes.
 - **`http/` is three modules, not five.** `webdav.py`, `digest.py` and
   `macaroon.py` are one file (`dav.py`): they share the XML helpers and the
   `HTTPClient`, and splitting them would have meant three modules importing
@@ -110,8 +110,8 @@ which is where that work now lives.
   executor and cheaper than the bug class it removes. It also stays honest
   about concurrency: two endpoints genuinely overlap, and calls on *one*
   endpoint serialise on the session lock, exactly as they would have in an
-  asyncio driver over a single connection. `import xrd` still does not import
-  `asyncio` — `xrd.aio` is resolved by a module `__getattr__` on first use.
+  asyncio driver over a single connection. `import xrdclient` still does not import
+  `asyncio` — `xrdclient.aio` is resolved by a module `__getattr__` on first use.
 - **`copy_tree`, not `copytree`.** The rest of the surface is `snake_case`
   (`read_bytes`, `query_config`), and `shutil`'s spelling is the outlier.
 - **`xrd-fs`, not `xrdfs`.** The hyphen matches `xrd-cp`, and the tool is not
@@ -175,14 +175,14 @@ which is where that work now lives.
 
 **Deliverable:** an installable, empty-but-correct package with CI green.
 
-- `src/xrd/` layout, `pyproject.toml` (hatchling), extras declared as designed,
+- `src/xrdclient/` layout, `pyproject.toml` (hatchling), extras declared as designed,
   `py.typed`.
 - `ruff`, `mypy --strict`, `pytest` (`-n auto`, `--timeout`), `coverage`
   configured; pre-commit hooks.
 - GitHub Actions: matrix 3.10–3.13 × {core-only, all-extras}. The core-only job
   asserts, by import hook, that no third-party module is imported by
-  `import xrd`.
-- `xrd.__version__`, `_log.py` with the secret-redacting filter, `LICENSE`
+  `import xrdclient`.
+- `xrdclient.__version__`, `_log.py` with the secret-redacting filter, `LICENSE`
   (LGPL, matching the reference projects), `README` skeleton, attribution to
   `libxrdc` recorded up front.
 
@@ -328,8 +328,8 @@ xrootd server. **This is the first genuinely usable release: v0.1.**
 ## Phase 5 — The Pythonic surface
 
 **Status: done**, including the async facade that Phases 3 and 4 deferred.
-`xrd.aio` mirrors the whole surface: `xrd.aio.open` is both awaitable and an
-async context manager, `AsyncFile` carries every method `xrd.open`'s handle
+`xrdclient.aio` mirrors the whole surface: `xrdclient.aio.open` is both awaitable and an
+async context manager, `AsyncFile` carries every method `xrdclient.open`'s handle
 does (`readv`, `pgread`, `writev`, `pgwrite`, `stat`, `checksum` included) plus
 `async for` over lines, and `AsyncFileSystem` carries every `FileSystem`
 method, with `iterdir`/`walk`/`glob` returning async iterators that stay lazy —
@@ -339,7 +339,7 @@ predicates that need no round trip (`readable`, `closed`, `mode`, `name`)
 stay synchronous, because coroutining them would cost every caller an `await`
 and buy nothing. `davs://` works through the same objects. Covered by
 `tests/test_aio.py` (27 tests), which includes a subprocess check that
-`import xrd` still leaves `asyncio` out of `sys.modules`. Not done:
+`import xrdclient` still leaves `asyncio` out of `sys.modules`. Not done:
 `io/buffered.py` and `io/vector.py` as separate modules — `io/raw.py` under
 the stdlib's own `BufferedReader`/`BufferedWriter` covers what they were for,
 and `File.readv` is the vector scheduler.
@@ -355,7 +355,7 @@ wire in this phase.
 2. **`io/buffered.py`, `io/vector.py`** — readahead window, write-behind,
    adaptive chunk sizing, and a `readv`/`pgread` chunk scheduler that keeps N
    requests in flight.
-3. **`xrd.open()`** — full `builtins.open` mode-string semantics mapped onto
+3. **`xrdclient.open()`** — full `builtins.open` mode-string semantics mapped onto
    `OpenFlags`.
 4. **`path.py`** — `XRootDPath`: `/`, `parent`, `name`, `suffix`, `iterdir`,
    `glob`, `rglob`, `walk`, `stat`, `exists`, `is_dir`, `is_file`, `mkdir`,
@@ -364,12 +364,12 @@ wire in this phase.
    endpoint and credentials.
 5. **`config.py`** — `Config` dataclass, `XRD_*`/`BEARER_TOKEN*`/
    `X509_USER_PROXY`/`XrdSecSSSKT` resolution, `contextvars` override,
-   `xrd.configure()` / `with xrd.config(...)`.
+   `xrdclient.configure()` / `with xrdclient.config(...)`.
 6. **`xrd/__init__.py`** — the curated public surface; `__all__` is a
    deliberate, short list.
 
 **Tests:** a conformance suite that runs the *same* test body against a local
-file, an `XRootDPath`, and an `xrd.open()` handle, asserting identical
+file, an `XRootDPath`, and an `xrdclient.open()` handle, asserting identical
 behavior — the strongest statement that the API is genuinely Pythonic.
 
 **Done when:** the design §6 examples all run verbatim. **v0.2.**
@@ -379,9 +379,9 @@ behavior — the strongest statement that the API is genuinely Pythonic.
 ## Phase 6 — HTTP, WebDAV, and XrdHttp
 
 **Status: done** — `http/{client,file,dav}.py`, stdlib only (no `httpx`),
-tested against `xrd.testing.FakeDAVServer` in `tests/test_http.py`. Scheme
-dispatch is transparent: `xrd.open`, `xrd.FileSystem`, `xrd.XRootDPath` and
-`xrd.copy` all take `http(s)`/`dav(s)`/`webdav` URLs. Not done: HTTP/2,
+tested against `xrdclient.testing.FakeDAVServer` in `tests/test_http.py`. Scheme
+dispatch is transparent: `xrdclient.open`, `xrdclient.FileSystem`, `xrdclient.XRootDPath` and
+`xrdclient.copy` all take `http(s)`/`dav(s)`/`webdav` URLs. Not done: HTTP/2,
 multi-range responses, and `COPY`-based HTTP third-party copy.
 
 **Deliverable:** `https://`, `davs://`, and XrdHttp endpoints as first-class
@@ -400,7 +400,7 @@ peers of `root://`, behind the same `FileSystem`/`XRootDPath`/`open()` surface.
 4. **`http/macaroon.py`** — minting via `POST` with caveat requests,
    attenuation for delegation.
 5. Wire it into the URL dispatcher so scheme selection is transparent:
-   `XRootDPath("davs://...")` and `xrd.open("https://...")` just work.
+   `XRootDPath("davs://...")` and `xrdclient.open("https://...")` just work.
 
 **Tests:** against a local WebDAV server fixture and, when available, a real
 XrdHttp door started from the installed `xrootd` with the HTTP protocol
@@ -476,7 +476,7 @@ is waiting on, so a read and a write overlap instead of taking turns; the
 chunk size stays fixed, because the span layout hands every worker a whole
 `chunk_size` and a size that moved under it would change that plan.
 
-**Deliverable:** `xrd.copy` / `xrd.copytree`, any backend to any backend.
+**Deliverable:** `xrdclient.copy` / `xrdclient.copytree`, any backend to any backend.
 
 1. **`copy/engine.py`** — chunked pump, in-flight window over a multiplexed
    connection, adaptive chunk size, resumption from partial state.
@@ -558,7 +558,7 @@ purpose. As built:
    other half — a real `xrootd`, with stock `xrdcp`/`xrdfs` reading back what
    we wrote. It found a genuine bug the fake could not: `kXR_writev` counted
    its data in `dlen`, which the real server refuses.
-2. **Fault-injection sweep** — done, `xrd.testing.FaultProxy` (shipped in the
+2. **Fault-injection sweep** — done, `xrdclient.testing.FaultProxy` (shipped in the
    package, not just the suite) and `tests/test_faults.py`: drop, stall,
    delay, corrupt, chop, rewrite, refuse, cut. Handle recovery, mid-transfer
    redirect and reconnect all drive through it.
@@ -594,7 +594,7 @@ purpose. As built:
   ships today. Nothing in the suite is version-specific.
 - The fault proxy is written here rather than borrowed from `libxrdc`'s
   `brix_fault_proxy`: it is 340 lines, it has no dependency, and shipping it
-  in `xrd.testing` means users can break *their* code with it too.
+  in `xrdclient.testing` means users can break *their* code with it too.
 - The "GIL-bound checksum ceiling" turned out not to be worth documenting as a
   ceiling: checksums are asked of the server (`kXR_query`), so the only
   Python-speed path is one the user opts into.
@@ -634,8 +634,8 @@ semantics.
 | Dependency policy | Stdlib core + optional extras | Installs on locked-down grid worker nodes with no wheel access. **As built the extras shrank twice:** HTTP needed none (`http.client`), and neither did GSI once AES/RSA/DER were written in pure Python. What is left is `[krb5]` (gssapi), `[fsspec]`, `[dev]`. |
 | Concurrency | Sans-io core, sync + async facades | One protocol implementation, two thin drivers. Async matters for high-fan-out metadata and multi-file reads; sync must stay usable without an event loop (notebooks, scripts). |
 | Error model | Exceptions (also `OSError`) + `(status, result)` compat shim | `except FileNotFoundError` must work on remote paths for the API to feel native; the shim preserves the migration path from pyxrootd. |
-| Import name | `xrd` (dist `pyxrootdclient`) | Verified: official bindings occupy `XRootD`. A distinct name lets both live in one venv, which the parity harness in Phase 10 requires. |
+| Import name | `xrdclient` (dist `xrdclient`) | Verified: official bindings occupy `XRootD`. A distinct name lets both live in one venv, which the parity harness in Phase 10 requires. |
 | Python floor | 3.10 | `slots=True` dataclasses, `X | Y` annotations, `match`. 3.9 is EOL. |
-| Reference server | Grow `pyxrdcp/tests/_refserver.py`, ship it in `xrd.testing` | Offline CI everywhere, plus downstream users can test against it. **As built:** written fresh as `xrd.testing.FakeServer`; see the status section. |
+| Reference server | Grow `pyxrdcp/tests/_refserver.py`, ship it in `xrdclient.testing` | Offline CI everywhere, plus downstream users can test against it. **As built:** written fresh as `xrdclient.testing.FakeServer`; see the status section. |
 | Error model, revised | Exceptions only; no `(status, result)` shim | The shim would reintroduce the ergonomics the project exists to replace, and every call site that wants it can write `try/except` once. |
 | TPC dialect | Stock XRootD order only | `libxrdc/lib/xfer/copy_remote.c:154` documents that the legacy full-URL `tpc.src` form fails against stock servers. |

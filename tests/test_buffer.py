@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from xrd.errors import ProtocolError
-from xrd.proto.buffer import Reader, Writer
+from xrdclient.errors import ProtocolError
+from xrdclient.proto.buffer import Reader, Writer
 
 
 def test_reader_reads_every_width_big_endian():

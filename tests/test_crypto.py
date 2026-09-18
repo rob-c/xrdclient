@@ -11,10 +11,10 @@ import zlib
 
 import pytest
 
-from xrd.crypto.aes import BLOCK_SIZE, cbc_encrypt
-from xrd.crypto.blowfish import Blowfish, _pi_fraction_words
-from xrd.crypto.checksum import algorithms, checksum_bytes, checksum_file, new
-from xrd.crypto.crc32c import (
+from xrdclient.crypto.aes import BLOCK_SIZE, cbc_encrypt
+from xrdclient.crypto.blowfish import Blowfish, _pi_fraction_words
+from xrdclient.crypto.checksum import algorithms, checksum_bytes, checksum_file, new
+from xrdclient.crypto.crc32c import (
     PAGE_SIZE,
     _crc32c_py,
     crc32c,
@@ -22,11 +22,11 @@ from xrd.crypto.crc32c import (
     page_span,
     unpack_pages,
 )
-from xrd.crypto.crc64 import crc64, crc64nvme
-from xrd.crypto.sigver import Signer, is_signed, sigver_hash, sigver_sign, sigver_verify
-from xrd.proto import constants as c
-from xrd.proto import requests as r
-from xrd.proto.frames import encode
+from xrdclient.crypto.crc64 import crc64, crc64nvme
+from xrdclient.crypto.sigver import Signer, is_signed, sigver_hash, sigver_sign, sigver_verify
+from xrdclient.proto import constants as c
+from xrdclient.proto import requests as r
+from xrdclient.proto.frames import encode
 
 # --------------------------------------------------------------------------
 # CRC32C (Castagnoli) - RFC 3720 appendix B

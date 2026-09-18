@@ -1,6 +1,6 @@
 """The byte pipes underneath the protocol: sockets, TLS, and the memory pair.
 
-Everything above this layer is written against :class:`~xrd.transport.base.
+Everything above this layer is written against :class:`~xrdclient.transport.base.
 Transport`, so these two implementations are what decides whether a timeout
 arrives as :class:`TimeoutError` or as something the caller has to guess at.
 The socket tests use a real loopback listener - a mocked socket would test the
@@ -18,11 +18,11 @@ from collections import deque
 import pytest
 
 from _pki import make_certificate, name, pem, private_key_pem, throwaway_key
-from xrd.config import Config
-from xrd.errors import ConnectionError as XrdConnectionError
-from xrd.errors import TimeoutError as XrdTimeoutError
-from xrd.transport.memory import MemoryTransport, pipe
-from xrd.transport.sync import SocketTransport
+from xrdclient.config import Config
+from xrdclient.errors import ConnectionError as XrdConnectionError
+from xrdclient.errors import TimeoutError as XrdTimeoutError
+from xrdclient.transport.memory import MemoryTransport, pipe
+from xrdclient.transport.sync import SocketTransport
 
 CONFIG = Config(connect_timeout=5.0, request_timeout=5.0)
 

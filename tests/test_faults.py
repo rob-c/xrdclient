@@ -1,6 +1,6 @@
 """Resilience: what happens when the network stops cooperating.
 
-Every test here puts a :class:`~xrd.testing.FaultProxy` between the client and
+Every test here puts a :class:`~xrdclient.testing.FaultProxy` between the client and
 a real loopback server and then breaks it — drops, stalls, corruption,
 byte-at-a-time delivery, refused connections. The assertions are about what
 the *client* does, which is the only part of this that ships.
@@ -14,16 +14,16 @@ import time
 
 import pytest
 
-from xrd import FileSystem
-from xrd.client.file import File
-from xrd.config import Config
-from xrd.errors import ConnectionError as XrdConnectionError
-from xrd.errors import ProtocolError, TransientError
-from xrd.errors import TimeoutError as XrdTimeoutError
-from xrd.flags import OpenFlags
-from xrd.testing import FakeServer, FaultProxy
-from xrd.testing.faults import _address, _pieces
-from xrd.url import parse
+from xrdclient import FileSystem
+from xrdclient.client.file import File
+from xrdclient.config import Config
+from xrdclient.errors import ConnectionError as XrdConnectionError
+from xrdclient.errors import ProtocolError, TransientError
+from xrdclient.errors import TimeoutError as XrdTimeoutError
+from xrdclient.flags import OpenFlags
+from xrdclient.testing import FakeServer, FaultProxy
+from xrdclient.testing.faults import _address, _pieces
+from xrdclient.url import parse
 
 PAYLOAD = b"".join(bytes([i % 251]) for i in range(8192))
 
@@ -290,10 +290,10 @@ def test_recovery_gives_up_when_the_server_is_really_gone(broken, patient):
 
 
 def test_the_high_level_file_object_recovers_too(broken, patient):
-    """``xrd.open`` is what most callers use; it must inherit the property."""
-    import xrd
+    """``xrdclient.open`` is what most callers use; it must inherit the property."""
+    import xrdclient
 
-    with xrd.open(broken.url.with_path("/data/big.root"), "rb", config=patient) as fh:
+    with xrdclient.open(broken.url.with_path("/data/big.root"), "rb", config=patient) as fh:
         assert fh.read(32) == PAYLOAD[:32]
         broken.cut()
         assert fh.read(32) == PAYLOAD[32:64]

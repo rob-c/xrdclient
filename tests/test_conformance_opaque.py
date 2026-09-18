@@ -15,10 +15,10 @@ from __future__ import annotations
 
 import pytest
 
-from xrd.client.filesystem import _cgi, _split_cgi
-from xrd.config import Config
-from xrd.proto import constants as c
-from xrd.testing import FakeServer
+from xrdclient.client.filesystem import _cgi, _split_cgi
+from xrdclient.config import Config
+from xrdclient.proto import constants as c
+from xrdclient.testing import FakeServer
 
 TOKEN = "authz=TOKEN"
 
@@ -35,7 +35,7 @@ def srv():
 @pytest.fixture
 def tokened(srv):
     """A filesystem whose own URL carries a token, as a signed URL does."""
-    from xrd import FileSystem
+    from xrdclient import FileSystem
 
     fs = FileSystem(f"{srv.url.with_path('/store')}?{TOKEN}", _CONFIG)
     try:
@@ -72,7 +72,7 @@ def test_a_path_with_no_opaque_data_stays_that_way():
 
 def test_the_inherited_token_is_appended():
     assert _cgi("", {"authz": "T"}) == "?authz=T"
-    assert _cgi("xrd.k=1", {"authz": "T"}) == "?xrd.k=1&authz=T"
+    assert _cgi("xrdclient.k=1", {"authz": "T"}) == "?xrdclient.k=1&authz=T"
 
 
 def test_what_the_caller_spelled_out_wins():
@@ -130,10 +130,10 @@ def test_both_halves_of_a_rename_keep_their_own(tokened, srv):
 
 
 def test_a_rename_lets_each_half_carry_something_different(tokened, srv):
-    tokened.rename("f.root?xrd.a=1", "moved.root?xrd.b=2")
+    tokened.rename("f.root?xrdclient.a=1", "moved.root?xrdclient.b=2")
     source, destination = arguments(srv, c.kXR_mv)[0].split()
-    assert "xrd.a=1" in source and "xrd.b=2" not in source
-    assert "xrd.b=2" in destination and "xrd.a=1" not in destination
+    assert "xrdclient.a=1" in source and "xrdclient.b=2" not in source
+    assert "xrdclient.b=2" in destination and "xrdclient.a=1" not in destination
 
 
 def test_every_level_of_a_makedirs_is_asked_for_with_the_token(tokened, srv):
@@ -160,8 +160,8 @@ def test_an_open_carries_the_token_and_only_once(tokened, srv):
 
 
 def test_a_caller_can_add_to_the_inherited_token(tokened, srv):
-    tokened.stat("f.root?xrd.k=1")
-    assert arguments(srv, c.kXR_stat) == [f"/store/f.root?xrd.k=1&{TOKEN}"]
+    tokened.stat("f.root?xrdclient.k=1")
+    assert arguments(srv, c.kXR_stat) == [f"/store/f.root?xrdclient.k=1&{TOKEN}"]
 
 
 def test_a_caller_can_override_the_inherited_token(tokened, srv):
@@ -170,8 +170,8 @@ def test_a_caller_can_override_the_inherited_token(tokened, srv):
 
 
 def test_the_token_survives_path_normalisation(tokened, srv):
-    tokened.stat("sub/../f.root?xrd.k=1")
-    assert arguments(srv, c.kXR_stat) == [f"/store/f.root?xrd.k=1&{TOKEN}"]
+    tokened.stat("sub/../f.root?xrdclient.k=1")
+    assert arguments(srv, c.kXR_stat) == [f"/store/f.root?xrdclient.k=1&{TOKEN}"]
 
 
 def test_walk_yields_paths_not_paths_with_a_query_on_the_end(tokened, srv):
@@ -193,14 +193,14 @@ def test_a_raw_query_is_left_exactly_as_it_was_written(tokened, srv):
     wants ``"version"``, not ``"/store/version?authz=..."`` - so guessing
     would be worse than the caller saying what they mean.
     """
-    from xrd.flags import QueryCode
+    from xrdclient.flags import QueryCode
 
     assert b"v5.6.0" in tokened.query(QueryCode.CONFIG, "version")
     assert arguments(srv, c.kXR_query) == ["version"]
 
 
 def test_a_filesystem_without_a_token_sends_no_query_at_all(srv):
-    from xrd import FileSystem
+    from xrdclient import FileSystem
 
     with FileSystem(srv.url, _CONFIG) as fs:
         srv.arguments.clear()
@@ -215,9 +215,9 @@ def test_a_filesystem_without_a_token_sends_no_query_at_all(srv):
 
 
 def test_a_path_carries_its_query_into_the_open(srv):
-    import xrd
+    import xrdclient
 
-    path = xrd.Path(f"{srv.url.with_path('/store/f.root')}?{TOKEN}", config=_CONFIG)
+    path = xrdclient.Path(f"{srv.url.with_path('/store/f.root')}?{TOKEN}", config=_CONFIG)
     try:
         assert path.read_bytes() == b"payload"
     finally:
@@ -226,9 +226,9 @@ def test_a_path_carries_its_query_into_the_open(srv):
 
 
 def test_a_child_path_inherits_the_query(srv):
-    import xrd
+    import xrdclient
 
-    root = xrd.Path(f"{srv.url.with_path('/store')}?{TOKEN}", config=_CONFIG)
+    root = xrdclient.Path(f"{srv.url.with_path('/store')}?{TOKEN}", config=_CONFIG)
     try:
         assert (root / "f.root").read_bytes() == b"payload"
     finally:
@@ -237,26 +237,28 @@ def test_a_child_path_inherits_the_query(srv):
 
 
 def test_xrd_open_carries_the_query(srv):
-    import xrd
+    import xrdclient
 
-    with xrd.open(f"{srv.url.with_path('/store/f.root')}?{TOKEN}", "rb", config=_CONFIG) as fh:
+    url = f"{srv.url.with_path('/store/f.root')}?{TOKEN}"
+    with xrdclient.open(url, "rb", config=_CONFIG) as fh:
         assert fh.read() == b"payload"
     assert srv.opened == [f"/store/f.root?{TOKEN}"]
 
 
 def test_a_copy_carries_the_query_of_both_ends(srv, tmp_path):
-    import xrd
+    import xrdclient
 
     local = tmp_path / "out.root"
-    xrd.copy(f"{srv.url.with_path('/store/f.root')}?{TOKEN}", local, config=_CONFIG, verify=False)
+    url = f"{srv.url.with_path('/store/f.root')}?{TOKEN}"
+    xrdclient.copy(url, local, config=_CONFIG, verify=False)
     assert local.read_bytes() == b"payload"
     assert srv.opened == [f"/store/f.root?{TOKEN}"]
 
 
 def test_the_token_is_not_in_the_repr_of_a_url(srv):
     """It is a credential, and a repr ends up in a traceback."""
-    import xrd
+    import xrdclient
 
-    url = xrd.parse(f"{srv.url.with_path('/store/f.root')}?{TOKEN}")
+    url = xrdclient.parse(f"{srv.url.with_path('/store/f.root')}?{TOKEN}")
     assert "TOKEN" not in repr(url)
     assert "redacted" in repr(url)

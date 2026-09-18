@@ -1,13 +1,13 @@
 """Wire conformance: what the client does when the answer is wrong.
 
-Two halves. The first drives :class:`~xrd.proto.machine.SessionMachine` by
+Two halves. The first drives :class:`~xrdclient.proto.machine.SessionMachine` by
 hand with frames a server would never send - split in the middle of the
 header, shorter than the length they declare, addressed to a stream nobody
 opened - because a client that only works against a correct server is not a
 client, it is a demo.
 
 The second half goes over a real socket, with
-:attr:`~xrd.testing.FakeServer.handlers` replacing one opcode's reply, and
+:attr:`~xrdclient.testing.FakeServer.handlers` replacing one opcode's reply, and
 checks that a plausible-but-wrong answer is refused rather than handed back
 to the caller as data. Every one of these is a way to silently corrupt an
 analysis, which is why none of them is allowed to be a warning.
@@ -20,13 +20,13 @@ import struct
 import pytest
 
 from conftest import handshake_reply, login_body, ok, protocol_body
-from xrd.config import Config
-from xrd.errors import ProtocolError
-from xrd.proto import constants as c
-from xrd.proto import machine as m
-from xrd.proto import requests as r
-from xrd.proto.frames import decode_header
-from xrd.testing import error, frame
+from xrdclient.config import Config
+from xrdclient.errors import ProtocolError
+from xrdclient.proto import constants as c
+from xrdclient.proto import machine as m
+from xrdclient.proto import requests as r
+from xrdclient.proto.frames import decode_header
+from xrdclient.testing import error, frame
 
 SID = 4  # the first streamid the machine hands out
 
@@ -202,8 +202,8 @@ def hostile(server, fs):
 
 
 def test_a_read_answered_with_more_than_was_asked_for_is_refused(hostile):
-    from xrd.client.file import File
-    from xrd.flags import OpenFlags
+    from xrdclient.client.file import File
+    from xrdclient.flags import OpenFlags
 
     client = hostile(c.kXR_read, answer(b"x" * 4096))
     handle = File(client.url.with_path("/data/a.root"), client.config, router=client._router)
@@ -216,8 +216,8 @@ def test_a_read_answered_with_more_than_was_asked_for_is_refused(hostile):
 
 
 def test_a_paged_read_answered_with_more_than_was_asked_for_is_refused(hostile, server):
-    from xrd.client.file import File
-    from xrd.flags import OpenFlags
+    from xrdclient.client.file import File
+    from xrdclient.flags import OpenFlags
 
     client = hostile(c.kXR_pgread, answer(b"\x00" * 9000))
     handle = File(client.url.with_path("/data/a.root"), client.config, router=client._router)
@@ -237,8 +237,8 @@ def _readv_body(handle: bytes, segments):
 
 
 def test_a_vector_read_missing_a_segment_is_refused_not_returned_empty(hostile, server):
-    from xrd.client.file import File
-    from xrd.flags import OpenFlags
+    from xrdclient.client.file import File
+    from xrdclient.flags import OpenFlags
 
     def only_the_first(conn, sid, params, body):
         fhandle = body[:4]
@@ -255,8 +255,8 @@ def test_a_vector_read_missing_a_segment_is_refused_not_returned_empty(hostile, 
 
 
 def test_a_vector_read_segment_longer_than_asked_for_is_refused(hostile, server):
-    from xrd.client.file import File
-    from xrd.flags import OpenFlags
+    from xrdclient.client.file import File
+    from xrdclient.flags import OpenFlags
 
     def too_generous(conn, sid, params, body):
         # One segment, four times the length asked for - and still inside what
@@ -276,8 +276,8 @@ def test_a_vector_read_segment_longer_than_asked_for_is_refused(hostile, server)
 
 
 def test_a_vector_read_segment_with_a_negative_length_is_refused(hostile, server):
-    from xrd.client.file import File
-    from xrd.flags import OpenFlags
+    from xrdclient.client.file import File
+    from xrdclient.flags import OpenFlags
 
     def negative(conn, sid, params, body):
         yield frame(sid, c.kXR_ok, body[:4] + struct.pack(">iq", -8, 0))
@@ -357,7 +357,7 @@ def test_every_request_frame_is_a_multiple_of_the_header_length(server, fs):
 
 
 def test_a_request_body_past_the_protocol_maximum_is_refused_here(monkeypatch):
-    from xrd.proto.frames import encode
+    from xrdclient.proto.frames import encode
 
     request = r.Write(b"\x00\x00\x00\x01", 0, b"payload")
     monkeypatch.setattr(c, "MAX_FRAME_PAYLOAD", 3)
@@ -366,7 +366,7 @@ def test_a_request_body_past_the_protocol_maximum_is_refused_here(monkeypatch):
 
 
 def test_a_request_that_writes_the_wrong_parameter_length_is_refused():
-    from xrd.proto.frames import Request, encode
+    from xrdclient.proto.frames import Request, encode
 
     class Broken(Request):
         opcode = c.kXR_ping

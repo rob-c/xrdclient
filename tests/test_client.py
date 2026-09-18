@@ -1,6 +1,6 @@
 """``FileSystem`` and ``File`` against a live loopback server.
 
-Everything here goes over a real socket to :class:`xrd.testing.FakeServer`, so
+Everything here goes over a real socket to :class:`xrdclient.testing.FakeServer`, so
 a passing test means the request was framed correctly, the server understood
 it, and the response parsed back into the right Python object.
 """
@@ -14,9 +14,9 @@ import time
 
 import pytest
 
-from xrd.client.file import READV_MAX_BYTES, File, _batches, _write_batches
-from xrd.client.filesystem import FileSystem
-from xrd.errors import (
+from xrdclient.client.file import READV_MAX_BYTES, File, _batches, _write_batches
+from xrdclient.client.filesystem import FileSystem
+from xrdclient.errors import (
     ChecksumMismatchError,
     InvalidArgumentError,
     PageIntegrityError,
@@ -24,10 +24,10 @@ from xrd.errors import (
     TransientError,
     UnsupportedError,
 )
-from xrd.flags import Access, DirListFlags, OpenFlags, StatInfoFlags
-from xrd.proto import constants as c
-from xrd.testing import FakeServer, error, frame, pgwrite_cse
-from xrd.types import CloneRange, ReadRange, WriteChunk
+from xrdclient.flags import Access, DirListFlags, OpenFlags, StatInfoFlags
+from xrdclient.proto import constants as c
+from xrdclient.testing import FakeServer, error, frame, pgwrite_cse
+from xrdclient.types import CloneRange, ReadRange, WriteChunk
 
 
 @pytest.fixture
@@ -110,7 +110,7 @@ def test_a_relative_path_resolves_against_the_url(server, config):
 
 
 def test_cgi_survives_path_resolution(fs):
-    assert fs._abs("a.root?xrd.k=1") == "/a.root?xrd.k=1"
+    assert fs._abs("a.root?xrdclient.k=1") == "/a.root?xrdclient.k=1"
     assert fs._abs("/data/../data/a.root") == "/data/a.root"
 
 
@@ -140,7 +140,7 @@ def test_scandir_without_stat_still_lists(fs):
 def test_a_listing_can_digest_every_entry_as_it_goes(fs):
     """``kXR_dcksm``: one round trip where a checksum per entry would be one
     round trip each."""
-    from xrd.crypto import checksum_bytes
+    from xrdclient.crypto import checksum_bytes
 
     entries = {e.name: e for e in fs.scandir("/data", algorithm="crc32c")}
     assert entries["a.root"].checksum is not None
@@ -255,7 +255,7 @@ def test_glob_only_walks_what_the_pattern_can_reach(fs, server):
     ],
 )
 def test_the_glob_pattern_language(pattern, path, matches):
-    from xrd.client.filesystem import _glob_regex
+    from xrdclient.client.filesystem import _glob_regex
 
     assert bool(_glob_regex(pattern).fullmatch(path)) is matches
 
@@ -405,7 +405,7 @@ def test_checksum_can_ask_for_another_algorithm(fs):
 def test_a_crc64_checksum_is_one_the_client_can_check_itself(fs):
     """Stock XRootD computes no 64-bit CRC, so a gateway that answers with one
     is only useful to a client that can compute the same value."""
-    from xrd.crypto import checksum_bytes
+    from xrdclient.crypto import checksum_bytes
 
     result = fs.checksum("/data/a.root", "crc64")
     assert result.algorithm == "crc64"
@@ -452,7 +452,7 @@ def test_prepare_returns_a_request_handle(fs):
 
 
 def test_evict_is_a_prepare(fs, server):
-    from xrd.proto import constants as c
+    from xrdclient.proto import constants as c
 
     fs.evict(["/data/a.root"])
     assert c.kXR_prepare in server.seen
@@ -467,7 +467,7 @@ def test_a_plain_prepare_evicts_nothing(fs, server):
 def test_prepare_flags_split_across_the_two_option_fields(fs, server):
     """``EVICT`` is an ``optionX`` bit and ``NOTIFY`` an options-byte one, and
     asking for both has to reach the server as both."""
-    from xrd.flags import PrepareFlags
+    from xrdclient.flags import PrepareFlags
 
     fs.prepare(["/data/a.root"], flags=PrepareFlags.EVICT | PrepareFlags.NOTIFY)
     assert server.evicted == ["/data/a.root"]
@@ -549,7 +549,7 @@ def test_archive_info_says_where_each_file_lives(fs, server):
 
 
 def test_archive_info_is_one_round_trip_for_the_lot(fs, server):
-    from xrd.proto import constants as c
+    from xrdclient.proto import constants as c
 
     server.seen.clear()
     fs.archive_info(["/data/a.root", "/data/a.root"])
@@ -897,7 +897,7 @@ def test_cloning_nothing_asks_the_server_for_nothing(source, opened, server):
 
 
 def test_a_clone_of_more_ranges_than_fit_is_split(source, opened, server):
-    from xrd.client.file import CLONE_MAX_RANGES
+    from xrdclient.client.file import CLONE_MAX_RANGES
 
     spans = [(i % 10, 1, i) for i in range(CLONE_MAX_RANGES + 1)]
     assert opened.clone(source, spans) == CLONE_MAX_RANGES + 1
@@ -936,15 +936,15 @@ def test_a_clone_cannot_be_checkpointed(source, opened):
 
 
 def test_a_clone_of_a_handle_the_server_never_opened_is_an_error(opened):
-    from xrd.errors import XRootDError
-    from xrd.proto import requests as r
+    from xrdclient.errors import XRootDError
+    from xrdclient.proto import requests as r
 
     with pytest.raises(XRootDError, match="file is not open"):
         opened._router.execute(r.Clone(opened.handle, [(b"\xff\xff\xff\xff", 0, 1, 0)]))
 
 
 def test_a_clone_list_that_is_not_whole_items_is_refused(opened):
-    from xrd.proto import requests as r
+    from xrdclient.proto import requests as r
 
     class Broken(r.Clone):
         def payload(self) -> bytes:
@@ -1079,7 +1079,7 @@ def test_a_checkpoint_commits_on_a_clean_exit(opened, server):
 
 
 def test_a_checkpoint_rolls_back_and_re_raises(opened, server):
-    from xrd.proto import constants as c
+    from xrdclient.proto import constants as c
 
     opened.write(b"before")
     with pytest.raises(RuntimeError):
@@ -1312,7 +1312,7 @@ def test_removing_an_attribute_that_is_not_there_is_reported(fs):
 def test_an_open_that_answers_with_no_stat_still_yields_a_handle(server, config):
     """``kXR_retstat`` is a request, not a promise; the size is asked for later."""
 
-    from xrd.testing.server import _HANDLERS
+    from xrdclient.testing.server import _HANDLERS
 
     def bare(conn, sid, params, body):
         """The real open, with the optional stat trailer trimmed off."""
@@ -1378,7 +1378,7 @@ def test_a_checkpoint_undoes_a_truncate_as_well_as_a_write(opened, server):
 
 
 def test_a_checkpoint_reports_how_much_room_is_left(opened):
-    from xrd.testing.server import CHECKPOINT_CAPACITY
+    from xrdclient.testing.server import CHECKPOINT_CAPACITY
 
     with opened.checkpoint() as checkpoint:
         assert checkpoint.query().used == 0
@@ -1395,7 +1395,7 @@ def test_a_checkpoint_says_which_file_it_belongs_to(opened):
 
 
 def test_checkpoints_do_not_nest(opened):
-    from xrd.errors import UnsupportedError
+    from xrdclient.errors import UnsupportedError
 
     with opened.checkpoint():
         with pytest.raises(UnsupportedError, match="already has a checkpoint"):
@@ -1404,7 +1404,7 @@ def test_checkpoints_do_not_nest(opened):
 
 
 def test_a_writev_cannot_be_checkpointed_and_says_so(opened):
-    from xrd.errors import UnsupportedError
+    from xrdclient.errors import UnsupportedError
 
     with opened.checkpoint():
         with pytest.raises(UnsupportedError, match="write, pgwrite and truncate"):
@@ -1419,8 +1419,8 @@ def test_a_pgwrite_inside_a_checkpoint_is_wrapped_too(opened, server):
 
 
 def test_a_checkpoint_that_runs_out_of_room_raises(opened, monkeypatch):
-    from xrd.errors import NoSpaceError
-    from xrd.testing import server as fake
+    from xrdclient.errors import NoSpaceError
+    from xrdclient.testing import server as fake
 
     monkeypatch.setattr(fake, "CHECKPOINT_CAPACITY", 4)
     with pytest.raises(NoSpaceError):
@@ -1429,15 +1429,15 @@ def test_a_checkpoint_that_runs_out_of_room_raises(opened, monkeypatch):
 
 
 def test_only_a_write_or_a_truncate_can_be_checkpointed():
-    from xrd.proto import requests as r
+    from xrdclient.proto import requests as r
 
     with pytest.raises(ProtocolError, match="kXR_read"):
         r.ChkPoint.execute(b"HDL0", r.Read(b"HDL0", 0, 4))
 
 
 def test_a_server_asked_for_an_unknown_checkpoint_subcode_complains(opened):
-    from xrd.errors import InvalidArgumentError
-    from xrd.proto import requests as r
+    from xrdclient.errors import InvalidArgumentError
+    from xrdclient.proto import requests as r
 
     with opened.checkpoint():
         with pytest.raises(InvalidArgumentError, match="unknown checkpoint subcode"):
@@ -1445,18 +1445,18 @@ def test_a_server_asked_for_an_unknown_checkpoint_subcode_complains(opened):
 
 
 def test_a_checkpoint_operation_with_no_checkpoint_open_is_refused(opened):
-    from xrd.errors import InvalidArgumentError
-    from xrd.flags import ChkPointCode
-    from xrd.proto import requests as r
+    from xrdclient.errors import InvalidArgumentError
+    from xrdclient.flags import ChkPointCode
+    from xrdclient.proto import requests as r
 
     with pytest.raises(InvalidArgumentError, match="no checkpoint is open"):
         opened._router.execute(r.ChkPoint(opened.handle, int(ChkPointCode.QUERY)))
 
 
 def test_a_checkpoint_payload_that_is_not_a_request_header_is_refused(opened):
-    from xrd.errors import InvalidArgumentError
-    from xrd.flags import ChkPointCode
-    from xrd.proto import requests as r
+    from xrdclient.errors import InvalidArgumentError
+    from xrdclient.flags import ChkPointCode
+    from xrdclient.proto import requests as r
 
     with opened.checkpoint():
         with pytest.raises(InvalidArgumentError, match="not one request header"):
@@ -1464,10 +1464,10 @@ def test_a_checkpoint_payload_that_is_not_a_request_header_is_refused(opened):
 
 
 def test_a_server_refuses_to_checkpoint_an_operation_that_is_not_one(opened):
-    from xrd.errors import UnsupportedError
-    from xrd.flags import ChkPointCode
-    from xrd.proto import requests as r
-    from xrd.proto.frames import encode
+    from xrdclient.errors import UnsupportedError
+    from xrdclient.flags import ChkPointCode
+    from xrdclient.proto import requests as r
+    from xrdclient.proto.frames import encode
 
     header = encode(r.Read(opened.handle, 0, 4), 0)[: c.REQUEST_HDRLEN]
     with opened.checkpoint():
@@ -1493,14 +1493,14 @@ def test_a_hard_link_is_the_same_bytes_under_another_name(fs):
 
 
 def test_linking_to_a_target_that_is_not_there_raises(fs):
-    from xrd.errors import NotFoundError
+    from xrdclient.errors import NotFoundError
 
     with pytest.raises(NotFoundError):
         fs.symlink("/data/absent.root", "/data/dangling.root")
 
 
 def test_reading_a_link_that_is_not_one_raises(fs):
-    from xrd.errors import NotFoundError
+    from xrdclient.errors import NotFoundError
 
     with pytest.raises(NotFoundError):
         fs.readlink("/data/a.root")
@@ -1531,7 +1531,7 @@ def test_is_symlink_asks_the_only_question_with_an_unambiguous_answer(fs):
 
 
 def test_a_server_without_the_link_extension_says_it_is_unsupported(server, config):
-    from xrd.errors import UnsupportedError, kXR_Unsupported
+    from xrdclient.errors import UnsupportedError, kXR_Unsupported
 
     def refuse(conn, sid, params, body):
         yield error(sid, kXR_Unsupported, "kXR_symlink is not supported")
@@ -1582,7 +1582,7 @@ def test_utime_refuses_to_guess_between_seconds_and_nanoseconds(fs):
 def test_a_time_the_request_asks_to_omit_is_left_alone(fs, server):
     """Nothing in ``os.utime`` says "this one only", but the wire has a word
     for it, and a server that gets it must not move the other."""
-    from xrd.proto import requests as r
+    from xrdclient.proto import requests as r
 
     fs.utime("/data/a.root", (1_000_000_000, 1_000_000_000))
     fs._router.execute(
@@ -1606,7 +1606,7 @@ def test_chown_changes_the_ids_and_minus_one_leaves_one_alone(fs, server):
 
 
 def test_setting_the_times_of_something_absent_raises(fs):
-    from xrd.errors import NotFoundError
+    from xrdclient.errors import NotFoundError
 
     with pytest.raises(NotFoundError):
         fs.utime("/data/absent.root")
@@ -1615,7 +1615,7 @@ def test_setting_the_times_of_something_absent_raises(fs):
 
 
 def test_a_server_without_setattr_says_it_is_unsupported(server, config):
-    from xrd.errors import UnsupportedError, kXR_Unsupported
+    from xrdclient.errors import UnsupportedError, kXR_Unsupported
 
     def refuse(conn, sid, params, body):
         yield error(sid, kXR_Unsupported, "kXR_setattr is not supported")

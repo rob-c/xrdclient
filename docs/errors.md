@@ -9,7 +9,7 @@ raised, so code written against `/tmp` works against `root://` unchanged:
 
 ```python
 try:
-    data = xrd.Path("root://host//store/f.root").read_bytes()
+    data = xrdclient.Path("root://host//store/f.root").read_bytes()
 except FileNotFoundError:
     ...
 except PermissionError:
@@ -52,7 +52,7 @@ Exception
         └── ServerTimeoutError        + TimeoutError        ETIMEDOUT
 ```
 
-Catch broadly with `xrd.XRootDError`, or narrowly with the builtin you already
+Catch broadly with `xrdclient.XRootDError`, or narrowly with the builtin you already
 know.
 
 `TLSRequiredError` is a server refusing to do this in the clear (`kXR_error`
@@ -64,7 +64,7 @@ know.
 ```python
 try:
     fs.stat("/store/missing")
-except xrd.ServerError as exc:
+except xrdclient.ServerError as exc:
     exc.code        # 3011, the kXR_ code
     exc.message     # the server's own text
     exc.path        # what we asked about
@@ -88,8 +88,8 @@ permanent answer.
 ```python
 for attempt in range(5):
     try:
-        return xrd.Path(url).read_bytes()
-    except xrd.TransientError:
+        return xrdclient.Path(url).read_bytes()
+    except xrdclient.TransientError:
         time.sleep(2 ** attempt)
 raise
 ```
@@ -115,7 +115,7 @@ to repeat, are reissued on a fresh connection.
 ## Authentication failures
 
 ```python
-except xrd.NoMechanismError as exc:
+except xrdclient.NoMechanismError as exc:
     print(exc)
     exc.offered    # ['gsi', 'unix'] - what the server said it would take
     exc.tried      # {'gsi': 'there is no file at /tmp/x509up_u1000; try: ...'}
@@ -140,7 +140,7 @@ when the invented answer turns out to be wrong.
 ## Checksums
 
 ```python
-except xrd.ChecksumMismatchError as exc:
+except xrdclient.ChecksumMismatchError as exc:
     exc.algorithm, exc.expected, exc.actual
 ```
 
@@ -150,7 +150,7 @@ authentication one - see [Security](security.md).
 ## Too much at once
 
 ```python
-except xrd.TooLargeError as exc:
+except xrdclient.TooLargeError as exc:
     exc.size, exc.limit, exc.path
 ```
 
@@ -165,4 +165,4 @@ anything at all once `max_read_size` is `0`. See [Safety](safety.md).
 `FormatError` when the bytes are not the format they claim, and
 `UnsupportedFeatureError` for a valid file using something that reader does
 not decode. Both are `XRootDError` subclasses from here, so an `except
-xrd.errors.XRootDError` catches them too.
+xrdclient.errors.XRootDError` catches them too.

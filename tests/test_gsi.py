@@ -12,9 +12,9 @@ import time
 import pytest
 
 from _pki import DH_GENERATOR, DH_PRIME, dh_parameters_pem, pem, proxy_chain, throwaway_key
-from xrd.auth import gsi, registry, select
-from xrd.auth.base import Offer
-from xrd.auth.gsi import (
+from xrdclient.auth import gsi, registry, select
+from xrdclient.auth.base import Offer
+from xrdclient.auth.gsi import (
     BUCKET_CIPHER,
     BUCKET_CIPHER_ALG,
     BUCKET_CLNT_OPTS,
@@ -46,9 +46,9 @@ from xrd.auth.gsi import (
     parse_peer_blob,
     session_key,
 )
-from xrd.config import Config
-from xrd.crypto import cbc_decrypt, load_proxy
-from xrd.errors import CredentialError
+from xrdclient.config import Config
+from xrdclient.crypto import cbc_decrypt, load_proxy
+from xrdclient.errors import CredentialError
 
 OFFER = Offer("gsi", "v:10400,c:ssl,ca:1a2b3c4d.0")
 

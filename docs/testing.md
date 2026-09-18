@@ -1,12 +1,12 @@
 # Testing against it
 
-`xrd.testing` ships three servers. They are part of the installed package, not
+`xrdclient.testing` ships three servers. They are part of the installed package, not
 test-suite scaffolding, because the code that is hardest to test is yours -
 the retry loop, the failure handler, the thing that has to cope with a data
 server disappearing.
 
 ```python
-from xrd.testing import FakeServer, FakeDAVServer, FakeS3Server, FaultProxy
+from xrdclient.testing import FakeServer, FakeDAVServer, FakeS3Server, FaultProxy
 ```
 
 Nothing here needs a daemon, a port you own, or root. Everything binds an
@@ -15,11 +15,11 @@ ephemeral loopback port and cleans up.
 ## `FakeServer` - the XRootD protocol
 
 ```python
-import xrd
-from xrd.testing import FakeServer
+import xrdclient
+from xrdclient.testing import FakeServer
 
 with FakeServer(files={"/store/f.root": b"payload"}, dirs=["/store/empty"]) as srv:
-    fs = xrd.FileSystem(str(srv.url))
+    fs = xrdclient.FileSystem(str(srv.url))
     assert fs.read_bytes("/store/f.root") == b"payload"
     fs.write_bytes("/store/g.root", b"new")
 
@@ -41,7 +41,7 @@ were aimed.
 
 That is what a stock daemon does. A gateway may instead key a sub-stream on the
 connection a request *arrived* on and answer the whole thing there, which is
-what `xrd` tries first — set `srv.serves_arrivals = True` for a server of that
+what `xrdclient` tries first — set `srv.serves_arrivals = True` for a server of that
 kind. Leave it off for the standard split; a client that mixes the two would
 have both ends reading the same socket.
 
@@ -75,12 +75,12 @@ And for assertions:
 | `srv.config_values` | what `kXR_query` config answers |
 
 ```python
-from xrd.proto import constants as c
+from xrdclient.proto import constants as c
 
 with FakeServer(files={"/f": b"x" * (1 << 20)}) as srv:
     srv.chunk_reads = 8192               # force reassembly
     srv.waits[c.kXR_open] = 1            # and one wait first
-    assert xrd.Path(f"{srv.url}/f").read_bytes() == b"x" * (1 << 20)
+    assert xrdclient.Path(f"{srv.url}/f").read_bytes() == b"x" * (1 << 20)
     assert c.kXR_open in srv.seen
 ```
 
@@ -88,11 +88,11 @@ with FakeServer(files={"/f": b"x" * (1 << 20)}) as srv:
 
 `srv.handlers[opcode]` replaces one opcode's reply. A handler takes
 `(connection, streamid, params, body)` and yields raw frames, which
-`xrd.testing.frame` and `xrd.testing.error` build for you:
+`xrdclient.testing.frame` and `xrdclient.testing.error` build for you:
 
 ```python
-from xrd.testing import FakeServer, error, frame
-from xrd.proto import constants as c
+from xrdclient.testing import FakeServer, error, frame
+from xrdclient.proto import constants as c
 
 def truncated(conn, sid, params, body):
     yield frame(sid, c.kXR_ok, b"short")      # fewer bytes than were asked for
@@ -114,7 +114,7 @@ dataset, a file you are debugging - without a daemon, a configuration file or
 a port you need permission to bind:
 
 ```console
-$ python -m xrd.testing datasets --port 21094 --pattern '*.root'
+$ python -m xrdclient.testing datasets --port 21094 --pattern '*.root'
 serving 2 files on root://127.0.0.1:21094/ with no login
   root://127.0.0.1:21094//home/you/datasets/mnist.root  11,561,483 bytes
   root://127.0.0.1:21094//mnist.root  11,561,483 bytes
@@ -125,7 +125,7 @@ it has here, so either URL reaches it. `from_directory` is the same thing from
 Python, and takes the same arguments:
 
 ```python
-from xrd.testing import from_directory
+from xrdclient.testing import from_directory
 
 with from_directory("datasets", port=21094, pattern="*.root") as server:
     with xrdroot.open_root(f"{server.url}mnist.root") as f:   # pip install xrdroot
@@ -141,7 +141,7 @@ will try to hold gigabytes.
 
 ```python
 with FakeDAVServer(files={"/store/f.root": b"payload"}) as dav:
-    fs = xrd.FileSystem(str(dav.url))          # already http://host:port/
+    fs = xrdclient.FileSystem(str(dav.url))          # already http://host:port/
     fs.stat("/store/f.root")
     assert ("PROPFIND", "/store/f.root") in dav.seen
 ```
@@ -171,7 +171,7 @@ staging test never needs a tape:
 ```python
 with FakeDAVServer(files={"/store/f.root": b"payload"}) as dav:
     dav.nearline.add("/store/f.root")
-    fs = xrd.FileSystem(str(dav.url))
+    fs = xrdclient.FileSystem(str(dav.url))
     handle = fs.prepare(["/store/f.root"])
     assert not fs.query_prepare(handle, ["/store/f.root"])[0]
     dav.nearline.clear()                       # the tape robot got there
@@ -188,8 +188,8 @@ def hostile(method, path, headers):
 
 with FakeDAVServer(files={"/d/f.root": b"payload"}) as dav:
     dav.handlers["PROPFIND"] = hostile
-    with pytest.raises(xrd.ProtocolError):
-        xrd.FileSystem(str(dav.url)).stat("/d/f.root")
+    with pytest.raises(xrdclient.ProtocolError):
+        xrdclient.FileSystem(str(dav.url)).stat("/d/f.root")
 ```
 
 `ignore_ranges` is the one worth knowing about: caches in front of real
@@ -203,7 +203,7 @@ third-party copy can be tested end to end in one process:
 
 ```python
 with FakeDAVServer(files={"/d/f.root": b"payload"}) as src, FakeDAVServer(dirs=["/d"]) as dst:
-    xrd.third_party(src.url / "d/f.root", dst.url / "d/f.root")
+    xrdclient.third_party(src.url / "d/f.root", dst.url / "d/f.root")
     assert dst.contents("/d/f.root") == b"payload"
 ```
 
@@ -211,7 +211,7 @@ with FakeDAVServer(files={"/d/f.root": b"payload"}) as src, FakeDAVServer(dirs=[
 
 ```python
 with FakeS3Server(objects={"d/a.root": b"payload"}) as s3:
-    fs = xrd.FileSystem(s3.url, endpoint=s3.endpoint, credentials=creds)
+    fs = xrdclient.FileSystem(s3.url, endpoint=s3.endpoint, credentials=creds)
     assert fs.read_bytes("/d/a.root") == b"payload"
     assert ("GET", "/test-bucket/d/a.root", "") in s3.seen
 ```
@@ -229,7 +229,7 @@ with FakeS3Server(objects={"d/a.root": b"payload"}) as s3:
 | `s3.seen` | `(method, path, query)` for every request served, in order |
 
 Signatures are checked rather than trusted, and the check is written out again
-from the AWS specification instead of calling `xrd.s3.sigv4` - a client that
+from the AWS specification instead of calling `xrdclient.s3.sigv4` - a client that
 signs the wrong string is caught here rather than agreed with.
 
 ## `FaultProxy` - breaking the network
@@ -239,10 +239,10 @@ A loopback TCP proxy that sits in front of anything with an address - a
 misbehave mid-connection.
 
 ```python
-from xrd.testing import FakeServer, FaultProxy
+from xrdclient.testing import FakeServer, FaultProxy
 
 with FakeServer(files={"/big": b"payload" * 1000}) as srv, FaultProxy(srv) as proxy:
-    with xrd.open(proxy.url.with_path("/big"), "rb") as fh:
+    with xrdclient.open(proxy.url.with_path("/big"), "rb") as fh:
         head = fh.read(32)
         proxy.cut()                      # the data server goes away mid-read
         assert fh.read(32)               # re-opened underneath, no error
@@ -271,11 +271,11 @@ and `proxy.armed` are there for the assertion.
 
 ```python
 proxy.chop(64).delay(0.01)               # slow and fragmented, still correct
-assert xrd.FileSystem(str(proxy.url)).stat("/big").st_size == 7000
+assert xrdclient.FileSystem(str(proxy.url)).stat("/big").st_size == 7000
 
 proxy.refuse()                           # now the endpoint is simply down
-with pytest.raises(xrd.TransientError):
-    xrd.FileSystem(str(proxy.url)).stat("/big")
+with pytest.raises(xrdclient.TransientError):
+    xrdclient.FileSystem(str(proxy.url)).stat("/big")
 proxy.accept().heal()
 ```
 
@@ -303,7 +303,7 @@ required to develop against the library, and both run in CI.
 ## Coverage
 
 The default suite covers 100% of the package's statements *and* branches -
-including the fake servers in `xrd.testing`, which are shipped code and so are
+including the fake servers in `xrdclient.testing`, which are shipped code and so are
 held to the same standard:
 
 ```console

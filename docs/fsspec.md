@@ -1,7 +1,7 @@
 # fsspec
 
 ```console
-$ pip install pyxrootdclient[fsspec]
+$ pip install xrdclient[fsspec]
 ```
 
 That is the whole setup. The schemes register themselves through entry
@@ -24,7 +24,7 @@ hand when you want this one instead:
 
 ```python
 import fsspec
-from xrd.fsspec_impl import S3XRootDFileSystem
+from xrdclient.fsspec_impl import S3XRootDFileSystem
 
 fsspec.register_implementation("s3", S3XRootDFileSystem, clobber=True)
 ```
@@ -59,7 +59,7 @@ of a thousand files costs a single login.
 fs = fsspec.filesystem(
     "root",
     endpoint="root://eos.example.org",
-    config=xrd.Config(token=my_token, request_timeout=60.0),
+    config=xrdclient.Config(token=my_token, request_timeout=60.0),
 )
 ```
 
@@ -68,7 +68,7 @@ fs = fsspec.filesystem(
 ```python
 pd.read_parquet(
     "root://eos.example.org//store/t.parquet",
-    storage_options={"config": xrd.Config(token=my_token)},
+    storage_options={"config": xrdclient.Config(token=my_token)},
 )
 ```
 

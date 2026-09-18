@@ -15,16 +15,16 @@ import time
 import pytest
 
 from _pki import proxy_chain, throwaway_key
-from xrd import auth
-from xrd.auth import Ask, GSICredential, TokenCredential, UnixCredential, prompt
-from xrd.auth.base import Credential, Offer
-from xrd.auth.sss import SSSCredential
-from xrd.cli import common_flags, config_from
-from xrd.config import Config
-from xrd.errors import NoMechanismError
-from xrd.http import HTTPClient
-from xrd.testing import FakeDAVServer
-from xrd.url import parse
+from xrdclient import auth
+from xrdclient.auth import Ask, GSICredential, TokenCredential, UnixCredential, prompt
+from xrdclient.auth.base import Credential, Offer
+from xrdclient.auth.sss import SSSCredential
+from xrdclient.cli import common_flags, config_from
+from xrdclient.config import Config
+from xrdclient.errors import NoMechanismError
+from xrdclient.http import HTTPClient
+from xrdclient.testing import FakeDAVServer
+from xrdclient.url import parse
 
 GSI = Offer("gsi")
 ZTN = Offer("ztn")
@@ -447,7 +447,7 @@ def test_a_proxy_supplied_by_hand_authenticates(nowhere, proxy_path):
 def test_a_token_supplied_by_hand_authenticates_and_stays_out_of_the_log(nowhere, caplog):
     scripted = Scripted("eyJhbGciOi.payload.signature")
     config = nowhere.evolve(prompt=True, prompter=scripted)
-    with caplog.at_level("DEBUG", logger="xrd"):
+    with caplog.at_level("DEBUG", logger="xrdclient"):
         (cred,) = auth.select("&P=ztn", config, host="dav.example.org")
     assert isinstance(cred, TokenCredential)
     # A ``TokenResp``, not a bare token: the id, the header, then the token.

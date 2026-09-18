@@ -13,9 +13,15 @@ from _pki import (
     throwaway_key,
     tlv,
 )
-from xrd.crypto import RSAPrivateKey, RSAPublicKey, load_private_key, load_public_key, pem_blocks
-from xrd.crypto.der import DERError, parse
-from xrd.crypto.rsa import RSA_OID, _pkcs1_v15_pad, _probably_prime, public_key_from_bitstring
+from xrdclient.crypto import (
+    RSAPrivateKey,
+    RSAPublicKey,
+    load_private_key,
+    load_public_key,
+    pem_blocks,
+)
+from xrdclient.crypto.der import DERError, parse
+from xrdclient.crypto.rsa import RSA_OID, _pkcs1_v15_pad, _probably_prime, public_key_from_bitstring
 
 
 @pytest.fixture(scope="module")
@@ -230,7 +236,7 @@ def _next_prime(start: int) -> int:
 def test_generation_redraws_until_the_pair_is_usable(monkeypatch):
     """Two rejections: ``p == q`` factors ``n`` by ``isqrt``, and a short ``n``
     is not the key size that was asked for."""
-    import xrd.crypto.rsa as rsa
+    import xrdclient.crypto.rsa as rsa
 
     real = rsa._prime
     twin = _next_prime(1 << 255)

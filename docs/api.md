@@ -1,113 +1,113 @@
 # API reference
 
 Generated from the source. Everything below is importable from the top-level
-`xrd` package unless the heading says otherwise.
+`xrdclient` package unless the heading says otherwise.
 
 ## One-line verbs
 
-Each of these takes a URL - as text, as an `XRootDURL`, or as an `xrd.Path` -
+Each of these takes a URL - as text, as an `XRootDURL`, or as an `xrdclient.Path` -
 opens a connection, answers the question and closes it again. See
 [Easy mode](easy.md).
 
-::: xrd.ls
+::: xrdclient.ls
 
-::: xrd.glob
+::: xrdclient.glob
 
-::: xrd.stat
+::: xrdclient.stat
 
-::: xrd.exists
+::: xrdclient.exists
 
-::: xrd.size
+::: xrdclient.size
 
-::: xrd.checksum
+::: xrdclient.checksum
 
-::: xrd.read_bytes
+::: xrdclient.read_bytes
 
-::: xrd.read_text
+::: xrdclient.read_text
 
-::: xrd.write_bytes
+::: xrdclient.write_bytes
 
-::: xrd.write_text
+::: xrdclient.write_text
 
-::: xrd.mkdir
+::: xrdclient.mkdir
 
-::: xrd.remove
+::: xrdclient.remove
 
-::: xrd.move
+::: xrdclient.move
 
-::: xrd.stage
+::: xrdclient.stage
 
-::: xrd.is_online
+::: xrdclient.is_online
 
 ## Entry points
 
-::: xrd.open
+::: xrdclient.open
 
-::: xrd.FileSystem
+::: xrdclient.FileSystem
 
-::: xrd.File
+::: xrdclient.File
 
-::: xrd.Checkpoint
+::: xrdclient.Checkpoint
 
-::: xrd.XRootDPath
+::: xrdclient.XRootDPath
 
 ## Copying
 
-::: xrd.copy
+::: xrdclient.copy
 
-::: xrd.copy_tree
+::: xrdclient.copy_tree
 
-::: xrd.third_party
+::: xrdclient.third_party
 
-::: xrd.CopyResult
+::: xrdclient.CopyResult
 
-::: xrd.SyncMode
+::: xrdclient.SyncMode
 
 ## Configuration
 
-::: xrd.Config
+::: xrdclient.Config
 
-::: xrd.find_config_file
+::: xrdclient.find_config_file
 
-::: xrd.configure
+::: xrdclient.configure
 
-::: xrd.current
+::: xrdclient.current
 
-::: xrd.override
+::: xrdclient.override
 
 ## URLs
 
-::: xrd.parse
+::: xrdclient.parse
 
-::: xrd.XRootDURL
+::: xrdclient.XRootDURL
 
 ## Values
 
-::: xrd.StatInfo
+::: xrdclient.StatInfo
 
-::: xrd.DirEntry
+::: xrdclient.DirEntry
 
-::: xrd.ChecksumInfo
+::: xrdclient.ChecksumInfo
 
-::: xrd.CheckpointInfo
+::: xrdclient.CheckpointInfo
 
-::: xrd.LocationInfo
+::: xrdclient.LocationInfo
 
-::: xrd.PageResult
+::: xrdclient.PageResult
 
-::: xrd.PrepareStatus
+::: xrdclient.PrepareStatus
 
-::: xrd.ProtocolInfo
+::: xrdclient.ProtocolInfo
 
-::: xrd.ReadRange
+::: xrdclient.ReadRange
 
-::: xrd.SpaceInfo
+::: xrdclient.SpaceInfo
 
-::: xrd.VFSInfo
+::: xrdclient.VFSInfo
 
-::: xrd.WriteChunk
+::: xrdclient.WriteChunk
 
-::: xrd.human_bytes
+::: xrdclient.human_bytes
 
 ## Flags
 
@@ -116,75 +116,75 @@ accepts bits - `"stage notify"`, `"checksum"`, `"rwxr-x---"` - and prints as
 those names rather than as a number. The helpers below turn an ordinary
 call's keyword arguments into them.
 
-::: xrd.OpenFlags
+::: xrdclient.OpenFlags
 
-::: xrd.Access
+::: xrdclient.Access
 
-::: xrd.MkDirFlags
+::: xrdclient.MkDirFlags
 
-::: xrd.DirListFlags
+::: xrdclient.DirListFlags
 
-::: xrd.QueryCode
+::: xrdclient.QueryCode
 
-::: xrd.StatInfoFlags
+::: xrdclient.StatInfoFlags
 
-::: xrd.LocateFlags
+::: xrdclient.LocateFlags
 
-::: xrd.PrepareFlags
+::: xrdclient.PrepareFlags
 
-::: xrd.flags.permissions
+::: xrdclient.flags.permissions
 
-::: xrd.flags.open_flags
+::: xrdclient.flags.open_flags
 
-::: xrd.flags.dirlist_flags
+::: xrdclient.flags.dirlist_flags
 
-::: xrd.flags.locate_flags
+::: xrdclient.flags.locate_flags
 
-::: xrd.flags.prepare_flags
+::: xrdclient.flags.prepare_flags
 
 ## Authentication
 
-::: xrd.auth.select
+::: xrdclient.auth.select
 
-::: xrd.auth.require
+::: xrdclient.auth.require
 
-::: xrd.auth.supply
+::: xrdclient.auth.supply
 
-::: xrd.auth.prompt.Ask
+::: xrdclient.auth.prompt.Ask
 
-::: xrd.auth.prompt.ask_on_terminal
+::: xrdclient.auth.prompt.ask_on_terminal
 
-::: xrd.auth.prompt.forget
+::: xrdclient.auth.prompt.forget
 
 ## Errors
 
-::: xrd.errors
+::: xrdclient.errors
 
 ## Asynchronous
 
-::: xrd.aio
+::: xrdclient.aio
 
 ## HTTP and WebDAV
 
-::: xrd.http.third_party
+::: xrdclient.http.third_party
 
-::: xrd.http.macaroon
+::: xrdclient.http.macaroon
 
-::: xrd.http.propfind
+::: xrdclient.http.propfind
 
-::: xrd.http.digest
+::: xrdclient.http.digest
 
-::: xrd.http.HTTPClient
+::: xrdclient.http.HTTPClient
 
 ## S3
 
-::: xrd.s3.S3FileSystem
+::: xrdclient.s3.S3FileSystem
 
-::: xrd.s3.open_s3
+::: xrdclient.s3.open_s3
 
-::: xrd.s3.Credentials
+::: xrdclient.s3.Credentials
 
-::: xrd.s3.sign
+::: xrdclient.s3.sign
 
 ## The packages above this one
 
@@ -194,20 +194,20 @@ own surfaces.
 
 ## Diagnosing
 
-::: xrd.diagnose
+::: xrdclient.diagnose
 
-::: xrd.Report
+::: xrdclient.Report
 
-::: xrd.Check
+::: xrdclient.Check
 
 ## Testing
 
-::: xrd.testing.FakeServer
+::: xrdclient.testing.FakeServer
 
-::: xrd.testing.from_directory
+::: xrdclient.testing.from_directory
 
-::: xrd.testing.FakeDAVServer
+::: xrdclient.testing.FakeDAVServer
 
-::: xrd.testing.FakeS3Server
+::: xrdclient.testing.FakeS3Server
 
-::: xrd.testing.FaultProxy
+::: xrdclient.testing.FaultProxy

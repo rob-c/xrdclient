@@ -11,12 +11,12 @@ from __future__ import annotations
 import subprocess
 import sys
 
-import xrd
-from xrd.config import Config
-from xrd.proto import constants as c
-from xrd.session import SESSIONS, Session, SessionPool
-from xrd.session.pool import _identity, _key
-from xrd.url import parse
+import xrdclient
+from xrdclient.config import Config
+from xrdclient.proto import constants as c
+from xrdclient.session import SESSIONS, Session, SessionPool
+from xrdclient.session.pool import _identity, _key
+from xrdclient.url import parse
 
 
 def logins(server) -> int:
@@ -24,7 +24,7 @@ def logins(server) -> int:
 
 
 class FakeSession:
-    """Enough of a :class:`~xrd.session.Session` to be pooled and closed."""
+    """Enough of a :class:`~xrdclient.session.Session` to be pooled and closed."""
 
     def __init__(self, closed: bool = False, broken: bool = False) -> None:
         self.closed = closed
@@ -50,11 +50,11 @@ def pooled(*sessions: FakeSession) -> Session:
 
 
 def test_a_second_filesystem_reuses_the_first_ones_login(server, config):
-    with xrd.FileSystem(server.url, config) as fs:
+    with xrdclient.FileSystem(server.url, config) as fs:
         fs.stat("/data/a.root")
     assert len(SESSIONS) == 1
 
-    with xrd.FileSystem(server.url, config) as fs:
+    with xrdclient.FileSystem(server.url, config) as fs:
         fs.stat("/data/a.root")
     assert logins(server) == 1
     assert len(SESSIONS) == 1
@@ -67,9 +67,9 @@ def test_two_open_at_once_get_a_connection_each(server, config):
     the documented way to have two things in flight at once is to have two
     handles.
     """
-    with xrd.FileSystem(server.url, config) as first:
+    with xrdclient.FileSystem(server.url, config) as first:
         first.stat("/data/a.root")
-        with xrd.FileSystem(server.url, config) as second:
+        with xrdclient.FileSystem(server.url, config) as second:
             second.stat("/data/a.root")
             assert len(SESSIONS) == 0
     assert logins(server) == 2
@@ -77,18 +77,18 @@ def test_two_open_at_once_get_a_connection_each(server, config):
 
 
 def test_a_file_that_owns_its_connection_returns_it(server, config):
-    with xrd.File(f"{server.url}/data/a.root", config) as handle:
+    with xrdclient.File(f"{server.url}/data/a.root", config) as handle:
         assert handle.read() == b"hello world"
     assert len(SESSIONS) == 1
 
-    with xrd.File(f"{server.url}/data/a.root", config) as handle:
+    with xrdclient.File(f"{server.url}/data/a.root", config) as handle:
         assert handle.read() == b"hello world"
     assert logins(server) == 1
 
 
 def test_a_file_opened_through_a_filesystem_borrows(server, config):
     """The file shares the filesystem's connection, so it must not pool it."""
-    with xrd.FileSystem(server.url, config) as fs:
+    with xrdclient.FileSystem(server.url, config) as fs:
         with fs.open("/data/a.root") as handle:
             assert handle.read() == b"hello world"
         # Closing the file let go of a connection it did not own: had it been
@@ -101,7 +101,7 @@ def test_a_file_opened_through_a_filesystem_borrows(server, config):
 
 def test_an_open_that_fails_still_returns_its_connection(server, config):
     try:
-        xrd.File(f"{server.url}/data/missing.root", config).open()
+        xrdclient.File(f"{server.url}/data/missing.root", config).open()
     except FileNotFoundError:
         pass
     assert len(SESSIONS) == 1
@@ -111,7 +111,7 @@ def test_a_redirect_leaves_the_manager_pooled(server, config):
     """The server that redirected is fine - it just has not got the file."""
     host, port = server.address
     server.redirects[c.kXR_open] = (host, port, "tok=1")
-    with xrd.FileSystem(server.url, config) as fs, fs.open("/data/a.root") as handle:
+    with xrdclient.FileSystem(server.url, config) as fs, fs.open("/data/a.root") as handle:
         assert handle.read() == b"hello world"
     # Redirected back to the same address, so the pooled manager connection is
     # the one the second leg picked up: one login for the two hops.
@@ -123,44 +123,44 @@ def test_a_redirect_leaves_the_manager_pooled(server, config):
 
 
 def test_a_different_credential_never_reuses_a_connection(server, config):
-    with xrd.FileSystem(server.url, config) as fs:
+    with xrdclient.FileSystem(server.url, config) as fs:
         fs.stat("/data/a.root")
-    with xrd.FileSystem(server.url, config.evolve(username="somebody-else")) as fs:
+    with xrdclient.FileSystem(server.url, config.evolve(username="somebody-else")) as fs:
         fs.stat("/data/a.root")
     assert logins(server) == 2
     assert len(SESSIONS) == 2
 
 
 def test_a_user_in_the_url_counts_as_a_different_credential(server, config):
-    with xrd.FileSystem(server.url, config) as fs:
+    with xrdclient.FileSystem(server.url, config) as fs:
         fs.stat("/data/a.root")
     url = parse(str(server.url)).evolve(username="someone")
-    with xrd.FileSystem(url, config) as fs:
+    with xrdclient.FileSystem(url, config) as fs:
         fs.stat("/data/a.root")
     assert logins(server) == 2
 
 
 def test_pooling_can_be_turned_off(server, config):
     off = config.evolve(pool_size=0)
-    with xrd.FileSystem(server.url, off) as fs:
+    with xrdclient.FileSystem(server.url, off) as fs:
         fs.stat("/data/a.root")
     assert len(SESSIONS) == 0
-    with xrd.FileSystem(server.url, off) as fs:
+    with xrdclient.FileSystem(server.url, off) as fs:
         fs.stat("/data/a.root")
     assert logins(server) == 2
 
 
 def test_a_connection_idle_too_long_is_not_reused(server, config):
     brief = config.evolve(pool_idle_ttl=0.0)
-    with xrd.FileSystem(server.url, brief) as fs:
+    with xrdclient.FileSystem(server.url, brief) as fs:
         fs.stat("/data/a.root")
-    with xrd.FileSystem(server.url, brief) as fs:
+    with xrdclient.FileSystem(server.url, brief) as fs:
         fs.stat("/data/a.root")
     assert logins(server) == 2
 
 
 def test_a_connection_the_server_dropped_is_not_pooled(server, config):
-    with xrd.FileSystem(server.url, config) as fs:
+    with xrdclient.FileSystem(server.url, config) as fs:
         fs.stat("/data/a.root")
         server.disconnect()
         fs.ping()  # reconnects, and the dead session is closed on the way
@@ -170,7 +170,7 @@ def test_a_connection_the_server_dropped_is_not_pooled(server, config):
 
 def test_a_connection_that_failed_under_a_handle_is_discarded(server, config):
     """A file recovers by dialling again, not by passing the wreck on."""
-    with xrd.File(f"{server.url}/data/a.root", config) as handle:
+    with xrdclient.File(f"{server.url}/data/a.root", config) as handle:
         assert handle.read(4) == b"hell"
         server.disconnect()
         assert handle.read(4, offset=0) == b"hell"
@@ -219,15 +219,15 @@ def test_a_child_lets_go_of_its_parents_connections_without_closing_them():
 #: sides is exactly the corruption the hook exists to prevent.
 FORK_PROBE = """
 import os, sys
-import xrd
-from xrd.session import SESSIONS
+import xrdclient
+from xrdclient.session import SESSIONS
 
 url = sys.argv[1]
-config = xrd.Config(username="tester", auth_order=("host",), require_tls=False)
+config = xrdclient.Config(username="tester", auth_order=("host",), require_tls=False)
 
 
 def stat():
-    with xrd.FileSystem(url, config) as fs:
+    with xrdclient.FileSystem(url, config) as fs:
         return fs.stat("/data/a.root").size
 
 

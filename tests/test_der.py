@@ -3,7 +3,7 @@
 import pytest
 
 from _pki import integer, oid, sequence, tlv
-from xrd.crypto.der import (
+from xrdclient.crypto.der import (
     TAG_INTEGER,
     TAG_OID,
     TAG_SEQUENCE,

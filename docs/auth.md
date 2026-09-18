@@ -25,7 +25,7 @@ The proxy's lifetime is checked **before** the round trip, so an expired proxy
 is a sentence and not a mystery timeout an hour into a batch job.
 
 ```python
-from xrd.crypto.x509 import load_proxy
+from xrdclient.crypto.x509 import load_proxy
 proxy = load_proxy("/tmp/x509up_u1000")
 print(proxy.identity, proxy.remaining() / 3600, "hours left")
 ```
@@ -68,7 +68,7 @@ scheme; `Config(require_tls=True)` refuses a server that will not upgrade.
 The one mechanism that needs an extra:
 
 ```console
-$ pip install pyxrootdclient[krb5]
+$ pip install xrdclient[krb5]
 ```
 
 The credential cache is read with no help at all - so an expired ticket is
@@ -173,9 +173,9 @@ Config(prompter=my_dialog)    # a GUI, a notebook widget, a secrets manager
 
 `$XRD_PROMPT=0` does the same for a whole job, and `--no-prompt` for one
 command. A prompter is any callable taking an
-[`Ask`][xrd.auth.prompt.Ask] - the mechanism, what is missing, why, the fix,
+[`Ask`][xrdclient.auth.prompt.Ask] - the mechanism, what is missing, why, the fix,
 and whether the answer is secret - and returning what was typed, or `None` to
-decline. Answers live in this process only; `xrd.auth.forget()` drops them.
+decline. Answers live in this process only; `xrdclient.auth.forget()` drops them.
 
 With nobody there to ask, the same explanation goes into the error instead:
 

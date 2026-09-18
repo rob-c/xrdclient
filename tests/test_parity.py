@@ -17,10 +17,10 @@ import zlib
 
 import pytest
 
-import xrd
+import xrdclient
 from conftest import _REAL_CONFIG
-from xrd.client.file import File
-from xrd.flags import OpenFlags
+from xrdclient.client.file import File
+from xrdclient.flags import OpenFlags
 
 client = pytest.importorskip("XRootD.client", reason="the official bindings are not installed")
 from XRootD.client.flags import DirListFlags, MkDirFlags, QueryCode  # noqa: E402
@@ -45,7 +45,7 @@ def theirs(real_server):
 
 @pytest.fixture
 def ours(real_server):
-    with xrd.FileSystem(real_server.url, _REAL_CONFIG) as filesystem:
+    with xrdclient.FileSystem(real_server.url, _REAL_CONFIG) as filesystem:
         yield filesystem
 
 
@@ -288,7 +288,7 @@ def test_a_file_copied_by_their_engine_matches_ours(ours, real_server, sandbox, 
     check(process.run()[0])
 
     ours_out = tmp_path / "ours.root"
-    xrd.copy(url_for(real_server, blob), str(ours_out), config=_REAL_CONFIG)
+    xrdclient.copy(url_for(real_server, blob), str(ours_out), config=_REAL_CONFIG)
     assert ours_out.read_bytes() == theirs_out.read_bytes() == BLOB
 
 

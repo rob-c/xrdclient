@@ -6,8 +6,8 @@ tested only against itself is tested against nothing.
 
 import pytest
 
-from xrd.crypto import AES, cbc_decrypt, cbc_encrypt
-from xrd.crypto.aes import BLOCK_SIZE, SBOX, pkcs7_pad, pkcs7_unpad
+from xrdclient.crypto import AES, cbc_decrypt, cbc_encrypt
+from xrdclient.crypto.aes import BLOCK_SIZE, SBOX, pkcs7_pad, pkcs7_unpad
 
 #: FIPS-197 appendix C: one plaintext, the three key sizes.
 FIPS_197 = [

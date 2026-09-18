@@ -1,27 +1,27 @@
 # Copying
 
 ```python
-xrd.copy(source, target, *, chunk_size=None, verify=None, algorithm=None,
+xrdclient.copy(source, target, *, chunk_size=None, verify=None, algorithm=None,
          overwrite=True, progress=None, config=None, dry_run=False,
          remove_source=False) -> CopyResult
 ```
 
-Either side may be a URL, a local path, an `xrd.Path`, or an already-open
+Either side may be a URL, a local path, an `xrdclient.Path`, or an already-open
 binary file object. That covers every direction without a separate function
 per case:
 
 ```python
-xrd.copy("root://host//store/f.root", "/scratch/f.root")     # download
-xrd.copy("/scratch/f.root", "root://host//store/f.root")     # upload
-xrd.copy("root://a//store/f", "davs://b/store/f")            # across, via here
+xrdclient.copy("root://host//store/f.root", "/scratch/f.root")     # download
+xrdclient.copy("/scratch/f.root", "root://host//store/f.root")     # upload
+xrdclient.copy("root://a//store/f", "davs://b/store/f")            # across, via here
 with open("/scratch/f", "wb") as fh:
-    xrd.copy("root://host//store/f.root", fh)                # into a stream
+    xrdclient.copy("root://host//store/f.root", fh)                # into a stream
 ```
 
 The result says what happened:
 
 ```python
-r = xrd.copy(src, dst)
+r = xrdclient.copy(src, dst)
 r.size, r.seconds, r.rate, r.checksum, r.verified
 print(r)   # root://... -> /scratch/f.root (4194304 bytes, 212.4 MB/s)
 ```
@@ -35,10 +35,10 @@ A server that cannot checksum degrades quietly; `verify=True` makes that an
 error instead.
 
 ```python
-xrd.copy(src, dst, verify=True, algorithm="crc32c")
+xrdclient.copy(src, dst, verify=True, algorithm="crc32c")
 ```
 
-Any name in `xrd.crypto.algorithms()` works, including the 64-bit CRCs a
+Any name in `xrdclient.crypto.algorithms()` works, including the 64-bit CRCs a
 gateway offers and stock XRootD has no calculator for.
 
 A mismatch raises `ChecksumMismatchError`, which carries both digests.
@@ -54,7 +54,7 @@ A mismatch raises `ChecksumMismatchError`, which carries both digests.
 def bar(done, total):
     print(f"\r{done * 100 // total}%", end="")
 
-xrd.copy(src, dst, progress=bar)
+xrdclient.copy(src, dst, progress=bar)
 ```
 
 `total` is the size the source reported, which for a stream source may be
@@ -63,8 +63,8 @@ zero.
 ## Moving, and rehearsing
 
 ```python
-xrd.copy(src, dst, dry_run=True)        # what it would be: size, nothing sent
-xrd.copy(src, dst, remove_source=True)  # a move: the source goes after verify
+xrdclient.copy(src, dst, dry_run=True)        # what it would be: size, nothing sent
+xrdclient.copy(src, dst, remove_source=True)  # a move: the source goes after verify
 ```
 
 `remove_source` deletes only once the copy has finished *and* verification has
@@ -77,7 +77,7 @@ is why its `str` leaves the rate off.
 A transfer that died half way through does not have to start again:
 
 ```python
-xrd.copy(src, dst, resume=True)     # keep what is at dst, carry on from there
+xrdclient.copy(src, dst, resume=True)     # keep what is at dst, carry on from there
 ```
 
 Whatever is already at the target is kept and the copy begins at the end of
@@ -110,8 +110,8 @@ turn spends each one waiting out the other. Every transfer therefore reads
 own, so the copy goes at the slower of its two ends rather than at their sum:
 
 ```python
-xrd.copy(src, dst, config=xrd.Config(in_flight=4))   # four chunks in hand
-xrd.copy(src, dst, config=xrd.Config(in_flight=1))   # strictly one at a time
+xrdclient.copy(src, dst, config=xrdclient.Config(in_flight=4))   # four chunks in hand
+xrdclient.copy(src, dst, config=xrdclient.Config(in_flight=1))   # strictly one at a time
 ```
 
 It costs `in_flight` buffers of `chunk_size` and one thread per transfer, which
@@ -128,8 +128,8 @@ because a session serialises its own calls - two spans are only ever in flight
 together if there are two sessions to put them on.
 
 ```python
-xrd.copy(src, dst, config=xrd.Config(parallel_chunks=8))   # eight spans
-xrd.copy(src, dst, config=xrd.Config(parallel_chunks=1))   # one stream
+xrdclient.copy(src, dst, config=xrdclient.Config(parallel_chunks=8))   # eight spans
+xrdclient.copy(src, dst, config=xrdclient.Config(parallel_chunks=1))   # one stream
 ```
 
 From the command line that is `xrd-cp --stripes 8`. Its neighbour
@@ -152,7 +152,7 @@ workers, not a position in any one span.
 ## Recursive copies
 
 ```python
-results = xrd.copy_tree("root://a//store/run7", "/scratch/run7")
+results = xrdclient.copy_tree("root://a//store/run7", "/scratch/run7")
 print(sum(r.size for r in results))
 ```
 
@@ -163,7 +163,7 @@ are handed to `copy()` for each file.
 ### Several files at once
 
 ```python
-xrd.copy_tree(src, dst, workers=8)          # eight transfers in flight
+xrdclient.copy_tree(src, dst, workers=8)          # eight transfers in flight
 ```
 
 `workers` files are copied at once, defaulting to `config.parallel_files`
@@ -182,8 +182,8 @@ per-file positions would not add up to anything.
 ### Choosing what travels
 
 ```python
-xrd.copy_tree(src, dst, exclude=("*.log", "tmp/*"))
-xrd.copy_tree(src, dst, include=("*.root",), exclude=("bad/*",))
+xrdclient.copy_tree(src, dst, exclude=("*.log", "tmp/*"))
+xrdclient.copy_tree(src, dst, include=("*.root",), exclude=("bad/*",))
 ```
 
 `fnmatch` patterns, matched against each path relative to the source root.
@@ -193,9 +193,9 @@ wins over it.
 ### Only what has changed
 
 ```python
-xrd.copy_tree(src, dst, sync="size")       # stat both sides
-xrd.copy_tree(src, dst, sync="mtime")      # size, and no newer than the target
-xrd.copy_tree(src, dst, sync="checksum")   # ask both endpoints for a digest
+xrdclient.copy_tree(src, dst, sync="size")       # stat both sides
+xrdclient.copy_tree(src, dst, sync="mtime")      # size, and no newer than the target
+xrdclient.copy_tree(src, dst, sync="checksum")   # ask both endpoints for a digest
 ```
 
 `sync` (a `SyncMode`) skips a file already at the target. Length is checked
@@ -206,8 +206,8 @@ stat each.
 ### Pruning the target
 
 ```python
-xrd.copy_tree(src, dst, delete=True)
-xrd.copy_tree(src, dst, delete=True, dry_run=True)   # says what it would remove
+xrdclient.copy_tree(src, dst, delete=True)
+xrdclient.copy_tree(src, dst, delete=True, dry_run=True)   # says what it would remove
 ```
 
 `delete` removes files under the target that the source does not have. What
@@ -222,8 +222,8 @@ directory you named.
 ## Third-party copy
 
 ```python
-xrd.third_party("root://a//store/f.root", "root://b//store/f.root")
-xrd.third_party("davs://a/store/f.root", "davs://b/store/f.root")
+xrdclient.third_party("root://a//store/f.root", "root://b//store/f.root")
+xrdclient.third_party("davs://a/store/f.root", "davs://b/store/f.root")
 ```
 
 The data moves between the two servers and never through this process. One
@@ -243,7 +243,7 @@ which is what a mixed pair needs anyway.
 rather more, because the header set is the protocol:
 
 ```python
-xrd.http.third_party(src, dst, mode="pull", overwrite=True, delegate=False,
+xrdclient.http.third_party(src, dst, mode="pull", overwrite=True, delegate=False,
                      verify=None, streams=None, remote_token=None,
                      transfer_headers={}, progress=None, timeout=None)
 ```
@@ -257,7 +257,7 @@ xrd.http.third_party(src, dst, mode="pull", overwrite=True, delegate=False,
   needs nothing else:
 
     ```python
-    xrd.third_party(f"{src}?authz={read_token}", f"{dst}?authz={write_token}")
+    xrdclient.third_party(f"{src}?authz={read_token}", f"{dst}?authz={write_token}")
     ```
 
   The token is stripped from the URL the far side is given, since it belongs

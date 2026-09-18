@@ -1,9 +1,9 @@
 # Files and paths
 
-## `xrd.open` returns an `io` object
+## `xrdclient.open` returns an `io` object
 
 ```python
-fh = xrd.open("root://host//store/f.root", "rb")
+fh = xrdclient.open("root://host//store/f.root", "rb")
 ```
 
 `fh` is an `io.BufferedReader` wrapping an `XRootDRawIO`, which is an
@@ -28,10 +28,10 @@ The signature is overloaded the way typeshed overloads the builtin, so a type
 checker knows what came back:
 
 ```python
-xrd.open(url, "rb").read()               # bytes
-xrd.open(url, "r").read()                # str
-xrd.open(url, "rb", buffering=0)         # XRootDRawIO, so .file is there
-xrd.open(url, mode_from_config).read()   # Any - a non-literal mode is the escape hatch
+xrdclient.open(url, "rb").read()               # bytes
+xrdclient.open(url, "r").read()                # str
+xrdclient.open(url, "rb", buffering=0)         # XRootDRawIO, so .file is there
+xrdclient.open(url, mode_from_config).read()   # Any - a non-literal mode is the escape hatch
 ```
 
 The package ships a `py.typed` marker, so this reaches your code without a
@@ -58,7 +58,7 @@ stub package. See [Typing](typing.md).
 
 ## The handle underneath
 
-`fh.raw.file` (or `fh.file` on a raw object) is an `xrd.File`, which is where
+`fh.raw.file` (or `fh.file` on a raw object) is an `xrdclient.File`, which is where
 the operations that have no `io` equivalent live:
 
 ```python
@@ -82,7 +82,7 @@ rather than assume.
 `File` can also be used on its own, with or without `with`:
 
 ```python
-from xrd import File
+from xrdclient import File
 
 handle = File("root://host//store/f.root")
 handle.open("x")                    # the builtin's letters, or the protocol's
@@ -92,7 +92,7 @@ finally:
     handle.close()
 ```
 
-`open()` takes what `xrd.open` takes - `"r"`, `"w"`, `"x"`, `"a"`, `"r+"` -
+`open()` takes what `xrdclient.open` takes - `"r"`, `"w"`, `"x"`, `"a"`, `"r+"` -
 or the flag names in a string, or the flags themselves; its second argument
 is the mode a created file gets, and reads either as `0o640` or as
 `"rw-r-----"`.
@@ -134,7 +134,7 @@ one open file and into another. The data never leaves the server, which makes
 it the cheap way to build a file out of pieces of another one:
 
 ```python
-with xrd.FileSystem("root://host") as fs, \
+with xrdclient.FileSystem("root://host") as fs, \
      fs.open("/store/src.root", "rb") as reader, \
      fs.open("/store/dst.root", "wb") as writer:
     src, dst = reader.raw.file, writer.raw.file
@@ -168,7 +168,7 @@ level up.
     ```python
     try:
         dst.clone(src, ranges)
-    except xrd.UnsupportedError:
+    except xrdclient.UnsupportedError:
         for offset, length in ranges:
             dst.write(src.read(length, offset), offset)
     ```
@@ -206,7 +206,7 @@ A checkpoint is a transaction over one handle: the server journals what you
 write, and either keeps it or puts the file back the way it was.
 
 ```python
-with xrd.File("root://host//store/f.root") as handle:
+with xrdclient.File("root://host//store/f.root") as handle:
     handle.open(OpenFlags.UPDATE)
     with handle.checkpoint() as cp:
         handle.write(header, 0)
@@ -234,14 +234,14 @@ data server disappears is re-opened transparently and the read is retried.
 silently recovered, because a partially applied write is not something a
 client can reason about on your behalf.
 
-## `xrd.Path`
+## `xrdclient.Path`
 
-`xrd.Path` (also spelled `xrd.XRootDPath`) is the `pathlib` front door. It is
+`xrdclient.Path` (also spelled `xrdclient.XRootDPath`) is the `pathlib` front door. It is
 not a `PurePosixPath` subclass - it carries an endpoint - but it answers the
 same questions:
 
 ```python
-p = xrd.Path("root://host//store/user/me")
+p = xrdclient.Path("root://host//store/user/me")
 
 p.name, p.stem, p.suffix, p.parent, p.parts
 p / "runs" / "run1.root"

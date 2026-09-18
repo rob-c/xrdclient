@@ -1,4 +1,4 @@
-"""``xrd.diagnose`` - the questions a first transfer asks, asked on purpose.
+"""``xrdclient.diagnose`` - the questions a first transfer asks, asked on purpose.
 
 Every check has to be able to fail without the diagnosis failing with it, so
 most of what is tested here is what happens when something is broken: an
@@ -13,12 +13,12 @@ from dataclasses import replace
 
 import pytest
 
-from xrd import diagnose
-from xrd.auth import Offer, registry
-from xrd.config import Config
-from xrd.doctor import Check, Report, _nearest
-from xrd.errors import ConnectionError as XrdConnectionError
-from xrd.testing import FakeDAVServer
+from xrdclient import diagnose
+from xrdclient.auth import Offer, registry
+from xrdclient.config import Config
+from xrdclient.doctor import Check, Report, _nearest
+from xrdclient.errors import ConnectionError as XrdConnectionError
+from xrdclient.testing import FakeDAVServer
 
 BODY = b"hello world"
 
@@ -221,7 +221,7 @@ def test_a_webdav_endpoint_is_diagnosed_the_same_way_without_a_protocol_reply(da
 def test_a_server_that_will_not_answer_is_not_confused_with_one_that_is_absent(
     server, monkeypatch
 ):
-    from xrd.client import FileSystem
+    from xrdclient.client import FileSystem
 
     monkeypatch.setattr(
         FileSystem, "ping", lambda self: (_ for _ in ()).throw(XrdConnectionError("gone away"))
@@ -234,7 +234,7 @@ def test_a_server_that_will_not_answer_is_not_confused_with_one_that_is_absent(
 
 
 def test_a_login_that_fails_outright_is_a_line_rather_than_an_exception(server, monkeypatch):
-    from xrd.client import FileSystem
+    from xrdclient.client import FileSystem
 
     def refuse(self, *args, **kwargs):
         raise XrdConnectionError("the door is shut")
@@ -249,13 +249,13 @@ def test_a_login_that_fails_outright_is_a_line_rather_than_an_exception(server, 
 
 
 def _fs(server):
-    from xrd.client import FileSystem
+    from xrdclient.client import FileSystem
 
     return FileSystem(str(server.url))
 
 
 def _run_over(server, path):
-    from xrd.doctor import _Run
+    from xrdclient.doctor import _Run
 
     run = _Run(Config())
     run.path = path
@@ -270,7 +270,7 @@ def test_every_mechanism_the_config_names_gets_a_line_of_its_own():
 
 
 def test_the_optional_packages_are_listed_however_many_there_are(monkeypatch):
-    from xrd import doctor
+    from xrdclient import doctor
 
     monkeypatch.setattr(doctor, "EXTRAS", {"json": "json", "sys": "sys"})
     assert named(diagnose(), "extras").detail == "json; sys"
@@ -279,8 +279,8 @@ def test_the_optional_packages_are_listed_however_many_there_are(monkeypatch):
 
 
 def test_a_manager_offering_tls_is_described_as_what_it_is(server, monkeypatch):
-    from xrd.client import FileSystem
-    from xrd.types import ProtocolInfo
+    from xrdclient.client import FileSystem
+    from xrdclient.types import ProtocolInfo
 
     info = ProtocolInfo(version=0x563, flags=0x80000002)
     monkeypatch.setattr(FileSystem, "protocol", lambda self: info)

@@ -4,12 +4,12 @@
 and derive variants with `evolve`.
 
 ```python
-cfg = xrd.Config(request_timeout=60.0)
+cfg = xrdclient.Config(request_timeout=60.0)
 patient = cfg.evolve(request_timeout=600.0)
 
-xrd.open("root://host//store/f.root", config=cfg)
-xrd.FileSystem("root://host", config=cfg)
-xrd.copy(src, dst, config=cfg)
+xrdclient.open("root://host//store/f.root", config=cfg)
+xrdclient.FileSystem("root://host", config=cfg)
+xrdclient.copy(src, dst, config=cfg)
 ```
 
 Frozen because a configuration is shared by every session it reaches, and a
@@ -99,7 +99,7 @@ the TLS negotiation and the login. A script that opens a `FileSystem` per file
 pays for one bring-up rather than a hundred.
 
 ```python
-from xrd.session import SESSIONS
+from xrdclient.session import SESSIONS
 
 len(SESSIONS)      # connections being held open right now
 SESSIONS.clear()   # end them all, politely
@@ -170,7 +170,7 @@ Defaults to `$XRD_USER`, `$USER`, `$LOGNAME`, then `getpass.getuser()`, then
 ## Secrets never print
 
 ```python
->>> xrd.Config(token="eyJhbGciOi...")
+>>> xrdclient.Config(token="eyJhbGciOi...")
 Config(username='me', ..., token='<redacted>', ...)
 ```
 
@@ -193,9 +193,9 @@ preferred_checksum = adler32
 ```
 
 ```python
-cfg = xrd.Config.from_file()                  # the usual places
-cfg = xrd.Config.from_file(alias="eos")       # [defaults], then [alias eos]
-cfg = xrd.Config.from_file("./job.ini")       # exactly this file
+cfg = xrdclient.Config.from_file()                  # the usual places
+cfg = xrdclient.Config.from_file(alias="eos")       # [defaults], then [alias eos]
+cfg = xrdclient.Config.from_file("./job.ini")       # exactly this file
 ```
 
 ```console

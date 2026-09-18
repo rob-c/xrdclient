@@ -89,7 +89,7 @@ ok  connect       1094/tcp answered in 41 ms
 
 With no URL it checks the machine alone, which is the useful thing to paste
 into a ticket. It never prompts for anything, exits `1` if any line failed,
-and `--json` gives the same report as data. `xrd.diagnose()` is the same thing
+and `--json` gives the same report as data. `xrdclient.diagnose()` is the same thing
 from Python.
 
 `rm -r` is the one subcommand that asks before it acts: at a terminal it says

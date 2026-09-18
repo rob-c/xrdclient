@@ -23,14 +23,14 @@ import struct
 
 import pytest
 
-import xrd
+import xrdclient
 from conftest import handshake_reply, login_body, ok, protocol_body
-from xrd.config import Config
-from xrd.flags import OpenFlags
-from xrd.proto import constants as c
-from xrd.proto import machine as m
-from xrd.proto import requests as r
-from xrd.testing import error
+from xrdclient.config import Config
+from xrdclient.flags import OpenFlags
+from xrdclient.proto import constants as c
+from xrdclient.proto import machine as m
+from xrdclient.proto import requests as r
+from xrdclient.testing import error
 
 
 @pytest.fixture
@@ -41,7 +41,7 @@ def arrival_server():
     only bulk replies back down it; this one is asked *on* it, and the request
     it answers is the one it read there.
     """
-    from xrd.testing import FakeServer
+    from xrdclient.testing import FakeServer
 
     with FakeServer(files={"/data/a.root": b"hello world"}) as srv:
         srv.serves_arrivals = True
@@ -147,7 +147,7 @@ def _mute_config_queries(server):
 
 
 def test_a_default_open_binds_a_stream(server):
-    with xrd.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
+    with xrdclient.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
         assert fh._data_paths, "open did not bind an automatic data stream"
 
 
@@ -155,7 +155,7 @@ def test_a_multistream_read_is_byte_exact_via_the_standard_split(server):
     # The fake server is push-only and says so when asked, so the read stays
     # on a data path via the standard split rather than giving up on one, and
     # the bytes are the bytes either way.
-    with xrd.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
+    with xrdclient.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
         assert fh.read() == b"hello world"
         assert fh._router.session.arrives_on_path is False
         assert fh._multistream is True, "the standard split still works here"
@@ -165,7 +165,7 @@ def test_a_multistream_read_is_byte_exact_via_the_standard_split(server):
 def test_a_stock_server_answers_the_question_and_keeps_its_path(server):
     # The server disclaims arrival routing when asked, so no request is ever
     # abandoned on the data socket and the socket never has to be sacrificed.
-    with xrd.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
+    with xrdclient.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
         first = list(fh._data_paths)
         assert fh.read() == b"hello world"
         assert fh._router.session.arrives_on_path is False
@@ -177,7 +177,7 @@ def test_a_server_that_advertises_but_will_not_serve_falls_back(server):
     # trial that follows fails, the socket goes, and the read is byte-exact
     # via the standard split on a replacement path.
     server.config_values["brix.substreams"] = "rw"
-    with xrd.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
+    with xrdclient.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
         assert fh.read() == b"hello world"
         assert fh._router.session.arrives_on_path is False
 
@@ -188,7 +188,7 @@ def test_the_stream_left_waiting_is_released_with_the_socket(server):
     # socket goes; what it was carrying must not be left in flight for the
     # rest of the session, and its id is free to use again.
     _mute_config_queries(server)
-    with xrd.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
+    with xrdclient.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
         first = list(fh._data_paths)
         assert fh.read() == b"hello world"
         machine = fh._router.session._m
@@ -200,7 +200,7 @@ def test_the_stream_left_waiting_is_released_with_the_socket(server):
 def test_a_server_that_will_not_serve_it_is_asked_once_per_connection(server, monkeypatch):
     # Finding this out costs a whole data_stream_timeout, so it is asked of the
     # server, not of every file opened on it.
-    from xrd.session.sync import Session
+    from xrdclient.session.sync import Session
 
     asked = []
     execute = Session.execute
@@ -216,7 +216,7 @@ def test_a_server_that_will_not_serve_it_is_asked_once_per_connection(server, mo
     config = _fast_multistream()
     sessions = []
     for _ in range(3):
-        with xrd.File(f"{server.url}//data/a.root", config) as fh:
+        with xrdclient.File(f"{server.url}//data/a.root", config) as fh:
             assert fh.read() == b"hello world"
             sessions.append(fh._router.session)
     assert len({id(s) for s in sessions}) == 1, "the pool handed out a new session"
@@ -229,7 +229,7 @@ def test_a_server_that_will_not_serve_it_is_asked_once_per_connection(server, mo
 
 
 def test_a_server_that_serves_the_arrival_is_asked_there(arrival_server):
-    with xrd.File(f"{arrival_server.url}//data/a.root", _fast_multistream()) as fh:
+    with xrdclient.File(f"{arrival_server.url}//data/a.root", _fast_multistream()) as fh:
         assert fh.read() == b"hello world"
         assert fh._router.session.arrives_on_path is True
         assert fh._data_paths, "the path that served the read was given up"
@@ -240,7 +240,7 @@ def test_an_arrival_server_takes_the_write_on_the_same_socket(arrival_server):
     # Header and payload travel together here, which is the whole point: the
     # server reads both off the connection the request came in on.
     path = "/data/arr_w.root"
-    fh = xrd.File(f"{arrival_server.url}/{path}", _fast_multistream())
+    fh = xrdclient.File(f"{arrival_server.url}/{path}", _fast_multistream())
     fh.open(OpenFlags.NEW | OpenFlags.UPDATE)
     try:
         assert fh.write(b"payload", 0) == 7
@@ -260,7 +260,7 @@ def test_a_server_that_refuses_to_bind_stays_on_the_control_link(server):
         yield error(sid, 3013, "no sub-streams here")
 
     server.handlers[c.kXR_bind] = refuse
-    with xrd.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
+    with xrdclient.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
         assert not fh._data_paths, "a refused bind must leave no path behind"
         assert fh.read() == b"hello world"
 
@@ -268,10 +268,10 @@ def test_a_server_that_refuses_to_bind_stays_on_the_control_link(server):
 def test_a_bind_that_hands_back_no_path_id_is_no_path(server, monkeypatch):
     # A server answering the bind but naming no path leaves nothing to send
     # down; the file must notice rather than route to path 0 by accident.
-    from xrd.session.sync import Session
+    from xrdclient.session.sync import Session
 
     monkeypatch.setattr(Session, "bind_data_path", lambda self: 0)
-    with xrd.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
+    with xrdclient.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
         assert not fh._data_paths
         assert fh.read() == b"hello world"
 
@@ -279,8 +279,8 @@ def test_a_bind_that_hands_back_no_path_id_is_no_path(server, monkeypatch):
 def test_a_file_that_cannot_rebind_finishes_on_the_control_link(server, monkeypatch):
     # The arrival attempt costs the path it was sent on. If a replacement
     # cannot be had, the read still has to happen - on the control link.
-    from xrd.errors import XRootDError
-    from xrd.session.sync import Session
+    from xrdclient.errors import XRootDError
+    from xrdclient.session.sync import Session
 
     _mute_config_queries(server)
     real = Session.bind_data_path
@@ -293,7 +293,7 @@ def test_a_file_that_cannot_rebind_finishes_on_the_control_link(server, monkeypa
         return real(self)
 
     monkeypatch.setattr(Session, "bind_data_path", once)
-    with xrd.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
+    with xrdclient.File(f"{server.url}//data/a.root", _fast_multistream()) as fh:
         assert fh._data_paths, "the first bind should have worked"
         assert fh.read() == b"hello world"
         assert not fh._data_paths, "the abandoned path was not let go"
@@ -301,7 +301,7 @@ def test_a_file_that_cannot_rebind_finishes_on_the_control_link(server, monkeypa
 
 def test_a_multistream_write_is_byte_exact_via_fallback(server):
     path = "/data/ms_w.root"
-    fh = xrd.File(f"{server.url}/{path}", _fast_multistream())
+    fh = xrdclient.File(f"{server.url}/{path}", _fast_multistream())
     fh.open(OpenFlags.NEW | OpenFlags.UPDATE)
     try:
         assert fh.write(b"payload", 0) == 7

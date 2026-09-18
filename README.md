@@ -1,19 +1,19 @@
-# PyXRootDClient
+# xrdclient
 
 A pure-Python client for XRootD. `root://`, `roots://`, `https://`, HEP
 WebDAV and `s3://`, spoken by the same objects, with no compiled extension, no
 `libXrdCl`, and no third-party import in the core.
 
 ```python
-import xrd
+import xrdclient
 
-for path in xrd.ls("root://eos.example.org//store/user/me"):
-    print(path.name, xrd.human_bytes(xrd.size(path)))
+for path in xrdclient.ls("root://eos.example.org//store/user/me"):
+    print(path.name, xrdclient.human_bytes(xrdclient.size(path)))
 
-with xrd.open("root://eos.example.org//store/data.root", "rb") as fh:
+with xrdclient.open("root://eos.example.org//store/data.root", "rb") as fh:
     header = fh.read(1024)
 
-xrd.copy("root://a.example.org//store/f.root", "davs://b.example.org/store/f.root")
+xrdclient.copy("root://a.example.org//store/f.root", "davs://b.example.org/store/f.root")
 ```
 
 It is a Python library first and an XRootD binding second: files are real
@@ -23,9 +23,9 @@ and nothing returns a `(status, result)` pair.
 ## Install
 
 ```console
-$ pip install pyxrootdclient                 # the whole library
-$ pip install pyxrootdclient[fsspec]         # pandas / dask / pyarrow URLs
-$ pip install pyxrootdclient[krb5]           # the Kerberos mechanism
+$ pip install xrdclient                 # the whole library
+$ pip install xrdclient[fsspec]         # pandas / dask / pyarrow URLs
+$ pip install xrdclient[krb5]           # the Kerberos mechanism
 ```
 
 Requires Python 3.9+, which is what RHEL 9 and AlmaLinux 9 ship, so the
@@ -36,15 +36,15 @@ Kerberos is the one exception — see below.
 
 ## What it does
 
-**One-liners.** `xrd.ls`, `xrd.glob`, `xrd.stat`, `xrd.exists`, `xrd.size`,
-`xrd.checksum`, `xrd.read_text`, `xrd.read_bytes`, `xrd.write_text`,
-`xrd.write_bytes`, `xrd.mkdir`, `xrd.remove`, `xrd.move`, `xrd.stage` and
-`xrd.is_online` each take a URL and answer one question, with nothing to
+**One-liners.** `xrdclient.ls`, `xrdclient.glob`, `xrdclient.stat`, `xrdclient.exists`, `xrdclient.size`,
+`xrdclient.checksum`, `xrdclient.read_text`, `xrdclient.read_bytes`, `xrdclient.write_text`,
+`xrdclient.write_bytes`, `xrdclient.mkdir`, `xrdclient.remove`, `xrdclient.move`, `xrdclient.stage` and
+`xrdclient.is_online` each take a URL and answer one question, with nothing to
 build and nothing to close.
 
 ```python
-if not xrd.is_online("root://tape.example.org//store/f.root"):
-    xrd.stage("root://tape.example.org//store/f.root")
+if not xrdclient.is_online("root://tape.example.org//store/f.root"):
+    xrdclient.stage("root://tape.example.org//store/f.root")
 ```
 
 **No bit algebra.** Every flag answers to its own name, and the common
@@ -54,7 +54,7 @@ choices are keyword arguments: `fh.open("r")`, `fh.open("new makepath")`,
 says what you probably meant. Printing a flag prints its name, printing a
 stat prints the line `ls -l` would have.
 
-**Files.** `xrd.open(url, mode)` returns something from the `io` stack:
+**Files.** `xrdclient.open(url, mode)` returns something from the `io` stack:
 seekable, buffered, iterable, context-managed, `read`/`write`/`readinto`,
 text mode when you ask for it. Vector reads (`kXR_readv`), paged I/O with
 CRC32c verification, checkpointed writes, server-side range copies
@@ -62,14 +62,14 @@ CRC32c verification, checkpointed writes, server-side range copies
 when you want them.
 
 ```python
-with xrd.open("root://host//store/f.root", "rb") as fh:
+with xrdclient.open("root://host//store/f.root", "rb") as fh:
     for line in fh:            # buffered, like any other file
         ...
     fh.seek(-4096, 2)
     tail = fh.read()
 ```
 
-**Namespaces.** `xrd.FileSystem` covers `stat`, `statx`, `statvfs`,
+**Namespaces.** `xrdclient.FileSystem` covers `stat`, `statx`, `statvfs`,
 `scandir`, `walk`, `glob`, `mkdir`, `makedirs`, `rename`, `remove`,
 `rmtree`, `truncate`, `chmod`, `touch`, `checksum`, `locate`, `deep_locate`,
 `prepare` (with `query_prepare` for how the staging is going and
@@ -79,21 +79,21 @@ and - where a server has been taught the vendor opcodes - `symlink`, `link`,
 which `extensions()` asks about before sending.
 
 ```python
-fs = xrd.FileSystem("davs://dav.example.org")
+fs = xrdclient.FileSystem("davs://dav.example.org")
 fs.makedirs("/store/user/me/2026", exist_ok=True)
 print(fs.checksum("/store/user/me/f.root"))     # adler32:1a0b045d
 ```
 
-**Paths.** `xrd.Path` is a `PurePosixPath` that knows its endpoint:
+**Paths.** `xrdclient.Path` is a `PurePosixPath` that knows its endpoint:
 
 ```python
-p = xrd.Path("root://host//store") / "user" / "me"
+p = xrdclient.Path("root://host//store") / "user" / "me"
 p.mkdir(parents=True, exist_ok=True)
 (p / "note.txt").write_text("hello")
 sizes = {child.name: child.stat().st_size for child in p.iterdir()}
 ```
 
-**Copies.** `xrd.copy`, `xrd.copy_tree` and `xrd.third_party` move data
+**Copies.** `xrdclient.copy`, `xrdclient.copy_tree` and `xrdclient.third_party` move data
 between any two endpoints, local paths included, with checksum verification
 on by default and a `progress=` callback that takes `(done, total)`. A tree
 can be filtered (`include=`, `exclude=`), brought up to date rather than
@@ -115,7 +115,7 @@ its server re-opens and resumes from where it got to, and a transfer that ends
 short of the file's length is an error rather than a truncated file.
 
 **Objects.** A bucket is one more endpoint: `s3://bucket/key` reads, writes,
-lists and copies through the same `xrd.open`, `xrd.FileSystem` and `xrd.copy`,
+lists and copies through the same `xrdclient.open`, `xrdclient.FileSystem` and `xrdclient.copy`,
 signed with AWS SigV4 out of `hmac` and `hashlib` — no `boto3`, in the
 dependency tree or the import graph. Credentials come from the environment or
 `~/.aws/credentials`, or are left out entirely for a public bucket; an object
@@ -124,9 +124,9 @@ rather than left in the bucket. Ceph RGW, MinIO and anything else with an
 endpoint are addressed path-style, AWS virtual-hosted.
 
 ```python
-fs = xrd.FileSystem("s3://my-bucket", endpoint="https://rgw.example.org")
+fs = xrdclient.FileSystem("s3://my-bucket", endpoint="https://rgw.example.org")
 fs.listdir("/store/user/me")
-xrd.copy("root://eos.example.org//store/f.root", "s3://my-bucket/store/f.root")
+xrdclient.copy("root://eos.example.org//store/f.root", "s3://my-bucket/store/f.root")
 ```
 
 **Built on this.** Three packages of their own, each depending on the one
@@ -142,15 +142,15 @@ before it, so a client install stays a client install:
 $ pip install xrdml          # brings xrdroot and this client with it
 ```
 
-**Async.** `xrd.aio` mirrors the whole surface — same names, same arguments,
-`await` in front. `import xrd` does not import `asyncio`; the facade is
+**Async.** `xrdclient.aio` mirrors the whole surface — same names, same arguments,
+`await` in front. `import xrdclient` does not import `asyncio`; the facade is
 resolved on first use.
 
 ```python
-import asyncio, xrd.aio
+import asyncio, xrdclient.aio
 
 async def main():
-    async with xrd.aio.FileSystem("root://eos.example.org") as fs:
+    async with xrdclient.aio.FileSystem("root://eos.example.org") as fs:
         async for entry in fs.iterdir("/store"):
             print(entry.name)
         names = await fs.listdir("/store")
@@ -193,11 +193,11 @@ to go, and refuses a path less than two components deep until `--yes`; and
 `root://host/store/f` means the same file as `root://host//store/f` rather
 than a confusing miss. Each has one flag that says "yes, I mean it".
 
-When something does go wrong, `xrd-fs doctor` (or `xrd.diagnose()`) asks every
+When something does go wrong, `xrd-fs doctor` (or `xrdclient.diagnose()`) asks every
 question a transfer would ask - settings, each authentication mechanism and
 what would fix it, DNS, the port, the login, how far down the path exists -
 and prints one line each, so the first `!!` is the cause rather than the last
-symptom. See [Safety](https://rob-c.github.io/PyXRootDClient/safety/).
+symptom. See [Safety](https://rob-c.github.io/xrdclient/safety/).
 
 ## Command line
 
@@ -230,14 +230,14 @@ df = pd.read_parquet("root://eos.example.org//store/t.parquet")
 
 ## Testing against it
 
-`xrd.testing` ships the servers this library's own suite runs against — no
+`xrdclient.testing` ships the servers this library's own suite runs against — no
 storage element required:
 
 ```python
-from xrd.testing import FakeServer
+from xrdclient.testing import FakeServer
 
 with FakeServer(files={"/data/a.root": b"hello"}) as server:
-    fs = xrd.FileSystem(server.url)
+    fs = xrdclient.FileSystem(server.url)
     assert fs.read_bytes("/data/a.root") == b"hello"
 ```
 
@@ -261,7 +261,7 @@ cryptography and the client surface are gated there; `ruff` and
 [maintainability gate](docs/maintainability.md) reports CCN, Cognitive
 Complexity, NPath, Halstead Volume and maximum nesting per function and file;
 the same limits apply to all existing and new code, without baseline allowances. The
-package ships `py.typed`, and `xrd.open` is overloaded the way the builtin is,
+package ships `py.typed`, and `xrdclient.open` is overloaded the way the builtin is,
 so a literal mode tells your type checker whether you get bytes or text.
 
 Staging from tape works in both dialects from the same three method names:
@@ -270,7 +270,7 @@ to a `root://` endpoint and drive the WLCG Tape REST API - the one FTS and
 Rucio use - at an `http(s)`/`dav(s)` one, and `archive_info` answers "on disk
 or still on tape" over either.
 
-Third-party copy works in both dialects from one call: `xrd.third_party` sends
+Third-party copy works in both dialects from one call: `xrdclient.third_party` sends
 the `XrdOucTPC` rendezvous to a `root://` pair and the WLCG `COPY` dialect to
 an `http(s)`/`dav(s)` one, so the bytes move server to server either way.
 

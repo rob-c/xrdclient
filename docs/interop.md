@@ -57,7 +57,7 @@ this library is unaffected.
 The same argument applies to the S3 signature, which is a hash of a string
 this client builds: a fake endpoint that verified it with this client's own
 signer would agree with any misreading. So two things are true of the test
-suite instead. `xrd.s3.sign` is asserted against the worked examples the AWS
+suite instead. `xrdclient.s3.sign` is asserted against the worked examples the AWS
 documentation publishes - the canonical request, the string to sign and the
 final signature, byte for byte - and `FakeS3Server` re-derives the signature
 from the raw request as it arrived, written out from the specification with
@@ -167,7 +167,7 @@ reads every module for the handful of spellings that parse anywhere but only
 *run* on 3.10 or later, and - when a `python3.9` is on `PATH` - imports the
 whole package into it. CI runs the full suite on 3.9 through 3.13.
 
-The two or three things the floor lacks live in `xrd._compat`, and nothing
+The two or three things the floor lacks live in `xrdclient._compat`, and nothing
 else in the package names a version:
 
 | Wanted | On 3.9 |
@@ -179,7 +179,7 @@ else in the package names a version:
 
 Type annotations are not on that list: every module imports `annotations`
 from `__future__`, so `str | None` in a signature is a string until something
-asks, and `xrd.easy.Location` is spelled `Union[...]` only because a type
+asks, and `xrdclient.easy.Location` is spelled `Union[...]` only because a type
 alias assigned at the top of a module is evaluated where an annotation is not.
 Dataclass fields that a reader cannot do without carry `datasets.REQUIRED`
 instead of `kw_only=True`, and the description refuses to be built without

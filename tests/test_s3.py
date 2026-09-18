@@ -7,10 +7,10 @@ from datetime import datetime, timezone
 
 import pytest
 
-import xrd
-import xrd.s3.fs as s3fs
-from xrd.config import Config
-from xrd.errors import (
+import xrdclient
+import xrdclient.s3.fs as s3fs
+from xrdclient.config import Config
+from xrdclient.errors import (
     BusyError,
     ExistsError,
     NotFoundError,
@@ -18,10 +18,10 @@ from xrd.errors import (
     ServerError,
     UnsupportedError,
 )
-from xrd.http import HTTPClient
-from xrd.s3 import Credentials, S3FileSystem, S3RawIO, hash_payload, open_s3, sign
-from xrd.s3.sigv4 import EMPTY_SHA256, UNSIGNED_PAYLOAD
-from xrd.testing import FakeS3Server
+from xrdclient.http import HTTPClient
+from xrdclient.s3 import Credentials, S3FileSystem, S3RawIO, hash_payload, open_s3, sign
+from xrdclient.s3.sigv4 import EMPTY_SHA256, UNSIGNED_PAYLOAD
+from xrdclient.testing import FakeS3Server
 
 #: The account every AWS worked example is signed with.
 ACCESS = "AKIAIOSFODNN7EXAMPLE"
@@ -247,7 +247,7 @@ def test_a_url_with_no_bucket_in_it_is_not_an_s3_url():
 
 
 def test_an_s3_url_carries_no_port_because_a_bucket_is_not_an_endpoint():
-    url = xrd.parse("s3://bucket/runs/a.root")
+    url = xrdclient.parse("s3://bucket/runs/a.root")
     assert str(url) == "s3://bucket/runs/a.root"
     assert url.is_s3 and url.use_tls and url.port == 443
 
@@ -255,7 +255,7 @@ def test_an_s3_url_carries_no_port_because_a_bucket_is_not_an_endpoint():
 def test_the_filesystem_for_an_s3_url_is_the_s3_one(bucket, monkeypatch):
     monkeypatch.setenv("AWS_ENDPOINT_URL", bucket.endpoint)
     bucket.access_key = ""
-    with xrd.FileSystem(bucket.url) as fs:
+    with xrdclient.FileSystem(bucket.url) as fs:
         assert isinstance(fs, S3FileSystem)
         assert fs.read_bytes("/top.txt") == b"top"
 
@@ -602,7 +602,7 @@ def test_an_object_opens_through_the_ordinary_front_door(bucket, monkeypatch):
     monkeypatch.setenv("AWS_ENDPOINT_URL", bucket.endpoint)
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", ACCESS)
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", SECRET)
-    with xrd.open(f"s3://{bucket.bucket}/runs/2024/a.root") as handle:
+    with xrdclient.open(f"s3://{bucket.bucket}/runs/2024/a.root") as handle:
         assert handle.read() == b"hello"
     with open_s3(f"s3://{bucket.bucket}/written.txt", "wt", encoding="utf-8") as handle:
         handle.write("through the front door")
@@ -631,9 +631,9 @@ def test_a_bucket_is_a_copy_source_and_a_copy_destination(bucket, tmp_path, monk
     monkeypatch.setenv("AWS_ENDPOINT_URL", bucket.endpoint)
     bucket.access_key = ""
     local = tmp_path / "a.root"
-    xrd.copy(f"s3://{bucket.bucket}/runs/2024/a.root", str(local))
+    xrdclient.copy(f"s3://{bucket.bucket}/runs/2024/a.root", str(local))
     assert local.read_bytes() == b"hello"
-    xrd.copy(str(local), f"s3://{bucket.bucket}/copied.root")
+    xrdclient.copy(str(local), f"s3://{bucket.bucket}/copied.root")
     assert bucket.contents("copied.root") == b"hello"
 
 
@@ -781,7 +781,7 @@ def test_an_answer_that_is_not_xml_is_a_protocol_error(bucket, fs):
 def _response(body):
     import email.message
 
-    from xrd.http.client import Response
+    from xrdclient.http.client import Response
 
     return Response(200, "OK", email.message.Message(), body)
 
@@ -823,7 +823,7 @@ def test_a_chunk_size_above_the_minimum_part_size_is_left_alone(bucket):
 
 
 def test_the_package_exports_what_it_documents():
-    import xrd.s3
+    import xrdclient.s3
 
-    assert set(xrd.s3.__all__) <= set(dir(xrd.s3))
-    assert os.path.basename(xrd.s3.fs.__file__) == "fs.py"
+    assert set(xrdclient.s3.__all__) <= set(dir(xrdclient.s3))
+    assert os.path.basename(xrdclient.s3.fs.__file__) == "fs.py"

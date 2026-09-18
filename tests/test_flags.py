@@ -1,6 +1,6 @@
 """Flags in words: what a person writes when they will not write bits.
 
-Every enum in :mod:`xrd.flags` answers to its own member names, and the
+Every enum in :mod:`xrdclient.flags` answers to its own member names, and the
 keyword helpers turn an ordinary call's arguments into the flags an operation
 sends. Between them, nothing above this module has to spell out an algebra.
 """
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from xrd.flags import (
+from xrdclient.flags import (
     Access,
     DirListFlags,
     LocateFlags,

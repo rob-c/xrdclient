@@ -1,10 +1,10 @@
 # Namespaces
 
-`xrd.FileSystem` is one endpoint's namespace. It holds a connection, so use
+`xrdclient.FileSystem` is one endpoint's namespace. It holds a connection, so use
 it as a context manager or call `close()`.
 
 ```python
-with xrd.FileSystem("root://eos.example.org") as fs:
+with xrdclient.FileSystem("root://eos.example.org") as fs:
     ...
 ```
 
@@ -278,7 +278,7 @@ returns whatever the server actually computed, which is not always what you
 asked for. Anything the server names can be verified here without a compiler:
 `adler32`, `crc32`, `crc32c`, `crc64` (CRC-64/XZ, what `xrdcrc64` computes,
 also spelled `crc64xz`), `crc64nvme` and the `hashlib` digests -
-`xrd.crypto.algorithms()` is the list.
+`xrdclient.crypto.algorithms()` is the list.
 
 !!! warning "Servers cache checksums"
     A file rewritten in place can come back with the digest of its previous
@@ -328,7 +328,7 @@ Every object that talks to a server accepts an existing router, and
 files through one `FileSystem` costs one connection, not a hundred.
 
 ```python
-with xrd.FileSystem("root://host") as fs:
+with xrdclient.FileSystem("root://host") as fs:
     handles = [fs.open(f"/store/{n}", "rb") for n in names]
 ```
 

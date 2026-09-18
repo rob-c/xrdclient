@@ -56,7 +56,7 @@ jobs:
         run: >-
           pytest -q -p no:cacheprovider -n auto
           -m "not interop and not parity"
-          --cov=xrd --cov-report=term-missing
+          --cov=xrdclient --cov-report=term-missing
 
   interop:
     # A real daemon, because a fake written from the same reading of the

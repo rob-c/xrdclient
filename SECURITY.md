@@ -43,7 +43,7 @@ encrypting everything is the only reading that keeps the promise. A server
 that demands TLS and does not offer it is an error, not a downgrade.
 
 **Credentials do not reach logs, reprs or tracebacks.** Every logger under
-`xrd.` carries a filter that interpolates the record and then redacts the
+`xrdclient.` carries a filter that interpolates the record and then redacts the
 result, so a secret that only becomes recognisable once the format string and
 its arguments are joined is still caught. `Config`, `XRootDURL`,
 `TokenCredential`, `SSSKey`, `SSSCredential`, `Blowfish`, `AES`,
@@ -57,7 +57,7 @@ never `stdout`, so a redirected pipe can neither swallow one nor be polluted
 by it; and the `Ask` handed to a prompter carries the mechanism, the reason
 and the fix, but never a credential. Answers are held in memory for the life
 of the process so that one endpoint is asked about once -
-`xrd.auth.forget()` drops them - and nothing is written to disk. With no
+`xrdclient.auth.forget()` drops them - and nothing is written to disk. With no
 terminal there is no question at all: prompting is off unless `stdin` and
 `stderr` both say otherwise, or `Config(prompt=True)` insists.
 
@@ -123,7 +123,7 @@ the real daemon. They are not offered as a general-purpose crypto library and
 
 ## Auditing your own setup
 
-    python -c "import xrd; print(xrd.Config())"      # secrets print as <redacted>
+    python -c "import xrdclient; print(xrdclient.Config())"      # secrets print as <redacted>
     xrd-fs ls -vvv root://host//store/data           # redacted wire transcript
 
 The second command is the one to paste into a bug report: the redaction filter

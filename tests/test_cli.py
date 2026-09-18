@@ -8,14 +8,14 @@ import json
 
 import pytest
 
-from xrd import cli
-from xrd.cli import Endpoints, config_from, dumps, size_arg
-from xrd.cli import cp as cp_cli
-from xrd.cli import fs as fs_cli
-from xrd.errors import XRootDError
-from xrd.testing import FakeDAVServer, FakeS3Server, FakeServer
-from xrd.types import ChecksumInfo, StatInfo
-from xrd.url import parse
+from xrdclient import cli
+from xrdclient.cli import Endpoints, config_from, dumps, size_arg
+from xrdclient.cli import cp as cp_cli
+from xrdclient.cli import fs as fs_cli
+from xrdclient.errors import XRootDError
+from xrdclient.testing import FakeDAVServer, FakeS3Server, FakeServer
+from xrdclient.types import ChecksumInfo, StatInfo
+from xrdclient.url import parse
 
 BODY = b"hello world"
 
@@ -519,7 +519,7 @@ def test_the_json_encoder_refuses_what_it_cannot_render():
 
 
 def test_the_json_encoder_renders_flags_as_numbers_and_bytes_as_text():
-    from xrd.flags import OpenFlags
+    from xrdclient.flags import OpenFlags
 
     assert cli.dumps({"flags": OpenFlags.READ}) == f'{{\n  "flags": {int(OpenFlags.READ)}\n}}'
     assert '"payload": "hi"' in cli.dumps({"payload": b"hi"})
@@ -644,7 +644,7 @@ def test_du_of_a_single_file_counts_one(url, capsys):
 
 def test_du_adds_up_what_the_listing_does_not_carry(server, capsys):
     """A server that lists without sizes still gets counted, one stat each."""
-    from xrd.proto import constants as c
+    from xrdclient.proto import constants as c
 
     server.add_file("/data/sub/x.bin", b"12345")
 
@@ -658,8 +658,8 @@ def test_du_adds_up_what_the_listing_does_not_carry(server, capsys):
 
 def _plain_listing(conn, sid, params, body):
     """A ``kXR_dirlist`` reply with names only - no stat lines attached."""
-    from xrd.proto import constants as c
-    from xrd.testing import frame
+    from xrdclient.proto import constants as c
+    from xrdclient.testing import frame
 
     path = body.split(b"\x00", 1)[0].decode().partition("?")[0].rstrip("/") or "/"
     names = conn._children(path)
@@ -710,7 +710,7 @@ def test_prepare_asks_for_a_stage_and_prints_the_handle(url, capsys):
 
 
 def test_prepare_can_evict_instead(url, server, capsys):
-    from xrd.proto import constants as c
+    from xrdclient.proto import constants as c
 
     code, out, _ = run(["prepare", "--evict", "--priority", "2", url + "data/a.root"], capsys)
     assert (code, out) == (0, "")

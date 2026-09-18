@@ -7,8 +7,8 @@ server would send": a multistatus with no ``href`` in it, an entry pointing
 at ``/etc/passwd``, a ranged ``GET`` answered short, a redirect with a token
 in its ``Location``, a DTD hidden past the first kilobyte.
 
-Every one of these is served by :class:`~xrd.testing.FakeDAVServer` through
-its :attr:`~xrd.testing.FakeDAVServer.handlers` hook, so the hostile answer
+Every one of these is served by :class:`~xrdclient.testing.FakeDAVServer` through
+its :attr:`~xrdclient.testing.FakeDAVServer.handlers` hook, so the hostile answer
 arrives over a real socket, through the real ``http.client``, exactly as it
 would from a real endpoint.
 """
@@ -21,12 +21,12 @@ import json
 
 import pytest
 
-import xrd
-from xrd.config import Config
-from xrd.crypto import checksum_bytes
-from xrd.errors import ProtocolError, ServerError, UnsupportedError
-from xrd.http import HTTPClient, digest, macaroon, open_http, propfind
-from xrd.testing import FakeDAVServer
+import xrdclient
+from xrdclient.config import Config
+from xrdclient.crypto import checksum_bytes
+from xrdclient.errors import ProtocolError, ServerError, UnsupportedError
+from xrdclient.http import HTTPClient, digest, macaroon, open_http, propfind
+from xrdclient.testing import FakeDAVServer
 
 BODY = b"hello world"
 XML = '<?xml version="1.0" encoding="utf-8"?>'
@@ -40,7 +40,7 @@ def dav():
 
 @pytest.fixture
 def fs(dav):
-    filesystem = xrd.FileSystem(dav.url)
+    filesystem = xrdclient.FileSystem(dav.url)
     try:
         yield filesystem
     finally:
@@ -258,7 +258,7 @@ def test_a_status_that_is_not_a_multistatus_is_not_parsed(dav, fs):
 
 def test_a_body_past_the_cap_is_truncated_rather_than_buffered(dav, monkeypatch):
     """A PROPFIND on a huge collection is how a client's memory gets eaten."""
-    monkeypatch.setattr("xrd.http.client.MAX_BODY", 64)
+    monkeypatch.setattr("xrdclient.http.client.MAX_BODY", 64)
     dav.handlers["PROPFIND"] = canned(
         multistatus(*[entry(f"/d/f{i}.root", size=i) for i in range(200)])
     )
@@ -498,10 +498,10 @@ def test_a_write_of_exactly_the_chunk_size_is_still_one_put(dav):
 
 
 def test_text_mode_writes_go_through_the_same_put(dav):
-    with xrd.open(dav.url / "d/t.txt", "w", encoding="utf-8") as fh:
+    with xrdclient.open(dav.url / "d/t.txt", "w", encoding="utf-8") as fh:
         fh.write("héllo\n")
     assert dav.contents("/d/t.txt") == "héllo\n".encode()
-    with xrd.open(dav.url / "d/t.txt", "r", encoding="utf-8") as fh:
+    with xrdclient.open(dav.url / "d/t.txt", "r", encoding="utf-8") as fh:
         assert fh.read() == "héllo\n"
 
 
@@ -580,7 +580,7 @@ def test_the_redirect_budget_counts_hops_not_hosts(dav, elsewhere):
     dav.redirects["/d/a.root"] = str(elsewhere.url / "d/a.root")
     elsewhere.redirects["/d/a.root"] = str(dav.url / "d/a.root")
     with HTTPClient(Config(redirect_limit=1)) as client:
-        with pytest.raises(xrd.errors.RedirectLimitError):
+        with pytest.raises(xrdclient.errors.RedirectLimitError):
             client.request("GET", dav.url / "d/a.root")
 
 
@@ -604,16 +604,16 @@ def test_a_token_never_appears_in_a_request_target(dav):
 
 
 def test_other_query_parameters_do_reach_the_server(dav):
-    url = dav.url.evolve(path="/d/a.root", query={"authz": "S", "xrd.k": "1"})
+    url = dav.url.evolve(path="/d/a.root", query={"authz": "S", "xrdclient.k": "1"})
     with HTTPClient(Config()) as client:
         client.request("GET", url)
-    assert dav.targets == ["/d/a.root?xrd.k=1"]
+    assert dav.targets == ["/d/a.root?xrdclient.k=1"]
 
 
 def test_the_token_is_presented_on_every_request_of_a_walk(dav, watch):
     dav.require_token = "T"
     seen = watch("PROPFIND")
-    with xrd.FileSystem(dav.url, Config(token="T")) as filesystem:
+    with xrdclient.FileSystem(dav.url, Config(token="T")) as filesystem:
         assert [root for root, _, _ in filesystem.walk("/d")] == ["/d", "/d/sub"]
     assert len(seen) >= 2
     assert all(h["Authorization"] == "Bearer T" for h in seen)
@@ -828,7 +828,7 @@ def test_every_verb_goes_through_the_same_gate(fs, dav, attempt):
 def test_third_party_copy_is_refused_at_the_gate_as_well(dav):
     dav.require_token = "the-right-one"
     with pytest.raises(PermissionError):
-        xrd.third_party(dav.url / "d/a.root", dav.url / "d/copy.root")
+        xrdclient.third_party(dav.url / "d/a.root", dav.url / "d/copy.root")
 
 
 # ---------------------------------------------------------------------------
@@ -839,12 +839,12 @@ def test_third_party_copy_is_refused_at_the_gate_as_well(dav):
 def test_a_pull_from_a_host_that_is_not_listening_is_reported(dav, closed_port):
     host, port = closed_port
     with pytest.raises(ServerError, match="cannot reach"):
-        xrd.third_party(f"http://{host}:{port}/d/a.root", dav.url / "d/pulled.root")
+        xrdclient.third_party(f"http://{host}:{port}/d/a.root", dav.url / "d/pulled.root")
 
 
 def test_a_push_of_a_file_the_source_does_not_have_is_reported(dav, closed_port):
     host, port = closed_port
-    from xrd.http import third_party
+    from xrdclient.http import third_party
 
     with pytest.raises(ServerError, match="not here to push"):
         third_party(dav.url / "d/absent.root", f"http://{host}:{port}/d/x.root", mode="push")

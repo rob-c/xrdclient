@@ -11,7 +11,7 @@ Install the development tools and run a report from the repository root:
 $ python -m pip install -e ".[dev]"
 $ python tools/maintainability.py hotspots
 $ python tools/maintainability.py report --top 50
-$ python tools/maintainability.py report src/xrd/root --top 0
+$ python tools/maintainability.py report src/xrdclient/root --top 0
 ```
 
 `hotspots` is the immediate drill-down: it lists every function which exceeds

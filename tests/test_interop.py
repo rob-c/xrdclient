@@ -1,6 +1,6 @@
 """The client against a genuine ``xrootd`` daemon.
 
-Everywhere else the suite talks to :class:`~xrd.testing.FakeServer`, which was
+Everywhere else the suite talks to :class:`~xrdclient.testing.FakeServer`, which was
 written from the same reading of the specification as the client - so a
 misreading shared by both would pass every test. This file is the control: an
 unprivileged ``xrootd`` on loopback, and where it matters the stock ``xrdcp``
@@ -21,13 +21,13 @@ from pathlib import Path
 
 import pytest
 
-import xrd
+import xrdclient
 from conftest import _REAL_CONFIG
-from xrd.cli import cp as cli_cp
-from xrd.cli import fs as cli_fs
-from xrd.client.file import File
-from xrd.errors import ExistsError, NotFoundError, UnsupportedError
-from xrd.flags import OpenFlags, StatInfoFlags
+from xrdclient.cli import cp as cli_cp
+from xrdclient.cli import fs as cli_fs
+from xrdclient.client.file import File
+from xrdclient.errors import ExistsError, NotFoundError, UnsupportedError
+from xrdclient.flags import OpenFlags, StatInfoFlags
 
 pytestmark = pytest.mark.interop
 
@@ -36,8 +36,8 @@ BLOB = bytes(range(256)) * 64  # 16 KiB, and every byte value present
 
 @pytest.fixture
 def rfs(real_server):
-    """A :class:`~xrd.FileSystem` on the real daemon."""
-    with xrd.FileSystem(real_server.url, _REAL_CONFIG) as filesystem:
+    """A :class:`~xrdclient.FileSystem` on the real daemon."""
+    with xrdclient.FileSystem(real_server.url, _REAL_CONFIG) as filesystem:
         yield filesystem
 
 
@@ -198,21 +198,21 @@ def test_a_write_handle_updates_pages_and_syncs(rfs, sandbox):
 
 
 def test_the_file_object_behaves_like_a_python_file(rfs, blob, sandbox):
-    with xrd.open(rfs.url.with_path(blob), "rb", config=_REAL_CONFIG) as fh:
+    with xrdclient.open(rfs.url.with_path(blob), "rb", config=_REAL_CONFIG) as fh:
         assert fh.readable() and fh.seekable() and not fh.writable()
         assert fh.read(16) == BLOB[:16]
         assert fh.seek(-16, os.SEEK_END) == len(BLOB) - 16
         assert fh.read() == BLOB[-16:]
 
     text = f"{sandbox}/t.txt"
-    with xrd.open(rfs.url.with_path(text), "w", config=_REAL_CONFIG) as fh:
+    with xrdclient.open(rfs.url.with_path(text), "w", config=_REAL_CONFIG) as fh:
         fh.write("one\ntwo\n")
-    with xrd.open(rfs.url.with_path(text), "r", config=_REAL_CONFIG) as fh:
+    with xrdclient.open(rfs.url.with_path(text), "r", config=_REAL_CONFIG) as fh:
         assert list(fh) == ["one\n", "two\n"]
 
 
 def test_the_path_api_works_against_the_real_thing(real_server, sandbox):
-    path = xrd.XRootDPath(url_for(real_server, f"{sandbox}/p.root"), config=_REAL_CONFIG)
+    path = xrdclient.XRootDPath(url_for(real_server, f"{sandbox}/p.root"), config=_REAL_CONFIG)
     try:
         path.write_text("contents")
         assert path.exists() and path.is_file()
@@ -257,16 +257,16 @@ def test_the_metadata_queries_answer(rfs, sandbox, real_server):
 
 def test_copying_moves_bytes_in_both_directions(rfs, sandbox, blob, tmp_path, real_server):
     local = tmp_path / "down.root"
-    result = xrd.copy(url_for(real_server, blob), str(local), config=_REAL_CONFIG)
+    result = xrdclient.copy(url_for(real_server, blob), str(local), config=_REAL_CONFIG)
     assert local.read_bytes() == BLOB
     assert result.size == len(BLOB)
 
     up = f"{sandbox}/up.root"
-    xrd.copy(str(local), url_for(real_server, up), config=_REAL_CONFIG)
+    xrdclient.copy(str(local), url_for(real_server, up), config=_REAL_CONFIG)
     assert rfs.read_bytes(up) == BLOB
 
     across = f"{sandbox}/across.root"
-    xrd.copy(url_for(real_server, up), url_for(real_server, across), config=_REAL_CONFIG)
+    xrdclient.copy(url_for(real_server, up), url_for(real_server, across), config=_REAL_CONFIG)
     assert rfs.checksum(across).value == rfs.checksum(blob).value
 
 
@@ -274,7 +274,7 @@ def test_a_copied_tree_arrives_whole(rfs, sandbox, tmp_path, real_server):
     for name in ("a.root", "sub/b.root"):
         rfs.write_bytes(f"{sandbox}/{name}", name.encode())
     out = tmp_path / "tree"
-    results = xrd.copy_tree(url_for(real_server, sandbox), str(out), config=_REAL_CONFIG)
+    results = xrdclient.copy_tree(url_for(real_server, sandbox), str(out), config=_REAL_CONFIG)
     assert len(results) == 2
     assert (out / "a.root").read_bytes() == b"a.root"
     assert (out / "sub" / "b.root").read_bytes() == b"sub/b.root"

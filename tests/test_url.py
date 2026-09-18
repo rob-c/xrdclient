@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from xrd.url import DEFAULT_PORT, XRootDURL, parse
+from xrdclient.url import DEFAULT_PORT, XRootDURL, parse
 
 
 @pytest.mark.parametrize(

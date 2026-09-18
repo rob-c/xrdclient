@@ -4,8 +4,8 @@ import dataclasses
 
 import pytest
 
-from xrd import config as cfgmod
-from xrd.config import Config, configure, current, override
+from xrdclient import config as cfgmod
+from xrdclient.config import Config, configure, current, override
 
 
 def test_defaults_are_sane():

@@ -17,14 +17,14 @@ from contextlib import contextmanager
 
 import pytest
 
-from xrd.client.file import READV_MAX_CHUNKS, File
-from xrd.client.filesystem import FileSystem
-from xrd.config import Config
-from xrd.errors import ProtocolError
-from xrd.flags import Access, OpenFlags
-from xrd.proto import constants as c
-from xrd.testing import FakeServer
-from xrd.types import ReadRange, WriteChunk
+from xrdclient.client.file import READV_MAX_CHUNKS, File
+from xrdclient.client.filesystem import FileSystem
+from xrdclient.config import Config
+from xrdclient.errors import ProtocolError
+from xrdclient.flags import Access, OpenFlags
+from xrdclient.proto import constants as c
+from xrdclient.testing import FakeServer
+from xrdclient.types import ReadRange, WriteChunk
 
 PAGE = c.kXR_pgPageSZ
 SIZE = 4 * PAGE + 137

@@ -15,11 +15,11 @@ import zlib
 
 import pytest
 
-from xrd import auth
-from xrd._log import redact
-from xrd.auth.base import Offer, parse_security_trailer
-from xrd.auth.simple import HostCredential, UnixCredential
-from xrd.auth.sss import (
+from xrdclient import auth
+from xrdclient._log import redact
+from xrdclient.auth.base import Offer, parse_security_trailer
+from xrdclient.auth.simple import HostCredential, UnixCredential
+from xrdclient.auth.sss import (
     BASE_TIME,
     SSSCredential,
     SSSKey,
@@ -27,10 +27,10 @@ from xrd.auth.sss import (
     default_keytab_path,
     read_keytab,
 )
-from xrd.auth.ztn import TokenCredential, discover_token, token_claims, token_expiry
-from xrd.config import Config
-from xrd.crypto.blowfish import Blowfish
-from xrd.errors import CredentialError, NoMechanismError, TokenExpiredError
+from xrdclient.auth.ztn import TokenCredential, discover_token, token_claims, token_expiry
+from xrdclient.config import Config
+from xrdclient.crypto.blowfish import Blowfish
+from xrdclient.errors import CredentialError, NoMechanismError, TokenExpiredError
 
 # --------------------------------------------------------------------------
 # The security trailer
@@ -268,7 +268,7 @@ def test_the_sss_body_decrypts_to_the_documented_layout():
 
 
 def test_the_sss_checksum_is_ieee_not_castagnoli():
-    from xrd.crypto.crc32c import crc32c
+    from xrdclient.crypto.crc32c import crc32c
 
     plain = Blowfish(KEY.secret).decrypt_cfb64(
         bytes(8), build_credential(KEY, "u", nonce=bytes(32), gen_time=0)[16:]
@@ -381,7 +381,7 @@ def test_a_keytab_others_can_read_is_refused(tmp_path, mode):
 def test_an_exposed_keytab_is_skipped_with_a_warning(tmp_path, caplog):
     config = Config(keytab=write_keytab(tmp_path))
     os.chmod(config.keytab, 0o644)
-    with caplog.at_level(logging.WARNING, logger="xrd.xrd.auth.sss"):
+    with caplog.at_level(logging.WARNING, logger="xrdclient.xrdclient.auth.sss"):
         assert SSSCredential.available(Offer("sss"), config, username="", host="h") is None
     assert "readable by group or others" in caplog.text
 
@@ -638,7 +638,7 @@ def test_redact_leaves_ordinary_text_alone():
 def test_a_logged_credential_never_reaches_a_handler(caplog):
     """The filter is on the logger, so caplog sees the redacted record."""
     log = auth._log
-    with caplog.at_level("DEBUG", logger="xrd.auth"):
+    with caplog.at_level("DEBUG", logger="xrdclient.auth"):
         log.debug("sending %s", "token=eyJhbGciOiJub25lIn0.e30.sig")
     assert "e30" not in caplog.text
     assert "<redacted>" in caplog.text
@@ -665,7 +665,7 @@ def test_no_credential_reaches_a_traceback():
 
 def test_a_secret_split_across_the_format_string_is_still_caught(caplog):
     """Neither half looks like a credential; the joined message does."""
-    with caplog.at_level("DEBUG", logger="xrd.auth"):
+    with caplog.at_level("DEBUG", logger="xrdclient.auth"):
         auth._log.debug("%s=%s", "password", "hunter2")
     assert "hunter2" not in caplog.text
     assert "<redacted>" in caplog.text
@@ -673,7 +673,7 @@ def test_a_secret_split_across_the_format_string_is_still_caught(caplog):
 
 def test_redaction_does_not_eat_a_placeholder(caplog):
     """``"keytab: %s"`` is the shape of a secret assignment, and is not one."""
-    with caplog.at_level("DEBUG", logger="xrd.auth"):
+    with caplog.at_level("DEBUG", logger="xrdclient.auth"):
         auth._log.debug("keytab: %s", "/etc/xrd/sss.keytab")
     assert "<redacted>" in caplog.text  # the path still goes, as it should
     assert "not all arguments converted" not in caplog.text
@@ -681,15 +681,17 @@ def test_redaction_does_not_eat_a_placeholder(caplog):
 
 def test_a_broken_format_string_is_still_passed_along():
     """Redaction cannot read the message, and a logging bug is not ours to eat."""
-    from xrd._log import _filter
+    from xrdclient._log import _filter
 
-    record = logging.LogRecord("xrd.auth", logging.DEBUG, __file__, 1, "counted %d", ("x",), None)
+    record = logging.LogRecord(
+        "xrdclient.auth", logging.DEBUG, __file__, 1, "counted %d", ("x",), None
+    )
     assert _filter.filter(record) is True
     assert record.msg == "counted %d" and record.args == ("x",)
 
 
 def test_the_unix_credential_prints_the_name_it_will_send():
-    from xrd.auth.simple import UnixCredential
+    from xrdclient.auth.simple import UnixCredential
 
     assert repr(UnixCredential("tester")) == "UnixCredential(username='tester')"
 
@@ -701,8 +703,10 @@ def test_a_credential_with_nothing_to_show_prints_its_mechanism():
 
 def test_a_clean_message_with_no_arguments_is_left_exactly_as_it_was():
     """The filter only rewrites a record it had a reason to touch."""
-    from xrd._log import _filter
+    from xrdclient._log import _filter
 
-    record = logging.LogRecord("xrd.auth", logging.DEBUG, __file__, 1, "connected", None, None)
+    record = logging.LogRecord(
+        "xrdclient.auth", logging.DEBUG, __file__, 1, "connected", None, None
+    )
     assert _filter.filter(record) is True
     assert record.msg == "connected" and record.args is None

@@ -17,36 +17,36 @@ import pytest
 pytest.importorskip("mypy", reason="mypy is part of the dev extra")
 
 SOURCE = '''
-import xrd
+import xrdclient
 
 url = "root://host//store/f.root"
 
-reveal_type(xrd.open(url, "rb").read())
-reveal_type(xrd.open(url, "r").read())
-reveal_type(xrd.open(url, "rb", buffering=0))
-reveal_type(xrd.open(url, mode_from_config).read())
+reveal_type(xrdclient.open(url, "rb").read())
+reveal_type(xrdclient.open(url, "r").read())
+reveal_type(xrdclient.open(url, "rb", buffering=0))
+reveal_type(xrdclient.open(url, mode_from_config).read())
 
-fs = xrd.FileSystem("root://host")
+fs = xrdclient.FileSystem("root://host")
 reveal_type(fs.read_bytes("/f"))
 reveal_type(fs.read_text("/f"))
-reveal_type(xrd.XRootDPath(url).stat())
+reveal_type(xrdclient.XRootDPath(url).stat())
 '''
 
 EXPECTED = [
     'Revealed type is "bytes"',
     'Revealed type is "str"',
-    'Revealed type is "xrd.io.raw.XRootDRawIO"',
+    'Revealed type is "xrdclient.io.raw.XRootDRawIO"',
     'Revealed type is "Any"',
     'Revealed type is "bytes"',
     'Revealed type is "str"',
-    'Revealed type is "xrd.types.StatInfo"',
+    'Revealed type is "xrdclient.types.StatInfo"',
 ]
 
 
 WORDS = """
-import xrd
+import xrdclient
 
-fs = xrd.FileSystem("root://host")
+fs = xrdclient.FileSystem("root://host")
 fs.prepare(["/f"], evict=True)
 fs.prepare(["/f"], flags="stage notify")
 fs.scandir("/store", stat=False)
@@ -54,11 +54,11 @@ fs.locate("/f", refresh=True)
 fs.chmod("/f", "rw-r-----")
 fs.mkdir("/d", "rwxr-x---")
 fs.query("checksum", "/f")
-xrd.PrepareFlags("stage notify")
-xrd.Access("rwxr-x---")
-xrd.OpenFlags("new makepath")
-xrd.QueryCode("checksum")
-xrd.File("root://host//f").open("w", "rw-r--r--")
+xrdclient.PrepareFlags("stage notify")
+xrdclient.Access("rwxr-x---")
+xrdclient.OpenFlags("new makepath")
+xrdclient.QueryCode("checksum")
+xrdclient.File("root://host//f").open("w", "rw-r--r--")
 """
 
 

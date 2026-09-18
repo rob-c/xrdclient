@@ -13,9 +13,9 @@ import types
 
 import pytest
 
-from xrd.auth import registry
-from xrd.auth.base import Offer
-from xrd.auth.krb5 import (
+from xrdclient.auth import registry
+from xrdclient.auth.base import Offer
+from xrdclient.auth.krb5 import (
     CCACHE_VERSION_3,
     CCACHE_VERSION_4,
     KerberosCredential,
@@ -26,8 +26,8 @@ from xrd.auth.krb5 import (
     service_principal,
     tickets,
 )
-from xrd.config import Config
-from xrd.errors import CredentialError
+from xrdclient.config import Config
+from xrdclient.errors import CredentialError
 
 
 def _gssapi_installed() -> bool:
@@ -201,7 +201,7 @@ def test_a_truncated_entry_costs_the_tail_not_the_answer(tmp_path):
 
 
 def test_the_cursor_refuses_to_read_past_the_end():
-    from xrd.auth.krb5 import _Reader
+    from xrdclient.auth.krb5 import _Reader
 
     reader = _Reader(b"\x00\x01")
     assert reader.u16() == 1
@@ -307,7 +307,7 @@ def test_a_live_ticket_without_gssapi_says_so(monkeypatch, cache):
 @pytest.mark.skipif(HAS_GSSAPI, reason="gssapi is installed")
 def test_the_ladder_turns_that_into_a_reason_not_a_failure(monkeypatch, cache):
     """``select`` must survive a mechanism that raises, and record why."""
-    from xrd.auth import select
+    from xrdclient.auth import select
 
     monkeypatch.setenv("KRB5CCNAME", f"FILE:{cache}")
     rejected: dict[str, str] = {}
@@ -320,7 +320,7 @@ def test_the_ladder_turns_that_into_a_reason_not_a_failure(monkeypatch, cache):
 
 @pytest.mark.skipif(HAS_GSSAPI, reason="gssapi is installed")
 def test_the_exchange_itself_names_the_missing_extra():
-    with pytest.raises(CredentialError, match=r"pip install pyxrootdclient\[krb5\]"):
+    with pytest.raises(CredentialError, match=r"pip install xrdclient\[krb5\]"):
         KerberosCredential("xrootd/srv").initial()
 
 

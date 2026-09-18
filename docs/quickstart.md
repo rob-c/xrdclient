@@ -1,15 +1,15 @@
 # Quickstart
 
-Everything below is a complete program once you add `import xrd`.
+Everything below is a complete program once you add `import xrdclient`.
 
 If all you have is a URL and one question, start at
-[Easy mode](easy.md) instead - `xrd.ls`, `xrd.size`, `xrd.read_text` and a
+[Easy mode](easy.md) instead - `xrdclient.ls`, `xrdclient.size`, `xrdclient.read_text` and a
 dozen more, each of them one line.
 
 ## Read a file
 
 ```python
-with xrd.open("root://eos.example.org//store/data.root", "rb") as fh:
+with xrdclient.open("root://eos.example.org//store/data.root", "rb") as fh:
     header = fh.read(1024)
     fh.seek(-4096, 2)          # relative to the end
     trailer = fh.read()
@@ -21,7 +21,7 @@ data far more often than they are text - and `"r"` or `"rt"` gets you decoded
 lines with the usual `encoding`, `errors` and `newline` arguments:
 
 ```python
-with xrd.open("root://host//store/notes.txt", "r") as fh:
+with xrdclient.open("root://host//store/notes.txt", "r") as fh:
     for line in fh:
         print(line.rstrip())
 ```
@@ -29,7 +29,7 @@ with xrd.open("root://host//store/notes.txt", "r") as fh:
 ## Write a file
 
 ```python
-with xrd.open("root://host//store/out.root", "wb") as fh:
+with xrdclient.open("root://host//store/out.root", "wb") as fh:
     fh.write(payload)
 ```
 
@@ -41,7 +41,7 @@ dies.
 ## Walk a namespace
 
 ```python
-fs = xrd.FileSystem("root://eos.example.org")
+fs = xrdclient.FileSystem("root://eos.example.org")
 
 for entry in fs.scandir("/store/user/me"):
     print(entry.name, entry.stat.st_size, entry.is_dir())
@@ -60,7 +60,7 @@ in it.
 ## Use it as a path
 
 ```python
-p = xrd.Path("root://host//store") / "user" / "me"
+p = xrdclient.Path("root://host//store") / "user" / "me"
 p.mkdir(parents=True, exist_ok=True)
 (p / "note.txt").write_text("hello")
 sizes = {child.name: child.stat().st_size for child in p.iterdir()}
@@ -69,10 +69,10 @@ sizes = {child.name: child.stat().st_size for child in p.iterdir()}
 ## Copy something
 
 ```python
-xrd.copy("root://a//store/f.root", "/scratch/f.root")            # download
-xrd.copy("/scratch/f.root", "root://b//store/f.root")            # upload
-xrd.copy_tree("root://a//store/run7", "/scratch/run7")           # recursive
-xrd.third_party("root://a//store/f.root", "root://b//store/f.root")
+xrdclient.copy("root://a//store/f.root", "/scratch/f.root")            # download
+xrdclient.copy("/scratch/f.root", "root://b//store/f.root")            # upload
+xrdclient.copy_tree("root://a//store/run7", "/scratch/run7")           # recursive
+xrdclient.third_party("root://a//store/f.root", "root://b//store/f.root")
 ```
 
 Checksums are verified by default. `progress=` takes a `(done, total)`
@@ -93,10 +93,10 @@ There is no status object to inspect and no return value to forget to check.
 ## Do it asynchronously
 
 ```python
-import asyncio, xrd.aio
+import asyncio, xrdclient.aio
 
 async def main():
-    async with xrd.aio.FileSystem("root://eos.example.org") as fs:
+    async with xrdclient.aio.FileSystem("root://eos.example.org") as fs:
         names = await fs.listdir("/store")
         sizes = await asyncio.gather(*(fs.getsize(f"/store/{n}") for n in names))
 
@@ -106,10 +106,10 @@ asyncio.run(main())
 ## Configure it
 
 ```python
-cfg = xrd.Config(request_timeout=60.0, verify_checksums=False)
-fs = xrd.FileSystem("root://host", cfg)
+cfg = xrdclient.Config(request_timeout=60.0, verify_checksums=False)
+fs = xrdclient.FileSystem("root://host", cfg)
 
-with xrd.override(chunk_size=1 << 20):   # for this block only
+with xrdclient.override(chunk_size=1 << 20):   # for this block only
     ...
 ```
 
@@ -118,7 +118,7 @@ client uses, and settings you always want can live in
 `~/.config/xrd/config.ini`:
 
 ```python
-cfg = xrd.Config.from_file(alias="eos")     # [defaults], then [alias eos]
+cfg = xrdclient.Config.from_file(alias="eos")     # [defaults], then [alias eos]
 ```
 
 See [Configuration](config.md).
@@ -136,10 +136,10 @@ $ xrd-fs du --alias eos root://eos.example.org//store/user/me
 ## Without a storage element
 
 ```python
-from xrd.testing import FakeServer
+from xrdclient.testing import FakeServer
 
 with FakeServer(files={"/data/a.root": b"hello"}) as server:
-    fs = xrd.FileSystem(server.url)
+    fs = xrdclient.FileSystem(server.url)
     assert fs.read_bytes("/data/a.root") == b"hello"
 ```
 

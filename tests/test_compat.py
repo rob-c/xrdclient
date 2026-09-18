@@ -25,9 +25,9 @@ from dataclasses import dataclass
 
 import pytest
 
-import xrd
-from xrd._compat import SLOTS, TIMEOUTS, flag_members, zip_strict
-from xrd.flags import OpenFlags, StatInfoFlags
+import xrdclient
+from xrdclient._compat import SLOTS, TIMEOUTS, flag_members, zip_strict
+from xrdclient.flags import OpenFlags, StatInfoFlags
 
 #: The floor. ``feature_version`` will not go below 3.7, so this is honest
 #: about being a lower bound on what the parser will complain about.
@@ -36,7 +36,7 @@ FLOOR = (3, 9)
 #: The one module allowed to know what version it is running on.
 COMPAT = "_compat.py"
 
-SOURCES = sorted(pathlib.Path(xrd.__file__).parent.rglob("*.py"))
+SOURCES = sorted(pathlib.Path(xrdclient.__file__).parent.rglob("*.py"))
 
 
 def test_there_is_something_to_check():
@@ -58,8 +58,8 @@ def test_every_module_parses_as_the_oldest_supported_python(source):
 #: what to say instead, which is also what the rest of the package already
 #: does.
 LATER = {
-    "zip(..., strict=)": "xrd._compat.zip_strict",
-    "dataclass(slots=)": "**SLOTS from xrd._compat",
+    "zip(..., strict=)": "xrdclient._compat.zip_strict",
+    "dataclass(slots=)": "**SLOTS from xrdclient._compat",
     "dataclass(kw_only=)": "a default of REQUIRED and a NEEDS tuple",
     "itertools.pairwise": "zip(seq, seq[1:])",
     "isinstance(x, A | B)": "isinstance(x, (A, B))",
@@ -134,8 +134,8 @@ def test_no_module_spells_something_the_floor_cannot_run(source):
 
 def test_the_alias_assignments_that_have_to_be_evaluated_are_evaluated():
     """The receipt for that last paragraph, since importing proves it."""
-    from xrd.easy import Location
-    from xrd.testing.http import Handler
+    from xrdclient.easy import Location
+    from xrdclient.testing.http import Handler
 
     assert str in Location.__args__ and Handler is not None
 
@@ -150,12 +150,12 @@ def test_a_real_3_9_can_import_every_module():
     python = shutil.which("python3.9")
     if python is None:
         pytest.skip("no python3.9 on PATH to check the floor against")
-    src = str(pathlib.Path(xrd.__file__).parent.parent)
+    src = str(pathlib.Path(xrdclient.__file__).parent.parent)
     probe = """
-import importlib, pkgutil, xrd
+import importlib, pkgutil, xrdclient
 
 bad = []
-for info in pkgutil.walk_packages(xrd.__path__, "xrd."):
+for info in pkgutil.walk_packages(xrdclient.__path__, "xrdclient."):
     try:
         importlib.import_module(info.name)
     except ImportError as exc:
@@ -215,7 +215,7 @@ def test_the_written_out_check_behaves_as_the_one_in_c_does(monkeypatch):
     Without this the fallback would be dead code on the interpreter the
     coverage gate runs on, and alive on the one that has no gate at all.
     """
-    monkeypatch.setattr("xrd._compat._NATIVE_STRICT_ZIP", False)
+    monkeypatch.setattr("xrdclient._compat._NATIVE_STRICT_ZIP", False)
     assert list(zip_strict("abc", [1, 2, 3])) == [("a", 1), ("b", 2), ("c", 3)]
     with pytest.raises(ValueError, match="different lengths"):
         list(zip_strict("abc", [1, 2]))

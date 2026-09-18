@@ -23,17 +23,17 @@ import time
 import pytest
 
 from conftest import handshake_reply, login_body, ok, protocol_body
-from xrd.client.file import File
-from xrd.config import Config
-from xrd.errors import ChecksumMismatchError, TransientError, WaitLimitError
-from xrd.errors import ConnectionError as XrdConnectionError
-from xrd.errors import TimeoutError as XrdTimeoutError
-from xrd.flags import OpenFlags
-from xrd.proto import constants as c
-from xrd.proto import machine as m
-from xrd.proto import requests as r
-from xrd.session.sync import Session
-from xrd.testing import error, frame
+from xrdclient.client.file import File
+from xrdclient.config import Config
+from xrdclient.errors import ChecksumMismatchError, TransientError, WaitLimitError
+from xrdclient.errors import ConnectionError as XrdConnectionError
+from xrdclient.errors import TimeoutError as XrdTimeoutError
+from xrdclient.flags import OpenFlags
+from xrdclient.proto import constants as c
+from xrdclient.proto import machine as m
+from xrdclient.proto import requests as r
+from xrdclient.session.sync import Session
+from xrdclient.testing import error, frame
 
 IMPATIENT = Config(
     username="tester",
@@ -49,7 +49,7 @@ IMPATIENT = Config(
 @pytest.fixture
 def fs(server):
     """A filesystem on the shared server, retrying but never sleeping."""
-    from xrd import FileSystem
+    from xrdclient import FileSystem
 
     server.add_file("/data/doomed.root", b"x" * 32)
     server.dirs.add("/data")
@@ -211,7 +211,7 @@ def test_closing_a_session_twice_is_allowed(server):
 
 def test_a_pinned_router_refuses_to_reconnect_underneath_a_file_handle(server):
     """The handle only exists on the connection that opened it."""
-    from xrd.session.router import Router
+    from xrdclient.session.router import Router
 
     router = Router(server.url, IMPATIENT, reconnect=False)
     try:
@@ -280,7 +280,7 @@ def test_a_server_that_only_ever_says_wait_is_given_up_on(server, fs):
 def test_a_busy_server_is_not_mistaken_for_a_broken_connection(server, fs):
     """``kXR_wait`` past the budget must not start a reconnection loop.
 
-    :class:`~xrd.WaitLimitError` is a :class:`~xrd.TransientError`, and the
+    :class:`~xrdclient.WaitLimitError` is a :class:`~xrdclient.TransientError`, and the
     router retries those - so without an exception for it the budget would be
     spent once per reconnection attempt and the server asked four times over.
     """
@@ -452,7 +452,7 @@ def test_a_paged_write_of_nothing_is_not_sent_at_all(server):
 
 def test_a_retried_page_is_marked_as_one():
     """The flag tells the server this page is a second attempt, not new data."""
-    from xrd.proto.frames import encode
+    from xrdclient.proto.frames import encode
 
     body = encode(r.PgWrite(b"HDL0", 0, b"pageful", retry=True), 4)
     assert body[c.REQUEST_HDRLEN - 4 : c.REQUEST_HDRLEN] == struct.pack(">i", len(b"pageful"))

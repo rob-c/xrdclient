@@ -11,14 +11,14 @@ import struct
 import pytest
 
 from conftest import error, frame, handshake_reply, login_body, ok, protocol_body
-from xrd.auth.base import Credential
-from xrd.auth.simple import HostCredential
-from xrd.config import Config
-from xrd.errors import ConnectionError as XrdConnectionError
-from xrd.errors import NoMechanismError, ProtocolError, ServerError
-from xrd.proto import constants as c
-from xrd.proto import machine as m
-from xrd.proto import requests as r
+from xrdclient.auth.base import Credential
+from xrdclient.auth.simple import HostCredential
+from xrdclient.config import Config
+from xrdclient.errors import ConnectionError as XrdConnectionError
+from xrdclient.errors import NoMechanismError, ProtocolError, ServerError
+from xrdclient.proto import constants as c
+from xrdclient.proto import machine as m
+from xrdclient.proto import requests as r
 
 SID = 4  # the first streamid the machine hands out
 
@@ -779,7 +779,7 @@ def test_a_streamid_that_is_still_in_flight_is_not_handed_out_twice():
 
 
 def test_a_signer_leaves_the_requests_it_does_not_cover_alone():
-    from xrd.crypto.sigver import Signer
+    from xrdclient.crypto.sigver import Signer
 
     machine = ready()
     machine.signer = Signer(b"k" * 32, c.kXR_secStandard, {})
@@ -824,7 +824,7 @@ def test_status_data_for_a_stream_nobody_is_waiting_on_is_dropped():
 
 def test_an_error_body_that_is_not_an_error_still_becomes_one():
     """``raise_for_status`` says nothing about code 0; the caller still needs an exception."""
-    from xrd.proto import responses as rp
+    from xrdclient.proto import responses as rp
 
     exc = m._server_error(rp.ErrorInfo(0, "nothing went wrong"), "/d/f.root")
     assert isinstance(exc, ServerError)

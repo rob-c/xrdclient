@@ -6,10 +6,10 @@ import io
 
 import pytest
 
-from xrd.client.file import File
-from xrd.flags import OpenFlags
-from xrd.io import DEFAULT_BUFFER_SIZE, XRootDRawIO, flags_for_mode, open_url, parse_mode
-from xrd.testing import FakeServer
+from xrdclient.client.file import File
+from xrdclient.flags import OpenFlags
+from xrdclient.io import DEFAULT_BUFFER_SIZE, XRootDRawIO, flags_for_mode, open_url, parse_mode
+from xrdclient.testing import FakeServer
 
 
 @pytest.fixture
@@ -240,7 +240,7 @@ def test_repr_shows_the_name_and_the_position(raw):
 
 
 def test_an_already_opened_handle_is_not_reopened(fs, server):
-    from xrd.proto import constants as c
+    from xrdclient.proto import constants as c
 
     handle = File(fs.url.with_path("/data/a.root"), fs.config, router=fs._router)
     handle.open(OpenFlags.READ)
@@ -329,7 +329,7 @@ def test_reading_never_asks_to_create_anything():
 def test_a_mode_that_is_none_of_the_four_opens_nothing_in_particular(monkeypatch):
     """``parse_mode`` only ever yields ``r w x a``; the chain still falls through
     without an access flag rather than guessing one."""
-    from xrd import flags as flags_module
+    from xrdclient import flags as flags_module
 
     monkeypatch.setattr(flags_module, "parse_mode", lambda mode: ("z", False, False))
     flags = flags_module.flags_for_mode("zb", makepath=True, posc=True)

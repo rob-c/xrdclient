@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import pytest
 
-import xrd
-from xrd.cli import confirm, interactive
-from xrd.cli import cp as cp_cli
-from xrd.cli import fs as fs_cli
-from xrd.config import Config
-from xrd.errors import TooLargeError
-from xrd.testing import FakeDAVServer, FakeServer
+import xrdclient
+from xrdclient.cli import confirm, interactive
+from xrdclient.cli import cp as cp_cli
+from xrdclient.cli import fs as fs_cli
+from xrdclient.config import Config
+from xrdclient.errors import TooLargeError
+from xrdclient.testing import FakeDAVServer, FakeServer
 
 BODY = b"hello world"
 
@@ -34,7 +34,7 @@ def run(argv, capsys):
 @pytest.fixture
 def small(server):
     """The fixture server, with a ceiling low enough to bump into."""
-    with xrd.FileSystem(server.url, Config(max_read_size=4, auth_order=("host",))) as fs:
+    with xrdclient.FileSystem(server.url, Config(max_read_size=4, auth_order=("host",))) as fs:
         yield fs
 
 
@@ -45,7 +45,7 @@ def test_a_read_that_never_said_how_much_it_wanted_is_bounded(small, server):
     message = str(caught.value)
     assert "/data/a.root is 11 bytes" in message
     assert "over the 4 byte ceiling" in message
-    assert "xrd.copy()" in message and "max_read_size" in message
+    assert "xrdclient.copy()" in message and "max_read_size" in message
     assert (caught.value.size, caught.value.limit) == (11, 4)
 
 
@@ -60,7 +60,8 @@ def test_asking_for_a_number_of_bytes_is_always_answered(small):
 def test_the_ceiling_can_be_lifted_and_then_the_whole_file_arrives(server):
     """A dataset that really is meant to be in memory only has to say so."""
     for limit in (0, 1 << 20):
-        with xrd.FileSystem(server.url, Config(max_read_size=limit, auth_order=("host",))) as fs:
+        settings = Config(max_read_size=limit, auth_order=("host",))
+        with xrdclient.FileSystem(server.url, settings) as fs:
             assert fs.read_bytes("/data/a.root") == BODY
 
 
@@ -68,7 +69,7 @@ def test_the_same_ceiling_holds_over_http(monkeypatch):
     """HTTP counts it as it arrives - there is no length to ask for first."""
     with FakeDAVServer(files={"/d/a.root": BODY}) as dav:
         config = Config(max_read_size=4, chunk_size=2, verify_tls=False)
-        with xrd.FileSystem(dav.url, config) as fs:
+        with xrdclient.FileSystem(dav.url, config) as fs:
             with pytest.raises(TooLargeError):
                 fs.read_bytes("/d/a.root")
             with fs.open("/d/a.root", "rb") as handle:
@@ -88,7 +89,7 @@ def test_a_ceiling_survives_being_pickled_like_every_other_error():
 def test_an_unbounded_read_of_something_that_fits_is_left_alone():
     """Under the ceiling nothing changes, including the empty file."""
     with FakeServer(files={"/e.bin": b"", "/tiny": b"ab"}) as srv:
-        with xrd.FileSystem(srv.url, Config(max_read_size=4, auth_order=("host",))) as fs:
+        with xrdclient.FileSystem(srv.url, Config(max_read_size=4, auth_order=("host",))) as fs:
             assert fs.read_bytes("/e.bin") == b""
             assert fs.read_bytes("/tiny") == b"ab"
 
@@ -151,7 +152,7 @@ def test_a_terminal_is_asked_before_a_tree_goes(server, capsys, monkeypatch):
     """With somebody watching, the count of what is about to go is shown."""
     server.add_file("/data/tree/a.bin", b"x")
     server.add_file("/data/tree/b.bin", b"y")
-    monkeypatch.setattr("xrd.cli.fs.interactive", lambda: True)
+    monkeypatch.setattr("xrdclient.cli.fs.interactive", lambda: True)
 
     monkeypatch.setattr("builtins.input", lambda: "n")
     code, _out, err = run(["rm", "-r", str(server.url) + "data/tree"], capsys)

@@ -5,21 +5,21 @@ CI, so annotations reach your code without a stub package and without
 `ignore_missing_imports`.
 
 ```console
-$ mypy --strict your_analysis.py     # xrd is checked, not skipped
+$ mypy --strict your_analysis.py     # xrdclient is checked, not skipped
 ```
 
 ## What the annotations promise
 
-`xrd.open` is overloaded the way typeshed overloads the builtin: a *literal*
+`xrdclient.open` is overloaded the way typeshed overloads the builtin: a *literal*
 mode string decides whether you get bytes or text, and `buffering=0` decides
 whether you get the raw layer.
 
 | Call | Type |
 | --- | --- |
-| `xrd.open(url, "rb")` | `BinaryIO` |
-| `xrd.open(url, "r")` | `TextIO` |
-| `xrd.open(url, "rb", buffering=0)` | `XRootDRawIO` - so `.file` is visible |
-| `xrd.open(url, mode)` where `mode: str` | `IO[Any]` |
+| `xrdclient.open(url, "rb")` | `BinaryIO` |
+| `xrdclient.open(url, "r")` | `TextIO` |
+| `xrdclient.open(url, "rb", buffering=0)` | `XRootDRawIO` - so `.file` is visible |
+| `xrdclient.open(url, mode)` where `mode: str` | `IO[Any]` |
 
 That last row is the escape hatch: a mode computed at runtime still
 type-checks, it just cannot say which of the four you asked for.
@@ -28,7 +28,7 @@ type-checks, it just cannot say which of the four you asked for.
 
 `FileSystem.open` deliberately keeps one signature returning `IO[Any]` rather
 than repeating the overloads. It is the by-path spelling; if you want the
-element type statically, `xrd.open` is the one that knows. The whole-file
+element type statically, `xrdclient.open` is the one that knows. The whole-file
 helpers are precise either way:
 
 ```python
@@ -56,7 +56,7 @@ papered over:
 - **`gssapi`** and **`google_crc32c`** ship no stubs, and both are optional
   extras reached through a guarded import.
 - **`fsspec`** ships no `py.typed`, so `AbstractFileSystem` is `Any` and
-  `xrd.fsspec_impl` is the one module allowed to subclass an untyped base.
+  `xrdclient.fsspec_impl` is the one module allowed to subclass an untyped base.
 - **`copy(source, target)`** takes a URL, a `str`, an `os.PathLike`, an
   `XRootDPath` or an already-open binary file, and dispatches on what it got.
 

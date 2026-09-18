@@ -1,6 +1,6 @@
 """The fake server itself.
 
-:class:`~xrd.testing.FakeServer` is part of the public API, so its own
+:class:`~xrdclient.testing.FakeServer` is part of the public API, so its own
 behaviour - the contents it exposes, the knobs that inject awkward server
 behaviour, and its lifecycle - is tested here rather than assumed.
 """
@@ -13,10 +13,11 @@ import threading
 
 import pytest
 
-import xrd
-from xrd.proto import constants as c
-from xrd.testing import FakeServer, from_directory
-from xrd.testing.server import _checksum, _clean, _fattr_reply, _splice, main
+import xrdclient
+from xrdclient import OpenFlags
+from xrdclient.proto import constants as c
+from xrdclient.testing import FakeServer, from_directory
+from xrdclient.testing.server import _checksum, _clean, _fattr_reply, _splice, main
 
 # ---------------------------------------------------------------------------
 # Contents
@@ -102,7 +103,7 @@ def test_start_is_idempotent():
     try:
         assert srv.start() is srv
         srv.start()
-        with xrd.FileSystem(srv.url) as fs:
+        with xrdclient.FileSystem(srv.url) as fs:
             fs.ping()
     finally:
         srv.stop()
@@ -116,7 +117,7 @@ def test_repr_counts_the_contents():
 
 def test_disconnect_drops_live_connections_but_keeps_listening():
     with FakeServer(files={"/f": b"ok"}) as srv:
-        fs = xrd.FileSystem(srv.url)
+        fs = xrdclient.FileSystem(srv.url)
         fs.ping()
         srv.disconnect()
         assert fs.stat("/f").st_size == 2  # the router reconnects
@@ -138,7 +139,7 @@ def test_several_clients_are_served_at_once():
 
         def hammer() -> None:
             try:
-                with xrd.FileSystem(srv.url) as fs:
+                with xrdclient.FileSystem(srv.url) as fs:
                     for _ in range(5):
                         assert fs.read_bytes("/f") == b"ok"
             except BaseException as exc:  # pragma: no cover - only on failure
@@ -159,7 +160,7 @@ def test_several_clients_are_served_at_once():
 
 def test_seen_records_opcodes_in_order():
     with FakeServer() as srv:
-        with xrd.FileSystem(srv.url) as fs:
+        with xrdclient.FileSystem(srv.url) as fs:
             fs.ping()
         assert srv.seen[:3] == [c.kXR_protocol, c.kXR_login, c.kXR_ping]
 
@@ -167,7 +168,7 @@ def test_seen_records_opcodes_in_order():
 def test_a_redirect_fires_once_then_the_request_is_served():
     with FakeServer(files={"/f": b"ok"}) as srv:
         srv.redirects[c.kXR_stat] = (*srv.address, "tok=1")
-        with xrd.FileSystem(srv.url) as fs:
+        with xrdclient.FileSystem(srv.url) as fs:
             assert fs.stat("/f").st_size == 2
         assert not srv.redirects
 
@@ -175,7 +176,7 @@ def test_a_redirect_fires_once_then_the_request_is_served():
 def test_a_wait_counts_down():
     with FakeServer(files={"/f": b"ok"}) as srv:
         srv.waits[c.kXR_stat] = 2
-        with xrd.FileSystem(srv.url) as fs:
+        with xrdclient.FileSystem(srv.url) as fs:
             fs.stat("/f")
         assert srv.waits[c.kXR_stat] == 0
         assert srv.seen.count(c.kXR_stat) == 3
@@ -184,21 +185,21 @@ def test_a_wait_counts_down():
 def test_chunk_reads_splits_the_body():
     with FakeServer(files={"/f": b"0123456789"}) as srv:
         srv.chunk_reads = 4
-        with xrd.FileSystem(srv.url) as fs:
+        with xrdclient.FileSystem(srv.url) as fs:
             assert fs.read_bytes("/f") == b"0123456789"
 
 
 def test_chunk_reads_below_the_body_size_sends_one_frame():
     with FakeServer(files={"/f": b"abc"}) as srv:
         srv.chunk_reads = 100
-        with xrd.FileSystem(srv.url) as fs:
+        with xrdclient.FileSystem(srv.url) as fs:
             assert fs.read_bytes("/f") == b"abc"
 
 
 def test_config_values_are_what_a_query_answers():
     with FakeServer() as srv:
         srv.config_values["role"] = "manager"
-        with xrd.FileSystem(srv.url) as fs:
+        with xrdclient.FileSystem(srv.url) as fs:
             assert fs.query_config("role") == {"role": "manager"}
             assert fs.query_config("unknown") == {}  # unset names are absent
             # An empty answer must not shift the ones that follow it.
@@ -207,14 +208,14 @@ def test_config_values_are_what_a_query_answers():
 
 def test_the_announced_protocol_can_be_chosen():
     with FakeServer(version=0x0400_0000, flags=c.kXR_isManager) as srv:
-        with xrd.FileSystem(srv.url) as fs:
+        with xrdclient.FileSystem(srv.url) as fs:
             info = fs.protocol()
         assert info.version == 0x0400_0000
         assert info.flags == c.kXR_isManager
 
 
 def test_an_unsupported_request_is_refused_not_ignored():
-    from xrd.proto.frames import Request
+    from xrdclient.proto.frames import Request
 
     class Gpfile(Request):
         """An opcode the fake server has never heard of."""
@@ -222,15 +223,15 @@ def test_an_unsupported_request_is_refused_not_ignored():
         __slots__ = ()
         opcode = c.kXR_gpfile
 
-    with FakeServer() as srv, xrd.FileSystem(srv.url) as fs:
+    with FakeServer() as srv, xrdclient.FileSystem(srv.url) as fs:
         with pytest.raises(OSError, match="is not supported"):
             fs._router.execute(Gpfile())
 
 
 def test_an_unsupported_query_is_refused():
-    from xrd.proto import requests as r
+    from xrdclient.proto import requests as r
 
-    with FakeServer() as srv, xrd.FileSystem(srv.url) as fs:
+    with FakeServer() as srv, xrdclient.FileSystem(srv.url) as fs:
         with pytest.raises(OSError):
             fs._router.execute(r.Query(c.kXR_Qopaquf, "/"))
 
@@ -238,12 +239,12 @@ def test_an_unsupported_query_is_refused():
 def test_a_corrupt_pgwrite_is_reported_page_by_page():
     """Stock stores what it was sent and names the pages whose CRC did not
     survive the trip, so the client can resend those and only those."""
-    from xrd.proto import requests as r
-    from xrd.proto.responses import parse_pgwrite_cse
+    from xrdclient.proto import requests as r
+    from xrdclient.proto.responses import parse_pgwrite_cse
 
     with FakeServer() as srv:
-        handle = xrd.File(srv.url / "corrupt.bin")
-        handle.open(xrd.OpenFlags.UPDATE | xrd.OpenFlags.NEW | xrd.OpenFlags.MAKEPATH)
+        handle = xrdclient.File(srv.url / "corrupt.bin")
+        handle.open(OpenFlags.UPDATE | OpenFlags.NEW | OpenFlags.MAKEPATH)
         payload = struct.pack(">I", 0xDEADBEEF) + b"bad page"
         result = handle._router.execute(r.PgWrite(handle.handle, 0, payload))
         assert parse_pgwrite_cse(result.data) == (0,)
@@ -257,13 +258,14 @@ def test_only_new_and_delete_create_a_missing_file():
     open a missing file for update here and be refused by a real server.
     """
     with FakeServer() as srv:
-        for flags in (xrd.OpenFlags.UPDATE, xrd.OpenFlags.APPEND, xrd.OpenFlags.WRITE):
-            handle = xrd.File(srv.url / "absent.bin")
+        writing = (OpenFlags.UPDATE, OpenFlags.APPEND, OpenFlags.WRITE)
+        for flags in writing:
+            handle = xrdclient.File(srv.url / "absent.bin")
             with pytest.raises(FileNotFoundError):
-                handle.open(flags | xrd.OpenFlags.MAKEPATH)
-        for name, flags in (("new", xrd.OpenFlags.NEW), ("delete", xrd.OpenFlags.DELETE)):
-            handle = xrd.File(srv.url / f"{name}.bin")
-            handle.open(flags | xrd.OpenFlags.MAKEPATH)
+                handle.open(flags | OpenFlags.MAKEPATH)
+        for name, flags in (("new", OpenFlags.NEW), ("delete", OpenFlags.DELETE)):
+            handle = xrdclient.File(srv.url / f"{name}.bin")
+            handle.open(flags | OpenFlags.MAKEPATH)
             handle.close()
             assert srv.contents(f"/{name}.bin") == b""
 
@@ -274,9 +276,9 @@ def test_a_writev_whose_dlen_counts_its_data_is_refused():
     ``dlen`` sizes the write_list alone; anything else leaves the server
     unable to tell descriptors from data, and it says so.
     """
-    from xrd.errors import InvalidArgumentError
-    from xrd.proto import frames
-    from xrd.proto import requests as r
+    from xrdclient.errors import InvalidArgumentError
+    from xrdclient.proto import frames
+    from xrdclient.proto import requests as r
 
     class Broken(r.WriteV):
         def payload(self) -> bytes:  # descriptors *and* data, the old way
@@ -286,8 +288,8 @@ def test_a_writev_whose_dlen_counts_its_data_is_refused():
             return b""
 
     with FakeServer(files={"/v.bin": b"\x00" * 8}) as srv:
-        handle = xrd.File(srv.url / "v.bin")
-        handle.open(xrd.OpenFlags.UPDATE)
+        handle = xrdclient.File(srv.url / "v.bin")
+        handle.open(xrdclient.OpenFlags.UPDATE)
         broken = Broken([(handle.handle, 0, b"abc")])
         assert len(frames.encode(broken, 1)) == 24 + 16 + 3
         with pytest.raises(InvalidArgumentError, match="Write vector is invalid"):
@@ -297,22 +299,22 @@ def test_a_writev_whose_dlen_counts_its_data_is_refused():
 
 def test_writing_past_the_end_zero_fills_the_hole():
     with FakeServer() as srv:
-        handle = xrd.File(srv.url / "sparse.bin")
-        handle.open(xrd.OpenFlags.UPDATE | xrd.OpenFlags.NEW | xrd.OpenFlags.MAKEPATH)
+        handle = xrdclient.File(srv.url / "sparse.bin")
+        handle.open(OpenFlags.UPDATE | OpenFlags.NEW | OpenFlags.MAKEPATH)
         handle.write(b"end", 5)
         handle.close()
         assert srv.contents("/sparse.bin") == b"\x00" * 5 + b"end"
 
 
 def test_closing_a_handle_twice_is_refused_by_the_server():
-    from xrd.proto import requests as r
+    from xrdclient.proto import requests as r
 
     with FakeServer(files={"/f": b"x"}) as srv:
-        handle = xrd.File(srv.url / "f")
+        handle = xrdclient.File(srv.url / "f")
         handle.open()
         raw = handle.handle
         handle.close()
-        with xrd.FileSystem(srv.url) as fs:
+        with xrdclient.FileSystem(srv.url) as fs:
             with pytest.raises(OSError):
                 fs._router.execute(r.Close(raw))
 
@@ -364,7 +366,7 @@ def test_the_fattr_reply_counts_the_failures():
 
 @pytest.fixture
 def dav():
-    from xrd.testing import FakeDAVServer
+    from xrdclient.testing import FakeDAVServer
 
     with FakeDAVServer(files={"/d/a.root": b"hello"}, dirs=["/d/sub"]) as server:
         yield server
@@ -420,7 +422,7 @@ def test_a_server_that_bound_but_never_served_still_releases_its_port():
 
 def test_a_connection_that_will_not_close_does_not_take_the_server_with_it(monkeypatch):
     """Sockets fail to close for reasons nobody controls; serving continues."""
-    from xrd.testing import server as module
+    from xrdclient.testing import server as module
 
     class Brittle:
         def __init__(self, inner):
@@ -440,17 +442,17 @@ def test_a_connection_that_will_not_close_does_not_take_the_server_with_it(monke
 
     monkeypatch.setattr(module._Connection, "__init__", wrapped)
     with FakeServer(files={"/f": b"ok"}) as srv:
-        with xrd.FileSystem(srv.url) as fs:
+        with xrdclient.FileSystem(srv.url) as fs:
             assert fs.stat("/f").st_size == 2
-        with xrd.FileSystem(srv.url) as second:  # the listener survived the first
+        with xrdclient.FileSystem(srv.url) as second:  # the listener survived the first
             assert second.stat("/f").st_size == 2
 
 
 def test_a_signed_request_is_answered_and_the_signature_ignored():
     """The fake does not verify signatures, but it must not choke on them."""
-    from xrd.crypto.sigver import Signer
+    from xrdclient.crypto.sigver import Signer
 
-    with FakeServer(files={"/f.bin": b"..."}) as srv, xrd.FileSystem(srv.url) as fs:
+    with FakeServer(files={"/f.bin": b"..."}) as srv, xrdclient.FileSystem(srv.url) as fs:
         fs.ping()  # connect, so there is a session to arm
         fs._router._session._m.signer = Signer(b"k" * 32, c.kXR_secStandard, {})
         fs.truncate("/f.bin", 1)  # kXR_truncate is signed
@@ -459,33 +461,33 @@ def test_a_signed_request_is_answered_and_the_signature_ignored():
 
 
 def test_a_request_with_neither_a_path_nor_a_handle_is_refused():
-    from xrd.proto import requests as r
+    from xrdclient.proto import requests as r
 
-    with FakeServer() as srv, xrd.FileSystem(srv.url) as fs:
+    with FakeServer() as srv, xrdclient.FileSystem(srv.url) as fs:
         with pytest.raises(OSError, match="no path and no handle"):
             fs._router.execute(r.Stat(""))
 
 
 def test_set_is_accepted_and_answers_nothing_in_particular():
-    from xrd.proto import requests as r
+    from xrdclient.proto import requests as r
 
-    with FakeServer() as srv, xrd.FileSystem(srv.url) as fs:
+    with FakeServer() as srv, xrdclient.FileSystem(srv.url) as fs:
         assert bytes(fs._router.execute(r.Set("appid=tests"))) == b""
 
 
 def test_an_attribute_list_that_stops_mid_entry_is_read_as_far_as_it_goes():
-    from xrd.proto import requests as r
+    from xrdclient.proto import requests as r
 
-    with FakeServer(files={"/f.bin": b"x"}) as srv, xrd.FileSystem(srv.url) as fs:
+    with FakeServer(files={"/f.bin": b"x"}) as srv, xrdclient.FileSystem(srv.url) as fs:
         body = b"/f.bin\x00" + b"\x00"  # two attributes promised, one byte given
         reply = bytes(fs._router.execute(r.Fattr(c.kXR_fattrGet, body, numattr=2)))
         assert reply[:1] == b"\x00"  # a well-formed reply with nothing in it
 
 
 def test_an_unknown_attribute_subcode_touches_nothing():
-    from xrd.proto import requests as r
+    from xrdclient.proto import requests as r
 
-    with FakeServer(files={"/f.bin": b"x"}) as srv, xrd.FileSystem(srv.url) as fs:
+    with FakeServer(files={"/f.bin": b"x"}) as srv, xrdclient.FileSystem(srv.url) as fs:
         body = b"/f.bin\x00" + b"\x00\x00" + b"user.tag\x00"
         fs._router.execute(r.Fattr(99, body, numattr=1))
         assert srv.xattrs.get("/f.bin", {}) == {}
@@ -498,7 +500,7 @@ def test_writing_nothing_writes_nothing():
 
 
 def test_the_webdav_fake_starts_once_and_stops_from_wherever_it_got_to():
-    from xrd.testing import FakeDAVServer
+    from xrdclient.testing import FakeDAVServer
 
     bound = FakeDAVServer()
     was = bound.address  # binds a port without a thread behind it
@@ -507,7 +509,7 @@ def test_the_webdav_fake_starts_once_and_stops_from_wherever_it_got_to():
 
     with FakeDAVServer(files={"/f": b"ok"}) as srv:
         assert srv.start() is srv  # already serving: no second thread
-        with xrd.FileSystem(srv.url) as fs:
+        with xrdclient.FileSystem(srv.url) as fs:
             assert fs.stat("/f").st_size == 2
 
 
@@ -521,7 +523,7 @@ def test_a_connection_that_was_closed_behind_our_back_is_still_dropped():
             srv._live.add(stale)
         srv.disconnect()  # no EBADF escapes
         assert not srv._live
-        with xrd.FileSystem(srv.url) as fs:
+        with xrdclient.FileSystem(srv.url) as fs:
             fs.ping()  # the listener kept listening
         assert c.kXR_ping in srv.seen
 
@@ -535,7 +537,7 @@ def test_a_client_that_resets_the_connection_ends_it_quietly():
         assert len(sock.recv(64)) == 16  # handshake answered: past the preamble
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
         sock.close()  # RST, not FIN
-        with xrd.FileSystem(srv.url) as fs:
+        with xrdclient.FileSystem(srv.url) as fs:
             fs.ping()  # a fresh client is served as if nothing had happened
         assert c.kXR_ping in srv.seen
 
@@ -554,7 +556,7 @@ def test_a_directory_is_served_under_both_its_bare_names_and_its_real_paths(tmp_
         "/mnist.root", "/notes.txt",
         (tmp_path / "mnist.root").as_posix(), (tmp_path / "notes.txt").as_posix(),
     }
-    with server, xrd.FileSystem(server.url) as fs:
+    with server, xrdclient.FileSystem(server.url) as fs:
         assert fs.read_bytes("/mnist.root") == b"pretend ROOT"
         assert fs.read_bytes((tmp_path / "mnist.root").as_posix()) == b"pretend ROOT"
 
@@ -572,7 +574,7 @@ def test_serving_a_directory_from_the_command_line_reads_back_over_the_wire(tmp_
 
     def wait():
         port = int(capsys.readouterr().out.split("root://127.0.0.1:")[1].split("/")[0])
-        with xrd.FileSystem(f"root://127.0.0.1:{port}/") as fs:
+        with xrdclient.FileSystem(f"root://127.0.0.1:{port}/") as fs:
             read.append(fs.read_bytes("/held.root"))
 
     assert main([str(tmp_path), "--port", "0", "--pattern", "*.root"], wait=wait) == 0
@@ -590,11 +592,11 @@ def test_the_command_line_server_stops_when_the_terminal_interrupts_it(tmp_path,
     assert main([str(tmp_path), "--port", "0"], wait=wait) == 0
     assert "stopping" in capsys.readouterr().out
     with pytest.raises(OSError):
-        xrd.FileSystem(f"root://127.0.0.1:{ports[0]}/").stat("/held.root")
+        xrdclient.FileSystem(f"root://127.0.0.1:{ports[0]}/").stat("/held.root")
 
 
 def test_the_module_entry_point_hands_the_command_line_straight_to_main():
-    """``python -m xrd.testing`` is the documented way in, so it must import."""
-    import xrd.testing.__main__ as entry
+    """``python -m xrdclient.testing`` is the documented way in, so it must import."""
+    import xrdclient.testing.__main__ as entry
 
     assert entry.main is main

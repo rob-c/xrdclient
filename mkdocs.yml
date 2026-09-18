@@ -1,7 +1,7 @@
-site_name: PyXRootDClient
+site_name: xrdclient
 site_description: A pure-Python, Pythonic client for XRootD and HEP WebDAV
-site_url: https://example.org/pyxrootdclient/
-repo_url: https://github.com/rcurrie/PyXRootDClient
+site_url: https://example.org/xrdclient/
+repo_url: https://github.com/rob-c/xrdclient
 copyright: LGPL-3.0-or-later
 
 theme:
@@ -84,4 +84,4 @@ plugins:
             filters: ["!^_"]
 
 watch:
-  - src/xrd
+  - src/xrdclient

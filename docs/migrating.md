@@ -19,8 +19,8 @@ size = info.size
 
 ```python
 # here
-import xrd
-fs = xrd.FileSystem("root://host")
+import xrdclient
+fs = xrdclient.FileSystem("root://host")
 size = fs.stat("/store/f.root").st_size
 ```
 
@@ -62,7 +62,7 @@ them.
 
 | `XRootD.client.File` | here |
 | --- | --- |
-| `open(url, OpenFlags.READ)` | `xrd.open(url, "rb")` or `xrd.File(url)` |
+| `open(url, OpenFlags.READ)` | `xrdclient.open(url, "rb")` or `xrdclient.File(url)` |
 | `read(offset, size)` → `(status, buf)` | `fh.read(size)` / `file.read(size, offset)` → `bytes` |
 | `readline()`, `readlines()`, iteration | the same, from `io` - it is a real file object |
 | `write(data, offset)` | `fh.write(data)` / `file.write(data, offset)` |
@@ -74,9 +74,9 @@ them.
 | `stat(force)` | `file.stat()` |
 | `close()` | `close()`, or just leave the `with` block |
 
-`xrd.open` returns a genuine buffered file object, so `read`, `readline`,
+`xrdclient.open` returns a genuine buffered file object, so `read`, `readline`,
 `seek`, `tell`, iteration, `io.TextIOWrapper` and everything else in `io`
-already work. The `xrd.File` underneath it is reachable as `fh.raw.file` when
+already work. The `xrdclient.File` underneath it is reachable as `fh.raw.file` when
 you want `readv` or `pgread`.
 
 ## Copying
@@ -91,15 +91,15 @@ process.run()
 
 ```python
 # here
-xrd.copy(source, target)                    # returns a CopyResult
-xrd.copy_tree(source_dir, target_dir)       # recursive
-xrd.third_party(source, target)             # server-to-server
+xrdclient.copy(source, target)                    # returns a CopyResult
+xrdclient.copy_tree(source_dir, target_dir)       # recursive
+xrdclient.third_party(source, target)             # server-to-server
 ```
 
 Progress is a callback, not a handler class:
 
 ```python
-xrd.copy(src, dst, progress=lambda done, total: print(f"{done}/{total}"))
+xrdclient.copy(src, dst, progress=lambda done, total: print(f"{done}/{total}"))
 ```
 
 ## Configuration
@@ -111,16 +111,16 @@ settable in Python, on an immutable object, rather than through
 `client.EnvSetInt`:
 
 ```python
-cfg = xrd.Config(request_timeout=60.0, chunk_size=8 << 20)
-fs = xrd.FileSystem("root://host", config=cfg)
+cfg = xrdclient.Config(request_timeout=60.0, chunk_size=8 << 20)
+fs = xrdclient.FileSystem("root://host", config=cfg)
 ```
 
 See [Configuration](config.md).
 
 ## Flags
 
-`xrd.OpenFlags`, `xrd.MkDirFlags`, `xrd.DirListFlags`, `xrd.Access`,
-`xrd.QueryCode`, `xrd.StatInfoFlags`, `xrd.LocateFlags` and `xrd.PrepareFlags`
+`xrdclient.OpenFlags`, `xrdclient.MkDirFlags`, `xrdclient.DirListFlags`, `xrdclient.Access`,
+`xrdclient.QueryCode`, `xrdclient.StatInfoFlags`, `xrdclient.LocateFlags` and `xrdclient.PrepareFlags`
 exist with the same members, for the cases where you want the raw protocol.
 Most code should not need them: mode
 strings cover opening, `makedirs(exist_ok=True)` covers `MAKEPATH`, and
@@ -136,12 +136,12 @@ Where a flag is genuinely the point, it can be said in words instead of bits -
 
 Things the bindings do not offer at all:
 
-- `pathlib`: `xrd.Path("root://host//store/f.root").read_bytes()`
+- `pathlib`: `xrdclient.Path("root://host//store/f.root").read_bytes()`
 - `os`-style traversal: `walk`, `glob`, `scandir`
-- `asyncio`: the whole surface mirrored under `xrd.aio`
+- `asyncio`: the whole surface mirrored under `xrdclient.aio`
 - `fsspec`: `pd.read_parquet("root://host//store/t.parquet")`
 - WebDAV and HTTP behind the same three entry points
-- servers to test against: `xrd.testing`
+- servers to test against: `xrdclient.testing`
 - no compiled dependency, so `pip install` works in any wheelhouse
 
 ## What you give up
