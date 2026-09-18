@@ -27,8 +27,10 @@ XROOTD = shutil.which("xrootd")
 #: Enough of a configuration to be a storage element: one export, checksums
 #: on (so ``kXR_Qcksum`` answers rather than saying "not supported"), and
 #: extended attributes so ``kXR_fattr`` has somewhere to put them.
+# ``xrd.port`` is XRootD's own configuration directive, and has nothing to do
+# with this package's name.
 CONFIG = """\
-xrdclient.port {port}
+xrd.port {port}
 all.export {root}
 all.adminpath {admin}
 all.pidpath {admin}
