@@ -25,9 +25,11 @@ import contextvars
 import difflib
 import getpass
 import os
-from collections.abc import Iterator, Sequence
-from dataclasses import dataclass, field, fields, replace
-from typing import TYPE_CHECKING
+import threading
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import MISSING, Field, dataclass, field, fields, replace
+from types import MappingProxyType
+from typing import TYPE_CHECKING, TypeVar
 
 from ._compat import SLOTS
 from .errors import TooLargeError
@@ -171,7 +173,74 @@ def _default_user() -> str:
         return "nobody"
 
 
+#: What :func:`configure` has set for the whole process, as field changes.
+#: Replaced, never mutated, so a reader in another thread needs no lock.
+_configured: Mapping[str, object] = MappingProxyType({})
+_configure_lock = threading.Lock()
+#: The changes :func:`override` has layered on in this context, and the
+#: configuration they make, or ``None`` outside every ``override`` block.
+_scope: contextvars.ContextVar[tuple[Mapping[str, object], Config] | None] = contextvars.ContextVar(
+    "xrd_config_scope", default=None
+)
+
+
+def _ambient_changes() -> Mapping[str, object]:
+    """The settings :func:`configure` and :func:`override` have put in force here.
+
+    The override is layered over the process-wide configuration, so a
+    ``with override(...)`` block changes only what it names.
+    """
+    scope = _scope.get()
+    if scope is None:
+        return _configured
+    return {**_configured, **scope[0]}
+
+
+def _ambient_default(name: str, fallback: Callable[[], object]) -> Callable[[], object]:
+    """A field default that defers to the ambient configuration first."""
+
+    def default() -> object:
+        changes = _ambient_changes()
+        return changes[name] if name in changes else fallback()
+
+    return default
+
+
+def _constant(value: object) -> Callable[[], object]:
+    return lambda: value
+
+
+_T = TypeVar("_T")
+
+
+def _ambient(cls: type[_T]) -> type[_T]:
+    """Make every field's default consult :func:`configure` and :func:`override`.
+
+    This is what gives the module docstring's resolution order its middle
+    tier. Every entry point builds its configuration as ``config or
+    Config()``, so if ``Config()`` ignored the ambient settings, ``override``
+    would change nothing but :func:`current`. Each default - an environment
+    lookup or a constant - is wrapped so the ambient value wins over it, while
+    an argument passed to ``Config(...)`` still wins over both. Applied before
+    :func:`~dataclasses.dataclass` sees the class; a subclass inherits the
+    wrapped fields, so an ``xrdml`` config honours an override too.
+    """
+    for name, annotation in cls.__annotations__.items():
+        if "ClassVar" in str(annotation) or name not in cls.__dict__:
+            continue
+        spec = cls.__dict__[name]
+        if not isinstance(spec, Field):
+            setattr(cls, name, field(default_factory=_ambient_default(name, _constant(spec))))
+        elif spec.default_factory is not MISSING:
+            spec.default_factory = _ambient_default(name, spec.default_factory)
+        elif spec.default is not MISSING:
+            spec.default_factory = _ambient_default(name, _constant(spec.default))
+            spec.default = MISSING
+    return cls
+
+
 @dataclass(frozen=True, **SLOTS)
+@_ambient
 class Config:
     """Immutable client settings. Use :meth:`evolve` to derive a variant."""
 
@@ -186,7 +255,11 @@ class Config:
     connect_retries: int = field(default_factory=lambda: _env_int("XRD_CONNECTIONRETRY", 3))
     #: Seconds to wait before the first reconnection attempt, doubling for
     #: each one after it and capped by :attr:`wait_cap`. Zero retries flat out.
-    retry_backoff: float = field(default_factory=lambda: _env_float("XRD_STREAMERRORWINDOW", 0.5))
+    #: Its variable is this package's own: the official client has no backoff
+    #: setting, and its nearest-looking ``XRD_STREAMERRORWINDOW`` is how long a
+    #: stream error is *remembered* (1800 s by default), which read as a sleep
+    #: would park the first reconnect for the whole ``wait_cap``.
+    retry_backoff: float = field(default_factory=lambda: _env_float("XRD_RETRYBACKOFF", 0.5))
     redirect_limit: int = field(default_factory=lambda: _env_int("XRD_REDIRECTLIMIT", 16))
     wait_cap: float = 600.0
     #: Ceiling on one whole logical operation, from the request going out to
@@ -282,6 +355,14 @@ class Config:
     auth_order: Sequence[str] = ("gsi", "ztn", "krb5", "sss", "unix", "host")
     verify_tls: bool = True
     require_tls: bool = False
+    #: Domains an HTTP redirect may carry credentials to beyond the origin
+    #: they were meant for - storage that sends a client from a head node to
+    #: data nodes on other hosts. An entry matches that host and every host
+    #: under it. Empty by default, so a token stays with the host it was
+    #: given for; ``$XRD_TRUSTEDREDIRECTDOMAINS`` takes a comma-separated list.
+    trusted_redirect_domains: Sequence[str] = field(
+        default_factory=lambda: _sequence(os.environ.get("XRD_TRUSTEDREDIRECTDOMAINS", ""))
+    )
     #: Send a bearer token over a connection that is not encrypted. Off, as it
     #: is in the stock client, ``ztn`` simply is not attempted on cleartext -
     #: a token on the wire is a token for whoever reads the wire. Turn it on
@@ -343,6 +424,9 @@ class Config:
             return cls()
         parser = _read_config(target)
         settings = _file_settings(parser, target, alias)
+        # An override outranks the file, as the module docstring orders them;
+        # passing the file's values explicitly would otherwise put it first.
+        settings.update(_ambient_changes())
         return cls(**settings)  # type: ignore[arg-type]
 
     def __repr__(self) -> str:
@@ -385,21 +469,36 @@ def _file_settings(
     return settings
 
 
+#: What :func:`current` returns outside every ``override`` block: the
+#: defaults as :func:`configure` last left them.
 _default = Config()
-_current: contextvars.ContextVar[Config] = contextvars.ContextVar("xrd_config", default=_default)
 
 
 def current() -> Config:
-    """The configuration in effect right now."""
-    return _current.get()
+    """The configuration in effect right now.
+
+    Inside an :func:`override` block, the one it made; everywhere else, the
+    process-wide one :func:`configure` maintains - in every thread, not just
+    the one that configured it. A bare ``Config()`` resolves to the same
+    settings, which is why an entry point handed no configuration honours both.
+    """
+    scope = _scope.get()
+    return _default if scope is None else scope[1]
 
 
 def configure(**changes: object) -> Config:
-    """Mutate the process-wide default configuration and return it."""
-    global _default
-    _default = _default.evolve(**changes)
-    _current.set(_default)
-    return _default
+    """Change the process-wide default configuration and return it.
+
+    Seen by every thread and by every ``Config()`` built afterwards, with
+    anything named explicitly in a constructor still winning. An unknown
+    setting raises :class:`TypeError` and changes nothing.
+    """
+    global _configured, _default
+    with _configure_lock:
+        updated = _default.evolve(**changes)
+        _configured = MappingProxyType({**_configured, **changes})
+        _default = updated
+    return updated
 
 
 @contextlib.contextmanager
@@ -408,10 +507,17 @@ def override(**changes: object) -> Iterator[Config]:
 
     >>> with override(request_timeout=5.0):
     ...     ...
+
+    Scoped with :mod:`contextvars`, so it covers this thread or task and
+    whatever it runs inside the block - ``Config()`` and every entry point
+    left to make its own - and nothing running concurrently elsewhere.
+    Blocks nest, the inner one layering on the outer.
     """
+    scope = _scope.get()
+    layered = {**(scope[0] if scope else {}), **changes}
     cfg = current().evolve(**changes)
-    token = _current.set(cfg)
+    token = _scope.set((MappingProxyType(layered), cfg))
     try:
         yield cfg
     finally:
-        _current.reset(token)
+        _scope.reset(token)

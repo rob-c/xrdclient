@@ -560,7 +560,7 @@ def test_the_package_needs_nothing_but_the_standard_library():
 
     Checked in the source rather than in :data:`sys.modules`, which by now
     holds whatever every other test has imported. The optional extras -
-    ``fsspec``, ``gssapi``, ``google_crc32c`` - may be named, but only where a
+    ``fsspec``, ``google_crc32c`` - may be named, but only where a
     missing one cannot stop the package from importing.
     """
     stdlib = set(sys.stdlib_module_names) | {"xrdclient", "_typeshed"}

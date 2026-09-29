@@ -10,7 +10,17 @@ import ssl
 
 import pytest
 
-from _pki import pem, private_key_pem, proxy_chain, throwaway_key
+from _pki import (
+    _cached_key,
+    make_certificate,
+    name,
+    pem,
+    private_key_pem,
+    proxy_chain,
+    sequence,
+    throwaway_key,
+    tlv,
+)
 from xrdclient.config import Config
 from xrdclient.http.client import _context as http_context
 from xrdclient.transport.base import tls_context
@@ -27,13 +37,31 @@ def proxy(tmp_path_factory):
     return str(path)
 
 
+@pytest.fixture(scope="module")
+def ca_file(tmp_path_factory):
+    """A CA of the test's own, so the store's contents do not depend on the host's.
+
+    A system store kept as a directory (``capath``) is read lazily, during a
+    handshake, and lists nothing beforehand - which is how macOS and several
+    Linux distributions ship it.
+    """
+    key = _cached_key(1)
+    subject = name(("2.5.4.3", "Test CA"))
+    constraints = (("2.5.29.19", sequence(tlv(0x01, b"\xff"))),)  # basicConstraints CA:TRUE
+    certificate = make_certificate(subject, subject, key.public, key, extensions=constraints)
+    path = tmp_path_factory.mktemp("ca") / "ca.pem"
+    path.write_bytes(pem("CERTIFICATE", certificate))
+    return str(path)
+
+
 @pytest.mark.parametrize("build", BUILDERS)
-def test_a_proxy_is_loaded_as_the_client_chain(build, proxy):
+def test_a_proxy_is_loaded_as_the_client_chain(build, proxy, ca_file):
     """``load_cert_chain`` is what makes the connection mutually authenticated."""
-    context = build(Config(proxy=proxy))
+    context = build(Config(proxy=proxy, ca_file=ca_file))
     assert context.verify_mode is ssl.CERT_REQUIRED
     assert context.check_hostname
-    assert [str(chain[0]) for chain in [context.get_ca_certs()]]  # the store is populated
+    assert any(dict(cert["subject"][0]).get("commonName") == "Test CA"
+               for cert in context.get_ca_certs())  # the configured CA is in the store
 
 
 @pytest.mark.parametrize("build", BUILDERS)

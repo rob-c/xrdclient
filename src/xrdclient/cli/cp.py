@@ -5,8 +5,12 @@
     $ xrd-cp --tpc root://a//store/f.root root://b//store/f.root
 
 The tool is ``cp``: the last argument is the destination, several sources are
-allowed when it is a directory, and a trailing ``/`` means "into this
-directory". Everything it does is one call into :func:`xrdclient.copy`.
+allowed when it is a directory, and a trailing ``/`` on DEST means "into this
+directory". A trailing ``/`` on a SOURCE borrows rsync's convention instead:
+it means "the contents of this directory", which land in DEST itself rather
+than in ``DEST/<name>`` - the only spelling a repeated ``-r --sync`` can use,
+since from the second run on DEST exists and ``cp`` would nest the copy into
+it. Everything it does is one call into :func:`xrdclient.copy`.
 """
 
 from __future__ import annotations
@@ -34,8 +38,18 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROGRAM,
         description="Copy files between root://, https://, and the local filesystem.",
+        epilog=(
+            "As with cp, SOURCE goes inside DEST when DEST is an existing directory or "
+            "ends in '/'. As with rsync, a SOURCE ending in '/' means its contents, which "
+            "go into DEST itself: use 'xrd-cp -r --sync size SRC/ DEST' for a sync you "
+            "will run again, since without the slash the second run nests into DEST/SRC."
+        ),
     )
-    parser.add_argument("source", nargs="+", help="what to copy; several when DEST is a directory")
+    parser.add_argument(
+        "source",
+        nargs="+",
+        help="what to copy; several when DEST is a directory; with a trailing / its contents",
+    )
     parser.add_argument("dest", help="where to put it")
     parser.add_argument("-r", "--recursive", action="store_true", help="copy directories")
     parser.add_argument(
@@ -200,9 +214,27 @@ def _is_dir(url: XRootDURL, endpoints: Endpoints) -> bool:
         return False
 
 
+def _source(text: str) -> XRootDURL:
+    """``text`` parsed, keeping a trailing slash that asks for its contents.
+
+    A bare local path is made absolute on the way in, which drops the slash;
+    here it carries meaning (see :func:`_destination`), so it is put back.
+    """
+    url = parse(text)
+    if text.endswith(("/", os.sep)) and not url.path.endswith("/"):
+        return url.with_path(url.path + "/")
+    return url
+
+
 def _destination(source: XRootDURL, dest: XRootDURL, *, into: bool) -> XRootDURL:
-    """``cp f d`` writes ``d``; ``cp f d/`` and ``cp f dir`` write ``dir/f``."""
-    if not into:
+    """``cp f d`` writes ``d``; ``cp f d/`` and ``cp f dir`` write ``dir/f``.
+
+    ``cp -r src/ dir`` writes ``dir`` itself, as rsync does: the slash asks
+    for the contents of ``src``. Without it a repeated sync could never work,
+    because the first run creates ``dir`` and the second then nests into
+    ``dir/src``.
+    """
+    if not into or source.path.endswith("/"):
         return dest
     name = posixpath.basename(source.path.rstrip("/")) or "root"
     return dest / name
@@ -215,7 +247,7 @@ def _destination(source: XRootDURL, dest: XRootDURL, *, into: bool) -> XRootDURL
 
 def _misuse(args: argparse.Namespace) -> str | None:
     """The flag combinations that cannot mean anything, in words."""
-    for check in (_tree_misuse, _count_misuse, _transfer_misuse):
+    for check in (_tree_misuse, _count_misuse, _transfer_misuse, _tpc_misuse):
         complaint = check(args)
         if complaint is not None:
             return complaint
@@ -258,6 +290,34 @@ def _transfer_misuse(args: argparse.Namespace) -> str | None:
     return None
 
 
+#: The flags that shape how bytes pass through this process, which a
+#: third-party copy never sends through it.
+_STREAM_FLAGS = (
+    ("chunk_size", "--chunk-size"),
+    ("in_flight", "--in-flight"),
+    ("stripes", "--stripes"),
+    ("streams", "--streams"),
+)
+
+
+def _tpc_misuse(args: argparse.Namespace) -> str | None:
+    """Refuse what a third-party copy cannot honour, rather than dropping it.
+
+    The servers copy one file each time they are asked, so ``-r`` has no
+    meaning here, and the tuning flags describe a stream this process never
+    carries. (``--verify`` and ``--algorithm`` are honoured: both ends are
+    asked for their checksum afterwards.)
+    """
+    if not args.tpc:
+        return None
+    if args.recursive:
+        return "--tpc copies one file per pair of servers; -r cannot be combined with it"
+    for attribute, flag in _STREAM_FLAGS:
+        if getattr(args, attribute) is not None:
+            return f"--tpc moves no data through this process, so {flag} has nothing to tune"
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     complaint = _misuse(args)
@@ -265,7 +325,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"{PROGRAM}: {complaint}", file=sys.stderr)
         return USAGE
     config = _copy_config(args)
-    sources = [parse(s) for s in args.source]
+    sources = [_source(s) for s in args.source]
     dest = parse(args.dest)
     show = args.progress if args.progress is not None else (sys.stderr.isatty() and not args.quiet)
 
@@ -387,7 +447,7 @@ def _copy_one(
 ) -> list[CopyResult]:
     """Copy one resolved source using the selected transfer strategy."""
     if args.tpc:
-        return [third_party(source, target, config=config, overwrite=args.force)]
+        return [_third_party(source, target, args, config)]
     if args.recursive:
         return copy_tree(
             source,
@@ -402,6 +462,25 @@ def _copy_one(
             **options,
         )
     return [copy(source, target, config=config, progress=bar, **options)]
+
+
+def _third_party(
+    source: XRootDURL, target: XRootDURL, args: argparse.Namespace, config: Config
+) -> CopyResult:
+    """One ``--tpc`` transfer, verified when asked.
+
+    Naming a checksum with ``-a`` counts as asking, since there is no digest
+    taken on the way past for it to choose; ``--no-verify`` still wins.
+    """
+    verify = bool(args.verify) or (args.verify is None and bool(args.algorithm))
+    return third_party(
+        source,
+        target,
+        config=config,
+        overwrite=args.force,
+        verify=verify,
+        algorithm=args.algorithm,
+    )
 
 
 def _record(result: CopyResult) -> dict[str, object]:

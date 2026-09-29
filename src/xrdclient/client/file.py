@@ -9,8 +9,10 @@ per-page checksums, extended attributes on a handle, or checkpoints.
 
 from __future__ import annotations
 
+import io
+import struct
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 
 from .._log import get_logger
 from ..config import Config
@@ -26,6 +28,7 @@ from ..errors import (
     kXR_InvalidRequest,
     kXR_Unsupported,
 )
+from ..errors import ConnectionError as XrdConnectionError
 from ..flags import Access, ChkPointCode, OpenFlags, open_flags, permissions
 from ..proto import constants as c
 from ..proto import requests as r
@@ -44,14 +47,27 @@ from ..types import (
     WriteChunk,
 )
 from ..url import XRootDURL, parse
+from . import _fattr
 
 __all__ = ["File", "Checkpoint"]
 
 _log = get_logger(__name__)
 
-#: Server-side ceilings on one ``kXR_readv``.
+#: Server-side ceilings on one ``kXR_readv``: ``XrdProto::maxRvecsz``
+#: elements, and the byte total we choose to put in one request so that a
+#: reply stays about the size of one of the server's buffers.
 READV_MAX_CHUNKS = 1024
 READV_MAX_BYTES = 2 << 20
+
+#: ``maxReadv_ior`` - the largest single ``kXR_readv`` element xrootd accepts
+#: with its default 2 MiB buffer. The server keeps back room for the 16-byte
+#: ``readahead_list`` header it writes before each element's data, and refuses
+#: anything bigger with ``kXR_NoMemory``. XrdCl uses the same default.
+READV_MAX_ELEMENT = (2 << 20) - 16
+
+#: ``maxTransz`` - the largest single ``kXR_writev`` element xrootd accepts
+#: with its default buffer. A bigger one is refused and the connection with it.
+WRITEV_MAX_ELEMENT = 2 << 20
 
 #: ``maxClonesz`` - how many ranges one ``kXR_clone`` may carry.
 CLONE_MAX_RANGES = 1024
@@ -70,6 +86,15 @@ _MIN_BULK_READ = 1 << 20
 #: Floor on a bulk request, so dividing a buffer across the pipeline never
 #: turns one read into a burst of tiny ones.
 _MIN_BULK_CHUNK = 1 << 18
+
+#: Most a sequential reader fetches beyond what it was asked for. The window
+#: starts at ``config.readahead`` and doubles with every read that carries on
+#: where the last one stopped, up to this; it is also what the end of a
+#: sequential scan can cost in bytes nobody reads.
+_MAX_AHEAD = 8 << 20
+
+#: No readahead: nothing held, and no read that the next one could follow.
+_NOTHING_AHEAD: tuple[int, bytes] = (0, b"")
 
 
 class File:
@@ -105,6 +130,12 @@ class File:
         #: server. Zero on a healthy connection; useful in a log line when a
         #: long read survived a restart nobody noticed.
         self.recoveries = 0
+        #: Sequential readahead on a read-only handle: the block fetched
+        #: beyond the last read, where the next read is expected to start,
+        #: and how far the next fetch looks ahead. See :meth:`_sequential`.
+        self._ahead = _NOTHING_AHEAD
+        self._sequel = -1
+        self._window = self.config.readahead
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -143,10 +174,12 @@ class File:
         """Move this handle's bulk I/O onto a second connection.
 
         Opens one connection more to the same server, binds it to the same
-        session, and routes every subsequent read and write over it - the
+        session, and routes every subsequent read's answer over it - the
         requests still go out on the control link, so a stat or a close is
         never stuck behind a megabyte of file. Returns the path id, and is
-        idempotent: a handle already bound keeps the path it has.
+        idempotent: a handle already bound keeps the path it has. Writes stay
+        on the control link, because a stock server answers a split write on
+        the path where nothing waits for it (see :meth:`_split_path`).
 
         The path belongs to the connection. If the data server vanishes and
         the handle is re-opened elsewhere, the binding is not carried over -
@@ -165,7 +198,15 @@ class File:
         :meth:`bind_data_path` is untouched - these are a separate, automatic
         set that :meth:`read` and :meth:`write` spread their chunks over.
         """
-        for _ in range(self.config.data_streams - len(self._data_paths)):
+        want = self.config.data_streams - len(self._data_paths)
+        if want <= 0:
+            return
+        # A pooled connection keeps the paths an earlier file bound on it, and
+        # the server keeps serving them; binding afresh at every open would
+        # leave each connection with one more socket per file ever opened.
+        spare = [p for p in self._router.session.data_paths if p not in self._data_paths]
+        self._data_paths.extend(spare[:want])
+        for _ in range(want - len(spare[:want])):
             try:
                 pathid = self._router.bind_data_path()
             except Exception:  # binding is strictly optional
@@ -184,7 +225,7 @@ class File:
         self._rr += 1
         return pathid
 
-    def _bulk(self, build: Callable[[bytes, int], Request]) -> Result:
+    def _bulk(self, build: Callable[[bytes, int], Request], *, write: bool = False) -> Result:
         """Run one bulk read/write, over an automatic data path when there is
         one and the server serves it there, otherwise on the control link.
 
@@ -201,26 +242,24 @@ class File:
         offset, so the transfer stays byte-exact on any server. A checkpoint
         journals only what it was handed, so a checkpointed write stays on the
         control link where :meth:`_submit` can route it.
+
+        A ``write`` never takes the split: see :meth:`_split_path`.
         """
         pathid = self._next_path()
         if not pathid or self._checkpoint:
-            return self._execute(lambda handle: build(handle, self._pathid))
+            return self._execute(lambda handle: build(handle, self._split_path(write)))
         # One attempt, straight at the session so a server that will not serve
         # the bound op is not chased through the router's reconnect loop.
-        if self._router.session.arrives_on_path is not False:
-            try:
-                return self._router.session.execute(
-                    build(self.handle, pathid), path=self.url.path, arrive_on_path=True
-                )
-            except (XRootDError, ValueError) as exc:
-                _log.debug("data path %d does not serve what arrives on it: %s", pathid, exc)
-                # The session let that socket go with the request on it. Take
-                # a fresh one and use it the way the specification says.
-                self._data_paths.remove(pathid)
-                self._bind_data_streams()
-                pathid = self._next_path()
-                if not pathid:
-                    return self._execute(lambda handle: build(handle, 0))
+        # The question is settled before the request is built: a server that
+        # disclaims arrival would otherwise be handed that request split,
+        # which is fine for a read and a hang for a write.
+        if self._router.session.ask_arrival_routing() is not False:
+            result = self._on_arrival_path(build, pathid)
+            if result is not None:
+                return result
+            pathid = self._next_path()
+        if write or not pathid:
+            return self._execute(lambda handle: build(handle, 0))
         try:
             return self._execute(lambda handle: build(handle, pathid))
         except (XRootDError, ValueError) as exc:
@@ -232,6 +271,38 @@ class File:
             self._multistream = False
             _log.debug("data path %d fell back to the control link: %s", pathid, exc)
             return self._execute(lambda handle: build(handle, 0))
+
+    def _on_arrival_path(
+        self, build: Callable[[bytes, int], Request], pathid: int
+    ) -> Result | None:
+        """Send the whole op down ``pathid`` and take the answer there.
+
+        ``None`` when the server would not serve it: the session has let that
+        socket go with the request on it, so a fresh one is bound in its place
+        for the standard split to use.
+        """
+        try:
+            return self._router.session.execute(
+                build(self.handle, pathid), path=self.url.path, arrive_on_path=True
+            )
+        except (XRootDError, ValueError) as exc:
+            _log.debug("data path %d does not serve what arrives on it: %s", pathid, exc)
+            self._data_paths.remove(pathid)
+            self._bind_data_streams()
+            return None
+
+    def _split_path(self, write: bool) -> int:
+        """The path an op that is not arriving on a data path names.
+
+        The manual :meth:`bind_data_path` for a read, and always the control
+        link for a write. A stock xrootd takes a split write - header on the
+        control link, payload on the bound socket - and then answers it *on
+        the bound socket*, where nothing is listening, so the write would sit
+        out the whole ``request_timeout`` with its bytes already on disk. Only
+        a server that serves what arrives on the path takes a write there,
+        header and payload together (:meth:`_on_arrival_path`).
+        """
+        return 0 if write else self._pathid
 
     def open(
         self,
@@ -332,6 +403,7 @@ class File:
         self._data_paths = []
         self._rr = 0
         self._multistream = True
+        self._ahead, self._sequel = _NOTHING_AHEAD, -1
         if self._owns_router:
             # Discarded, not pooled: this connection has just failed under a
             # live handle, and the next caller deserves better than that.
@@ -355,18 +427,48 @@ class File:
         file, and a caller told the write succeeded when the server never
         heard the close would go on to trust a file that may be short. That
         failure is raised, not logged.
+
+        A connection already known to be broken - one a bulk read had to give
+        up on, say - is not asked at all: the handle is released here, and the
+        same rule decides whether that is worth raising.
         """
         handle, self._handle = self._handle, None
         try:
             if handle is not None:
-                self._router.execute(r.Close(handle))
+                self._close_handle(handle)
         except TransientError as exc:
             if self._flags & _WRITING:
                 raise
             _log.debug("close of %s found the connection gone: %s", self.url, exc)
         finally:
-            if self._owns_router:
-                self._router.close()
+            # Always: a router that only borrows its connection leaves it be,
+            # and one that moved to a data server on a connection of its own
+            # gives that back to the pool now rather than when collected.
+            self._router.close()
+
+    def _close_handle(self, handle: bytes) -> None:
+        """Send the ``kXR_close``, unless the connection can no longer carry it.
+
+        A broken session is still "open" as far as its socket goes, so the
+        router would happily send on it - and what came back could be a reply
+        still in transit from the operation that broke it, or nothing until
+        the request timeout. There is no need to ask: the server drops every
+        handle of a connection it has lost, so the handle is gone either way.
+        The :class:`~xrdclient.errors.TransientError` this raises instead is
+        what :meth:`close` forgives on a reader and reports on a writer.
+        """
+        try:
+            broken = self._router.session.broken
+        except XrdConnectionError:
+            # The router will not reconnect a handle's connection behind its
+            # back, and says so this way: that connection is lost too.
+            broken = True
+        if broken:
+            raise TransientError(
+                f"the connection {self.url} was open on broke before its close, "
+                f"so the server never heard it"
+            )
+        self._router.execute(r.Close(handle))
 
     def __enter__(self) -> File:
         if self._handle is None:
@@ -432,23 +534,61 @@ class File:
         stalled request cannot hold an unbounded buffer, and a read to the end
         of a file bigger than ``config.max_read_size`` is refused with a
         :class:`~xrdclient.errors.TooLargeError` rather than allocated.
+
+        On a handle opened only for reading, a read that starts where the
+        previous one ended also fetches ``config.readahead`` bytes beyond it
+        (doubling, while the reads stay sequential) and later reads are served
+        from them - see :meth:`_sequential`. ``readahead=0`` turns that off.
         """
         if size < 0:
             size = max(self.size - offset, 0)
             self.config.check_whole_read(size, self.url.path)
         if size == 0:
             return b""
-        if self.config.bulk and size >= _MIN_BULK_READ:
-            # One allocation, filled by the pipeline. The ordinary path below
-            # builds the same bytes out of a list of chunks and a join, which
-            # is two more copies of every byte than this needs.
-            buffer = bytearray(size)
-            try:
-                got = self._bulk_readinto(memoryview(buffer), offset)
-            except BulkUnsupported as exc:
-                _log.debug("bulk read declined for %s (%s); using the event path", self.url, exc)
-            else:
-                return bytes(buffer) if got == size else bytes(buffer[:got])
+        if self._reads_on_plane(size):
+            ahead = self._reads_ahead(size)
+            data = self._sequential(size, offset) if ahead else self._plane_read(size, offset)
+            if data is not None:
+                return data
+        return self._event_read(size, offset)
+
+    def _reads_ahead(self, size: int) -> bool:
+        """Whether a read of ``size`` may be served by, or fill, the readahead.
+
+        Only on a handle that cannot write: its own writes would otherwise
+        have to be tracked against the block, and the readahead is as fresh
+        as a buffered reader's is, which a reader of a file others may be
+        writing already accepts.
+        """
+        return bool(self.config.readahead) and size < _MAX_AHEAD and not self._flags & _WRITING
+
+    def _sequential(self, size: int, offset: int) -> bytes | None:
+        """A read that may be answered from, or read ahead for, the next ones.
+
+        Answered from the block already fetched when it lies inside it.
+        Otherwise it goes to the server - and when it starts where the last
+        read stopped, it asks for the window beyond it too and keeps that for
+        the reads that follow. Random access never reads ahead, and resets
+        the window, so it costs nothing but the check.
+        """
+        end = offset + size
+        start, block = self._ahead
+        if start <= offset and end <= start + len(block):
+            self._sequel = end
+            return block[offset - start : end - start]
+        streak, self._sequel = offset == self._sequel, end
+        if not streak:
+            self._window = self.config.readahead
+            return self._plane_read(size, offset)
+        window, self._window = self._window, min(self._window * 2, _MAX_AHEAD)
+        data = self._plane_read(size + window, offset)
+        if data is None:
+            return None
+        self._ahead = (offset, data)
+        return data[:size]
+
+    def _event_read(self, size: int, offset: int) -> bytes:
+        """``size`` bytes at ``offset`` through the event path, a chunk at a time."""
         limit = self.config.chunk_size
         if size <= limit:
             return self._read_one(offset, size)
@@ -478,35 +618,105 @@ class File:
     def readinto(self, buffer: bytearray | memoryview, offset: int = 0) -> int:
         """Read into a pre-allocated buffer; returns the byte count.
 
-        A request big enough to be worth it is served by the bulk data plane:
-        several reads in flight at once, each landing straight in its own
-        slice of ``buffer``, so the bytes are never copied between the socket
-        and the caller. Anything smaller, or a server that answers a read with
-        something other than bytes, takes the ordinary path.
+        Served by the bulk data plane where it can be: several reads in flight
+        at once, each landing straight in its own slice of ``buffer``, so the
+        bytes are never copied between the socket and the caller. A server
+        that answers a read with something other than bytes takes the
+        ordinary path.
         """
         view = memoryview(buffer).cast("B")
         if not view:
             return 0
-        if self.config.bulk and len(view) >= _MIN_BULK_READ:
-            try:
-                return self._bulk_readinto(view, offset)
-            except BulkUnsupported as exc:
-                _log.debug("bulk read declined for %s (%s); using the event path", self.url, exc)
-        data = self.read(len(view), offset)
+        if self._reads_on_plane(len(view)):
+            got = self._plane_readinto(view, offset)
+            if got is not None:
+                return got
+        data = self._event_read(len(view), offset)
         view[: len(data)] = data
         return len(data)
 
-    def _bulk_readinto(self, view: memoryview, offset: int) -> int:
-        """One pipelined, zero-copy fill of ``view``, on this file's connection.
+    def _reads_on_plane(self, size: int) -> bool:
+        """Whether a read of ``size`` bytes goes over the bulk data plane.
+
+        Every read does, whatever its size - one request framed and received
+        directly is a fraction of the interpreter time the event path spends
+        on it - except where a data path has been asked for: a small read on
+        a handle the caller bound one for (:meth:`bind_data_path`) keeps its
+        answers there, and so does one whose automatic paths the server
+        serves requests on.
+        """
+        if not self.config.bulk:
+            return False
+        if size >= _MIN_BULK_READ:
+            return True
+        return not self._pathid and self._paths_idle()
+
+    def _paths_idle(self) -> bool:
+        """Whether the automatic data paths have nothing to offer this handle.
+
+        True with none bound or after falling back from them, and on a server
+        that has said it will not serve a request that arrives on one - the
+        stock daemon, where the plane on the control link is the fast path.
+        """
+        if not self._data_paths or not self._multistream:
+            return True
+        return self._router.session.ask_arrival_routing() is False
+
+    def _recover_from_plane(self, error: XrdConnectionError) -> None:
+        """Re-open after the bulk plane lost the connection, or raise.
+
+        The plane has already marked the connection broken - its wire is out
+        of step, with replies still owed on it - so nothing may be sent on it
+        again, the event path included. A handle that can be re-opened is,
+        on a fresh one, and the caller's read is then run on the event path
+        there; one that cannot gets the failure, as the
+        :class:`~xrdclient.errors.TransientError` the event path would have
+        raised.
+        """
+        if not self.recoverable:
+            raise _transient(error)
+        _log.debug("recovering %s after the bulk plane lost its connection: %s", self.url, error)
+        self._reopen()
+
+    def _plane_read(self, size: int, offset: int) -> bytes | None:
+        """``size`` bytes at ``offset`` off the bulk data plane, or ``None``.
+
+        The bytes are received straight into the buffer of the ``bytes``
+        object that is returned - :class:`io.BytesIO` hands out a writable
+        view of its own storage and then the storage itself - so a gigabyte
+        read costs one allocation and no copy. ``None`` means the plane was
+        declined and the caller should use the event path.
+        """
+        buffer = _Landing(bytes(size))
+        view = buffer.getbuffer()
+        try:
+            got = self._plane_readinto(view, offset)
+        finally:
+            view.release()
+        if got is None:
+            return None
+        data = buffer.getvalue()
+        return data if got == size else data[:got]
+
+    def _plane_readinto(self, view: memoryview, offset: int) -> int | None:
+        """One pipelined, zero-copy fill of ``view``, or ``None`` if declined.
 
         The request size is whatever divides this buffer into a full pipeline:
         a caller asking for exactly one chunk would otherwise get one read at a
-        time, which is the round trip the pipeline exists to hide.
+        time, which is the round trip the pipeline exists to hide. A handle
+        that can be re-opened is, on the event path, if its connection went.
         """
         depth = self.config.bulk_depth
         chunk = max(_MIN_BULK_CHUNK, min(self.config.bulk_chunk, -(-len(view) // depth)))
-        with self.session.bulk(self.handle, chunk=chunk, depth=depth) as reader:
-            return reader.into(view, offset)
+        depth = min(depth, -(-len(view) // chunk))
+        try:
+            with self.session.bulk(self.handle, chunk=chunk, depth=depth) as reader:
+                return reader.into(view, offset)
+        except BulkUnsupported as exc:
+            _log.debug("bulk read declined for %s (%s); using the event path", self.url, exc)
+        except XrdConnectionError as exc:
+            self._recover_from_plane(exc)
+        return None
 
     def readv(self, ranges: Iterable[ReadRange | tuple[int, int]]) -> list[bytes]:
         """``kXR_readv`` - many scattered ranges in as few round trips as possible.
@@ -514,17 +724,57 @@ class File:
         Returns one ``bytes`` per requested range, in the order asked for,
         regardless of how the server batches or reorders them.
         """
-        wanted = [
-            rng if isinstance(rng, ReadRange) else ReadRange(rng[0], rng[1]) for rng in ranges
-        ]
+        wanted = [_as_range(rng) for rng in ranges]
         if not wanted:
             return []
-        out: dict[int, list[bytes]] = {}
-        for batch in _batches(wanted):
-            result = self._execute(_readv_for(batch, self))
-            for segment in rp.parse_readv(result.data):
-                out.setdefault(segment.offset, []).append(segment.data)
+        if all(rng.length <= READV_MAX_ELEMENT for rng in wanted):
+            return self._readv_elements(wanted)
+        # A range longer than the server takes in one element goes out as
+        # several, and is stitched back together below; the caller never sees
+        # the ceiling.
+        out = _by_offset(self._readv_bodies([p for rng in wanted for p in _pieces(rng)]))
+        return [_assemble(rng, out) for rng in wanted]
+
+    def _readv_elements(self, wanted: list[ReadRange]) -> list[bytes]:
+        """``wanted``, every range of which the server takes as one element."""
+        bodies = self._readv_bodies(wanted)
+        # The server answers in the order it was asked, whole ranges, all but
+        # always; checking that is cheaper than filing each segment by its
+        # offset, which is what anything else falls back to.
+        quick = _as_asked(bodies, wanted)
+        if quick is not None:
+            return quick
+        out = _by_offset(bodies)
         return [_segment_for(rng, out.get(rng.offset)) for rng in wanted]
+
+    def _readv_bodies(self, pieces: Sequence[ReadRange]) -> list[memoryview]:
+        """The reply body of every ``kXR_readv`` it takes to fetch ``pieces``."""
+        batches = list(_batches(pieces))
+        bodies = self._plane_readv(batches) if self._reads_on_plane(0) else None
+        if bodies is None:
+            bodies = [memoryview(self._execute(_readv_for(b, self)).data) for b in batches]
+        return bodies
+
+    def _plane_readv(self, batches: list[list[ReadRange]]) -> list[memoryview] | None:
+        """Every batch's reply body off the bulk data plane, or ``None`` if declined.
+
+        The batches go out together, ``config.bulk_depth`` at a time, so a
+        vector read too big for one request still costs about one round trip.
+        """
+        handle = self.handle
+        requests: list[tuple[Request, int]] = []
+        for batch in batches:
+            request = _PackedReadV([(handle, rng.offset, rng.length) for rng in batch])
+            requests.append((request, request.reply_cap()))
+        depth = min(self.config.bulk_depth, len(requests))
+        try:
+            with self.session.bulk(handle, chunk=1, depth=depth) as channel:
+                return channel.gather(requests)
+        except BulkUnsupported as exc:
+            _log.debug("bulk readv declined for %s (%s); using the event path", self.url, exc)
+        except XrdConnectionError as exc:
+            self._recover_from_plane(exc)
+        return None
 
     def pgread(self, size: int, offset: int, *, verify: bool = True) -> PageResult:
         """``kXR_pgread`` - read with a CRC-32C per 4 KiB page.
@@ -543,7 +793,7 @@ class File:
         """Iterate the file in ``config.chunk_size`` blocks."""
         offset = 0
         while True:
-            chunk = self._read_one(offset, self.config.chunk_size)
+            chunk = self.read(self.config.chunk_size, offset)
             if not chunk:
                 return
             yield chunk
@@ -565,9 +815,56 @@ class File:
             request = r.ChkPoint.execute(self.handle, request)
         return self._router.execute(request, path=self.url.path)
 
-    def write(self, data: bytes, offset: int = 0) -> int:
-        """``kXR_write``. Returns the number of bytes accepted."""
+    def write(self, data: bytes | bytearray | memoryview, offset: int = 0) -> int:
+        """``kXR_write``. Returns the number of bytes accepted.
+
+        Over the bulk data plane where it can be: ``config.chunk_size``
+        writes, ``config.bulk_depth`` of them in flight, each sent straight
+        from ``data`` without a copy. Any write the server refuses raises
+        here, after the rest of the window has been answered.
+        """
         view = memoryview(data).cast("B")
+        if view and self._writes_on_plane():
+            written = self._plane_write(view, offset)
+            if written is not None:
+                self._invalidate(offset + written)
+                return written
+        return self._event_write(view, offset)
+
+    def _writes_on_plane(self) -> bool:
+        """Whether a write goes over the bulk data plane.
+
+        Not inside a checkpoint, which journals only what arrives as
+        ``kXR_ckpXeq``; not on a handle opened to append, whose writes the
+        server places itself; and not where the automatic data paths are
+        served (see :meth:`_paths_idle`).
+        """
+        if not self.config.bulk or self._checkpoint or self._flags & OpenFlags.APPEND:
+            return False
+        return self._paths_idle()
+
+    def _plane_write(self, view: memoryview, offset: int) -> int | None:
+        """Pipelined, zero-copy write of ``view``, or ``None`` if declined.
+
+        Declined means a server that answered with a conversation - a
+        ``kXR_wait``, a redirect - rather than an acknowledgement. Some of the
+        window may have landed by then; the event path writes all of it again,
+        which puts the same bytes at the same offsets.
+        """
+        chunk = self.config.chunk_size
+        depth = min(self.config.bulk_depth, -(-len(view) // chunk))
+        try:
+            with self.session.bulk(self.handle, chunk=chunk, depth=depth) as channel:
+                return channel.write_from(view, offset)
+        except BulkUnsupported as exc:
+            _log.debug("bulk write declined for %s (%s); using the event path", self.url, exc)
+        except XrdConnectionError as exc:
+            # Never re-opened: see :data:`_WRITING`.
+            raise _transient(exc) from exc
+        return None
+
+    def _event_write(self, view: memoryview, offset: int) -> int:
+        """``view`` at ``offset`` through the event path, a chunk at a time."""
         limit = self.config.chunk_size
         written = 0
         while written < len(view):
@@ -575,9 +872,9 @@ class File:
             at = offset + written
             body = piece.tobytes()
             if self._checkpoint:
-                self._submit(r.Write(self.handle, at, body, self._pathid))
+                self._submit(r.Write(self.handle, at, body, self._split_path(write=True)))
             else:
-                self._bulk(_write_for(at, body))
+                self._bulk(_write_for(at, body), write=True)
             written += len(piece)
         self._invalidate(offset + written)
         return written
@@ -707,7 +1004,9 @@ class File:
     def _pgwrite_once(self, data: bytes, offset: int, *, retry: bool = False) -> tuple[int, ...]:
         """One ``kXR_pgwrite``, returning the offsets the server found corrupt."""
         result = self._submit(
-            r.PgWrite(self.handle, offset, pack_pages(data, offset), retry, self._pathid)
+            r.PgWrite(
+                self.handle, offset, pack_pages(data, offset), retry, self._split_path(write=True)
+            )
         )
         return rp.parse_pgwrite_cse(result.data) if result.data else ()
 
@@ -747,21 +1046,34 @@ class File:
     # ------------------------------------------------------------------
 
     def getxattr(self, name: str) -> bytes:
+        """One attribute's value; :class:`~xrdclient.errors.AttrNotFoundError` if absent.
+
+        The same error :meth:`FileSystem.getxattr` raises, so a caller need
+        not know whether it asked a path or an open handle.
+        """
         result = self._execute(lambda handle: r.Fattr.get("", name, fhandle=handle))
         for item in rp.parse_fattr(result.data).items:
             if item.code == 0 and item.value is not None:
                 return item.value
-        raise KeyError(name)
+        raise _fattr.missing(name, self.url.path)
 
     def setxattr(self, name: str, value: bytes) -> None:
-        self._router.execute(r.Fattr.set("", name, value, fhandle=self.handle), path=self.url.path)
+        """Set one attribute, raising if the server refused it."""
+        res = self._router.execute(
+            r.Fattr.set("", name, value, fhandle=self.handle), path=self.url.path
+        )
+        _fattr.check(rp.parse_fattr(res.data, values=False), self.url.path)
 
     def listxattr(self) -> list[str]:
         result = self._execute(lambda handle: r.Fattr.list("", fhandle=handle))
-        return [i.name for i in rp.parse_fattr(result.data, values=False).items]
+        return [i.name for i in rp.parse_fattr_list(result.data).items]
 
     def removexattr(self, name: str) -> None:
-        self._router.execute(r.Fattr.delete("", name, fhandle=self.handle), path=self.url.path)
+        """Remove one attribute, raising if the server refused - one absent, say."""
+        res = self._router.execute(
+            r.Fattr.delete("", name, fhandle=self.handle), path=self.url.path
+        )
+        _fattr.check(rp.parse_fattr(res.data, values=False), self.url.path)
 
     # ------------------------------------------------------------------
     # Checkpoints
@@ -858,6 +1170,108 @@ def _write_for(at: int, body: bytes) -> Callable[[bytes, int], Request]:
     return lambda handle, pid: r.Write(handle, at, body, pid)
 
 
+class _Landing(io.BytesIO):
+    """The buffer a plane read lands in, and then the ``bytes`` it returns.
+
+    A read that fails part-way leaves slices of this buffer's view in the
+    traceback, and the collector may finalize the buffer before them; closing
+    a :class:`io.BytesIO` with its storage still exported raises, which here
+    would only be reported as an ignored exception. There is nothing to
+    release that the collector will not, so the close is let go.
+    """
+
+    def close(self) -> None:
+        with suppress(BufferError):
+            super().close()
+
+
+def _transient(error: XrdConnectionError) -> TransientError:
+    """``error`` as the :class:`TransientError` a lost connection is reported as."""
+    if isinstance(error, TransientError):
+        return error
+    failure = TransientError(str(error))
+    failure.__cause__ = error
+    return failure
+
+
+#: A ``kXR_readv`` reply's ``readahead_list``: fhandle, length, offset.
+_READ_LIST = struct.Struct(">4xiq")
+
+
+class _PackedReadV(r.ReadV):
+    """A ``kXR_readv`` whose element list is packed in one call.
+
+    The same frame as :class:`~xrdclient.proto.requests.ReadV` builds a field
+    at a time, which for a thousand elements is most of the request's cost.
+    """
+
+    __slots__ = ()
+
+    def payload(self) -> bytes:
+        fields: list[bytes | int] = []
+        for fhandle, offset, length in self.chunks:
+            fields += (fhandle, length, offset)  # "4s" pads or truncates, as the field does
+        return struct.pack(">" + "4siq" * len(self.chunks), *fields)
+
+
+def _as_range(rng: ReadRange | tuple[int, int]) -> ReadRange:
+    return rng if isinstance(rng, ReadRange) else ReadRange(rng[0], rng[1])
+
+
+def _as_asked(bodies: list[memoryview], wanted: list[ReadRange]) -> list[bytes] | None:
+    """Every range's bytes, if the replies hold exactly ``wanted``, in order.
+
+    ``None`` as soon as anything differs - a segment out of order, a short
+    one at the end of the file, one too many or too few - and the caller
+    matches the segments up by offset instead.
+    """
+    out: list[bytes] = []
+    expected = iter(wanted)
+    for body in bodies:
+        for offset, data in _walk(body):
+            rng = next(expected, None)
+            if rng is None or rng.offset != offset or rng.length != len(data):
+                return None
+            out.append(bytes(data))
+    return out if len(out) == len(wanted) else None
+
+
+def _by_offset(bodies: list[memoryview]) -> dict[int, list[bytes]]:
+    """Every segment of the replies, filed by offset, in the order it came."""
+    out: dict[int, list[bytes]] = {}
+    for body in bodies:
+        for offset, data in _walk(body):
+            out.setdefault(offset, []).append(bytes(data))
+    return out
+
+
+def _walk(body: memoryview) -> Iterator[tuple[int, memoryview]]:
+    """``(offset, bytes)`` for each segment of one ``kXR_readv`` reply.
+
+    Walks the reply in place: the views are slices of the buffer the reply
+    was received into, so a caller copies each segment once, and only the
+    segments it keeps.
+    """
+    at, end = 0, len(body)
+    while at < end:
+        if end - at < _READ_LIST.size:
+            raise ProtocolError(
+                f"kXR_readv reply ends with {end - at} bytes of a {_READ_LIST.size}-byte "
+                "segment header"
+            )
+        length, offset = _READ_LIST.unpack_from(body, at)
+        at += _READ_LIST.size
+        if length < 0:
+            raise ProtocolError(f"kXR_readv segment declares a negative length of {length}")
+        if at + length > end:
+            raise ProtocolError(
+                f"kXR_readv segment at offset {offset} declares {length} bytes, "
+                f"and the reply has {end - at} left"
+            )
+        yield offset, body[at : at + length]
+        at += length
+
+
 def _segment_for(wanted: ReadRange, answers: list[bytes] | None) -> bytes:
     """One vector-read segment, or a refusal - never a silent empty string."""
     if not answers:
@@ -874,16 +1288,31 @@ def _segment_for(wanted: ReadRange, answers: list[bytes] | None) -> bytes:
     return data
 
 
+def _pieces(rng: ReadRange) -> Iterator[ReadRange]:
+    """``rng`` as ``kXR_readv`` elements no longer than the server accepts."""
+    if rng.length <= READV_MAX_ELEMENT:
+        yield rng
+        return
+    for start in range(0, rng.length, READV_MAX_ELEMENT):
+        yield ReadRange(rng.offset + start, min(READV_MAX_ELEMENT, rng.length - start))
+
+
+def _assemble(rng: ReadRange, answers: dict[int, list[bytes]]) -> bytes:
+    """One requested range, rejoined from the pieces :func:`_pieces` cut it into.
+
+    Every piece is claimed from ``answers``, even after a short one at the end
+    of the file, so that a later range starting at the same offset as one of
+    them is still handed its own segment and not a leftover.
+    """
+    parts = [_segment_for(piece, answers.get(piece.offset)) for piece in _pieces(rng)]
+    return parts[0] if len(parts) == 1 else b"".join(parts)
+
+
 def _batches(ranges: Sequence[ReadRange]) -> Iterator[list[ReadRange]]:
     """Split vector reads to respect the server's per-request ceilings."""
     batch: list[ReadRange] = []
     total = 0
     for rng in ranges:
-        if rng.length > READV_MAX_BYTES:
-            raise ProtocolError(
-                f"readv element of {rng.length} bytes exceeds the {READV_MAX_BYTES} limit; "
-                "use read() for ranges this large"
-            )
         if batch and (len(batch) >= READV_MAX_CHUNKS or total + rng.length > READV_MAX_BYTES):
             yield batch
             batch, total = [], 0
@@ -907,10 +1336,20 @@ def _clone_extent(batch: list[tuple[bytes, int, int, int]]) -> tuple[int, int]:
     return copied, extent
 
 
+def _write_pieces(chunk: WriteChunk) -> Iterator[WriteChunk]:
+    """``chunk`` as ``kXR_writev`` elements no longer than the server accepts."""
+    if len(chunk.data) <= WRITEV_MAX_ELEMENT:
+        yield chunk
+        return
+    for start in range(0, len(chunk.data), WRITEV_MAX_ELEMENT):
+        yield WriteChunk(chunk.offset + start, chunk.data[start : start + WRITEV_MAX_ELEMENT])
+
+
 def _write_batches(chunks: Sequence[WriteChunk]) -> Iterator[list[WriteChunk]]:
+    """Split vector writes to respect the server's per-element and per-request ceilings."""
     batch: list[WriteChunk] = []
     total = 0
-    for chunk in chunks:
+    for chunk in (piece for whole in chunks for piece in _write_pieces(whole)):
         if batch and (len(batch) >= READV_MAX_CHUNKS or total + len(chunk.data) > READV_MAX_BYTES):
             yield batch
             batch, total = [], 0

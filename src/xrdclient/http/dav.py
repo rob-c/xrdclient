@@ -53,7 +53,7 @@ from ..types import (
 )
 from ..url import XRootDURL, parse
 from . import tape
-from .client import HTTPClient
+from .client import HTTPClient, absolute_url
 from .file import open_http
 
 __all__ = ["HTTPFileSystem", "digest", "macaroon", "propfind"]
@@ -523,7 +523,11 @@ class HTTPFileSystem(FileSystem):
 
     def rename(self, src: str, dst: str) -> None:
         """``MOVE`` within the same endpoint."""
-        destination = str(self.url.with_path(self._abs(dst)))
+        # The ``http(s)`` form, percent-encoded and without the query: this
+        # is a header the server resolves, so ``davs://`` means nothing to it,
+        # a raw space ends it, a name outside Latin-1 cannot be sent at all,
+        # and a token in our own URL has no business being quoted back.
+        destination = absolute_url(self.url.without_query().with_path(self._abs(dst)))
         self.client.request(
             "MOVE",
             self._url(src),

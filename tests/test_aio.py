@@ -594,3 +594,146 @@ def test_a_checkpoint_needs_a_root_endpoint(dav):
                     pass
 
     run(main())
+
+
+# ---------------------------------------------------------------------------
+# The rest of the File surface
+# ---------------------------------------------------------------------------
+
+
+def test_positional_reads_and_writes_leave_the_cursor_alone(server):
+    async def main():
+        async with xrdclient.aio.open(server.url / "data/p.bin", "w+b") as handle:
+            await handle.write(b"0123456789")  # still in the buffer: pwrite must not overtake it
+            assert await handle.pwrite(b"AB", 2) == 2
+            assert await handle.tell() == 10
+            assert await handle.pread(4, 1) == b"1AB4"
+            assert await handle.tell() == 10
+        assert server.contents("/data/p.bin") == b"01AB456789"
+
+    run(main())
+
+
+def test_extended_attributes_on_an_open_handle(server):
+    async def main():
+        async with xrdclient.aio.open(server.url / "data/a.root", "r+b") as handle:
+            await handle.setxattr("run", b"7")
+            assert await handle.getxattr("run") == b"7"
+            assert await handle.listxattr() == ["run"]
+            await handle.removexattr("run")
+            assert await handle.listxattr() == []
+
+    run(main())
+
+
+def test_the_handle_bookkeeping_is_mirrored(server):
+    async def main():
+        async with xrdclient.aio.open(server.url / "data/a.root") as handle:
+            assert handle.is_open
+            assert await handle.size() == len(BODY)
+            assert handle.compression == (0, "")
+            assert handle.recoverable
+            assert handle.endpoint == handle.file.endpoint
+            assert isinstance(await handle.visa(), bytes)
+            await handle.verify("1a0b045d")
+            with pytest.raises(xrdclient.ChecksumMismatchError):
+                await handle.verify("00000000")
+        assert not handle.is_open
+
+    run(main())
+
+
+def test_the_positional_and_attribute_calls_need_a_root_endpoint(dav):
+    async def main():
+        async with xrdclient.aio.open(dav.url / "d/a.root") as handle:
+            with pytest.raises(UnsupportedError, match="pread needs a root://"):
+                await handle.pread(5, 0)
+            with pytest.raises(UnsupportedError, match="getxattr needs a root://"):
+                await handle.getxattr("run")
+
+    run(main())
+
+
+# ---------------------------------------------------------------------------
+# The rest of the FileSystem surface
+# ---------------------------------------------------------------------------
+
+
+def test_move_and_unlink_are_the_os_spellings(server):
+    server.add_file("/data/m.bin", b"m")
+
+    async def main():
+        async with AsyncFileSystem(server.url) as fs:
+            await fs.move("/data/m.bin", "/data/n.bin")
+            assert await fs.exists("/data/n.bin")
+            await fs.unlink("/data/n.bin")
+            assert not await fs.exists("/data/n.bin")
+
+    run(main())
+
+
+def test_walk_takes_the_os_walk_arguments(server):
+    server.add_file("/data/tree/x/f.bin", b"x")
+    seen = []
+
+    async def main():
+        async with AsyncFileSystem(server.url) as fs:
+            return [
+                root
+                async for root, _dirs, _files in fs.walk(
+                    top="/data/tree", topdown=False, onerror=seen.append, followlinks=False
+                )
+            ]
+
+    assert run(main()) == ["/data/tree/x", "/data/tree"]
+    assert seen == []
+
+
+# ---------------------------------------------------------------------------
+# The module-level verbs
+# ---------------------------------------------------------------------------
+
+
+def test_the_easy_listing_verbs_are_awaitable(server, config):
+    async def main():
+        listed = await xrdclient.aio.ls(server.url.with_path("/data"), config=config)
+        matched = await xrdclient.aio.glob(server.url.with_path("/data/*.root"), config=config)
+        return [p.name for p in listed], [p.name for p in matched]
+
+    assert run(main()) == (["a.root", "empty"], ["a.root"])
+
+
+def test_the_easy_reading_verbs_are_awaitable(server, config):
+    aio = xrdclient.aio
+    url = server.url.with_path("/data/a.root")
+
+    async def main():
+        assert (await aio.stat(url, config=config)).st_size == len(BODY)
+        assert await aio.exists(url, config=config)
+        assert await aio.size(url, config=config) == len(BODY)
+        assert (await aio.checksum(url, "adler32", config=config)).value == "1a0b045d"
+        assert await aio.is_online(url, config=config)
+        assert await aio.stage(url, priority=1, config=config)
+        assert await aio.read_bytes(url, config=config) == BODY
+        assert await aio.read_text(url, "ascii", config=config) == "hello world"
+
+    run(main())
+
+
+def test_the_easy_mutating_verbs_are_awaitable(server, config):
+    aio = xrdclient.aio
+
+    async def main():
+        made = server.url.with_path("/data/new/deeper")
+        await aio.mkdir(made, 0o700, parents=True, exist_ok=False, config=config)
+        target = server.url.with_path("/data/new/deeper/t.txt")
+        assert await aio.write_text(target, "tee", "ascii", config=config) == 3
+        assert await aio.write_bytes(target, b"bee", config=config) == 3
+        moved = server.url.with_path("/data/new/deeper/u.txt")
+        await aio.move(target, moved, config=config)
+        assert server.contents("/data/new/deeper/u.txt") == b"bee"
+        await aio.remove(server.url.with_path("/data/new"), recursive=True, config=config)
+        await aio.remove(moved, missing_ok=True, config=config)
+        assert not await aio.exists(server.url.with_path("/data/new"), config=config)
+
+    run(main())

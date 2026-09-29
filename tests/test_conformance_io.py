@@ -20,7 +20,6 @@ import pytest
 from xrdclient.client.file import READV_MAX_CHUNKS, File
 from xrdclient.client.filesystem import FileSystem
 from xrdclient.config import Config
-from xrdclient.errors import ProtocolError
 from xrdclient.flags import Access, OpenFlags
 from xrdclient.proto import constants as c
 from xrdclient.testing import FakeServer
@@ -200,11 +199,10 @@ def test_readv_segments_may_overlap(reader):
     assert reader.readv([(0, 16), (8, 16)]) == [PATTERN[:16], PATTERN[8:24]]
 
 
-def test_a_readv_segment_over_the_ceiling_is_refused_before_the_wire(reader, srv):
-    seen = len(srv.seen)
-    with pytest.raises(ProtocolError, match="use read"):
-        reader.readv([(0, (2 << 20) + 1)])
-    assert len(srv.seen) == seen
+def test_a_readv_segment_over_the_element_ceiling_is_split_not_refused(reader):
+    # xrootd refuses any one element over 2 MiB less 16 bytes; the client cuts
+    # the range up and hands back what the file holds, as a plain read would.
+    assert reader.readv([(0, (2 << 20) + 1)]) == [PATTERN]
 
 
 # ---------------------------------------------------------------------------

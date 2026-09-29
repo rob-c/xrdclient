@@ -24,7 +24,7 @@ from .._compat import SLOTS
 from .._log import get_logger
 from ..config import Config
 from ..crypto import new as new_checksum
-from ..errors import ChecksumMismatchError, UnsupportedError, kXR_Unsupported
+from ..errors import ChecksumMismatchError, UnsupportedError, XRootDError, kXR_Unsupported
 from ..session.bulk import BulkUnsupported
 from ..types import ChecksumInfo
 from ..url import XRootDURL, parse
@@ -266,7 +266,30 @@ def _in_parallel(
         return moved
 
     with ThreadPoolExecutor(plan.workers, thread_name_prefix="xrd-copy") as pool:
-        return sum(pool.map(move, _spans(plan.size, plan.workers)))
+        moved = sum(pool.map(move, _spans(plan.size, plan.workers)))
+    # A span whose reads ran dry stops quietly, so the only sign that the
+    # source ended early is the sum coming up short of what it promised.
+    _require_whole(plan.target, moved, plan.size)
+    return moved
+
+
+def _require_whole(target: object, moved: int, expected: int | None) -> None:
+    """Fail a transfer that ended before the source said it would.
+
+    A read that returns nothing looks the same whether the file is finished
+    or the server has stopped sending it, so the length the source reported
+    up front is the only thing that tells the two apart. Without it, a
+    truncated target would be reported as a copy - and a move would then
+    delete the only complete version. ``expected`` is ``None`` for a source
+    that never said how long it was, where nothing can be checked. More
+    bytes than promised is a file that grew while it was read, and every one
+    of them is at the target, so only a shortfall is an error. The target is
+    left as it is: a resumed copy can carry on from it.
+    """
+    if expected is not None and moved < expected:
+        raise XRootDError(
+            f"{target}: transfer ended with {moved} of {expected} bytes; the file is incomplete"
+        )
 
 
 def _shifted(progress: Progress | None, offset: int) -> Progress | None:
@@ -531,6 +554,41 @@ def _pump(
     return done
 
 
+def _one_stream(
+    source: tuple[Any, XRootDURL | None],
+    target: tuple[Any, XRootDURL | None],
+    resuming: _Resume | None,
+    config: Config,
+    chunk: int,
+    progress: Progress | None,
+    digest: Any,
+    *,
+    overwrite: bool,
+) -> int:
+    """Move the file through one reader and one writer, in order.
+
+    Each side is ``(what the caller passed, its URL or None for a stream)``.
+    Returns the bytes this call moved, which for a resumed transfer is only
+    the tail - but the tail is checked against the whole file, since what has
+    to be complete at the end is the target, not this call's share of it.
+    """
+    (src_obj, src_url), (dst_obj, dst_url) = source, target
+    offset = resuming.offset if resuming is not None else 0
+    with ExitStack() as stack:
+        reader, total = (src_obj, None) if src_url is None else _reader(src_url, config, stack)
+        if resuming is not None:
+            reader.seek(offset)
+            writer = _resumer(resuming.target, config, stack, offset)
+        elif dst_url is None:
+            writer = dst_obj
+        else:
+            writer = _writer(dst_url, config, stack, overwrite=overwrite)
+        report = progress if resuming is None else _shifted(progress, offset)
+        moved = _pump(reader, writer, total, chunk, report, digest, config.in_flight)
+    _require_whole(dst_url or repr(dst_obj), offset + moved, total)
+    return moved
+
+
 def copy(
     source: Any,
     target: Any,
@@ -560,7 +618,13 @@ def copy(
     own checksum - of the target if it is remote, otherwise of the source.
     Left at ``None`` it follows ``config.verify_checksums`` and degrades
     quietly when the server cannot checksum; set it to ``True`` to make an
-    unverifiable copy an error.
+    unverifiable copy an error. With no server at either end, ``True``
+    compares two local files by reading both, and refuses a copy to or from
+    an open stream outright, since there is nothing to compare it with.
+
+    A source that said how long it was and then stopped sending early raises
+    :class:`~xrdclient.errors.XRootDError` rather than leaving a truncated
+    target that looks finished, and ``remove_source`` does not run.
 
     ``overwrite=False`` creates the target exclusively, raising
     :class:`FileExistsError` if it is already there.
@@ -616,6 +680,7 @@ def copy(
     # And a digest is only worth taking at all if some server can be asked to
     # compare it with what it holds.
     checkable = next((u for u in (dst_url, src_url) if u is not None and not u.is_local), None)
+    ends = _strict_ends(src_url, dst_url, ends, checkable, verify=verify)
     digest = new_checksum(algo) if wanted and checkable is not None and ends is None else None
     # Reading a remote file, the answer to compare against exists before the
     # transfer does, so ask for it now: a server that cannot checksum is worth
@@ -653,17 +718,16 @@ def copy(
     elif spread is not None:
         size = _in_parallel(spread, cfg, chunk, progress, overwrite=overwrite)
     else:
-        with ExitStack() as stack:
-            reader, total = (source, None) if src_url is None else _reader(src_url, cfg, stack)
-            if resuming is not None:
-                reader.seek(resuming.offset)
-                writer = _resumer(resuming.target, cfg, stack, resuming.offset)
-            elif dst_url is None:
-                writer = target
-            else:
-                writer = _writer(dst_url, cfg, stack, overwrite=overwrite)
-            report = progress if resuming is None else _shifted(progress, resuming.offset)
-            size = _pump(reader, writer, total, chunk, report, digest, cfg.in_flight)
+        size = _one_stream(
+            (source, src_url),
+            (target, dst_url),
+            resuming,
+            cfg,
+            chunk,
+            progress,
+            digest,
+            overwrite=overwrite,
+        )
     elapsed = time.monotonic() - started
 
     checksum = None
@@ -688,6 +752,33 @@ def copy(
         checksum=checksum,
         resumed_at=resuming.offset if resuming is not None else 0,
     )
+
+
+def _strict_ends(
+    source: XRootDURL | None,
+    target: XRootDURL | None,
+    ends: _Ends | None,
+    checkable: XRootDURL | None,
+    *,
+    verify: bool | None,
+) -> _Ends | None:
+    """How ``verify=True`` checks a copy that has no server to ask.
+
+    Left to the default, such a copy goes unverified quietly. Asked for
+    explicitly, it must not: two local files are compared by reading both,
+    as a spread transfer between them already is, and a copy with an open
+    stream at one end and a local file at the other has nothing that could
+    be compared at all, so it is refused before a byte moves rather than
+    reported afterwards as a success nobody checked.
+    """
+    if verify is not True or checkable is not None or ends is not None:
+        return ends
+    if source is None or target is None:
+        raise ValueError(
+            "verify=True, but there is nothing to verify against: no server holds "
+            "either end and an open stream cannot be read back"
+        )
+    return _Ends(source, target)
 
 
 def _ask_first(
@@ -874,6 +965,18 @@ def _in_order(
                 future.cancel()
 
 
+def _sync_options(options: dict[str, Any], sync: SyncMode | None) -> dict[str, Any]:
+    """The options each file of a tree is copied with.
+
+    A sync only copies what it has already judged out of date, and replacing
+    that is the whole point: an exclusive create would turn every changed file
+    into a :class:`FileExistsError`, so that a sync could only ever add files
+    and never bring one up to date. ``overwrite=False`` still holds for a tree
+    copied without ``sync``.
+    """
+    return options if sync is None else {**options, "overwrite": True}
+
+
 def copy_tree(
     source: Any,
     target: Any,
@@ -896,7 +999,8 @@ def copy_tree(
 
     ``include`` and ``exclude`` are :mod:`fnmatch` patterns matched against
     each path relative to ``source``; an include list is a whitelist and an
-    exclusion always wins. ``sync`` skips files already at the target, and
+    exclusion always wins. ``sync`` skips files already at the target and
+    replaces the ones it finds out of date, whatever ``overwrite`` says, and
     ``delete`` removes files under the target that the source does not have -
     excluded ones among them, since after this call the target is meant to
     hold what the selection describes and nothing else.
@@ -917,6 +1021,7 @@ def copy_tree(
     wanted = [rel for rel in _walk(src_url, cfg) if _selected(rel, include, exclude)]
     count = cfg.parallel_files if workers is None else workers
     total = _Total(progress) if progress is not None and count > 1 else None
+    options = _sync_options(options, sync)
 
     def move(rel: str) -> CopyResult | None:
         destination = dst_url / rel

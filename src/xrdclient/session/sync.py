@@ -37,6 +37,9 @@ _log = get_logger(__name__)
 
 _RECV = 1 << 18
 
+#: Machine states in which a session can carry nothing more.
+_DEAD = frozenset({m.State.CLOSED, m.State.FAILED})
+
 #: Grace added to a kXR_waitresp delay before the deferred reply is overdue.
 _WAITRESP_GRACE = 30.0
 
@@ -184,6 +187,16 @@ class Session:
         """
         return self._broken or self._m.state in (m.State.FAILED, m.State.CLOSED)
 
+    def mark_broken(self) -> None:
+        """Record that this connection can no longer be trusted.
+
+        For a caller that drove the wire itself - the bulk reader - and left
+        it in a state the session cannot recover from, such as a reply still
+        in transit on a stream id nothing is waiting for. The pool then drops
+        the connection rather than handing it to someone else.
+        """
+        self._broken = True
+
     @property
     def closed(self) -> bool:
         return self._m.state in (m.State.CLOSED, m.State.FAILED)
@@ -208,6 +221,21 @@ class Session:
         :attr:`~xrdclient.Config.data_stream_timeout`.
         """
         return self._arrives_on_path
+
+    def ask_arrival_routing(self) -> bool | None:
+        """Settle :attr:`arrives_on_path` by asking, if it is not yet settled.
+
+        For a caller that must know *before* it builds a request which way it
+        is going: an :meth:`execute` with ``arrive_on_path`` asks too, but a
+        server that disclaims arrival then gets the standard split of the very
+        request that was meant for the path, and a write split that way is
+        answered where nobody waits for it. Returns the answer, still ``None``
+        when the server would not say and only a trial can tell.
+        """
+        with self._lock:
+            if self._arrives_on_path is None:
+                self._ask_arrival_routing()
+            return self._arrives_on_path
 
     def notices(self) -> list[rp.AttnInfo]:
         """Drain any unsolicited ``kXR_attn`` messages the server sent."""
@@ -307,45 +335,30 @@ class Session:
         server with an answer never costs the trial-and-timeout.
         """
         with self._lock:
-            self._validate_execute(request)
-            on_path = self._use_arrival_path(request, arrive_on_path)
-            sid = self._m.submit(request, path=path, arrive_on_path=on_path)
-            answers_on = self._answer_path(request, on_path)
-            if not on_path:
-                return self._await(sid, on_chunk, answers_on)
-            return self._await_arrival(sid, on_chunk, answers_on, request.pathid)
+            pathid = request.pathid
+            if self._m.state in _DEAD:
+                raise XrdConnectionError(f"session to {self.endpoint} is closed")
+            if pathid and pathid not in self._paths:
+                raise ValueError(f"data path {pathid} is not bound to {self.endpoint}")
+            if arrive_on_path and self._use_arrival_path(request):
+                sid = self._m.submit(request, path=path, arrive_on_path=True)
+                return self._await_arrival(sid, on_chunk, pathid)
+            sid = self._m.submit(request, path=path)
+            return self._await(sid, on_chunk, pathid if request.reply_on_path else 0)
 
-    def _validate_execute(self, request: Request) -> None:
-        if self.closed:
-            raise XrdConnectionError(f"session to {self.endpoint} is closed")
-        if request.pathid and request.pathid not in self._paths:
-            raise ValueError(f"data path {request.pathid} is not bound to {self.endpoint}")
-
-    def _use_arrival_path(self, request: Request, requested: bool) -> bool:
-        if requested and self._arrives_on_path is None and request.pathid:
+    def _use_arrival_path(self, request: Request) -> bool:
+        """Whether a request that asked to arrive on its data path may."""
+        if not request.pathid:
+            return False
+        if self._arrives_on_path is None:
             self._ask_arrival_routing()
-        return (
-            requested
-            and self._arrives_on_path is not False
-            and bool(request.pathid)
-            and request.pathid in self._paths
-        )
-
-    @staticmethod
-    def _answer_path(request: Request, arrival: bool) -> int:
-        if arrival:
-            return request.pathid
-        return request.pathid if request.reply_on_path else 0
+        return self._arrives_on_path is not False and request.pathid in self._paths
 
     def _await_arrival(
-        self,
-        sid: int,
-        on_chunk: Callable[[bytes], None] | None,
-        answers_on: int,
-        pathid: int,
+        self, sid: int, on_chunk: Callable[[bytes], None] | None, pathid: int
     ) -> Result:
         try:
-            result = self._await(sid, on_chunk, answers_on)
+            result = self._await(sid, on_chunk, pathid)
         except Exception:
             # The abandoned answer may still arrive on this link, so the path
             # cannot safely carry a later request.
@@ -397,9 +410,12 @@ class Session:
         state = _AwaitState(0, 0.0, 0, self._armed())
         while True:
             for event in self._events_for(sid, pathid, state.deadline):
-                result = self._consume_event(event, sid, on_chunk, state)
-                if result is not None:
-                    return result
+                if type(event) is m.Completed:
+                    # Completed carries the whole body; stream only its unseen tail.
+                    if on_chunk is not None and len(event.data) > state.streamed:
+                        on_chunk(event.data[state.streamed :])
+                    return Result(event.data, event.status)
+                self._consume_event(event, sid, on_chunk, state)
 
     def _consume_event(
         self,
@@ -407,12 +423,8 @@ class Session:
         sid: int,
         on_chunk: Callable[[bytes], None] | None,
         state: _AwaitState,
-    ) -> Result | None:
-        if isinstance(event, m.Completed):
-            # Completed carries the whole body; stream only its unseen tail.
-            if on_chunk is not None and len(event.data) > state.streamed:
-                on_chunk(event.data[state.streamed :])
-            return Result(event.data, event.status)
+    ) -> None:
+        """Act on one event for ``sid`` that is not its completion."""
         if isinstance(event, m.Failed):
             raise event.error
         if isinstance(event, m.Chunk):
@@ -424,7 +436,6 @@ class Session:
             raise RedirectRequired(event.target)
         elif isinstance(event, m.Waiting):
             self._wait_event(event, sid, state)
-        return None
 
     def _wait_event(self, event: m.Waiting, sid: int, state: _AwaitState) -> None:
         # Parking is not stalling, but repeated delays share one budget.
@@ -459,6 +470,8 @@ class Session:
         data = self._m.data_to_send()
         if data:
             self._t.send(data)
+        if not self._m.has_path_data:
+            return
         for pathid, transport in self._paths.items():
             queued = self._m.path_data_to_send(pathid)
             if queued:
@@ -495,11 +508,22 @@ class Session:
         """One send/receive turn; returns whatever events it produced."""
         try:
             self._flush()
-            self._m.receive_data(self._receive(pathid, deadline), pathid=pathid)
         except (XrdConnectionError, XrdTimeoutError):
             self._broken = True
             raise
-        return list(self._m.events())
+        try:
+            self._m.receive_data(self._receive(pathid, deadline), pathid=pathid)
+        except (XrdConnectionError, XrdTimeoutError):
+            if pathid:
+                # A data path that failed or went quiet takes only itself
+                # down: the control link, and every handle opened on it, is
+                # as good as it was, and calling the session broken would
+                # have its files skip their closes and the pool drop it.
+                self._close_path(pathid)
+            else:
+                self._broken = True
+            raise
+        return self._m.drain()
 
     def _events_for(
         self, sid: int, pathid: int = 0, deadline: float | None = None
@@ -511,12 +535,18 @@ class Session:
         for it would wait forever. ``deadline`` is the whole operation's, so
         a peer that dribbles cannot renew it one byte at a time.
         """
-        queued = self._inbox.pop(sid, None)
-        if queued:
-            return queued
+        if self._inbox:
+            queued = self._inbox.pop(sid, None)
+            if queued:
+                return queued
         while True:
+            events = self._pump(pathid, deadline)
+            if len(events) == 1 and getattr(events[0], "streamid", None) == sid:
+                # One reply, and it is the one being waited for: nearly every
+                # turn of a request-at-a-time caller.
+                return events
             mine: list[m.Event] = []
-            for event in self._pump(pathid, deadline):
+            for event in events:
                 self._route_event(event, sid, mine)
             if mine:
                 return mine
@@ -581,7 +611,12 @@ class Session:
             self._flush()
             self._bulk_active = True
             try:
-                yield BulkReader(self, handle, chunk=chunk, depth=depth)
+                # Leaving the block settles the reader - every reply it asked
+                # for is taken off the wire, or the connection is marked
+                # broken - even when its consumer abandoned a stream part-way
+                # and the suspended iterator has not been closed yet.
+                with BulkReader(self, handle, chunk=chunk, depth=depth) as reader:
+                    yield reader
             except (XrdConnectionError, XrdTimeoutError):
                 # The reader drives the socket itself, so this is where its
                 # failures reach the session that owns it.

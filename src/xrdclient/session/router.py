@@ -6,39 +6,129 @@ with "go ask this data server", possibly through several tiers. A
 re-issues requests as it is bounced along, and reconnects a dropped
 connection so that an idle handle survives a server restart.
 
-The redirect target is sticky: after a file is opened on a data server, its
-reads must go to that same server, so :meth:`pin` hands back a Router already
-positioned there.
+Whether a redirect outlives the request it answered depends on who is asking,
+and follows XrdCl. A file's router is *sticky*: after a file is opened on a
+data server, its reads must go to that same server, so the router moves there
+and :meth:`~Router.pin` hands back one already positioned. A filesystem's is
+not: the next path may live on a different data server, so every request
+starts again at the manager, and a redirect sends only that one request on,
+over a pooled connection of its own. Moving the shared connection instead
+would both misroute the next request and close the connection other threads
+were in the middle of using.
 """
 
 from __future__ import annotations
 
 import threading
 import time
+from dataclasses import dataclass
 
+from .._compat import SLOTS
 from .._log import get_logger
 from ..config import Config
 from ..errors import ConnectionError as XrdConnectionError
-from ..errors import RedirectLimitError, TransientError, WaitLimitError
+from ..errors import ProtocolError, RedirectLimitError, TransientError, WaitLimitError
 from ..errors import TimeoutError as XrdTimeoutError
+from ..proto import constants as c
+from ..proto import requests as r
 from ..proto.frames import Request
-from ..url import XRootDURL, parse
-from .pool import SESSIONS
+from ..proto.responses import RedirectInfo
+from ..url import ROOT_SCHEMES, XRootDURL, parse
+from .pool import SESSIONS, same_server
 from .sync import RedirectRequired, Result, Session
 
 __all__ = ["Router"]
 
 _log = get_logger(__name__)
 
+#: The fields of a request that name something the server resolves as a path,
+#: and so may carry opaque CGI - checked in order, subclasses first. A
+#: symlink's first field is the text the link will hold, not a path: a token
+#: appended there would end up inside the link. Anything not listed names its
+#: path, if it has one, in ``path``.
+_PATH_FIELDS: tuple[tuple[type[Request], tuple[str, ...]], ...] = (
+    (r.Symlink, ("dst",)),
+    (r.Mv, ("src", "dst")),
+    (r.Statx, ("paths",)),
+    (r.Prepare, ("paths",)),
+)
 
-def _retarget(request: Request, token: str) -> None:
-    """Fold a redirect's opaque token into the request's path CGI."""
-    path = getattr(request, "path", None)
-    if not token or not isinstance(path, str):
-        return
-    # Not every request carries a path, which is why this goes through
-    # getattr; the ones that do are ordinary mutable dataclasses.
-    request.path = f"{path}{'&' if '?' in path else '?'}{token}"  # type: ignore[attr-defined]
+#: A request's path fields as they were before any redirect touched them.
+PathFields = dict[str, "str | list[str]"]
+
+
+def _path_fields(request: Request) -> PathFields:
+    """Snapshot the fields a redirect token may be folded into.
+
+    A cancelling ``kXR_prepare`` names a request id rather than paths, and a
+    request by handle has an empty path: neither has anywhere for a token.
+    """
+    if isinstance(request, r.Prepare) and request.options & c.kXR_cancel:
+        return {}
+    names = next((f for kind, f in _PATH_FIELDS if isinstance(request, kind)), ("path",))
+    found: PathFields = {}
+    for name in names:
+        value = getattr(request, name, None)
+        if isinstance(value, (str, list)):
+            found[name] = list(value) if isinstance(value, list) else value
+    return found
+
+
+def _with_token(path: str, token: str) -> str:
+    if not token or not path:
+        return path
+    return f"{path}{'&' if '?' in path else '?'}{token}"
+
+
+def _retarget(request: Request, original: PathFields, token: str) -> None:
+    """Put this hop's redirect token on the request's paths.
+
+    Built from ``original`` rather than from what the request says now: each
+    redirector's token is a capability for the server it points at, so the
+    previous hop's is stale by the time the next one arrives, and appending
+    would pile them up - two values for one key, and the wrong one first. The
+    caller's own CGI is in ``original`` and survives every hop.
+    """
+    for name, value in original.items():
+        if isinstance(value, list):
+            setattr(request, name, [_with_token(p, token) for p in value])
+        else:
+            setattr(request, name, _with_token(value, token))
+
+
+def _redirect_url(base: XRootDURL, host: str) -> XRootDURL:
+    """Where a ``kXR_redirect`` with a negative port points.
+
+    A negative port says the host field is a whole URL - one the server sends
+    only to a client that could take it - rather than a host name. A URL for
+    another protocol (``https://``, say) is a redirect this client cannot
+    follow on the same request, so it is refused by name rather than dialled
+    as if it were XRootD.
+    """
+    if "://" not in host:
+        raise ProtocolError(f"kXR_redirect with a negative port must name a URL, not {host!r}")
+    target = parse(host)
+    if target.scheme not in ROOT_SCHEMES:
+        raise ProtocolError(f"redirected to a {target.scheme} URL, which is not XRootD: {host}")
+    return base.evolve(scheme=target.scheme, host=target.host, port=target.port)
+
+
+@dataclass(**SLOTS)
+class _Route:
+    """Where one request has been sent, and how often."""
+
+    #: The request's path fields before any redirect touched them, taken at
+    #: the first redirect - nothing changes them before one, and most
+    #: requests never meet one, so most never pay for the snapshot.
+    original: PathFields | None
+    #: The server a redirect sent this request to, or ``None`` for the
+    #: router's own. Only ever set on the request, never on the router, when
+    #: the router is not sticky.
+    target: XRootDURL | None = None
+    #: The connection the last attempt went out on.
+    session: Session | None = None
+    hops: int = 0
+    attempts: int = 0
 
 
 class Router:
@@ -50,6 +140,7 @@ class Router:
         config: Config | None = None,
         *,
         reconnect: bool = True,
+        sticky: bool = True,
     ) -> None:
         self.url = parse(url) if isinstance(url, str) else url
         self.config = config or Config()
@@ -59,11 +150,19 @@ class Router:
         #: turn "the server went away" into "invalid file handle", five frames
         #: further on and much harder to act on.
         self.reconnect = reconnect
+        #: Whether a redirect moves the router (a file) or only the request
+        #: that got it (a filesystem, which asks its manager every time).
+        self.sticky = sticky
         self._session: Session | None = None
         #: Whether this router may hand its connection back to the pool. False
         #: on a pinned router that borrowed the connection it shares: the
         #: router it came from is still using it.
         self._owns = True
+        #: The router a :meth:`lend` borrows its first connection from.
+        self._lender: Router | None = None
+        #: Whether this router was lent for one open, so that pinning it may
+        #: take over a connection it made for itself; see :meth:`pin`.
+        self._lent = False
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
@@ -71,6 +170,12 @@ class Router:
     @property
     def session(self) -> Session:
         """The live session, connecting on first use."""
+        session = self._session
+        if session is not None and not session.closed:
+            # The steady state, answered without the lock: reading one
+            # reference is atomic, and a thread replacing it meanwhile is a
+            # race the locked read would have lost the same way.
+            return session
         with self._lock:
             if self._session is not None and self._session.closed and not self.reconnect:
                 # Silently opening a replacement would hand the caller a live
@@ -79,15 +184,32 @@ class Router:
                 # three layers away from the cause.
                 raise XrdConnectionError(f"the connection to {self.endpoint} was lost")
             if self._session is None or self._session.closed:
-                if self._session is not None:
-                    # A session whose peer went away is closed as far as the
-                    # protocol goes, but its socket is still a descriptor.
-                    self._session.close()
-                self._owns = True
-                self._session = SESSIONS.acquire(self.url, self.config) or Session.connect(
-                    self.url, config=self.config
-                )
+                self._connect()
+            assert self._session is not None
             return self._session
+
+    def _connect(self) -> None:
+        """Replace a missing or dead session. Called with the lock held."""
+        if self._session is not None:
+            # A session whose peer went away is closed as far as the
+            # protocol goes, but its socket is still a descriptor.
+            self._session.close()
+        lender, self._lender = self._lender, None
+        if lender is not None:
+            # Borrowed, not dialled: the open this router was lent for starts
+            # on the connection its lender already has.
+            self._session, self._owns = lender.session, False
+            return
+        self._owns = True
+        self._session = self._dial(self.url)
+
+    def _dial(self, url: XRootDURL) -> Session:
+        return SESSIONS.acquire(url, self.config) or Session.connect(url, config=self.config)
+
+    def _offer(self, session: Session, url: XRootDURL) -> None:
+        """Pool a connection this router is finished with, or close it."""
+        if not SESSIONS.release(session, url, self.config):
+            session.close()
 
     @property
     def endpoint(self) -> str:
@@ -108,44 +230,120 @@ class Router:
 
     def execute(self, request: Request, *, path: str = "", **kwargs: object) -> Result:
         """Run ``request``, following redirects and retrying dropped connections."""
-        hops = 0
-        attempts = 0
+        route = _Route(None)
         while True:
             try:
-                return self.session.execute(request, path=path, **kwargs)  # type: ignore[arg-type]
+                return self._attempt(request, route, path=path, **kwargs)
             except RedirectRequired as redirect:
-                hops += 1
-                self._redirect(request, path, redirect, hops)
+                self._redirect(request, path, route, redirect)
             except WaitLimitError:
                 # A busy server is not a broken connection: the budget for
                 # "come back later" has already been spent once here, and
                 # reconnecting would only spend it again on a new socket.
                 raise
             except XrdConnectionError as exc:
-                attempts += 1
-                self._recover(request, exc, attempts)
+                self._recover(request, route, exc)
 
-    def _redirect(self, request: Request, path: str, redirect: RedirectRequired, hops: int) -> None:
-        if hops > self.config.redirect_limit:
+    def _attempt(self, request: Request, route: _Route, **kwargs: object) -> Result:
+        """Send ``request`` once, to wherever ``route`` says it is going."""
+        target = route.target
+        session = route.session = self.session if target is None else self._dial(target)
+        if target is None:
+            return session.execute(request, **kwargs)  # type: ignore[arg-type]
+        # A redirected request's own connection: borrowed from the pool for
+        # this one attempt and given back straight after, so that the next
+        # request redirected to the same data server finds it waiting.
+        try:
+            return session.execute(request, **kwargs)  # type: ignore[arg-type]
+        except WaitLimitError:
+            raise
+        except XrdConnectionError:
+            # Failed under a live request: whoever picks it up next deserves
+            # better than a connection with an unknown reply still owed on it.
+            session.close()
+            raise
+        finally:
+            self._offer(session, target)
+
+    def _redirect(
+        self, request: Request, path: str, route: _Route, redirect: RedirectRequired
+    ) -> None:
+        route.hops += 1
+        if route.hops > self.config.redirect_limit:
             raise RedirectLimitError(
                 f"more than {self.config.redirect_limit} redirects for "
                 f"{type(request).__name__} {path}"
             ) from redirect
-        self._follow(redirect)
-        _retarget(request, redirect.target.token)
+        destination = self._destination(route.target or self.url, redirect.target)
+        moved = self.sticky and route.target is None and self._move(route.session, destination)
+        if not moved:
+            home = same_server(destination, self.url, self.config)
+            route.target = None if home else destination
+        if route.original is None:
+            route.original = _path_fields(request)
+        _retarget(request, route.original, redirect.target.token)
+        _log.debug("redirected to %s:%s", destination.host, destination.port)
 
-    def _recover(self, request: Request, error: XrdConnectionError, attempts: int) -> None:
-        if not self._retryable(request, attempts):
+    @staticmethod
+    def _destination(base: XRootDURL, target: RedirectInfo) -> XRootDURL:
+        """The URL a redirect points at, keeping what it does not change.
+
+        A port of zero means "the port you already had"; a negative one means
+        the host field is a URL (see :func:`_redirect_url`). It does not mean
+        "use TLS": a TLS upgrade is negotiated in ``kXR_protocol``, and XRootD
+        spends the rest of a negative port on redirect flags.
+        """
+        if target.port < 0:
+            return _redirect_url(base, target.host)
+        return base.evolve(host=target.host, port=target.port or base.port)
+
+    def _move(self, came_from: Session | None, destination: XRootDURL) -> bool:
+        """Move a sticky router to ``destination``, if it is still where it was.
+
+        ``False`` when another thread has moved it since this request went
+        out: the router is now wherever that thread's redirect sent it, and
+        this request follows its own redirect on a connection of its own
+        rather than dragging the router - and the other thread's live
+        connection - somewhere else.
+        """
+        with self._lock:
+            if self._session is not came_from:
+                return False
+            if same_server(destination, self.url, self.config):
+                return True
+            leaving, owns, origin = self._session, self._owns, self.url
+            self._session, self._owns, self.url = None, True, destination
+        # The connection being left behind is not broken - it is simply not
+        # the server holding the file - so it goes back to the pool, keyed by
+        # the endpoint it is still connected to. The next open asks the same
+        # manager the same question, and finds it already answered once.
+        if leaving is not None and owns:
+            self._offer(leaving, origin)
+        return True
+
+    def _recover(self, request: Request, route: _Route, error: XrdConnectionError) -> None:
+        route.attempts += 1
+        where = route.target or self.url
+        if not self._retryable(request, route.attempts):
             # A timeout stays a timeout: "it was slow" and "it bounced" call
             # for different things from the caller.
             kind = XrdTimeoutError if isinstance(error, XrdTimeoutError) else TransientError
             raise kind(
-                f"{type(request).__name__} on {self.endpoint} failed: {error}",
-                attempts=attempts,
+                f"{type(request).__name__} on {where.host}:{where.port} failed: {error}",
+                attempts=route.attempts,
             ) from error
         _log.debug("reconnecting to %s after %s", self.endpoint, error)
-        self._drop()
-        self._pause(attempts)
+        if route.target is not None:
+            # A data server that has gone away is the least likely one to
+            # answer the retry; its manager can route around it, as XrdCl's
+            # does, and the manager hands out a fresh token with the redirect.
+            route.target = None
+            # A target is only ever set by a redirect, which took the snapshot.
+            assert route.original is not None
+            _retarget(request, route.original, "")
+        else:
+            self._drop(route.session)
+        self._pause(route.attempts)
 
     def _retryable(self, request: Request, attempts: int) -> bool:
         return self.reconnect and attempts <= self.config.connect_retries and request.idempotent
@@ -161,25 +359,21 @@ class Router:
         if backoff > 0:
             time.sleep(min(backoff * 2 ** (attempts - 1), self.config.wait_cap))
 
-    def _follow(self, redirect: RedirectRequired) -> None:
-        target = redirect.target
-        scheme = "roots" if target.port < 0 else self.url.scheme
-        # The connection being left behind is not broken - it is simply not
-        # the server holding the file - so it goes back to the pool, keyed by
-        # the endpoint it is still connected to. The next open asks the same
-        # manager the same question, and finds it already answered once.
-        self.close()
-        self.url = self.url.evolve(
-            scheme=scheme, host=target.host, port=abs(target.port) or self.url.port
-        )
-        _log.debug("redirected to %s", self.endpoint)
+    def _drop(self, failed: Session | None = None) -> None:
+        """Let go of the current connection after it failed.
 
-    def _drop(self) -> None:
+        Only if it is still ``failed``: another thread may have replaced it
+        already, and closing its fresh connection would turn one failure into
+        two. A borrowed connection is let go of without being closed - it is
+        its lender's to close.
+        """
         with self._lock:
-            if self._session is not None:
-                self._session.close()
-                self._session = None
-            self._owns = True
+            session = self._session
+            if session is None or (failed is not None and session is not failed):
+                return
+            owns, self._session, self._owns = self._owns, None, True
+        if owns:
+            session.close()
 
     def discard(self) -> None:
         """Close this connection for good, keeping it out of the pool.
@@ -188,6 +382,18 @@ class Router:
         has gone away only moves the failure to whoever picks it up next.
         """
         self._drop()
+
+    def lend(self) -> Router:
+        """A sticky router for one open, starting on this router's connection.
+
+        What a :class:`~xrdclient.client.FileSystem` gives the files it opens:
+        the open goes out on the filesystem's connection when it is not
+        redirected, and when it is, the lent router moves to the data server
+        on a connection of its own - leaving the filesystem where it was.
+        """
+        lent = Router(self.url, self.config)
+        lent._lender, lent._lent = self, True
+        return lent
 
     def pin(self, *, transfer: bool = False) -> Router:
         """A router bound to the current endpoint, sharing this connection.
@@ -204,14 +410,16 @@ class Router:
         owner, free to return the connection to the pool when it closes.
         Without it the pinned router is a borrower, and closing one of those
         lets go of the connection without touching it - the router it came
-        from still has work for it.
+        from still has work for it. A :meth:`lend`-ed router always hands over
+        a connection it made for itself: nobody else holds it.
         """
         pinned = Router(self.url, self.config, reconnect=False)
         with self._lock:
+            give = transfer or (self._lent and self._owns)
             pinned._session = self._session
-            if transfer:
+            if give:
                 self._session = None
-            pinned._owns = transfer or pinned._session is None
+            pinned._owns = give or pinned._session is None
         return pinned
 
     def close(self) -> None:

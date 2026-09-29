@@ -55,6 +55,17 @@ __all__ = ["S3FileSystem", "S3RawIO", "open_s3", "MIN_PART_SIZE"]
 #: one. A streamed write holds this much before it can send anything.
 MIN_PART_SIZE = 5 << 20
 
+#: The most parts one multipart upload may have, and the most one part may hold.
+MAX_PARTS = 10_000
+MAX_PART_SIZE = 5 << 30
+
+#: How many parts go up at one size before the size doubles. A part count
+#: that is capped, and a stream whose length is unknown until it ends, leave
+#: nothing to plan with but growth: at this rate the ten thousand parts hold
+#: more than S3's five-terabyte object limit, while an upload of a few
+#: gigabytes never holds more than the minimum part in memory.
+_PARTS_PER_DOUBLING = 900
+
 #: Where AWS itself answers, when no endpoint names somewhere else.
 AWS_SUFFIX = "amazonaws.com"
 
@@ -409,13 +420,18 @@ class S3FileSystem(HTTPFileSystem):
         between them leaves the object at both names.
         """
         source = urllib.parse.quote(f"/{self.bucket}/{self._key(src)}", safe="/")
-        self.client.request(
+        response = self.client.request(
             "PUT",
             self._url(dst),
             body=b"",
             headers={"x-amz-copy-source": source, "Content-Length": "0"},
             expect=(200,),
         )
+        # A copy, like a completion, can answer 200 and report its failure in
+        # the body - and the source is the only copy until this one is known
+        # to have worked.
+        if b"<Error" in response.body:
+            raise ProtocolError(f"{self.url.host} failed to copy {src} to {dst}")
         self.remove(src)
 
     move = rename
@@ -516,6 +532,10 @@ class S3RawIO(HTTPRawIO):
         self._upload_id = ""
         self._parts: list[str] = []
         self._pending = bytearray()
+        #: What lost a part, once one is lost. The upload is aborted then, and
+        #: every later write and the close raise this rather than complete an
+        #: object with a hole where the part should be.
+        self._failure: BaseException | None = None
         super().__init__(url, mode, config=config, client=client)
 
     def __repr__(self) -> str:
@@ -523,7 +543,10 @@ class S3RawIO(HTTPRawIO):
 
     @property
     def _streaming(self) -> bool:
-        return bool(self._upload_id)
+        # A failed upload still counts: that keeps later writes and the close
+        # on the path that reports the failure, rather than the one that
+        # would PUT what is left as if it were the whole object.
+        return bool(self._upload_id) or self._failure is not None
 
     def _stream_after(self) -> int:
         return max(self.config.chunk_size, MIN_PART_SIZE)
@@ -545,22 +568,43 @@ class S3RawIO(HTTPRawIO):
         self._drain(final=False)
 
     def _send_chunk(self, payload: bytes) -> None:
+        self._check_intact()
         self._pending += payload
         self._drain(final=False)
 
+    def _check_intact(self) -> None:
+        """Refuse to go on with an upload that has already lost a part."""
+        if self._failure is not None:
+            raise self._failure
+
     def _drain(self, *, final: bool) -> None:
         """Send a part, once there is one worth sending."""
-        if len(self._pending) >= MIN_PART_SIZE or (final and self._pending):
+        if len(self._pending) >= _part_size(len(self._parts)) or (final and self._pending):
             body, self._pending = bytes(self._pending), bytearray()
             number = len(self._parts) + 1
-            response = self.client.request(
-                "PUT",
-                self._with({"partNumber": str(number), "uploadId": self._upload_id}),
-                body=body,
-                headers={"Content-Length": str(len(body))},
-                expect=(200,),
-            )
+            try:
+                response = self.client.request(
+                    "PUT",
+                    self._with({"partNumber": str(number), "uploadId": self._upload_id}),
+                    body=body,
+                    headers={"Content-Length": str(len(body))},
+                    expect=(200,),
+                )
+            except BaseException as exc:
+                # The part's bytes are gone from here and never arrived
+                # there: nothing can complete this upload honestly now.
+                self._fail(exc)
+                raise
             self._parts.append(_etag(response.header("ETag")))
+
+    def _fail(self, exc: BaseException) -> None:
+        """Remember the first failure and abandon the upload. Idempotent."""
+        if self._failure is None:
+            self._failure = exc
+        upload, self._upload_id = self._upload_id, ""
+        self._pending = bytearray()
+        if upload:
+            self._abort(upload)
 
     def _finish_upload(self) -> None:
         """Send the tail and the manifest; abandon the upload if either fails.
@@ -569,13 +613,13 @@ class S3RawIO(HTTPRawIO):
         cost - until something deletes them, so a failure here aborts rather
         than leaving them for a lifecycle rule to find.
         """
-        upload = self._upload_id
+        self._check_intact()
         try:
             self._drain(final=True)
             body = _manifest(self._parts)
             response = self.client.request(
                 "POST",
-                self._with({"uploadId": upload}),
+                self._with({"uploadId": self._upload_id}),
                 body=body,
                 headers={"Content-Length": str(len(body)), "Content-Type": "application/xml"},
                 expect=(200,),
@@ -584,11 +628,10 @@ class S3RawIO(HTTPRawIO):
             # it can keep the connection alive while it assembles the object.
             if b"<Error" in response.body:
                 raise ProtocolError(f"{self.url.host} failed to complete a multipart upload")
-        except BaseException:
-            self._abort(upload)
+        except BaseException as exc:
+            self._fail(exc)
             raise
-        finally:
-            self._upload_id = ""
+        self._upload_id = ""
 
     def _abort(self, upload: str) -> None:
         """Throw the parts away. A failure here is not worth masking the one
@@ -772,6 +815,11 @@ def _iso8601(stamp: str) -> int:
         return int(datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp())
     except ValueError:
         return 0
+
+
+def _part_size(sent: int) -> int:
+    """How much the next part holds, once ``sent`` parts have gone up."""
+    return min(MIN_PART_SIZE << (sent // _PARTS_PER_DOUBLING), MAX_PART_SIZE)
 
 
 def _manifest(etags: list[str]) -> bytes:

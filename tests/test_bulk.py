@@ -124,8 +124,10 @@ def test_stream_bounds_its_memory(bulk_server, cfg):
     """Whatever the file's length, the reader holds ``chunk * depth``."""
     with _opened(bulk_server, cfg) as handle:
         with handle.session.bulk(handle.handle, chunk=16 << 10, depth=3) as reader:
-            assert sum(len(b) for b in reader._bufs) == 3 * (16 << 10)
+            # Nothing is set aside until a stream needs somewhere to land.
+            assert reader._bufs == []
             total = sum(len(view) for _, view in reader.stream(0, len(PAYLOAD)))
+            assert sum(len(b) for b in reader._bufs) == 3 * (16 << 10)
     assert total == len(PAYLOAD)
 
 
@@ -206,6 +208,14 @@ def test_download_writes_the_file(tmp_path, bulk_server, cfg):
     assert isinstance(result, BulkResult)
     assert result.size == len(PAYLOAD)
     assert target.read_bytes() == PAYLOAD
+
+
+def test_an_empty_file_downloads_as_an_empty_file(tmp_path, bulk_server, cfg):
+    """Nothing to divide among the workers is not a reason to fail."""
+    bulk_server.files["/data/empty.bin"] = bytearray()
+    target = tmp_path / "empty.bin"
+    assert download(_url(bulk_server, "/data/empty.bin"), target, config=cfg).size == 0
+    assert target.read_bytes() == b""
 
 
 def test_download_fans_out(tmp_path, bulk_server, cfg):

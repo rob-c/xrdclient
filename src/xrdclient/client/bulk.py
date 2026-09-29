@@ -100,8 +100,12 @@ def _plan(size: int, config: Config, workers: int | None, chunk: int | None) -> 
 
 def _spans(size: int, workers: int) -> list[tuple[int, int]]:
     """``size`` split into ``workers`` contiguous ``(start, length)`` pieces."""
+    if size <= 0:
+        # An empty file is one empty piece: there is nothing to divide, and a
+        # step of nothing would never get through it.
+        return [(0, 0)]
     step = -(-size // workers) if workers else size
-    return [(start, min(step, size - start)) for start in range(0, size, step)] or [(0, 0)]
+    return [(start, min(step, size - start)) for start in range(0, size, step)]
 
 
 @contextmanager

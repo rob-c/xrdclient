@@ -93,6 +93,80 @@ A bearer token goes in the `Authorization` header; an X.509 proxy is
 presented as the client certificate for `davs://` and `https://` alike. The
 same `Config` drives both protocols.
 
+### Credentials and redirects
+
+A `Location` header is chosen by the server, so a client that follows it
+would pass its token to whatever host that server names. The client uses
+the rule that browsers, `curl` and `requests` use:
+
+- Credentials follow a redirect only when the scheme, host and port all stay
+  the same. `Authorization`, `Proxy-Authorization`, `Cookie` and every
+  `TransferHeader*` header (a `COPY` passes these on to the far side) are
+  dropped at the first hop that leaves that origin. They stay dropped for
+  the rest of the chain, even if a later hop comes back to the original
+  host.
+- Credentials are never sent over plain `http` after the request started on
+  `https`, even to a trusted domain.
+- A token that the redirect itself carries (`Location: ...?authz=...`) is
+  still presented, because the redirecting server chose to hand it over.
+  That is how dCache and EOS doors usually hand off.
+- An S3 signature is still computed for each hop. It is bound to the host it
+  was computed for, so no other host can use it.
+
+Some WLCG sites redirect from a head node to data nodes on other hosts and
+expect the bearer token there. You can opt those sites in by domain:
+
+```python
+HTTPClient(config, trusted_redirect_domains=("desy.de", "cern.ch"))
+```
+
+An entry matches that host and every host under it, whatever the port.
+`"*"` trusts every host, which restores the old behaviour, but a
+downgrade from `https` to `http` still drops the token.
+
+### Query strings
+
+Opaque data is sent exactly as it was written. `authz=Bearer%20abc` stays
+`Bearer%20abc`, and `tpc.src=h:1094` keeps its colon, because XRootD servers
+compare these strings literally. Changing one parameter re-renders only that
+parameter. A new value escapes only `&`, `#`, `%`, `+` and whitespace, and a
+space is encoded as `%20`, never `+`.
+
+### Names and percent signs
+
+A URL is read the way a browser reads one: the `%XX` escapes in the path of
+an `http://`, `https://`, `dav://` or `davs://` URL are decoded once, so
+`https://h/store/a%20b` names the file `a b`, and a link copied out of a
+browser or a server's listing page works as it is. A path passed on its own -
+`fs.open("/store/a%20b")`, `fs.stat(...)`, `XRootDPath(...) / "name"` - is
+already a name and is not decoded: that call opens a file literally called
+`a%20b`.
+
+On the way to the server a name is percent-encoded exactly once, `%`
+included, and a name that comes back from a listing is decoded exactly once.
+So whatever `listdir` returns opens the file it came from - names with a `%`,
+a space, `#`, `?`, `+`, `~` or characters outside ASCII alike - and printing
+a URL gives the encoded form that parses back to the same name. A file whose
+name really contains `%20` is reached by URL as `%2520`.
+
+The one escape left as it is, both ways, is `%2F`: an escaped slash is a
+slash *inside* one path segment, as in a Hugging Face URL's
+`.../resolve/refs%2Fconvert%2Fparquet/...`, and decoding it would split the
+segment in two. The price is that a file whose name contains the three
+characters `%2F` cannot be reached over HTTP; over `root://` it can.
+
+`root://` URLs are not decoded, because XrdCl does not decode them: there the
+path is the name exactly as written. `s3://` keys are likewise taken as
+written, as the AWS tools take them.
+
+## Timeouts
+
+`Config.connect_timeout` bounds the TCP and TLS handshake and nothing more.
+Every read after it waits up to `Config.request_timeout` (300 s by default,
+`XRD_REQUESTTIMEOUT`), so a transfer that is slow but alive is not cut off at
+the connect window. A request that times out is not retried: a server that
+did not answer in the time allowed would only be given the time again.
+
 ## Macaroons
 
 ```python
@@ -119,7 +193,10 @@ xrdclient.third_party("davs://a.example.org/store/f.root",
 storage elements move the file between themselves. The outcome is in the
 response body rather than the status line - a failed transfer still answers
 `202 Accepted` - and this client reads through the performance markers to
-that last line before returning. [Copying](copying.md#third-party-copy) has
+that last line before returning. `timeout=` is the longest to wait between
+two markers, defaulting to `Config.request_timeout`; it is not a limit on the
+whole transfer, since a copy that keeps reporting is alive however long it
+runs. [Copying](copying.md#third-party-copy) has
 the header set, the push mode, and how the far side's token travels.
 
 ## Lower-level pieces

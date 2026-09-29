@@ -47,9 +47,15 @@ def test_parse_redirect_of_a_token_that_is_only_separators():
     assert info.token == ""
 
 
-def test_a_negative_redirect_port_means_tls():
-    info = rp.parse_redirect(struct.pack(">i", -1094) + b"h\x00")
-    assert info.url == "roots://h:1094/"
+def test_a_negative_redirect_port_means_the_host_is_a_whole_url():
+    """Not TLS: the port's complement is flags, and the host names the URL."""
+    info = rp.parse_redirect(struct.pack(">i", -1) + b"roots://h:1095//x\x00")
+    assert info.url == "roots://h:1095//x"
+
+
+def test_a_redirect_with_port_zero_names_no_port():
+    assert rp.parse_redirect(struct.pack(">i", 0) + b"h\x00").url == "root://h/"
+    assert rp.parse_redirect(struct.pack(">i", 1095) + b"h\x00").url == "root://h:1095/"
 
 
 def test_parse_pgwrite_cse_lists_the_corrupt_pages():
@@ -194,6 +200,27 @@ def test_parse_stat():
     assert info.flags == StatInfoFlags(19)
     assert info.st_mtime == 1700000000 == info.modtime
     assert info.path == "/a/b"
+
+
+def test_a_short_stat_line_reports_its_one_time_for_all_three():
+    info = rp.parse_stat(b"id0 4096 19 1700000000\x00")
+    assert info.st_ctime == info.st_atime == 1700000000
+    assert (info.mode_str, info.owner, info.group) == ("", "", "")
+
+
+def test_parse_stat_keeps_the_protocol_5_extension():
+    """``ctime atime mode owner group`` follow the mtime from a v5 server."""
+    info = rp.parse_stat(b"id0 5 48 1500000000 1790606968 1000000000 0600 alice wheel\x00")
+    assert info.st_mtime == 1500000000
+    assert info.st_ctime == 1790606968
+    assert info.st_atime == 1000000000
+    assert (info.mode_str, info.owner, info.group) == ("0600", "alice", "wheel")
+    assert info.st_mode == 0o100600  # the server's bits, not the access flags
+
+
+def test_a_directory_keeps_its_type_bit_beside_the_servers_mode():
+    info = rp.parse_stat(b"id0 96 51 1 1 1 0750 alice wheel\x00")
+    assert info.st_mode == 0o40750
 
 
 def test_parse_stat_rejects_a_short_line():

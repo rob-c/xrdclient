@@ -42,6 +42,7 @@ import io
 from collections.abc import AsyncIterator, Callable, Coroutine, Generator, Iterable, Sequence
 from typing import Any, TypeVar
 
+from . import easy as _easy
 from .client import Checkpoint as _Checkpoint
 from .client import File as _File
 from .client import FileSystem as _FileSystem
@@ -50,9 +51,11 @@ from .copy import CopyResult
 from .copy import copy as _copy
 from .copy import copy_tree as _copy_tree
 from .copy import third_party as _third_party
+from .easy import Location
 from .errors import UnsupportedError, kXR_Unsupported
 from .flags import DirListFlags, LocateFlags, PrepareFlags, QueryCode
 from .io import open_url as _open_url
+from .path import XRootDPath
 from .types import (
     CheckpointInfo,
     ChecksumInfo,
@@ -75,10 +78,25 @@ __all__ = [
     "AsyncFile",
     "AsyncFileSystem",
     "FileSystem",
+    "checksum",
     "copy",
     "copy_tree",
+    "exists",
+    "glob",
+    "is_online",
+    "ls",
+    "mkdir",
+    "move",
     "open",
+    "read_bytes",
+    "read_text",
+    "remove",
+    "size",
+    "stage",
+    "stat",
     "third_party",
+    "write_bytes",
+    "write_text",
 ]
 
 T = TypeVar("T")
@@ -209,6 +227,26 @@ class AsyncFile:
     def fileno(self) -> int:
         return self._sync.fileno()
 
+    @property
+    def is_open(self) -> bool:
+        """The opposite of :attr:`closed`, spelled as :class:`xrdclient.File` spells it."""
+        return not self.closed
+
+    @property
+    def endpoint(self) -> str:
+        """``host:port`` of the server holding the handle. ``root://`` only."""
+        return self._native("endpoint").endpoint
+
+    @property
+    def compression(self) -> tuple[int, str]:
+        """What the open reported about compression. ``root://`` only."""
+        return self._native("compression").compression
+
+    @property
+    def recoverable(self) -> bool:
+        """Whether a lost connection is re-opened rather than fatal. ``root://`` only."""
+        return self._native("recoverable").recoverable
+
     # -- reading -------------------------------------------------------
 
     async def read(self, size: int = -1) -> Any:
@@ -229,6 +267,14 @@ class AsyncFile:
         """One ``kXR_readv``: many ranges, one round trip. ``root://`` only."""
         return await _run(self._native("readv").readv, ranges)
 
+    async def pread(self, size: int, offset: int) -> bytes:
+        """:func:`os.pread`: ``size`` bytes at ``offset``, the cursor left alone. ``root://`` only.
+
+        It goes to the server directly, past this object's buffer, so writes
+        still sitting in that buffer are flushed first and the read sees them.
+        """
+        return await _run(self._flushed, self._native("pread").pread, size, offset)
+
     async def pgread(self, size: int, offset: int, *, verify: bool = True) -> PageResult:
         """Paged read with per-page CRC32c. ``root://`` only."""
         return await _run(
@@ -242,6 +288,16 @@ class AsyncFile:
 
     async def writelines(self, lines: Iterable[Any]) -> None:
         await _run(self._sync.writelines, lines)
+
+    async def pwrite(self, data: bytes, offset: int) -> int:
+        """:func:`os.pwrite`: ``data`` at ``offset``, the cursor left alone. ``root://`` only.
+
+        Buffered writes are flushed first, so an earlier ``write`` cannot land
+        on top of this one later. Bytes this object has already read ahead
+        into its buffer are not refreshed: open with ``buffering=0`` to mix
+        positional writes with cursor reads of the same range.
+        """
+        return await _run(self._flushed, self._native("pwrite").pwrite, data, offset)
 
     async def writev(
         self, chunks: Iterable[WriteChunk | tuple[int, bytes]], *, sync: bool = False
@@ -306,6 +362,41 @@ class AsyncFile:
         """The server's checksum for this file. ``root://`` only."""
         return await _run(self._native("checksum").checksum, algorithm)
 
+    async def size(self) -> int:
+        """File length, cached from the open. ``root://`` only.
+
+        A coroutine here where :attr:`xrdclient.File.size` is a property,
+        because it can cost a round trip when nothing was cached.
+        """
+        native = self._native("size")
+        return await _run(lambda: native.size)
+
+    async def verify(self, expected: str, algorithm: str = "adler32") -> None:
+        """Raise :class:`~xrdclient.ChecksumMismatchError` on a mismatch. ``root://`` only."""
+        await _run(self._native("verify").verify, expected, algorithm)
+
+    async def visa(self) -> bytes:
+        """``kXR_query`` visa for the open handle. ``root://`` only."""
+        return await _run(self._native("visa").visa)
+
+    # -- extended attributes -------------------------------------------
+
+    async def getxattr(self, name: str) -> bytes:
+        """One attribute of the open file. ``root://`` only."""
+        return await _run(self._native("getxattr").getxattr, name)
+
+    async def setxattr(self, name: str, value: bytes) -> None:
+        """Set one attribute of the open file. ``root://`` only."""
+        await _run(self._native("setxattr").setxattr, name, value)
+
+    async def listxattr(self) -> list[str]:
+        """The attribute names of the open file. ``root://`` only."""
+        return await _run(self._native("listxattr").listxattr)
+
+    async def removexattr(self, name: str) -> None:
+        """Remove one attribute of the open file. ``root://`` only."""
+        await _run(self._native("removexattr").removexattr, name)
+
     @contextlib.asynccontextmanager
     async def checkpoint(self) -> AsyncIterator[AsyncCheckpoint]:
         """Transactional writes: committed on a clean exit, rolled back on one.
@@ -348,6 +439,16 @@ class AsyncFile:
     async def _lines(self) -> AsyncIterator[Any]:
         while line := await self.readline():
             yield line
+
+    def _flushed(self, call: Callable[..., T], *args: Any) -> T:
+        """``call`` after the buffer is flushed, both on one worker thread.
+
+        Positional I/O goes straight to the protocol file, so anything still
+        buffered above it has to reach the server first or the two would be
+        applied out of order.
+        """
+        self._sync.flush()
+        return call(*args)
 
     def _native(self, operation: str) -> _File:
         """The protocol-level file, or a clear refusal if there is not one."""
@@ -585,9 +686,24 @@ class AsyncFileSystem:
         """``async for entry in fs.iterdir("/store")``."""
         return _Iterating(functools.partial(self._sync.iterdir, path))
 
-    def walk(self, path: str = "", *, topdown: bool = True) -> _Iterating:
-        """``async for root, dirs, files in fs.walk("/store")``."""
-        return _Iterating(functools.partial(self._sync.walk, path, topdown=topdown))
+    def walk(
+        self,
+        top: str = "",
+        *,
+        topdown: bool = True,
+        onerror: object = None,
+        followlinks: bool = False,
+    ) -> _Iterating:
+        """``async for root, dirs, files in fs.walk("/store")``.
+
+        ``onerror`` is called from the worker thread doing the listing, not
+        from the event loop, so it must not touch loop-bound objects.
+        """
+        return _Iterating(
+            functools.partial(
+                self._sync.walk, top, topdown=topdown, onerror=onerror, followlinks=followlinks
+            )
+        )
 
     def glob(self, pattern: str, *, root: str = "") -> _Iterating:
         """``async for path in fs.glob("/store/*.root")``."""
@@ -611,11 +727,17 @@ class AsyncFileSystem:
     async def remove(self, path: str) -> None:
         await _run(self._sync.remove, path)
 
+    #: ``os``'s spelling of the same call.
+    unlink = remove
+
     async def rmtree(self, path: str, *, ignore_errors: bool = False) -> None:
         await _run(functools.partial(self._sync.rmtree, path, ignore_errors=ignore_errors))
 
     async def rename(self, src: str, dst: str) -> None:
         await _run(self._sync.rename, src, dst)
+
+    #: :mod:`shutil`'s spelling of the same call.
+    move = rename
 
     async def chmod(self, path: str, mode: int | str) -> None:
         await _run(self._sync.chmod, path, mode)
@@ -799,3 +921,112 @@ async def copy_tree(source: Any, target: Any, **kwargs: Any) -> list[CopyResult]
 async def third_party(source: Any, target: Any, **kwargs: Any) -> CopyResult:
     """:func:`xrdclient.third_party`, awaitable."""
     return await _run(functools.partial(_third_party, source, target, **kwargs))
+
+
+# ---------------------------------------------------------------------------
+# The one-line verbs of :mod:`xrdclient.easy`
+# ---------------------------------------------------------------------------
+#
+# Each is its synchronous namesake on a worker thread. They are spelled out
+# rather than generated so that each keeps its own signature for a type
+# checker and its own line in the documentation.
+
+
+async def ls(url: Location, *, config: Config | None = None) -> list[XRootDPath]:
+    """:func:`xrdclient.ls`, awaitable."""
+    return await _run(_easy.ls, url, config=config)
+
+
+async def glob(pattern: Location, *, config: Config | None = None) -> list[XRootDPath]:
+    """:func:`xrdclient.glob`, awaitable. The whole match, not an iterator."""
+    return await _run(_easy.glob, pattern, config=config)
+
+
+async def stat(url: Location, *, config: Config | None = None) -> StatInfo:
+    """:func:`xrdclient.stat`, awaitable."""
+    return await _run(_easy.stat, url, config=config)
+
+
+async def exists(url: Location, *, config: Config | None = None) -> bool:
+    """:func:`xrdclient.exists`, awaitable."""
+    return await _run(_easy.exists, url, config=config)
+
+
+async def size(url: Location, *, config: Config | None = None) -> int:
+    """:func:`xrdclient.size`, awaitable."""
+    return await _run(_easy.size, url, config=config)
+
+
+async def checksum(
+    url: Location, algorithm: str | None = None, *, config: Config | None = None
+) -> ChecksumInfo:
+    """:func:`xrdclient.checksum`, awaitable."""
+    return await _run(_easy.checksum, url, algorithm, config=config)
+
+
+async def read_bytes(url: Location, *, config: Config | None = None) -> bytes:
+    """:func:`xrdclient.read_bytes`, awaitable."""
+    return await _run(_easy.read_bytes, url, config=config)
+
+
+async def read_text(url: Location, encoding: str = "utf-8", *, config: Config | None = None) -> str:
+    """:func:`xrdclient.read_text`, awaitable."""
+    return await _run(_easy.read_text, url, encoding, config=config)
+
+
+async def write_bytes(url: Location, data: bytes, *, config: Config | None = None) -> int:
+    """:func:`xrdclient.write_bytes`, awaitable."""
+    return await _run(_easy.write_bytes, url, data, config=config)
+
+
+async def write_text(
+    url: Location, text: str, encoding: str = "utf-8", *, config: Config | None = None
+) -> int:
+    """:func:`xrdclient.write_text`, awaitable."""
+    return await _run(_easy.write_text, url, text, encoding, config=config)
+
+
+async def mkdir(
+    url: Location,
+    mode: int | str = 0o755,
+    *,
+    parents: bool = True,
+    exist_ok: bool = True,
+    config: Config | None = None,
+) -> None:
+    """:func:`xrdclient.mkdir`, awaitable."""
+    await _run(
+        functools.partial(_easy.mkdir, url, mode, parents=parents, exist_ok=exist_ok, config=config)
+    )
+
+
+async def remove(
+    url: Location,
+    *,
+    recursive: bool = False,
+    missing_ok: bool = False,
+    config: Config | None = None,
+) -> None:
+    """:func:`xrdclient.remove`, awaitable."""
+    await _run(
+        functools.partial(
+            _easy.remove, url, recursive=recursive, missing_ok=missing_ok, config=config
+        )
+    )
+
+
+async def move(source: Location, destination: Location, *, config: Config | None = None) -> None:
+    """:func:`xrdclient.move`, awaitable."""
+    await _run(_easy.move, source, destination, config=config)
+
+
+async def stage(
+    urls: Location | Sequence[Location], *, priority: int = 0, config: Config | None = None
+) -> str:
+    """:func:`xrdclient.stage`, awaitable."""
+    return await _run(functools.partial(_easy.stage, urls, priority=priority, config=config))
+
+
+async def is_online(url: Location, *, config: Config | None = None) -> bool:
+    """:func:`xrdclient.is_online`, awaitable."""
+    return await _run(_easy.is_online, url, config=config)

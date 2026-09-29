@@ -143,16 +143,31 @@ class XRootDRawIO(io.RawIOBase):
         return count
 
     def readall(self) -> bytes:
+        """Everything from the position to the end of the file as it is now.
+
+        The size the open reported is only what the file was then: another
+        writer may have appended since, and a read "to the end" that stopped
+        at the old end would return a truncated file without saying so. So
+        the handle is stat'ed afresh, which is one round trip against a read
+        that is usually many.
+        """
         self._check_readable()
+        self._file.stat(refresh=True)
         data = self._file.read(-1, self._pos)
         self._pos += len(data)
         return data
 
     def write(self, data: ReadableBuffer) -> int:
         self._check_writable()
-        payload = bytes(data)
+        payload = _flat(data)
         if not payload:
             return 0
+        if self._base == "a":
+            # ``O_APPEND``: every write goes to the end of the file as it is
+            # now, whatever the position says. The end cached at open is
+            # wrong after a seek of the caller's own and after another
+            # writer's append, and writing there overwrites either.
+            self._pos = self._file.stat(refresh=True).st_size
         written = self._file.write(payload, self._pos)
         self._pos += written
         return written
@@ -192,3 +207,16 @@ class XRootDRawIO(io.RawIOBase):
 
     def __repr__(self) -> str:
         return f"XRootDRawIO({self.name!r}, mode={self._mode!r}, pos={self._pos})"
+
+
+def _flat(data: ReadableBuffer) -> memoryview:
+    """``data`` as a flat run of bytes, copied only if it is not one already.
+
+    A buffered writer hands over a view of its own buffer, and a large write
+    a view of the caller's; both go to the wire from where they are.
+    """
+    view = memoryview(data)
+    try:
+        return view.cast("B")
+    except TypeError:  # not C-contiguous: a strided view has to be gathered
+        return memoryview(view.tobytes())

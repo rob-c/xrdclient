@@ -19,6 +19,7 @@ implementation, and what makes the protocol testable without a socket.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING
@@ -40,7 +41,7 @@ from ..types import ProtocolInfo
 from . import constants as c
 from . import requests as r
 from . import responses as rp
-from .frames import HANDSHAKE, Request, ResponseHeader, decode_header, encode
+from .frames import HANDSHAKE, Request, encode, header_fields
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -229,7 +230,11 @@ class _Framer:
     """
 
     buffer: bytearray = field(default_factory=bytearray)
-    header: ResponseHeader | None = None
+    #: The header of the frame whose body is still arriving: its body
+    #: length, or -1 while no header has been read.
+    dlen: int = -1
+    sid: int = 0
+    status: int = 0
     need_trailer: int = 0
     trailer_for: int | None = None
 
@@ -312,6 +317,15 @@ class SessionMachine:
     @property
     def has_data_to_send(self) -> bool:
         return bool(self._out)
+
+    @property
+    def has_path_data(self) -> bool:
+        """Whether anything is queued for a bound data path.
+
+        The driver asks before visiting each path, because on the common
+        request nothing is, and asking once is cheaper than asking per path.
+        """
+        return bool(self._out_path)
 
     def submit(self, request: Request, *, path: str = "", arrive_on_path: bool = False) -> int:
         """Queue ``request`` on a fresh stream and return its streamid.
@@ -401,14 +415,19 @@ class SessionMachine:
         """
         if sid not in self._leased:
             raise ProtocolError(f"stream id {sid} was not leased for bulk use")
+        return self._frame(request, sid)
+
+    def _frame(self, request: Request, sid: int) -> bytes:
+        """``request`` on ``sid``, behind its ``kXR_sigver`` when it needs one."""
         frame = encode(request, sid)
-        if self.signer is not None:
-            signed = self.signer.sign(frame)
-            if signed is not None:
-                seqno, signature, nodata = signed
-                sigver = r.Sigver(request.opcode, seqno, signature, nodata=nodata)
-                frame = encode(sigver, sid) + frame
-        return frame
+        if self.signer is None:
+            return frame
+        signed = self.signer.sign(frame)
+        if signed is None:
+            return frame
+        seqno, signature, nodata = signed
+        sigver = r.Sigver(request.opcode, seqno, signature, nodata=nodata)
+        return encode(sigver, sid) + frame
 
     def _acquire_sid(self) -> int:
         if self._free:
@@ -424,44 +443,25 @@ class SessionMachine:
     def _send(
         self, request: Request, sid: int, *, path: str = "", arrive_on_path: bool = False
     ) -> None:
-        frame = encode(request, sid)
-        if self.signer is not None:
-            signed = self.signer.sign(frame)
-            if signed is not None:
-                seqno, signature, nodata = signed
-                sigver = r.Sigver(request.opcode, seqno, signature, nodata=nodata)
-                frame = encode(sigver, sid) + frame
+        frame = self._frame(request, sid)
         data = request.path_data()
+        pathid = request.pathid
+        self._pending[sid] = _Pending(
+            request, frame, path=path, pathid=pathid, path_bytes=data, cap=request.reply_cap()
+        )
         # Arrival routing (BriX and any server that keys a sub-stream on which
         # connection a request *arrived* on): the whole frame goes down the
         # bound data socket rather than the control link, and the answer comes
         # back on the same socket. The standard split - header on the control
         # link, payload on the data socket - is what runs otherwise.
-        if arrive_on_path and request.pathid:
-            self._pending[sid] = _Pending(
-                request,
-                frame,
-                path=path,
-                pathid=request.pathid,
-                path_bytes=data,
-                cap=request.reply_cap(),
-            )
-            buf = self._out_path.setdefault(request.pathid, bytearray())
-            buf.extend(frame)
-            if data:
-                buf.extend(data)
+        if arrive_on_path and pathid:
+            buf = self._out_path.setdefault(pathid, bytearray())
+            buf += frame
+            buf += data
             return
-        self._pending[sid] = _Pending(
-            request,
-            frame,
-            path=path,
-            pathid=request.pathid,
-            path_bytes=data,
-            cap=request.reply_cap(),
-        )
         self._out += frame
         if data:
-            self._out_path.setdefault(request.pathid, bytearray()).extend(data)
+            self._out_path.setdefault(pathid, bytearray()).extend(data)
 
     # ------------------------------------------------------------------
     # Inbound
@@ -474,12 +474,31 @@ class SessionMachine:
         control link. Losing a data path costs only the requests routed over
         it, so its EOF is not the session's.
         """
-        framer = self._framers.setdefault(pathid, _Framer())
+        framer = self._framers.get(pathid)
+        if framer is None:
+            framer = self._framers[pathid] = _Framer()
         if not data:
             self._on_eof() if pathid == 0 else self._on_path_eof(pathid)
             return
-        framer.buffer += data
-        self._parse(framer)
+        if not self._whole_frame(framer, data):
+            framer.buffer += data
+            self._parse(framer)
+
+    def _whole_frame(self, framer: _Framer, data: bytes) -> bool:
+        """Dispatch ``data`` straight off the wire when it is one whole frame.
+
+        Which is what nearly every read of a request-at-a-time caller gets:
+        one reply, all of it. Buffering it first would copy the body twice
+        for nothing. Anything else - a frame split across reads, several in
+        one, a trailer owed - goes through the buffer and :meth:`_parse`.
+        """
+        if framer.buffer or framer.dlen >= 0 or framer.need_trailer or len(data) < 8:
+            return False
+        sid, status, dlen = header_fields(data)
+        if len(data) != c.RESPONSE_HDRLEN + dlen:
+            return False
+        self._dispatch(sid, status, data[c.RESPONSE_HDRLEN :], framer)
+        return True
 
     def next_event(self) -> Event | None:
         """The oldest undelivered event, or ``None``."""
@@ -489,6 +508,11 @@ class SessionMachine:
         """Drain every pending event."""
         while self._events:
             yield self._events.pop(0)
+
+    def drain(self) -> list[Event]:
+        """Every pending event at once, oldest first, leaving none."""
+        out, self._events = self._events, []
+        return out
 
     @property
     def in_flight(self) -> int:
@@ -546,62 +570,69 @@ class SessionMachine:
                 self._on_status_data(sid, trailer)
                 continue
 
-            if framer.header is None:
+            if framer.dlen < 0:
                 if len(buf) < c.RESPONSE_HDRLEN:
                     return
-                framer.header = decode_header(buf[: c.RESPONSE_HDRLEN])
+                framer.sid, framer.status, framer.dlen = header_fields(buf)
                 del buf[: c.RESPONSE_HDRLEN]
 
-            header = framer.header
-            if len(buf) < header.dlen:
+            dlen = framer.dlen
+            if len(buf) < dlen:
                 return
-            body = bytes(memoryview(buf)[: header.dlen])
-            del buf[: header.dlen]
-            framer.header = None
-            self._dispatch(header, body, framer)
+            body = bytes(memoryview(buf)[:dlen])
+            del buf[:dlen]
+            framer.dlen = -1
+            self._dispatch(framer.sid, framer.status, body, framer)
 
     # ------------------------------------------------------------------
     # Dispatch
     # ------------------------------------------------------------------
 
-    def _dispatch(self, header: ResponseHeader, body: bytes, framer: _Framer) -> None:
-        if header.status == c.kXR_attn:
+    def _dispatch(self, sid: int, status: int, body: bytes, framer: _Framer) -> None:
+        if status == c.kXR_attn:
             inner = self._unwrap_attn(body)
             if inner is None:
                 return
-            header, body = inner
+            sid, status, body = inner
 
-        if self.state in (State.HANDSHAKE, State.PROTOCOL, State.LOGIN, State.AUTH, State.BIND):
-            self._bringup(header, body)
+        if self.state in _BRINGUP:
+            self._bringup(status, body)
             return
 
-        pending = self._pending.get(header.streamid)
+        pending = self._pending.get(sid)
         if pending is None:
-            _log.debug(
-                "response on unknown stream %d (%s)", header.streamid, c.status_name(header.status)
-            )
+            _log.debug("response on unknown stream %d (%s)", sid, c.status_name(status))
             return
-        self._on_response(header, body, pending, framer)
+        if status == c.kXR_ok:
+            # The answer to nearly everything, so it skips the table.
+            self._response_ok(sid, body, pending, framer)
+            return
+        handler = _HANDLERS.get(status)
+        if handler is None:
+            self._response_unexpected(sid, status, pending)
+            return
+        handler(self, sid, body, pending, framer)
 
-    def _unwrap_attn(self, body: bytes) -> tuple[ResponseHeader, bytes] | None:
+    def _unwrap_attn(self, body: bytes) -> tuple[int, int, bytes] | None:
         """Unpack a ``kXR_asynresp``, or record the notice and return None."""
         info = rp.parse_attn(body)
         if info.action == c.kXR_asynresp and len(body) >= 16:
-            return decode_header(body[8:16]), body[16:]
+            sid, status, _ = header_fields(body, 8)
+            return sid, status, body[16:]
         self._events.append(Attention(info))
         return None
 
     # -- bring-up -------------------------------------------------------
 
-    def _bringup(self, header: ResponseHeader, body: bytes) -> None:
-        if header.status == c.kXR_error:
+    def _bringup(self, status: int, body: bytes) -> None:
+        if status == c.kXR_error:
             info = rp.parse_error(body)
             self._fail(ServerError(info.code, info.message))
             return
-        if header.status not in (c.kXR_ok, c.kXR_authmore):
+        if status not in (c.kXR_ok, c.kXR_authmore):
             self._fail(
                 ProtocolError(
-                    f"unexpected {c.status_name(header.status)} during {self.state.name.lower()}"
+                    f"unexpected {c.status_name(status)} during {self.state.name.lower()}"
                 )
             )
             return
@@ -633,7 +664,7 @@ class SessionMachine:
             return
 
         # State.AUTH
-        if header.status == c.kXR_authmore:
+        if status == c.kXR_authmore:
             self._auth_step(body)
         else:
             self._become_ready()
@@ -729,26 +760,8 @@ class SessionMachine:
 
     # -- request responses ----------------------------------------------
 
-    def _on_response(
-        self, header: ResponseHeader, body: bytes, pending: _Pending, framer: _Framer
-    ) -> None:
-        handlers = {
-            c.kXR_ok: self._response_ok,
-            c.kXR_oksofar: self._response_chunk,
-            c.kXR_error: self._response_error,
-            c.kXR_redirect: self._response_redirect,
-            c.kXR_wait: self._response_wait,
-            c.kXR_waitresp: self._response_waitresp,
-            c.kXR_status: self._response_status,
-        }
-        handler = handlers.get(header.status, self._response_unexpected)
-        handler(header, body, pending, framer)
-
-    def _response_ok(
-        self, header: ResponseHeader, body: bytes, pending: _Pending, _framer: _Framer
-    ) -> None:
-        sid = header.streamid
-        if not self._within_cap(sid, pending, len(body)):
+    def _response_ok(self, sid: int, body: bytes, pending: _Pending, _framer: _Framer) -> None:
+        if pending.cap and not self._within_cap(sid, pending, len(body)):
             return
         if pending.buffer:
             # Extending before freezing avoids copying the accumulated body twice.
@@ -759,66 +772,49 @@ class SessionMachine:
         self.release(sid)
         self._events.append(Completed(sid, pending.request, data, pending.status))
 
-    def _response_chunk(
-        self, header: ResponseHeader, body: bytes, pending: _Pending, _framer: _Framer
-    ) -> None:
-        if self._within_cap(header.streamid, pending, len(body)):
+    def _response_chunk(self, sid: int, body: bytes, pending: _Pending, _framer: _Framer) -> None:
+        if self._within_cap(sid, pending, len(body)):
             pending.buffer += body
-            self._events.append(Chunk(header.streamid, pending.request, body))
+            self._events.append(Chunk(sid, pending.request, body))
 
-    def _response_error(
-        self, header: ResponseHeader, body: bytes, pending: _Pending, _framer: _Framer
-    ) -> None:
+    def _response_error(self, sid: int, body: bytes, pending: _Pending, _framer: _Framer) -> None:
         info = rp.parse_error(body)
-        self.release(header.streamid)
-        self._events.append(
-            Failed(header.streamid, pending.request, _server_error(info, pending.path))
-        )
+        self.release(sid)
+        self._events.append(Failed(sid, pending.request, _server_error(info, pending.path)))
 
     def _response_redirect(
-        self, header: ResponseHeader, body: bytes, pending: _Pending, _framer: _Framer
+        self, sid: int, body: bytes, pending: _Pending, _framer: _Framer
     ) -> None:
-        self._events.append(Redirected(header.streamid, pending.request, rp.parse_redirect(body)))
+        self._events.append(Redirected(sid, pending.request, rp.parse_redirect(body)))
 
-    def _response_wait(
-        self, header: ResponseHeader, body: bytes, pending: _Pending, _framer: _Framer
-    ) -> None:
+    def _response_wait(self, sid: int, body: bytes, pending: _Pending, _framer: _Framer) -> None:
         wait = rp.parse_wait(body)
         self._events.append(
-            Waiting(
-                header.streamid,
-                pending.request,
-                min(wait.seconds, self.config.wait_cap),
-                wait.message,
-            )
+            Waiting(sid, pending.request, min(wait.seconds, self.config.wait_cap), wait.message)
         )
 
     def _response_waitresp(
-        self, header: ResponseHeader, body: bytes, pending: _Pending, _framer: _Framer
+        self, sid: int, body: bytes, pending: _Pending, _framer: _Framer
     ) -> None:
         later = rp.parse_waitresp(body)
-        self._events.append(Waiting(header.streamid, pending.request, later.seconds, resend=False))
+        self._events.append(Waiting(sid, pending.request, later.seconds, resend=False))
 
-    def _response_status(
-        self, header: ResponseHeader, body: bytes, pending: _Pending, framer: _Framer
-    ) -> None:
+    def _response_status(self, sid: int, body: bytes, pending: _Pending, framer: _Framer) -> None:
         state = rp.parse_status(body)
         pending.status = state
         if state.dlen:
             framer.need_trailer = state.dlen
-            framer.trailer_for = header.streamid
+            framer.trailer_for = sid
         else:
-            self._on_status_data(header.streamid, b"")
+            self._on_status_data(sid, b"")
 
-    def _response_unexpected(
-        self, header: ResponseHeader, _body: bytes, pending: _Pending, _framer: _Framer
-    ) -> None:
-        self.release(header.streamid)
+    def _response_unexpected(self, sid: int, status: int, pending: _Pending) -> None:
+        self.release(sid)
         self._events.append(
             Failed(
-                header.streamid,
+                sid,
                 pending.request,
-                ProtocolError(f"unexpected response status {c.status_name(header.status)}"),
+                ProtocolError(f"unexpected response status {c.status_name(status)}"),
             )
         )
 
@@ -865,6 +861,23 @@ class SessionMachine:
             f"SessionMachine({self.host}:{self.port}, state={self.state.name}, "
             f"in_flight={len(self._pending)}, tls={self.tls_active})"
         )
+
+
+#: The states in which a reply belongs to bring-up rather than to a request.
+_BRINGUP = frozenset({State.HANDSHAKE, State.PROTOCOL, State.LOGIN, State.AUTH, State.BIND})
+
+_Handler = Callable[[SessionMachine, int, bytes, _Pending, _Framer], None]
+
+#: Every reply status a request can be answered with, bar ``kXR_ok`` - which
+#: :meth:`SessionMachine._dispatch` takes first - and bar the unexpected ones.
+_HANDLERS: dict[int, _Handler] = {
+    c.kXR_oksofar: SessionMachine._response_chunk,
+    c.kXR_error: SessionMachine._response_error,
+    c.kXR_redirect: SessionMachine._response_redirect,
+    c.kXR_wait: SessionMachine._response_wait,
+    c.kXR_waitresp: SessionMachine._response_waitresp,
+    c.kXR_status: SessionMachine._response_status,
+}
 
 
 def _server_error(info: rp.ErrorInfo, path: str) -> XRootDError:

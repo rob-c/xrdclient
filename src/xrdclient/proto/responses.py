@@ -35,7 +35,8 @@ __all__ = [
     "parse_dirlist", "parse_locate", "parse_open", "parse_checksum",
     "parse_checkpoint", "parse_readlink", "parse_space", "parse_prepare_status",
     "parse_error", "parse_redirect", "parse_wait", "parse_waitresp", "parse_attn",
-    "parse_status", "parse_pgwrite_cse", "parse_readv", "parse_fattr", "parse_fattr_tree",
+    "parse_status", "parse_pgwrite_cse", "parse_readv", "parse_fattr", "parse_fattr_list",
+    "parse_fattr_tree",
 ]
 
 
@@ -67,8 +68,18 @@ class RedirectInfo:
 
     @property
     def url(self) -> str:
-        scheme = "roots" if self.port < 0 else "root"
-        return f"{scheme}://{self.host}:{abs(self.port)}/"
+        """Where the redirect points, as XrdCl builds it.
+
+        A positive port goes after the host. A negative one means the host
+        field is already a whole URL - the port's complement carries redirect
+        flags, not a number - and zero means the host names no port at all
+        (``XrdClXRootDMsgHandler.cc``).
+        """
+        if self.port < 0:
+            return self.host
+        if self.port == 0:
+            return f"root://{self.host}/"
+        return f"root://{self.host}:{self.port}/"
 
 
 #: What closes the target field of a ``kXR_redirect``.
@@ -287,20 +298,41 @@ def parse_bind(data: bytes) -> int:
 # --------------------------------------------------------------------------
 
 
+#: Flag words already built, by value. A listing repeats a handful of values
+#: a thousand times over, and building an ``IntFlag`` goes through the enum
+#: machinery every time; a lookup does not. Bounded by the eight flag bits.
+_FLAGS: dict[int, StatInfoFlags] = {}
+
+
+def _flags(value: int) -> StatInfoFlags:
+    flags = _FLAGS.get(value)
+    if flags is None:
+        flags = StatInfoFlags(value)
+        if len(_FLAGS) < 256:
+            _FLAGS[value] = flags
+    return flags
+
+
 def _stat_fields(text: str, path: str) -> StatInfo:
+    """One stat line: ``id size flags mtime``, then the protocol-5 extension.
+
+    A version-5 server goes on to send ``ctime atime mode owner group``, with
+    the mode in octal as ``ls`` would print it. An older one stops after the
+    mtime, and then that is the only time there is to report for all three.
+    """
     parts = text.split()
+    if len(parts) >= 9:
+        ctime, atime, mode, owner, group = parts[4:9]
+        mtime = int(parts[3])
+        return StatInfo(
+            parts[0], int(parts[1]), _flags(int(parts[2])), mtime,
+            int(ctime), int(atime), path, mode, owner, group,
+        )  # fmt: skip
     if len(parts) < 4:
         raise ProtocolError(f"kXR_stat returned {len(parts)} fields, expected >= 4: {text!r}")
     mtime = int(parts[3])
-    return StatInfo(
-        id=parts[0],
-        st_size=int(parts[1]),
-        flags=StatInfoFlags(int(parts[2])),
-        st_mtime=mtime,
-        st_ctime=mtime,
-        st_atime=mtime,
-        path=path,
-    )
+    # Positional, in StatInfo's field order: a listing builds a thousand.
+    return StatInfo(parts[0], int(parts[1]), _flags(int(parts[2])), mtime, mtime, mtime, path)
 
 
 def parse_stat(data: bytes, path: str = "") -> StatInfo:
@@ -350,8 +382,10 @@ def _cksum_token(line: str) -> tuple[str, ChecksumInfo | None]:
     ``none`` for an entry the server had none for - a directory, or a file it
     could not read. That is no digest, so it arrives here as ``None``.
     """
-    head, bracket, rest = line.rpartition("[")
-    if not bracket or not rest.rstrip().endswith("]"):
+    if "[" not in line:  # the common case, and a cheap way to spot it
+        return line, None
+    head, _, rest = line.rpartition("[")
+    if not rest.rstrip().endswith("]"):
         return line, None
     algorithm, colon, value = rest.rstrip().rstrip("]").strip().partition(":")
     if not colon or not algorithm:
@@ -378,19 +412,13 @@ def parse_dirlist(data: bytes, path: str = "", with_stat: bool = True) -> list[D
         return [DirEntry(name=_checked(n, path), parent=path) for n in lines]
 
     entries: list[DirEntry] = []
+    prefix = f"{path.rstrip('/')}/" if path else ""
     for name, statline in zip(lines[::2], lines[1::2]):
         if name == ".":
             continue
         _checked(name, path)
         statline, checksum = _cksum_token(statline)
-        entries.append(
-            DirEntry(
-                name=name,
-                parent=path,
-                stat=_stat_fields(statline, f"{path.rstrip('/')}/{name}" if path else name),
-                checksum=checksum,
-            )
-        )
+        entries.append(DirEntry(name, path, _stat_fields(statline, prefix + name), checksum))
     return entries
 
 
@@ -605,6 +633,23 @@ def parse_fattr(data: bytes, values: bool = True) -> FattrResult:
             value = r.bytes(r.i32())
         items.append(FattrItem(name, code, value))
     return FattrResult(errors, items)
+
+
+def parse_fattr_list(data: bytes, values: bool = False) -> FattrResult:
+    """``kXR_fattr`` list - ``name\\0 [len[4] value]`` for each attribute.
+
+    Unlike get, set and delete, a list reply has neither the two-byte count
+    header nor a return code per attribute: there is nothing to have failed
+    for a name the server is reporting that it has. ``values`` says whether
+    the request asked for them (``kXR_fattrAData``).
+    """
+    r = Reader(data, "kXR_fattr")
+    items: list[FattrItem] = []
+    while r.remaining:
+        name = _read_name(r)
+        value = r.bytes(r.i32()) if values else None
+        items.append(FattrItem(name, 0, value))
+    return FattrResult(0, items)
 
 
 def parse_fattr_tree(data: bytes) -> dict[str, list[str]]:

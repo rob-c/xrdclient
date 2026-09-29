@@ -72,7 +72,7 @@ class HTTPRawIO(io.RawIOBase):
         self._readable, self._writable = _mode_access(mode)
         self._pos = 0
         self._size: int | None = None
-        self._eof_at: int | None = None
+        self._eof_at: int | None = None  # where the resource is known to end
         self._body: http.client.HTTPResponse | None = None  # the live GET response
         self._buffer = bytearray()  # pending PUT body, while it still fits
         self._upload: http.client.HTTPConnection | None = None  # mid-chunked-PUT
@@ -122,6 +122,10 @@ class HTTPRawIO(io.RawIOBase):
             self._drop_stream()
             response = self.client.request("HEAD", self.url)
             self._size = response.content_length or 0
+            if response.content_length is not None:
+                # A declared length is an end a read can stop at without
+                # asking; an undeclared one is not, however it is reported.
+                self._eof_at = response.content_length
         return self._size
 
     def _release_client(self) -> None:
@@ -142,11 +146,17 @@ class HTTPRawIO(io.RawIOBase):
     # Reading
     # ------------------------------------------------------------------
 
-    def _stream(self) -> http.client.HTTPResponse:
-        """The open response positioned at ``_pos``, started if need be."""
+    def _stream(self) -> http.client.HTTPResponse | None:
+        """The open response positioned at ``_pos``, started if need be, or
+        ``None`` when the server says there is nothing at or after it."""
         if self._body is None:
             headers = {"Range": f"bytes={self._pos}-"} if self._pos else {}
-            response = self.client.open("GET", self.url, headers=headers, expect=(200, 206))
+            response = self.client.open("GET", self.url, headers=headers, expect=(200, 206, 416))
+            if response.status == 416:
+                # The range starts at or past the end: what a file answers
+                # there is an empty read, not an error.
+                self._release(response)
+                return None
             if self._pos and response.status == 200:
                 # The server ignored the range; skip forward rather than
                 # hand back the wrong bytes.
@@ -158,12 +168,15 @@ class HTTPRawIO(io.RawIOBase):
     def readinto(self, buffer: WriteableBuffer) -> int:
         if not self._readable:
             raise io.UnsupportedOperation("not readable")
-        # Once an open-ended GET reached EOF, another read is local EOF.  Do
-        # not turn it into ``Range: bytes=<size>-``: that range is unsatisfiable
-        # and strict CDNs answer it with 416 rather than an empty body.
+        # At or past a known end - one a read reached, or the length a HEAD
+        # declared - a read is local EOF. Do not turn it into
+        # ``Range: bytes=<size>-``: that range is unsatisfiable and a
+        # compliant server answers it with 416 rather than an empty body.
         if self._eof_at is not None and self._pos >= self._eof_at:
             return 0
         stream = self._stream()
+        if stream is None:
+            return 0
         count = stream.readinto(buffer)
         if not count and memoryview(buffer).nbytes:
             # End of stream. If the response declared a length it has not
@@ -219,9 +232,21 @@ class HTTPRawIO(io.RawIOBase):
         return self._pos
 
     def _drop_stream(self) -> None:
+        """Give up the response being read, if there is one.
+
+        Closing a response does not close its connection, and one abandoned
+        mid-body - by a seek, a ``HEAD`` for the size, or a close - leaves the
+        rest of the body on the socket. The pool would hand that connection
+        to the next request, which would read the leftover bytes as its
+        status line; a ``POST`` is not retried, so it would fail outright.
+        """
         body, self._body = self._body, None
         if body is not None:
-            body.close()
+            self._release(body)
+
+    def _release(self, body: http.client.HTTPResponse) -> None:
+        """Close a response, leaving its connection fit for the next request."""
+        self.client.abandon(body)
 
     # ------------------------------------------------------------------
     # Writing
@@ -231,6 +256,10 @@ class HTTPRawIO(io.RawIOBase):
         if not self._writable:
             raise io.UnsupportedOperation("not writable")
         payload = bytes(data)
+        if not payload:
+            # Nothing to do - and in a chunked upload an empty chunk is the
+            # end-of-body marker, which would commit a truncated file.
+            return 0
         if not self._streaming:
             self._buffer += payload
             if len(self._buffer) <= self._stream_after():
@@ -257,7 +286,7 @@ class HTTPRawIO(io.RawIOBase):
 
     def _begin_upload(self) -> None:
         """Start a chunked ``PUT`` and flush whatever is already buffered."""
-        conn = self.client.connection(self.url)
+        conn = self.client.ready(self.url)
         # ``None`` for the body: it is about to be streamed, so a signer that
         # would hash it has nothing to hash yet.
         headers = self.client.sign(

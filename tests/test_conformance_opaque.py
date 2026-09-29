@@ -19,6 +19,7 @@ from xrdclient.client.filesystem import _cgi, _split_cgi
 from xrdclient.config import Config
 from xrdclient.proto import constants as c
 from xrdclient.testing import FakeServer
+from xrdclient.url import parse
 
 TOKEN = "authz=TOKEN"
 
@@ -66,17 +67,23 @@ def carried(srv):
 
 
 def test_a_path_with_no_opaque_data_stays_that_way():
-    assert _cgi("", {}) == ""
+    assert _cgi("", parse("root://h//")) == ""
     assert _split_cgi("/store/f") == ("/store/f", "")
 
 
 def test_the_inherited_token_is_appended():
-    assert _cgi("", {"authz": "T"}) == "?authz=T"
-    assert _cgi("xrdclient.k=1", {"authz": "T"}) == "?xrdclient.k=1&authz=T"
+    assert _cgi("", parse("root://h//?authz=T")) == "?authz=T"
+    assert _cgi("xrdclient.k=1", parse("root://h//?authz=T")) == "?xrdclient.k=1&authz=T"
+
+
+def test_the_inherited_token_goes_on_as_it_was_spelled():
+    """``Bearer%20`` is not ``Bearer+`` to a server that does not decode it."""
+    url = parse("root://h//?authz=Bearer%20abc&tpc.src=h:1094")
+    assert _cgi("", url) == "?authz=Bearer%20abc&tpc.src=h:1094"
 
 
 def test_what_the_caller_spelled_out_wins():
-    assert _cgi("authz=MINE", {"authz": "T"}) == "?authz=MINE"
+    assert _cgi("authz=MINE", parse("root://h//?authz=T")) == "?authz=MINE"
 
 
 def test_the_suffix_survives_a_split():

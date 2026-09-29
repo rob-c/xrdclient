@@ -65,16 +65,42 @@ scheme; `Config(require_tls=True)` refuses a server that will not upgrade.
 
 ## `krb5` - Kerberos
 
-The one mechanism that needs an extra:
+Pure Python, like everything else: `kinit` as usual, and the client does the
+rest.
 
 ```console
-$ pip install xrdclient[krb5]
+$ kinit jane@EXAMPLE.ORG
 ```
 
-The credential cache is read with no help at all - so an expired ticket is
-reported as such before anything is sent - but the exchange itself goes
-through `gssapi`, because a Kerberos token can only honestly be tested
-against a live KDC.
+What the server's `krb5` plugin wants is a raw Kerberos AP-REQ for the
+principal it names in its offer (`xrootd/host@REALM`). The client reads the
+FILE credential cache - `$KRB5CCNAME`, else `default_ccache_name` from
+`krb5.conf`, else `/tmp/krb5cc_<uid>` - and uses the service ticket there if
+`kvno` or an earlier program already fetched one. If the cache holds only
+your ticket-granting ticket, it asks the KDC for the service ticket itself (a
+TGS exchange, over UDP with a TCP fallback, to the `kdc` listed for the realm
+in `$KRB5_CONFIG` or `/etc/krb5.conf`) and keeps it in memory for the rest of
+the process; the cache file is never written. A server started with
+`-exptkn` (its offer ends `,fwd`) also gets a forwarded TGT, which needs a
+forwardable one: `kinit -f`.
+
+Supported: the AES enctypes - `aes256-cts-hmac-sha1-96`,
+`aes128-cts-hmac-sha1-96`, `aes256-cts-hmac-sha384-192` and
+`aes128-cts-hmac-sha256-128` - in the order `default_tgs_enctypes` or
+`permitted_enctypes` gives. Refused, each with an error saying so:
+
+| Situation | What to do |
+| --- | --- |
+| a `KCM:`, `KEYRING:` or `API:` cache (RHEL 9 defaults to KCM) | `KRB5CCNAME=FILE:/tmp/krb5cc_$(id -u) kinit` |
+| tickets that have expired | `kinit` - the error says how long ago |
+| a realm with no `kdc =` line (DNS SRV lookup is not done) | add `[realms] REALM = { kdc = host }` |
+| a service in another realm than your TGT (cross-realm) | not supported |
+| DES, triple-DES or RC4 keys | ask for AES keys - RC4 needs MD4, which `hashlib` often lacks |
+
+Host names are not canonicalised through DNS (as with
+`dns_canonicalize_hostname = false` and `rdns = false`); the server names its
+own principal in its offer, so none is needed. When it does not, the realm
+comes from `[domain_realm]`, else your own.
 
 ## `sss` - Simple Shared Secret
 

@@ -31,7 +31,7 @@ ROOT files and publishes the catalogue they are served from.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING as _TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from .client import Checkpoint, File, FileSystem
 from .config import Config, configure, current, find_config_file, override
@@ -111,9 +111,10 @@ from .types import (
 )
 from .url import XRootDURL, parse
 
-if _TYPE_CHECKING:  # bound at runtime by ``__getattr__`` below, named here so
+if TYPE_CHECKING:  # bound at runtime by ``__getattr__`` below, named here so
     # that a type checker and the documentation can both see what they are
     from .doctor import Check, Report, diagnose
+del TYPE_CHECKING  # imported for the block above, not part of the package
 
 __version__ = "0.1.0"
 

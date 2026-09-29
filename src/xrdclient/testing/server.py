@@ -38,7 +38,14 @@ from typing import cast
 from urllib.parse import parse_qs
 
 from .._compat import zip_strict
-from ..errors import kXR_ArgInvalid, kXR_FileNotOpen, kXR_NoSpace, kXR_Unsupported
+from ..errors import (
+    kXR_ArgInvalid,
+    kXR_AttrNotFound,
+    kXR_FileNotOpen,
+    kXR_ItExists,
+    kXR_NoSpace,
+    kXR_Unsupported,
+)
 from ..proto import constants as c
 from ..proto.buffer import Reader, Writer
 from ..url import XRootDURL, parse
@@ -536,12 +543,15 @@ class _Connection:
         return self.s.times.get(path, (0, 1700000000 * 10**9))[1] // 10**9
 
     def _children(self, path: str) -> list[str]:
+        # Listing a link lists what it points at, as readdir(3) through a
+        # link to a directory does; the links themselves are entries.
+        path = self.s.links.get(path, path)
         if path not in self.s.dirs:
             raise _NotFound(path)
         prefix = path.rstrip("/") + "/"
         names = {
             entry[len(prefix) :].split("/", 1)[0]
-            for entry in list(self.s.files) + list(self.s.dirs)
+            for entry in list(self.s.files) + list(self.s.dirs) + list(self.s.links)
             if entry.startswith(prefix) and entry != path
         }
         return sorted(names)
@@ -639,6 +649,7 @@ def _h_statx(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterato
 def _h_dirlist(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
     args = body.split(b"\x00", 1)[0].decode()
     path = _clean(args)
+    path = conn.s.links.get(path, path)
     names = conn._children(path)
     if not params[15] & c.kXR_dstat:
         yield _frame(sid, c.kXR_ok, "\n".join(names).encode() + b"\x00")
@@ -650,7 +661,12 @@ def _h_dirlist(conn: _Connection, sid: int, params: bytes, body: bytes) -> Itera
     out = bytearray(b".\n" + conn._stat_line(path) + b"\n")
     for name in names:
         full = posixpath.join(path, name)
-        line = conn._stat_line(full)
+        try:
+            line = conn._stat_line(full)
+        except _NotFound:
+            # A dangling link has nothing to describe, and stock xrootd
+            # leaves it out of a stat'ed listing rather than failing it.
+            continue
         if algorithm:
             # A directory has nothing to digest, and the server says so in the
             # token rather than leaving it out.
@@ -679,6 +695,11 @@ def _h_mkdir(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterato
 
 def _h_rm(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
     path = _clean(body.split(b"\x00", 1)[0].decode())
+    if path in conn.s.links:
+        # unlink(2) on a link removes the link, never what it points at.
+        del conn.s.links[path]
+        yield _frame(sid, c.kXR_ok)
+        return
     if path in conn.s.dirs:
         yield _error(sid, 3016, f"is a directory: {path}")
         return
@@ -690,10 +711,16 @@ def _h_rm(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[b
 
 def _h_rmdir(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
     path = _clean(body.split(b"\x00", 1)[0].decode())
+    if path in conn.s.links:
+        # rmdir(2) never follows a link, so it is not a directory; stock
+        # xrootd reports ENOTDIR as kXR_FSError.
+        yield _error(sid, 3005, f"not a directory: {path}")
+        return
     if path not in conn.s.dirs:
         raise _NotFound(path)
     if conn._children(path):
-        yield _error(sid, 3005, f"directory not empty: {path}")
+        # ENOTEMPTY, which stock xrootd reports as kXR_ItExists.
+        yield _error(sid, 3018, f"directory not empty: {path}")
         return
     conn.s.dirs.discard(path)
     yield _frame(sid, c.kXR_ok)
@@ -1122,10 +1149,15 @@ def _h_fattr(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterato
     store = conn.s.xattrs.setdefault(path, {})
 
     if subcode == c.kXR_fattrList:
-        names = sorted(store)
+        # A list reply is bare ``name\0 [len value]`` records: no count
+        # header and no per-attribute code, unlike the other subcodes.
         values = bool(options & c.kXR_fattrAData)
-        reply = _fattr_reply([(n, 0, store[n] if values else None) for n in names])
-        yield _frame(sid, c.kXR_ok, reply)
+        reply = Writer()
+        for name in sorted(store):
+            reply.text(name, nul=True)
+            if values:
+                reply.i32(len(store[name])).raw(store[name])
+        yield _frame(sid, c.kXR_ok, reply.bytes())
         return
 
     items: list[tuple[str, int, bytes | None]] = []
@@ -1137,15 +1169,15 @@ def _h_fattr(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterato
         if subcode == c.kXR_fattrSet:
             value = reader.bytes(reader.i32())
             if options & c.kXR_fattrIsNew and name in store:
-                items.append((name, 17, None))
+                items.append((name, kXR_ItExists, None))
                 continue
             store[name] = bytes(value)
             items.append((name, 0, None))
         elif subcode == c.kXR_fattrGet:
             current = store.get(name)
-            items.append((name, 0 if current is not None else 61, current or b""))
+            items.append((name, 0 if current is not None else kXR_AttrNotFound, current or b""))
         elif subcode == c.kXR_fattrDel:
-            items.append((name, 0 if store.pop(name, None) is not None else 61, None))
+            items.append((name, 0 if store.pop(name, None) is not None else kXR_AttrNotFound, None))
     yield _frame(sid, c.kXR_ok, _fattr_reply(items))
 
 

@@ -24,7 +24,7 @@ production. `evolve` returns a new one.
 | `request_timeout` | `300.0` | `XRD_REQUESTTIMEOUT` | one request/response |
 | `stream_timeout` | `60.0` | `XRD_STREAMTIMEOUT` | idle socket before a keepalive |
 | `connect_retries` | `3` | `XRD_CONNECTIONRETRY` | reconnection attempts |
-| `retry_backoff` | `0.5` | `XRD_STREAMERRORWINDOW` | first backoff, then doubling |
+| `retry_backoff` | `0.5` | `XRD_RETRYBACKOFF` | first backoff, then doubling |
 | `redirect_limit` | `16` | `XRD_REDIRECTLIMIT` | redirects before giving up |
 | `wait_cap` | `600.0` | | ceiling on a server-requested wait |
 | `stall_deadline` | `1800.0` | `XRD_STALLDEADLINE` | one whole operation, first byte to last |
@@ -38,6 +38,12 @@ exactly what the second is for. A `kXR_wait` restarts the deadline — a delay
 the server declared is not a stall — but the delays are added up against
 `wait_budget`, so a redirector cannot park a caller indefinitely one polite
 minute at a time. Both take `0` to wait forever.
+
+`XRD_RETRYBACKOFF` is this package's own name. The official client's
+`XRD_STREAMERRORWINDOW` looks similar but is not a backoff: it is how long a
+stream error is remembered (1800 s by default), so it is deliberately not read
+here - a site environment that sets it must not park every reconnect for ten
+minutes.
 
 ## Transfers
 
@@ -60,9 +66,13 @@ and defaults to one because each of them is already spread over
 `parallel_chunks`. `in_flight` is how many chunks a transfer reads ahead of
 the write it is waiting on, so that the two ends overlap; `1` is the strictly
 sequential pump, and is what a copy between two local disks wants.
-`data_streams` is how many extra `kXR_bind` sub-streams a file binds at open,
-so a plain read or write already travels beside the control traffic instead of
-behind it; it is on by default (one extra link). The official client counts the
+`data_streams` is how many extra `kXR_bind` sub-streams a file uses, so a
+plain read or write already travels beside the control traffic instead of
+behind it; it is on by default (one extra link). The sub-streams belong to the
+connection, as XrdCl's belong to its channel: the first file opened on a
+connection binds them, and every later file on the same pooled connection
+reuses them, so a warm open costs one `kXR_open` round trip and no extra
+connect. The official client counts the
 control link in its total, so `XRD_SUBSTREAMSPERCHANNEL=1` means "control only"
 and turns the extras off — our field is the extras. It is best-effort, in two
 steps. The whole request goes down the bound link first, for a server that
@@ -136,6 +146,7 @@ believes in. `pool_size = 0` turns pooling off entirely.
 | `auth_order` | `("gsi", "ztn", "krb5", "sss", "unix", "host")` | |
 | `verify_tls` | `True` | |
 | `require_tls` | `False` | |
+| `trusted_redirect_domains` | `()` (credentials stay with their origin) | `XRD_TRUSTEDREDIRECTDOMAINS` |
 | `ztn_cleartext` | `False` | `XRD_ZTNCLEARTEXT` |
 | `prompt` | `None` (ask only at a terminal) | `XRD_PROMPT` |
 | `prompter` | `None` (ask on the terminal) | |

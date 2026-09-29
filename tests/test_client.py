@@ -14,9 +14,18 @@ import time
 
 import pytest
 
-from xrdclient.client.file import READV_MAX_BYTES, File, _batches, _write_batches
+from xrdclient.client.file import (
+    READV_MAX_BYTES,
+    READV_MAX_ELEMENT,
+    WRITEV_MAX_ELEMENT,
+    File,
+    _batches,
+    _pieces,
+    _write_batches,
+)
 from xrdclient.client.filesystem import FileSystem
 from xrdclient.errors import (
+    AttrNotFoundError,
     ChecksumMismatchError,
     InvalidArgumentError,
     PageIntegrityError,
@@ -800,7 +809,8 @@ def test_a_large_read_is_split_into_chunks(server, config):
     from dataclasses import replace
 
     with FakeServer(files={"/big": b"a" * 100}) as srv:
-        small = replace(config, chunk_size=16)
+        # The event path: the bulk plane sizes its requests by bulk_chunk.
+        small = replace(config, chunk_size=16, bulk=False)
         handle = File(srv.url.with_path("/big"), small)
         with handle:
             assert handle.read() == b"a" * 100
@@ -1072,6 +1082,21 @@ def test_xattrs_on_the_open_handle(opened):
         opened.getxattr("user.k")
 
 
+def test_a_missing_attribute_is_the_same_error_on_a_handle_and_a_path(opened, fs):
+    """``AttrNotFoundError`` either way, and still a ``KeyError`` for older callers."""
+    with pytest.raises(AttrNotFoundError) as on_handle:
+        opened.getxattr("user.none")
+    with pytest.raises(AttrNotFoundError) as on_path:
+        fs.getxattr("/data/w.bin", "user.none")
+    assert type(on_handle.value) is type(on_path.value)
+    assert isinstance(on_path.value, KeyError)
+
+
+def test_setting_or_removing_an_attribute_the_server_refuses_raises(opened):
+    with pytest.raises(AttrNotFoundError):
+        opened.removexattr("user.none")
+
+
 def test_a_checkpoint_commits_on_a_clean_exit(opened, server):
     with opened.checkpoint():
         opened.write(b"committed")
@@ -1130,14 +1155,70 @@ def test_read_batches_respect_the_byte_ceiling():
     assert [len(b) for b in _batches(ranges)] == [2, 2]
 
 
-def test_a_single_oversized_range_is_refused():
-    with pytest.raises(ProtocolError, match="use read"):
-        list(_batches([ReadRange(0, READV_MAX_BYTES + 1)]))
+def test_the_element_ceiling_is_what_xrootd_allows_with_its_default_buffer():
+    # maxReadv_ior = maxBuffsz - sizeof(readahead_list), and writev checks
+    # each element against maxTransz, which is maxBuffsz itself.
+    assert READV_MAX_ELEMENT == (2 << 20) - 16
+    assert WRITEV_MAX_ELEMENT == 2 << 20
+
+
+def test_a_range_within_the_element_ceiling_is_left_whole():
+    rng = ReadRange(7, READV_MAX_ELEMENT)
+    assert list(_pieces(rng)) == [rng]
+    assert list(_pieces(ReadRange(3, 0))) == [ReadRange(3, 0)]
+
+
+def test_a_range_past_the_element_ceiling_is_cut_into_element_sized_pieces():
+    pieces = list(_pieces(ReadRange(5, 2 * READV_MAX_ELEMENT + 1)))
+    assert pieces == [
+        ReadRange(5, READV_MAX_ELEMENT),
+        ReadRange(5 + READV_MAX_ELEMENT, READV_MAX_ELEMENT),
+        ReadRange(5 + 2 * READV_MAX_ELEMENT, 1),
+    ]
+
+
+def test_a_readv_range_past_the_element_ceiling_is_split_and_reassembled(server, fs):
+    body = bytes(range(251)) * (5 * READV_MAX_ELEMENT // 251)
+    server.files["/data/wide.bin"] = bytearray(body)
+    handle = File(fs.url.with_path("/data/wide.bin"), fs.config, router=fs._router)
+    with handle:
+        seen = server.seen.count(c.kXR_readv)
+        wanted = [(1, 2 * READV_MAX_ELEMENT + 9), (0, 4), (1, 2 * READV_MAX_ELEMENT + 9)]
+        got = handle.readv(wanted)
+        assert got == [body[o : o + n] for o, n in wanted]
+        # Four element-sized pieces cannot share a request under the byte
+        # ceiling; the small tails ride along with them rather than costing a
+        # round trip of their own.
+        assert server.seen.count(c.kXR_readv) - seen == 4
+
+
+def test_a_split_readv_range_that_runs_past_the_end_comes_back_short(server, fs):
+    server.files["/data/short.bin"] = bytearray(b"x" * (READV_MAX_ELEMENT + 3))
+    handle = File(fs.url.with_path("/data/short.bin"), fs.config, router=fs._router)
+    with handle:
+        assert handle.readv([(0, 3 * READV_MAX_ELEMENT)]) == [b"x" * (READV_MAX_ELEMENT + 3)]
 
 
 def test_write_batches_respect_the_ceilings():
     chunks = [WriteChunk(0, b"x" * (READV_MAX_BYTES // 2)) for _ in range(4)]
     assert [len(b) for b in _write_batches(chunks)] == [2, 2]
+
+
+def test_a_writev_chunk_past_the_transfer_ceiling_is_split():
+    data = bytes(range(256)) * ((2 * WRITEV_MAX_ELEMENT + 5) // 256 + 1)
+    batches = list(_write_batches([WriteChunk(9, data)]))
+    pieces = [chunk for batch in batches for chunk in batch]
+    assert all(len(chunk.data) <= WRITEV_MAX_ELEMENT for chunk in pieces)
+    assert [chunk.offset for chunk in pieces] == [
+        9 + k for k in range(0, len(data), WRITEV_MAX_ELEMENT)
+    ]
+    assert b"".join(chunk.data for chunk in pieces) == data
+
+
+def test_a_writev_chunk_past_the_transfer_ceiling_lands_whole(opened, server):
+    data = bytes(range(256)) * ((WRITEV_MAX_ELEMENT + 5) // 256 + 1)
+    assert opened.writev([(0, b"ab"), (2, data)]) == len(data) + 2
+    assert server.contents("/data/w.bin") == b"ab" + data
 
 
 # ---------------------------------------------------------------------------
@@ -1624,3 +1705,50 @@ def test_a_server_without_setattr_says_it_is_unsupported(server, config):
     with FileSystem(server.url, config) as filesystem:
         with pytest.raises(UnsupportedError):
             filesystem.utime("/data/a.root")
+
+
+def test_a_readers_close_on_a_broken_session_releases_the_handle_quietly(server, config):
+    """Nothing is asked of a connection known to be broken; the handle just goes."""
+    handle = File(server.url.with_path("/data/a.root"), config)
+    handle.open(OpenFlags.READ)
+    handle.session.mark_broken()
+    closes = server.seen.count(c.kXR_close)
+    handle.close()
+    assert not handle.is_open
+    assert server.seen.count(c.kXR_close) == closes, "a close went down a broken link"
+
+
+def test_a_writers_close_on_a_broken_session_still_says_so(server, config):
+    """The handle is released, but a writer is told its close was never heard."""
+    handle = File(server.url.with_path("/data/wb.bin"), config)
+    handle.open(OpenFlags.UPDATE | OpenFlags.NEW, Access.OWNER_WRITE)
+    handle.write(b"payload", 0)
+    handle.session.mark_broken()
+    with pytest.raises(TransientError, match="never heard"):
+        handle.close()
+    assert not handle.is_open
+    handle.close()  # and it stays closed
+
+
+def test_a_close_on_a_connection_the_router_will_not_replace_is_local(server, config):
+    handle = File(server.url.with_path("/data/a.root"), config)
+    handle.open(OpenFlags.READ)
+    handle._router.reconnect = False
+    handle.session.close()
+    handle.close()
+    assert not handle.is_open
+
+
+def test_a_server_that_reports_an_errno_per_attribute_is_understood():
+    """Some servers put an ``errno`` beside a refused attribute, not a ``kXR_`` code."""
+    import errno
+
+    from xrdclient.client import _fattr
+    from xrdclient.errors import ExistsError, IOError_
+    from xrdclient.proto.responses import FattrItem, FattrResult
+
+    with pytest.raises(ExistsError):
+        _fattr.check(FattrResult(1, [FattrItem("user.a", errno.EEXIST)]), "/f")
+    with pytest.raises(IOError_):
+        _fattr.check(FattrResult(1, [FattrItem("user.a", errno.EIO)]), "/f")
+    _fattr.check(FattrResult(0, [FattrItem("user.a", 0)]), "/f")

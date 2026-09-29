@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import os
 import posixpath
+import re
 import urllib.parse
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field, replace
 
 from ._compat import SLOTS
@@ -23,6 +25,13 @@ HTTP_SCHEMES = frozenset({"http", "https", "dav", "davs", "webdav"})
 #: bucket rather than a server, so it is its own thing to this parser.
 S3_SCHEMES = frozenset({"s3"})
 _TLS_SCHEMES = frozenset({"roots", "xroots", "https", "davs", "s3"})
+
+#: What a rendered CGI value leaves alone. XrdCl sends opaque data exactly as
+#: written, and servers compare it literally - a ``tpc.src`` of ``h:1094`` is
+#: not the same string as ``h%3A1094`` to anything on the far side - so only
+#: what would change the meaning of the query is escaped: ``&`` and ``#``
+#: (structure), ``%`` and ``+`` (which this parser decodes), and whitespace.
+_CGI_SAFE = ":/@,;=!$'()*~"
 
 
 @dataclass(frozen=True, **SLOTS)
@@ -40,14 +49,20 @@ class XRootDURL:
     username: str = ""
     password: str = ""
     query: dict[str, str] = field(default_factory=dict)
-    # HTTP signatures cover the escaped query bytes, not merely their decoded
-    # values.  Keep those bytes for a URL parsed from text; callers that edit
-    # ``query`` deliberately fall back to the ordinary canonical rendering.
+    # The query exactly as it goes on the wire. ``query`` is the decoded view
+    # of it, for reading; this is what is sent, because both a server
+    # (XrdSciTokens strips a literal ``Bearer%20``) and a signature (a CDN's
+    # signed redirect covers the escaped bytes) see the spelling, not the
+    # values. Kept in step with ``query`` by ``__post_init__``: the fields
+    # that were not edited keep their bytes, and only edited ones are
+    # rendered afresh.
     _raw_query: str = field(default="", repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "scheme", self.scheme.lower())
         object.__setattr__(self, "host", self.host.lower())
+        if _decode(self._raw_query) != self.query:
+            object.__setattr__(self, "_raw_query", _reconcile(self._raw_query, self.query))
 
     # -- classification ------------------------------------------------
 
@@ -92,9 +107,11 @@ class XRootDURL:
     # -- derivation ----------------------------------------------------
 
     def evolve(self, **changes: object) -> XRootDURL:
-        """A copy with ``changes`` applied."""
-        if "query" in changes and "_raw_query" not in changes:
-            changes["_raw_query"] = ""
+        """A copy with ``changes`` applied.
+
+        A changed ``query`` keeps the written spelling of every field it did
+        not change; see :attr:`cgi`.
+        """
         return replace(self, **changes)  # type: ignore[arg-type]
 
     def with_path(self, path: str) -> XRootDURL:
@@ -110,7 +127,7 @@ class XRootDURL:
     def with_query(self, **params: str) -> XRootDURL:
         merged = dict(self.query)
         merged.update({k: v for k, v in params.items() if v is not None})
-        return replace(self, query=merged, _raw_query="")
+        return replace(self, query=merged)
 
     def without_query(self) -> XRootDURL:
         return replace(self, query={}, _raw_query="")
@@ -118,11 +135,26 @@ class XRootDURL:
     # -- formatting ----------------------------------------------------
 
     @property
+    def cgi(self) -> str:
+        """The opaque data as it goes on the wire, without the ``?``.
+
+        Byte for byte what was parsed, for every field nobody has changed
+        since; a field that was added or changed is rendered the way XrdCl
+        would leave it: a space as ``%20``, and ``:``, ``/``, ``@`` and ``,``
+        as they are.
+        """
+        return self._raw_query
+
+    def cgi_except(self, names: Collection[str]) -> str:
+        """:attr:`cgi` without the fields called ``names``, the rest untouched."""
+        return "&".join(f for f in _fields(self._raw_query) if _field_name(f) not in names)
+
+    @property
     def path_with_cgi(self) -> str:
         """What goes on the wire as an operation's path argument."""
-        if not self.query:
+        if not self._raw_query:
             return self.path
-        return f"{self.path}?{urllib.parse.urlencode(self.query)}"
+        return f"{self.path}?{self._raw_query}"
 
     def __str__(self) -> str:
         if self.is_local:
@@ -137,9 +169,10 @@ class XRootDURL:
         # A bucket is a name rather than an endpoint, so an ``s3`` URL carries
         # no port: ``s3://bucket:443/key`` is not what anyone wrote or expects.
         where = self.host if self.is_s3 else self.netloc
-        base = f"{self.scheme}://{auth}{where}{sep}{self.path.lstrip('/')}"
-        if self.query:
-            base += "?" + urllib.parse.urlencode(self.query)
+        path = quote_path(self.path) if self.is_http else self.path
+        base = f"{self.scheme}://{auth}{where}{sep}{path.lstrip('/')}"
+        if self._raw_query:
+            base += "?" + self._raw_query
         return base
 
     def __hash__(self) -> int:
@@ -160,12 +193,87 @@ class XRootDURL:
 
     @property
     def http_url(self) -> str:
-        """This URL rendered for an HTTP client (single slash, no CGI dupes)."""
+        """This URL as another HTTP server must be handed it.
+
+        ``dav``/``davs`` become ``http``/``https``, which is all a server
+        resolves, and the path is percent-encoded: this string travels in a
+        header (``Source``, ``Destination``), where a raw space ends the URL
+        and a name outside Latin-1 cannot be sent at all.
+        """
         scheme = {"dav": "http", "davs": "https", "webdav": "https"}.get(self.scheme, self.scheme)
-        base = f"{scheme}://{self.netloc}{self.path}"
-        if self.query:
-            base += "?" + urllib.parse.urlencode(self.query)
+        base = f"{scheme}://{self.netloc}{quote_path(self.path)}"
+        if self._raw_query:
+            base += "?" + self._raw_query
         return base
+
+
+#: A slash that is part of one path segment rather than a separator - a git
+#: ref such as ``refs%2Fconvert`` in a Hugging Face URL. It stays escaped both
+#: ways: decoding it would move the segment boundary.
+_ENCODED_SLASH = re.compile("%2F", re.IGNORECASE)
+
+
+def quote_path(path: str) -> str:
+    """A plain path percent-encoded exactly once, as an HTTP URL carries it.
+
+    Everything but ``/`` and RFC 3986's unreserved characters is escaped, a
+    ``%`` included, except an escaped slash (``%2F``), which is kept: the
+    path is a name, and :func:`parse` decodes an HTTP URL's path exactly once
+    and leaves ``%2F`` alone, so the two are inverses and a name survives
+    being written out as a URL and read back.
+    """
+    return "%2F".join(urllib.parse.quote(part, safe="/") for part in _ENCODED_SLASH.split(path))
+
+
+def unquote_path(path: str) -> str:
+    """An HTTP URL's path decoded once into the name it spells; see :func:`quote_path`."""
+    return "%2F".join(urllib.parse.unquote(part) for part in _ENCODED_SLASH.split(path))
+
+
+def _render_field(name: str, value: str) -> str:
+    """One CGI field rendered the way XrdCl leaves it.
+
+    Unlike :func:`urllib.parse.urlencode`, a space is ``%20`` rather than
+    ``+``, and ``:``, ``/``, ``@`` and ``,`` stay as they are - the spelling
+    a server that does not decode its CGI (and most do not) expects.
+    """
+    quote = urllib.parse.quote
+    return f"{quote(name, safe=_CGI_SAFE)}={quote(value, safe=_CGI_SAFE)}"
+
+
+def _fields(raw: str) -> list[str]:
+    """The ``&``-separated fields of a raw query, empty ones dropped."""
+    return [f for f in raw.split("&") if f] if raw else []
+
+
+def _field_name(raw_field: str) -> str:
+    return urllib.parse.unquote_plus(raw_field.partition("=")[0])
+
+
+def _decode(raw: str) -> dict[str, str]:
+    """The decoded view of a raw query: what :attr:`XRootDURL.query` holds."""
+    return dict(urllib.parse.parse_qsl(raw, keep_blank_values=True)) if raw else {}
+
+
+def _reconcile(raw: str, query: Mapping[str, str]) -> str:
+    """The raw query that decodes to ``query``, reusing ``raw`` where it can.
+
+    A field whose value did not change keeps its written bytes and its
+    place; a changed one is rendered afresh in the same place; a removed one
+    is dropped; a new one is appended. Only the last of a repeated name is
+    kept, since the last is the one ``query`` holds.
+    """
+    kept: dict[str, str] = {}
+    for raw_field in _fields(raw):
+        name = _field_name(raw_field)
+        if name in query:
+            unchanged = _decode(raw_field).get(name) == query[name]
+            kept.pop(name, None)
+            kept[name] = raw_field if unchanged else _render_field(name, query[name])
+    for name, value in query.items():
+        if name not in kept:
+            kept[name] = _render_field(name, value)
+    return "&".join(kept.values())
 
 
 def _normalize(path: str) -> str:
@@ -195,6 +303,12 @@ def parse(url: str | os.PathLike[str] | XRootDURL) -> XRootDURL:
     host, port_s = _host_port(hostport)
     port = _port(port_s, scheme, text)
     path_s, cgi, query = _path_query(sep, tail)
+    if scheme in HTTP_SCHEMES:
+        # An HTTP URL's path is percent-encoded - that is what a browser, a
+        # server's ``Location`` and a copied link all hand over - so it is
+        # decoded once into the name it spells. ``root://`` and ``s3://``
+        # paths are names as written, as XrdCl and the AWS tools take them.
+        path_s = unquote_path(path_s)
 
     return XRootDURL(
         scheme=scheme,
@@ -246,5 +360,4 @@ def _port(value: str, scheme: str, text: str) -> int:
 def _path_query(separator: str, tail: str) -> tuple[str, str, dict[str, str]]:
     path_and_cgi = (separator + tail) if separator else "/"
     path, _, cgi = path_and_cgi.partition("?")
-    query = dict(urllib.parse.parse_qsl(cgi, keep_blank_values=True)) if cgi else {}
-    return path, cgi, query
+    return path, cgi, _decode(cgi)

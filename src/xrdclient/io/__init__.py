@@ -165,6 +165,22 @@ def _other_protocol(
     return None
 
 
+def _write_window(raw: XRootDRawIO, size: int, buffering: int) -> int:
+    """The buffer a writer gets: by default, one whole window of writes.
+
+    Each flush of a writer's buffer is one :meth:`~xrdclient.client.file.File.write`,
+    which the bulk data plane sends as ``config.bulk_depth`` pipelined
+    requests of ``config.chunk_size``. A megabyte buffer would make every
+    flush one request and one round trip; a buffer the size of the window
+    keeps the pipeline full, at the cost of that much memory per open writer.
+    An explicit ``buffering`` is taken as given.
+    """
+    config = raw.file.config
+    if buffering >= 0 or not config.bulk:
+        return size
+    return max(size, config.chunk_size * config.bulk_depth)
+
+
 def _xrootd_layers(
     raw: XRootDRawIO,
     binary: bool,
@@ -182,7 +198,7 @@ def _xrootd_layers(
     if updating or (raw.readable() and raw.writable()):
         stream = io.BufferedRandom(raw, size)
     elif raw.writable():
-        stream = io.BufferedWriter(raw, size)
+        stream = io.BufferedWriter(raw, _write_window(raw, size, buffering))
     else:
         stream = io.BufferedReader(raw, size)
 

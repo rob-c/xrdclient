@@ -32,7 +32,7 @@ from ..config import Config
 from ..url import XRootDURL
 from .sync import Session
 
-__all__ = ["SessionPool", "SESSIONS"]
+__all__ = ["SessionPool", "SESSIONS", "same_server"]
 
 _log = get_logger(__name__)
 
@@ -58,6 +58,14 @@ _IDENTITY_FIELDS = (
 Key = tuple[str, str, int, str]
 
 
+#: Digests already worked out, by the config and URL user they were worked out
+#: for. The config is held, not just its ``id``: a config that was collected
+#: could otherwise hand its id, and so its digest, to a stranger. Bounded,
+#: because a caller that builds a config per request must not grow it forever.
+_DIGESTS: dict[tuple[int, str], tuple[Config, str]] = {}
+_DIGESTS_MAX = 64
+
+
 def _identity(url: XRootDURL, config: Config) -> str:
     """A digest standing in for whoever this connection will log in as.
 
@@ -65,7 +73,22 @@ def _identity(url: XRootDURL, config: Config) -> str:
     dictionary key, and dictionary keys end up in reprs, logs and tracebacks -
     one of these fields is a bearer token. Comparing digests answers the only
     question the pool has ("same credentials?") and answers nothing else.
+
+    Every acquire and release asks, with the same frozen config nearly every
+    time, so the answer is remembered per config rather than re-hashed.
     """
+    key = (id(config), url.username)
+    known = _DIGESTS.get(key)
+    if known is not None and known[0] is config:
+        return known[1]
+    digest = _digest(url, config)
+    if len(_DIGESTS) >= _DIGESTS_MAX:
+        _DIGESTS.clear()
+    _DIGESTS[key] = (config, digest)
+    return digest
+
+
+def _digest(url: XRootDURL, config: Config) -> str:
     digest = hashlib.sha256()
     digest.update(repr(url.username or config.username).encode())
     for name in _IDENTITY_FIELDS:
@@ -74,13 +97,22 @@ def _identity(url: XRootDURL, config: Config) -> str:
     return digest.hexdigest()
 
 
+def _where(url: XRootDURL, config: Config) -> tuple[str, str, int]:
+    return ("roots" if url.use_tls or config.require_tls else "root", url.host, url.port)
+
+
 def _key(url: XRootDURL, config: Config) -> Key:
-    return (
-        "roots" if url.use_tls or config.require_tls else "root",
-        url.host,
-        url.port,
-        _identity(url, config),
-    )
+    return (*_where(url, config), _identity(url, config))
+
+
+def same_server(a: XRootDURL, b: XRootDURL, config: Config) -> bool:
+    """Whether a connection made for ``a`` would also serve ``b``.
+
+    The question a redirect back to where the request came from asks: the
+    connection already open is the right one, and dialling a second one to
+    the same place only costs a login.
+    """
+    return _where(a, config) == _where(b, config)
 
 
 def _cannot_pool(session: Session, config: Config) -> bool:

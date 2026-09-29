@@ -413,3 +413,92 @@ def test_the_cli_lists_stats_and_copies(real_server, rfs, sandbox, tmp_path, cap
 def test_the_cli_reports_a_missing_file_without_a_traceback(real_server, sandbox, capsys):
     assert cli_fs.main(["stat", url_for(real_server, f"{sandbox}/no.root")]) != 0
     assert "Traceback" not in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Third-party copy between two stock daemons
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tpc_pair(tmp_path, monkeypatch):
+    """Two daemons that will run a stock ``XrdOucTPC`` pull between them.
+
+    The pull is made by the destination's own ``xrdcp --server``, so this is
+    the stock server judging the rendezvous: a ``tpc.dst`` naming anything
+    but the host that connects is refused by the source.
+    """
+    import shutil
+
+    import _xrootd
+
+    xrdcp = shutil.which("xrdcp")
+    if not _xrootd.available() or xrdcp is None:
+        pytest.skip("needs the xrootd and xrdcp binaries")
+    tpc = f"ofs.tpc autorm pgm {xrdcp} --server\n"
+    monkeypatch.setattr(_xrootd, "CONFIG", _xrootd.CONFIG + tpc)
+    roots = [Path(os.path.realpath(tmp_path / name)) for name in ("src", "dst")]
+    for root in roots:
+        root.mkdir()
+    with _xrootd.RealServer(roots[0]) as source, _xrootd.RealServer(roots[1]) as target:
+        yield (source, roots[0]), (target, roots[1])
+
+
+def test_a_stock_destination_pulls_a_verified_third_party_copy(tpc_pair):
+    """The whole rendezvous - placement, arm, register, pull - as a stock pair runs it.
+
+    The FakeServer tests pin the opaque down byte for byte, including behind
+    a redirector; this is the check that a real source accepts what they pin.
+    """
+    (source, src_root), (target, dst_root) = tpc_pair
+    (src_root / "f.bin").write_bytes(BLOB)
+    result = xrdclient.third_party(
+        url_for(source, str(src_root / "f.bin")),
+        url_for(target, str(dst_root / "g.bin")).replace("127.0.0.1", "localhost"),
+        config=_REAL_CONFIG,
+        verify=True,
+    )
+    assert (dst_root / "g.bin").read_bytes() == BLOB
+    assert result.verified and result.checksum.value == f"{zlib.adler32(BLOB):08x}"
+
+
+# ---------------------------------------------------------------------------
+# Vector I/O at the server's per-element ceilings
+# ---------------------------------------------------------------------------
+
+#: A pattern whose bytes identify their own offset closely enough that a piece
+#: reassembled in the wrong order, or shifted by one element header, shows.
+_BIG = bytes(range(251)) * (6 * 1024 * 1024 // 251 + 1)
+
+
+@pytest.fixture
+def big(rfs, sandbox):
+    """``sandbox/big.root``: six MiB and change of :data:`_BIG`."""
+    path = f"{sandbox}/big.root"
+    Path(path).write_bytes(_BIG)
+    return path
+
+
+@pytest.mark.parametrize(
+    "length",
+    [
+        (2 << 20) - 16,  # maxReadv_ior with the default 2 MiB buffer: the largest one element
+        (2 << 20) - 15,  # one byte over, which xrootd refuses as kXR_NoMemory
+        2 << 20,
+        5 * 1024 * 1024 + 7,  # several elements, the last a ragged one
+    ],
+)
+def test_a_readv_range_past_the_element_ceiling_is_split_not_refused(rfs, big, length):
+    with File(rfs.url.with_path(big), _REAL_CONFIG) as handle:
+        assert handle.readv([(3, length), (1, 10)]) == [_BIG[3 : 3 + length], _BIG[1:11]]
+
+
+def test_a_writev_chunk_past_the_transfer_ceiling_is_split_not_refused(rfs, sandbox):
+    path = f"{sandbox}/wide.root"
+    rfs.write_bytes(path, b"")
+    body = _BIG[: 5 * 1024 * 1024 + 7]
+    handle = File(rfs.url.with_path(path), _REAL_CONFIG)
+    handle.open(OpenFlags.UPDATE)
+    with handle:
+        assert handle.writev([(0, b"head"), (4, body)]) == len(body) + 4
+    assert Path(path).read_bytes() == b"head" + body

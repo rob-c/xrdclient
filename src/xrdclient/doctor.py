@@ -3,7 +3,7 @@
     >>> import xrdclient
     >>> print(xrdclient.diagnose("root://eos.example.org//store/user/me"))  # doctest: +SKIP
     ok  python        3.13.5 on linux
-    ok  extras        zstandard; fsspec (absent: gssapi, google-crc32c)
+    ok  extras        fsspec (absent: google-crc32c)
     ok  settings      connect 30s, request 300s, TLS verified
     !!  auth:gsi      no proxy file at /tmp/x509up_u1000
                       -> voms-proxy-init -voms lhcb
@@ -48,8 +48,6 @@ __all__ = ["Check", "Report", "diagnose"]
 
 #: Optional packages, under the name you would install them by.
 EXTRAS = {
-    "gssapi": "gssapi",
-    "zstandard": "zstandard",
     "fsspec": "fsspec",
     "google_crc32c": "google-crc32c",
 }

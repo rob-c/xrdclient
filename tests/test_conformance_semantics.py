@@ -375,14 +375,22 @@ def test_a_wait_restarts_the_deadline_rather_than_spending_it(server):
     """A server that says "not yet" is not stalling, so the delay it asked
     for must not be charged against the cutoff it would otherwise trip."""
 
+    asked = []
+
     def slow(conn, sid, params, body):
-        yield frame(sid, c.kXR_wait, struct.pack(">i", 1) + b"staging\x00")
-        yield frame(sid, c.kXR_ok, conn._stat_line("/data/a.root"))
+        # ``kXR_wait`` means "ask again later": the answer goes to the resend,
+        # as a real server gives it, never unprompted after the wait.
+        asked.append(sid)
+        if len(asked) == 1:
+            yield frame(sid, c.kXR_wait, struct.pack(">i", 1) + b"staging\x00")
+        else:
+            yield frame(sid, c.kXR_ok, conn._stat_line("/data/a.root"))
 
     server.handlers[c.kXR_stat] = slow
     with Session.connect(server.url, config=IMPATIENT_STALL) as session:
         # The whole operation outlasts the deadline; the wait is why.
         assert session.execute(r.Stat("/data/a.root"), path="/data/a.root").data
+    assert len(asked) == 2
 
 
 def test_a_deferred_reply_extends_the_deadline_without_a_resend(server):

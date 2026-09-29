@@ -220,7 +220,9 @@ def test_a_server_that_will_not_serve_it_is_asked_once_per_connection(server, mo
             assert fh.read() == b"hello world"
             sessions.append(fh._router.session)
     assert len({id(s) for s in sessions}) == 1, "the pool handed out a new session"
-    assert len(asked) == 1, f"{len(asked)} files paid the same timeout"
+    # The fake disclaims arrival routing when asked, so no file pays for a
+    # trial at all - and a request meant for the path is never split instead.
+    assert asked == [], f"{len(asked)} files paid the timeout a question avoids"
 
 
 # --------------------------------------------------------------------------

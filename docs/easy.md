@@ -70,8 +70,17 @@ xrdclient.remove("root://host//store/run7", recursive=True)
 
 `move` is a rename when both ends are the same server - instant, and no data
 crosses the network - and a verified copy followed by a delete when they are
-not. `remove` refuses a directory with anything in it until you say
-`recursive=True`, because that is the one call here that cannot be undone.
+not. The copy has to be verifiable: if neither end can report a checksum,
+`move` raises and leaves the source where it was, rather than deleting the
+only copy on the strength of a transfer nobody checked. `remove` refuses a
+directory with anything in it until you say `recursive=True`, because that is
+the one call here that cannot be undone.
+
+A plain local path works wherever a URL does in `stat`, `exists`, `size`,
+`checksum`, `read_*`, `write_*`, `mkdir`, `remove` and `move`, so
+`xrdclient.move("/tmp/out.root", "root://host//store/out.root")` uploads and
+then deletes the local file. `ls`, `glob` and `stage` are for remote
+namespaces and refuse a local path; use `pathlib` for those.
 
 ## Tape
 

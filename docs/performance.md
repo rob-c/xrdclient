@@ -4,6 +4,36 @@ Pure Python framing a binary protocol sounds slow. On the transfers that
 matter it is not, because the work is dominated by the network and by
 `memoryview` slicing, not by interpreted bytecode.
 
+## The gate against the official bindings
+
+`benchmarks/compare.py` is the bar every change has to clear. It runs each
+case through the native API, through `xrdclient.compat` (the official
+bindings' calls, unchanged), and through the official `XRootD.client`, on the
+same server in the same process:
+
+- latency, per operation: `ping`, `stat`, `open`+`close`, a 4 KiB read on an
+  open file, and a 1000-entry directory listing with stat information;
+- throughput: a whole-file read, 64 KiB and 1 MiB sequential reads, a
+  1024-element vector read, a whole-file write, 1 MiB chunked writes, and a
+  download copy against `CopyProcess`.
+
+The contenders take turns within every round, in a rotating order, so the
+machine's own drift falls on all of them alike. A case counts as won only
+when the median is faster *and* a one-sided sign test over the paired rounds
+agrees at 5% - faster reliably, not once. `--rtt 2` runs the same cases
+through a relay that holds every packet for half of a 2 ms round trip each
+way, which is where keeping requests in flight matters most. With `--gate`
+a case not won is a failing exit status, and CI runs it both ways on every
+push:
+
+```console
+$ python benchmarks/compare.py --gate
+$ python benchmarks/compare.py --gate --rtt 2
+```
+
+Run it on a quiet machine: other load cannot flip a loss into a win - the
+sign test sees to that - but it can hide a real win in the noise.
+
 ## Measured
 
 `benchmarks/bench.py`, 16 MiB file, real `xrootd` daemon on loopback,
@@ -110,6 +140,44 @@ part way through the transfer and then started again:
 
 A mistyped host name, by contrast, fails in 0.4 s.
 
+## Everyday reads and writes on the plane
+
+The plane is not only for downloads. Every `File.read`, `readinto`, `write`
+and `readv` frames its requests directly on the connection and lands the
+reply where it is returned, with no event machinery in between:
+
+- **Writes are pipelined and uncopied.** A write is sent as
+  `config.chunk_size` pieces, `config.bulk_depth` in flight, each as a request
+  header followed by a slice of the caller's own buffer. A refusal anywhere in
+  the window is raised after the other replies are read, so nothing is lost
+  and the connection stays usable. A file opened `"wb"` buffers one whole
+  window by default, so a loop of small writes becomes pipelined large ones.
+- **Reads return the buffer they were received into.** A large read is
+  received straight into the storage of the `bytes` it returns, so there is
+  no copy at the end.
+- **Sequential reads read ahead.** On a read-only handle, a read that starts
+  where the last one ended also fetches `config.readahead` bytes beyond it,
+  doubling to 8 MiB while the reads stay sequential. Random access never
+  reads ahead.
+- **Vector reads go out together** when they need more than one request, and
+  their replies are walked in place.
+
+`benchmarks/compare.py --size 64 --rounds 9`, against the official bindings,
+on a heavily shared machine (ratio = official time / ours, above 1 is faster):
+
+| Case | loopback | 2 ms round trip |
+| --- | --- | --- |
+| read whole file | 0.98x | 1.12x |
+| 512 x 64 KiB reads | 7.98x | 19.5x |
+| 64 x 1 MiB reads | 1.48x | 2.11x |
+| readv 1024 x 4 KiB | 1.43x | 1.19x |
+| write whole file | 1.10x | 0.68x-0.94x (noisy) |
+| write 1 MiB chunks | 1.58x | 3.16x |
+| copy download | 1.47x | 1.75x |
+
+A single large write is bound by how fast the server stores it, for either
+client.
+
 ## What a transfer no longer pays for
 
 Two costs were being paid by every caller and used by almost none.
@@ -152,12 +220,26 @@ takes a URL and returns bytes.
 **Reads are batched when you let them.** `readv` is one round trip for many
 ranges; `pgread` gets per-page CRC32C from the server for free.
 
+**A small request costs little besides its round trip.** A `ping`, a `stat`
+or a small read is a few hundred bytes each way, so on a fast network what it
+costs is mostly the client's own work, and that path is kept short. The
+requests every operation sends (`read`, `write`, `stat`, `open`, `close`)
+pack their 16 header bytes with one precomputed `struct` each. A reply that
+arrives whole in one receive, which is nearly all of them, is dispatched
+straight from the bytes the socket returned without passing through the
+framing buffer. The session skips the bound data paths when nothing is queued
+for them. The pool remembers the credential digest per `Config`, so it does
+not re-hash it on every open and close. A listing builds each entry's
+`StatInfoFlags` from a table instead of the enum machinery. On an in-memory
+transport, which takes the network out of the measurement, the client's work
+per request is less than half what it was.
+
 ## Making it faster
 
 ```python
 cfg = xrdclient.Config(
     chunk_size=8 << 20,        # bigger writes, fewer round trips
-    readahead=4 << 20,         # buffered reads pull more per request
+    readahead=4 << 20,         # first window a sequential File.read fetches ahead
     parallel_chunks=8,         # spans of a copy moved at once, one connection each
     parallel_files=4,          # files of a tree copied at once
     in_flight=4,               # chunks read ahead of the write in flight

@@ -21,7 +21,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e ".[dev,fsspec]"
+      - run: pip install -e ".[dev]"
       - name: ruff
         run: ruff check src tests benchmarks tools examples
       - name: mypy --strict
@@ -47,7 +47,7 @@ jobs:
       # The point of the library is that it needs nothing compiled; installing
       # the fsspec extra as well keeps that adapter's tests from silently
       # skipping on every run.
-      - run: pip install -e ".[dev,fsspec]"
+      - run: pip install -e ".[dev]"
       # pytest-cov rather than `coverage run`, because the workers xdist
       # spawns are separate processes and only pytest-cov collects them all.
       # `fail_under = 100` on proto/, crypto/ and client/ comes from
@@ -75,7 +75,7 @@ jobs:
         run: conda install -y xrootd
       - name: install
         shell: bash -el {0}
-        run: pip install -e ".[dev,fsspec]"
+        run: pip install -e ".[dev]"
       - name: interop and parity
         shell: bash -el {0}
         run: |
@@ -94,11 +94,13 @@ jobs:
       # failure, which is the only way documentation stays true.
       - run: mkdocs build --strict
 
-  benchmarks:
-    # Informational: a regression shows up as a number in the log, not a
-    # failing job, because a shared runner cannot promise stable timings.
+  performance:
+    # A gate, not a report: every case in benchmarks/compare.py must be won
+    # against the official XRootD bindings on the same runner, by both the
+    # native API and xrdclient.compat. Rounds are paired and interleaved and
+    # a win must pass a one-sided sign test, so a noisy runner cannot turn a
+    # loss into a pass by luck - only into a failure, which is re-runnable.
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
       - uses: conda-incubator/setup-miniconda@v3
@@ -110,9 +112,14 @@ jobs:
         run: conda install -y xrootd
       - shell: bash -el {0}
         run: pip install -e .
-      - shell: bash -el {0}
-        run: python benchmarks/bench.py --size 16 --repeat 3 --json bench.json
-      - uses: actions/upload-artifact@v4
+      - name: loopback
+        shell: bash -el {0}
+        run: python benchmarks/compare.py --gate --size 64 --rounds 15 --json loopback.json
+      - name: 2 ms round trip
+        shell: bash -el {0}
+        run: python benchmarks/compare.py --gate --size 64 --rounds 15 --rtt 2 --json rtt2.json
+      - if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: benchmarks
-          path: bench.json
+          name: performance
+          path: "*.json"

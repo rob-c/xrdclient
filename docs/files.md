@@ -15,7 +15,7 @@ through a `TextIOWrapper`, `shutil.copyfileobj`.
 | Argument | Meaning |
 | --- | --- |
 | `mode` | `r w x a` with `b t +`, exactly as the builtin. Default `"rb"` |
-| `buffering` | `0` raw (binary only), `-1` a 1 MiB buffer, or a size |
+| `buffering` | `0` raw (binary only), `-1` the default buffer (below), or a size |
 | `encoding`, `errors`, `newline` | passed to `io.TextIOWrapper` in text mode |
 | `config` | a [`Config`](config.md) for this file |
 | `router` | share an existing connection |
@@ -23,6 +23,12 @@ through a `TextIOWrapper`, `shutil.copyfileobj`.
 
 The buffer defaults to a megabyte rather than the stdlib's 8 KiB because a
 wide-area round trip costs several orders of magnitude more than a local one.
+A file opened only for writing gets more: one whole window of writes,
+`config.chunk_size * config.bulk_depth` (16 MiB by default), because each
+flush of the buffer is sent as that many pipelined `kXR_write`s and a smaller
+buffer would leave the pipeline empty. Writes bigger than the buffer skip it
+and go to the wire straight from your own buffer. An explicit `buffering`
+is always taken as given.
 
 The signature is overloaded the way typeshed overloads the builtin, so a type
 checker knows what came back:
@@ -92,6 +98,33 @@ finally:
     handle.close()
 ```
 
+### How the bytes move
+
+Reads, writes and vector reads on a `File` run on the
+[bulk data plane](performance.md#the-bulk-data-plane): each request is framed
+directly on the connection and its reply received straight into the buffer it
+is returned in, with several requests in flight at once.
+
+- `write(data, offset)` sends `config.chunk_size` pieces, `config.bulk_depth`
+  of them in flight, each straight from `data` without a copy. A refusal of
+  any piece raises from that `write`, after every other reply in the window
+  has been read, so the connection is fit for the next request and nothing is
+  reported written that the server did not acknowledge.
+- `readv()` sends every batch its ranges need together, so a vector read too
+  big for one request still costs about one round trip.
+- `read(size, offset)` on a handle opened only for reading notices when a read
+  starts where the last one ended, and then fetches `config.readahead` bytes
+  beyond it (1 MiB, doubling while the reads stay sequential, up to 8 MiB);
+  the reads that follow are answered from those bytes without a round trip. A
+  read anywhere else never reads ahead and starts the window again, so random
+  access pays nothing for it. `readahead=0` turns it off. What is read ahead
+  is as fresh as a buffered reader's buffer: a handle that can write never
+  reads ahead.
+
+A server that answers with a conversation rather than bytes - a `kXR_wait`, a
+redirect - gets the same request again the ordinary way, and `config.bulk =
+False` puts everything back on that path.
+
 `open()` takes what `xrdclient.open` takes - `"r"`, `"w"`, `"x"`, `"a"`, `"r+"` -
 or the flag names in a string, or the flags themselves; its second argument
 is the mode a created file gets, and reads either as `0o640` or as
@@ -104,8 +137,8 @@ have already opened is an error rather than a silent re-open.
 
 `readv()` returns one `bytes` per requested range, in the order you asked
 for, no matter how the server batches or reorders the reply. Requests larger
-than the server's advertised limits are split into as few round trips as the
-limits allow.
+than the server's advertised limits are split into as few requests as the
+limits allow, and those go out together, `config.bulk_depth` at a time.
 
 ```python
 ranges = [(off, 128 << 10) for off in offsets]
@@ -256,6 +289,10 @@ p.touch(), p.unlink(), p.rmdir(), p.rename(other), p.replace(other)
 p.read_bytes(), p.write_text("hi"), p.open("rb")
 p.checksum(), p.chmod(0o640), p.locate()      # chmod also takes "rw-r-----"
 ```
+
+`relative_to` follows `pathlib`: it raises `ValueError` when the base is not
+an ancestor or is on another endpoint, rather than answering with `..`;
+`walk_up=True` asks for the `..` form, on every Python version.
 
 A path holds a connection once it has used one; `close()` returns it, and
 `with` does that for you.

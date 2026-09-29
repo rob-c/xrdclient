@@ -53,8 +53,8 @@ read:
 Three places are honestly `Any`, and are annotated as such rather than being
 papered over:
 
-- **`gssapi`** and **`google_crc32c`** ship no stubs, and both are optional
-  extras reached through a guarded import.
+- **`google_crc32c`** ships no stubs; it is an optional accelerator reached
+  through a guarded import, and nothing needs it.
 - **`fsspec`** ships no `py.typed`, so `AbstractFileSystem` is `Any` and
   `xrdclient.fsspec_impl` is the one module allowed to subclass an untyped base.
 - **`copy(source, target)`** takes a URL, a `str`, an `os.PathLike`, an

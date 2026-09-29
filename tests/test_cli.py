@@ -988,3 +988,131 @@ def test_continue_needs_a_target_it_is_allowed_to_extend(url, tmp_path, capsys, 
 def test_a_third_party_copy_cannot_pretend(url, tmp_path, capsys, flag):
     code = cp_cli.main(["--tpc", flag, url + "data/a.root", url + "b.root"])
     assert (code, "--tpc" in capsys.readouterr().err) == (2, True)
+
+
+# ---------------------------------------------------------------------------
+# xrd-cp: a trailing slash on SOURCE means its contents (rsync's convention)
+# ---------------------------------------------------------------------------
+
+
+def _files_under(root):
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
+
+
+def _copied(capsys):
+    return [record["target"] for record in json.loads(capsys.readouterr().out)]
+
+
+def test_a_repeated_sync_of_source_contents_copies_only_what_changed(local_tree, tmp_path, capsys):
+    """``SRC/`` pins the target to DEST itself, so run two cannot nest into DEST/tree.
+
+    Without the slash, ``cp -r`` semantics put the tree *inside* an existing
+    DEST - which it is from the second run on - so a repeated sync could
+    never find what the first one copied.
+    """
+    dest = tmp_path / "mirror"
+    argv = ["-r", "--json", "--sync", "size", str(local_tree) + "/", str(dest)]
+
+    assert cp_cli.main(argv) == 0
+    assert len(_copied(capsys)) == 3
+    assert _files_under(dest) == ["keep.root", "skip.log", "sub/deep.root"]
+
+    assert cp_cli.main(argv) == 0
+    assert _copied(capsys) == []
+
+    (local_tree / "sub" / "deep.root").write_bytes(b"deeper")
+    assert cp_cli.main(argv) == 0
+    (changed,) = _copied(capsys)
+    assert changed.endswith("/mirror/sub/deep.root")
+    assert (dest / "sub" / "deep.root").read_bytes() == b"deeper"
+    assert _files_under(dest) == ["keep.root", "skip.log", "sub/deep.root"]
+
+
+def test_a_repeated_sync_of_source_contents_to_a_server_does_not_nest(
+    local_tree, url, server, capsys
+):
+    argv = ["-r", "-q", "--sync", "size", str(local_tree) + "/", url + "flat"]
+    assert cp_cli.main(argv) == 0
+    assert cp_cli.main(argv) == 0
+    assert sorted(p for p in server.files if p.startswith("/flat")) == [
+        "/flat/keep.root",
+        "/flat/skip.log",
+        "/flat/sub/deep.root",
+    ]
+
+
+def test_without_the_slash_an_existing_directory_still_receives_the_tree(
+    local_tree, tmp_path, capsys
+):
+    """``cp -r SRC DIR`` puts SRC inside DIR when DIR exists, as cp does."""
+    dest = tmp_path / "into"
+    dest.mkdir()
+    assert cp_cli.main(["-r", "-q", str(local_tree), str(dest)]) == 0
+    assert _files_under(dest) == ["tree/keep.root", "tree/skip.log", "tree/sub/deep.root"]
+
+
+def test_the_help_explains_the_trailing_slash(capsys):
+    with pytest.raises(SystemExit):
+        cp_cli.main(["--help"])
+    assert "contents" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# xrd-cp --tpc: every flag is either honoured or refused
+# ---------------------------------------------------------------------------
+
+
+def _answer_checksum(srv, value):
+    from xrdclient.proto import constants as c
+    from xrdclient.testing import frame
+
+    srv.handlers[c.kXR_query] = lambda conn, sid, params, body: iter(
+        [frame(sid, c.kXR_ok, f"adler32 {value}\x00".encode())]
+    )
+
+
+def test_a_verified_third_party_copy_compares_both_ends(url, capsys):
+    import zlib
+
+    with FakeServer(dirs=["/"]) as destination:
+        # The fake does not really pull, so it is told what a real one would hold.
+        _answer_checksum(destination, f"{zlib.adler32(BODY):08x}")
+        code = cp_cli.main(
+            ["--tpc", "--verify", "--json", url + "data/a.root", str(destination.url) + "p"]
+        )
+    assert code == 0
+    record = json.loads(capsys.readouterr().out)[0]
+    assert (record["verified"], record["checksum"]) == (True, f"adler32:{zlib.adler32(BODY):08x}")
+
+
+def test_a_third_party_copy_that_does_not_match_fails(url, capsys):
+    with FakeServer(dirs=["/"]) as destination:
+        _answer_checksum(destination, "00000001")
+        code = cp_cli.main(["--tpc", "--verify", url + "data/a.root", str(destination.url) + "p"])
+    assert code == 1
+    assert "mismatch" in capsys.readouterr().err
+
+
+def test_naming_an_algorithm_for_a_third_party_copy_asks_for_verification(url, capsys):
+    with FakeServer(dirs=["/"]) as destination:
+        _answer_checksum(destination, "00000001")
+        code = cp_cli.main(
+            ["--tpc", "-a", "adler32", url + "data/a.root", str(destination.url) + "p"]
+        )
+    assert code == 1
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["-r"],
+        ["--chunk-size", "1M"],
+        ["--stripes", "2"],
+        ["--streams", "2"],
+        ["--in-flight", "2"],
+    ],
+)
+def test_a_third_party_copy_refuses_what_it_cannot_honour(url, capsys, argv):
+    code = cp_cli.main(["--tpc", *argv, url + "data/a.root", url + "b.root"])
+    err = capsys.readouterr().err
+    assert (code, "--tpc" in err, argv[0] in err) == (2, True, True)

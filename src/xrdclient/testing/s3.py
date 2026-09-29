@@ -74,6 +74,12 @@ class FakeS3Server:
         #: Report a failure in the body of an otherwise successful completion,
         #: which is exactly how S3 reports one.
         self.complete_fails = False
+        #: Part numbers to refuse with a 500, once each: a part lost on the
+        #: way in, which the rest of the upload must not paper over.
+        self.failing_parts: set[int] = set()
+        #: Report a failure in the body of an otherwise successful copy,
+        #: which S3 does for ``CopyObject`` exactly as it does for completion.
+        self.copy_fails = False
         #: Refuse every request, whatever it is signed with.
         self.forbidden = False
 
@@ -346,6 +352,9 @@ class _Handler(BaseHTTPRequestHandler):
         if data is None:
             self._error(404, "NoSuchKey")
             return
+        if self.fake.copy_fails:
+            self._send(200, b"<Error><Code>InternalError</Code></Error>")
+            return
         self.fake.objects[key] = data
         self._send(
             200,
@@ -358,6 +367,10 @@ class _Handler(BaseHTTPRequestHandler):
         parts = self.fake.uploads.get(upload)
         if parts is None or not number:
             self._error(404, "NoSuchUpload")
+            return
+        if number in self.fake.failing_parts:
+            self.fake.failing_parts.discard(number)
+            self._error(500, "InternalError")
             return
         parts[number] = body
         self._send(200, b"", ETag=f'"{_md5(body)}"')

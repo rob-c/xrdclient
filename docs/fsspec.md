@@ -1,10 +1,12 @@
 # fsspec
 
 ```console
-$ pip install xrdclient[fsspec]
+$ pip install xrdclient fsspec
 ```
 
-That is the whole setup. The schemes register themselves through entry
+That is the whole setup, and pandas, dask and pyarrow already bring `fsspec`
+with them. This package does not depend on it: the adapter is only loaded by
+`fsspec` itself. The schemes register themselves through entry
 points, so nothing has to be imported by hand:
 
 ```python
@@ -45,6 +47,30 @@ fs.glob("/store/**/*.root")
 fs.put("/tmp/f.root", "/store/f.root")
 fs.get("/store/f.root", "/tmp/f.root")
 ```
+
+`cat_file` and `cat_ranges` read their bounds as a Python slice does:
+`None` is the matching end of the file, a negative bound counts back from
+the end (`fs.cat_file(path, start=-1024)` is the last kilobyte), and a range
+past either end is clamped. `ls` of a file is a one-element listing of that
+file, as fsspec expects.
+
+## More than one server
+
+An instance names paths on its own endpoint bare (`/store/f.root`), as
+fsspec-xrootd does, and `fs.unstrip_protocol(name)` turns one back into a
+full URL. A full URL to any *other* server is honoured, and the names `ls`,
+`find`, `glob` and `info` return for it keep that server in them, so they
+can be handed straight back to the same instance:
+
+```python
+fs = fsspec.filesystem("root", endpoint="root://eos.example.org")
+fs.glob("root://other.example.org//store/*.root")
+# ['root://other.example.org:1094//store/a.root', ...]
+```
+
+`mv` within one server is a rename. Between two it is a copy whose checksum
+is verified before the source is deleted, as `xrdclient.move` does; a
+directory needs `recursive=True`.
 
 ## Connections are shared
 

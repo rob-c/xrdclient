@@ -6,11 +6,11 @@ ordered by :attr:`~xrdclient.config.Config.auth_order`. Every mechanism register
 unconditionally, because a zero-dependency install can genuinely attempt
 ``gsi``, ``ztn``, ``sss``, ``unix`` and ``host`` — all five are pure Python.
 
-``krb5`` registers too, and reads your credential cache without help, but the
-exchange needs :mod:`gssapi`. With no ticket and no module it stays quiet and
-the ladder moves on; with a live ticket and no module it raises, so that
-:func:`select` records *why* rather than falling through to ``unix`` with a
-perfectly good ticket sitting there.
+``krb5`` is pure Python too: it reads the credential cache, asks the KDC for a
+service ticket when the cache holds only a TGT, and builds the AP-REQ itself
+(:mod:`xrdclient.auth.kerberos`). With no ticket it stays quiet and the ladder
+moves on; with one that has expired it raises, so that :func:`select` records
+*why* rather than falling through to ``unix`` and leaving the cause unsaid.
 
 A mechanism that raises from ``available()`` is never fatal: :func:`select`
 catches it, records the reason, and carries on to the next one.

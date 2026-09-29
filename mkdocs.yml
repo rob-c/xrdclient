@@ -42,7 +42,9 @@ nav:
       - fsspec: fsspec.md
       - Command line: cli.md
       - Safety: safety.md
-  - Coming from pyxrootd: migrating.md
+  - Coming from pyxrootd:
+      - Migrating: migrating.md
+      - Compatibility layer: compat.md
   - Reference:
       - API: api.md
       - Configuration: config.md

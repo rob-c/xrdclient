@@ -1,41 +1,58 @@
-"""``krb5`` — Kerberos 5, over a GSSAPI the platform already trusts.
+"""``krb5`` — Kerberos 5, in pure Python.
 
-The credential blob is ``"krb5\\0"`` followed by a marshalled AP-REQ for the
-service principal the server names in its offer (``xrootd/host@REALM``).
-Producing that AP-REQ means holding a service ticket and encrypting an
-authenticator under its session key.
+The credential XRootD's ``krb5`` security plugin expects is ``"krb5\\0"``
+followed by a raw AP-REQ (RFC 4120 section 3.2) for the service principal
+the server names in its offer - ``xrootd/host@REALM`` - exactly what MIT's
+``krb5_mk_req_extended`` produces and the server's ``krb5_rd_req`` checks
+against its keytab. It is not a GSS-API token: the plugin never calls
+GSS-API, and would reject one.
 
-**This module does not do that in Python.** Everything else in this package
-is pure Python because the alternative was a compiled extension for a wire
-format that is fully specified. Kerberos is different: an AP-REQ this client
-built could only be validated against a live KDC, and a security exchange
-whose only test is its own decoder is worse than no implementation at all.
-So the token comes from :mod:`gssapi` — the platform's MIT or Heimdal
-library, the one the KDC administrator already tests against — and this
-module is the framing and the discovery around it.
+Building it takes a service ticket and its session key. Both come from the
+FILE credential cache ``kinit`` wrote; if the cache holds only the
+ticket-granting ticket, a TGS exchange with the KDC named in ``krb5.conf``
+gets the service ticket first - the step ``kinit`` leaves to the first
+program that needs it. The new ticket is kept in memory for this process
+and never written back to the cache. When the server runs with ``-exptkn``
+(its offer ends ``,fwd``) it then asks for the TGT itself, and gets a
+forwarded one in a KRB-CRED.
 
-What *is* pure Python is everything that does not need the KDC: the FILE
-credential-cache reader below. It is what makes the difference between
-"authentication failed" and "your Kerberos ticket expired 40 minutes ago";
-it works with no extra installed, and :func:`tickets` is public so a script
-can ask the same question.
+This is all done here rather than through a system GSS-API library, which
+is what makes the package installable with no compiler and no extra - and
+it is proven the only way a security exchange can be: by RFC test vectors
+for the cryptography, and by a real MIT KDC and a real ``xrootd`` accepting
+what it builds (``tests/test_krb5_interop.py``).
 
-Install the mechanism with ``pip install xrdclient[krb5]``.
+What is not supported, each with an error that says so: ``kinit`` itself
+(the AS exchange), cross-realm service tickets, KDC discovery through DNS,
+credential caches that are not files (``KCM:``, ``KEYRING:``, ``API:``),
+and single-DES, triple-DES and RC4 keys.
 """
 
 from __future__ import annotations
 
-import os
-import struct
-import time
-from dataclasses import dataclass
-from typing import Any
+import threading
 
-from .._compat import SLOTS
 from .._log import get_logger
 from ..config import Config
 from ..errors import CredentialError
 from .base import Credential, Offer
+
+# The cache format's names were this module's before the reader moved into
+# :mod:`.kerberos.ccache`; they are re-exported so that code naming them here
+# keeps working.
+from .kerberos.ccache import CCACHE_VERSION_3 as CCACHE_VERSION_3
+from .kerberos.ccache import CCACHE_VERSION_4 as CCACHE_VERSION_4
+from .kerberos.ccache import _Reader as _Reader
+from .kerberos.ccache import read_ccache, resolve_ccache
+from .kerberos.model import Principal, Ticket, parse_principal
+from .kerberos.profile import Profile, enctype_list
+from .kerberos.tgs import (
+    KDC_OPT_FORWARDABLE,
+    KDC_OPT_FORWARDED,
+    build_ap_req,
+    build_krb_cred,
+    request_ticket,
+)
 
 __all__ = [
     "KerberosCredential",
@@ -49,167 +66,35 @@ __all__ = [
 
 _log = get_logger(__name__)
 
-#: The FILE credential cache format this reader understands (``0x0504``).
-CCACHE_VERSION_4 = 0x0504
-CCACHE_VERSION_3 = 0x0503
+PROTOCOL = b"krb5\x00"
 
+#: The server's challenge when it wants a forwarded TGT (``-exptkn``).
+FORWARD_CHALLENGE = b"fwdtgt"
 
-@dataclass(frozen=True, **SLOTS)
-class Principal:
-    """A Kerberos principal: components and a realm."""
+#: MIT's default ``default_tgs_enctypes`` order, restricted to what this client does.
+DEFAULT_ENCTYPES = (18, 17, 20, 19)
 
-    components: tuple[str, ...]
-    realm: str
-    name_type: int = 0
-
-    def __str__(self) -> str:
-        return "/".join(self.components) + (f"@{self.realm}" if self.realm else "")
-
-    def __bool__(self) -> bool:
-        return bool(self.components)
-
-
-@dataclass(frozen=True, **SLOTS)
-class Ticket:
-    """One credential-cache entry."""
-
-    client: Principal
-    server: Principal
-    enctype: int
-    auth_time: int
-    start_time: int
-    end_time: int
-    renew_till: int
-    flags: int
-    der: bytes = b""
-
-    @property
-    def expired(self) -> bool:
-        return self.end_time != 0 and self.end_time <= time.time()
-
-    def remaining(self) -> float:
-        """Seconds of validity left; negative once expired."""
-        return self.end_time - time.time()
-
-    @property
-    def is_tgt(self) -> bool:
-        """True for the ticket-granting ticket, ``krbtgt/REALM@REALM``."""
-        return bool(self.server.components) and self.server.components[0] == "krbtgt"
-
-    def __repr__(self) -> str:
-        return f"Ticket(server={str(self.server)!r}, expires_in={self.remaining():.0f}s)"
-
-
-class _Reader:
-    """A big-endian cursor that refuses to read past the end."""
-
-    __slots__ = ("data", "pos")
-
-    def __init__(self, data: bytes) -> None:
-        self.data = data
-        self.pos = 0
-
-    def take(self, count: int) -> bytes:
-        if count < 0 or self.pos + count > len(self.data):
-            raise ValueError(f"credential cache truncated at offset {self.pos}")
-        out = self.data[self.pos : self.pos + count]
-        self.pos += count
-        return out
-
-    def u16(self) -> int:
-        return int(struct.unpack(">H", self.take(2))[0])
-
-    def u32(self) -> int:
-        return int(struct.unpack(">I", self.take(4))[0])
-
-    def blob(self) -> bytes:
-        return self.take(self.u32())
-
-    @property
-    def exhausted(self) -> bool:
-        return self.pos >= len(self.data)
-
-
-def _read_principal(reader: _Reader) -> Principal:
-    """One principal, in the layout versions 3 and 4 share."""
-    name_type = reader.u32()
-    count = reader.u32()
-    realm = reader.blob().decode("utf-8", "replace")
-    components = tuple(reader.blob().decode("utf-8", "replace") for _ in range(count))
-    return Principal(components, realm, name_type)
-
-
-def read_ccache(path: str) -> tuple[Principal, list[Ticket]]:
-    """Parse a FILE credential cache into its default principal and tickets.
-
-    Versions 3 and 4 are read; both are what MIT and Heimdal write. Entries
-    that will not parse end the scan rather than raising, because a cache
-    being rewritten under us should cost the tail, not the whole answer.
-    """
-    with open(path, "rb") as handle:
-        reader = _Reader(handle.read())
-    version = reader.u16()
-    if version not in (CCACHE_VERSION_3, CCACHE_VERSION_4):
-        raise ValueError(f"unsupported credential cache version 0x{version:04x} in {path}")
-    if version == CCACHE_VERSION_4:
-        reader.take(reader.u16())  # header tags: none of them matter here
-    default = _read_principal(reader)
-
-    out: list[Ticket] = []
-    while not reader.exhausted:
-        try:
-            client = _read_principal(reader)
-            server = _read_principal(reader)
-            enctype = reader.u16()
-            if version == CCACHE_VERSION_3:
-                reader.u16()  # version 3 wrote the enctype twice
-            key = reader.blob()
-            auth_time, start_time, end_time, renew_till = (reader.u32() for _ in range(4))
-            reader.take(1)  # is_skey
-            flags = reader.u32()
-            for _ in range(reader.u32()):  # addresses
-                reader.u16()
-                reader.blob()
-            for _ in range(reader.u32()):  # authorization data
-                reader.u16()
-                reader.blob()
-            der = reader.blob()
-            reader.blob()  # second ticket, used only for user-to-user
-        except (ValueError, struct.error) as exc:
-            _log.debug("credential cache %s ends early: %s", path, exc)
-            break
-        del key  # the session key stays in the cache; nothing here needs it
-        out.append(
-            Ticket(
-                client=client,
-                server=server,
-                enctype=enctype,
-                auth_time=auth_time,
-                start_time=start_time,
-                end_time=end_time,
-                renew_till=renew_till,
-                flags=flags,
-                der=der,
-            )
-        )
-    return default, out
+#: Service tickets fetched from the KDC, by (cache, client, service). A
+#: process that opens many connections to one server asks the KDC once.
+_FETCHED: dict[tuple[str, str, str], Ticket] = {}
+_FETCHED_LOCK = threading.Lock()
 
 
 def default_ccache_path(config: Config | None = None) -> str:
-    """``$KRB5CCNAME`` with its ``FILE:`` prefix stripped, else ``/tmp/krb5cc_<uid>``."""
-    name = os.environ.get("KRB5CCNAME", "")
-    if name.startswith("FILE:"):
-        return name[5:]
-    if name and ":" not in name:
-        return name
-    return f"/tmp/krb5cc_{os.geteuid()}"
+    """The file the default credential cache lives in, as MIT would find it.
+
+    ``$KRB5CCNAME``, else ``default_ccache_name`` from ``krb5.conf``, else
+    ``/tmp/krb5cc_<uid>``. Raises :class:`~xrdclient.errors.CredentialError`
+    for a cache that is not a file (``KCM:``, ``KEYRING:``, ...).
+    """
+    return resolve_ccache()
 
 
 def tickets(path: str | None = None) -> list[Ticket]:
     """Every unexpired ticket in the credential cache. Empty if there is none."""
     try:
         _default, found = read_ccache(path or default_ccache_path())
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, CredentialError) as exc:
         _log.debug("no usable credential cache: %s", exc)
         return []
     return [ticket for ticket in found if not ticket.expired]
@@ -218,85 +103,151 @@ def tickets(path: str | None = None) -> list[Ticket]:
 def service_principal(offer: Offer, host: str) -> str:
     """The principal to ask for a ticket to.
 
-    The server names it in the offer's parameters; when it does not, the
-    convention is ``xrootd/<host>``. The realm is dropped, because GSSAPI
-    derives it from the instance and a stale realm in an offer is a common
-    way to fail confusingly.
+    The server names it - realm and all - as the first parameter of its
+    offer; when it does not, the convention is ``xrootd/<host>``, and the
+    realm is found from ``krb5.conf`` by :meth:`KerberosCredential.available`.
     """
     named = offer.params.split(",")[0].strip() if offer.params else ""
     if not named or ":" in named:
         named = f"xrootd/{host}" if host else "xrootd"
-    return named.partition("@")[0]
+    return named
+
+
+def wants_forwarding(offer: Offer) -> bool:
+    """Whether the server runs with ``-exptkn`` and will ask for the TGT."""
+    return "fwd" in (part.strip() for part in offer.params.split(",")[1:])
+
+
+def _target(offer: Offer, host: str, profile: Profile, client: Principal) -> Principal:
+    """The service principal, with a realm: named, else mapped from the host, else the client's."""
+    target = parse_principal(service_principal(offer, host))
+    if target.realm:
+        return target
+    instance = target.components[1] if len(target.components) > 1 else host
+    realm = profile.realm_for_host(instance) or client.realm
+    return Principal(target.components, realm, target.name_type)
+
+
+def _etypes(profile: Profile) -> list[int]:
+    for tag in ("default_tgs_enctypes", "permitted_enctypes"):
+        configured = profile.libdefault(tag)
+        if configured:
+            found = enctype_list(configured)
+            if found:
+                return found
+    return list(DEFAULT_ENCTYPES)
+
+
+def _expired(path: str, found: list[Ticket]) -> CredentialError:
+    latest = max(found, key=lambda ticket: ticket.end_time)
+    minutes = int(-latest.remaining() // 60)
+    return CredentialError(
+        f"the Kerberos tickets for {latest.client} in {path} expired {minutes} minutes ago; "
+        "run kinit"
+    )
+
+
+def _tgt(path: str, client: Principal, live: list[Ticket]) -> Ticket:
+    home = Principal(("krbtgt", client.realm), client.realm)
+    for ticket in live:
+        if ticket.server.same_name(home) and ticket.key:
+            return ticket
+    raise CredentialError(
+        f"no live ticket-granting ticket for {client.realm} in {path} to get a service "
+        "ticket with; run kinit"
+    )
+
+
+def _service_ticket(
+    path: str, client: Principal, live: list[Ticket], target: Principal, profile: Profile
+) -> Ticket:
+    """A ticket for ``target``: from the cache, from memory, or from the KDC."""
+    for ticket in live:
+        if ticket.server.same_name(target) and ticket.key:
+            return ticket
+    slot = (path, str(client), str(target))
+    with _FETCHED_LOCK:
+        held = _FETCHED.get(slot)
+    if held is not None and held.remaining() > 60:
+        return held
+    ticket = request_ticket(_tgt(path, client, live), target, profile, etypes=_etypes(profile))
+    with _FETCHED_LOCK:
+        _FETCHED[slot] = ticket
+    return ticket
+
+
+def _forwarded_tgt(path: str, client: Principal, live: list[Ticket], profile: Profile) -> Ticket:
+    tgt = _tgt(path, client, live)
+    if not tgt.forwardable:
+        raise CredentialError(
+            "the server runs with -exptkn and wants a forwarded ticket-granting ticket, but "
+            f"the one in {path} is not forwardable; run kinit -f"
+        )
+    return request_ticket(
+        tgt,
+        tgt.server,
+        profile,
+        etypes=_etypes(profile),
+        options=KDC_OPT_FORWARDED | KDC_OPT_FORWARDABLE,
+    )
 
 
 class KerberosCredential(Credential):
-    """``krb5`` — a GSSAPI context against the server's service principal."""
+    """``krb5`` — a raw AP-REQ for the server's principal, and a forwarded TGT if asked."""
 
-    __slots__ = ("principal", "_context", "_established")
+    __slots__ = ("principal", "_ticket", "_forward", "_forwarded")
     name = "krb5"
 
-    def __init__(self, principal: str) -> None:
+    def __init__(
+        self, principal: str, ticket: Ticket | None = None, *, forward: Ticket | None = None
+    ) -> None:
         self.principal = principal
-        # ``gssapi.SecurityContext``; the module is optional, so it is only
-        # named where an import of it is guarded.
-        self._context: Any = None
-        self._established = False
+        self._ticket = ticket
+        self._forward = forward
+        self._forwarded = False
 
     def initial(self) -> bytes:
-        return b"krb5\x00" + self._advance(None)
+        if self._ticket is None:
+            raise CredentialError(f"no service ticket for {self.principal}")
+        return PROTOCOL + build_ap_req(self._ticket)
 
     def step(self, challenge: bytes) -> bytes | None:
-        if self._established:
+        if self._forwarded:
             return None
-        token = self._advance(challenge)
-        return b"krb5\x00" + token if token else None
-
-    def _advance(self, token: bytes | None) -> bytes:
-        """Drive the GSSAPI context one round, importing the module lazily."""
-        try:
-            import gssapi
-        except ImportError as exc:  # pragma: no cover - the extra is not installed
+        if not challenge.startswith(FORWARD_CHALLENGE):
+            raise CredentialError(f"unexpected krb5 challenge from the server: {challenge[:16]!r}")
+        if self._forward is None or self._ticket is None:
             raise CredentialError(
-                "krb5 authentication needs the gssapi module: "
-                "pip install xrdclient[krb5]"
-            ) from exc
-        if self._context is None:
-            target = gssapi.Name(self.principal, gssapi.NameType.kerberos_principal)
-            self._context = gssapi.SecurityContext(name=target, usage="initiate")
-        context = self._context
-        try:
-            out = context.step(token)
-        except Exception as exc:  # gssapi raises its own hierarchy
-            raise CredentialError(f"Kerberos exchange failed: {exc}") from exc
-        self._established = bool(getattr(context, "complete", False))
-        if not out and not self._established:
-            raise CredentialError("the Kerberos exchange produced no token and did not complete")
-        return bytes(out or b"")
+                "the server asked for a forwarded ticket-granting ticket without saying so "
+                "in its offer (',fwd'), so none was fetched"
+            )
+        self._forwarded = True
+        return PROTOCOL + build_krb_cred(self._forward, self._ticket)
 
     @classmethod
     def available(
         cls, offer: Offer, config: Config, *, username: str, host: str
     ) -> KerberosCredential | None:
-        path = default_ccache_path(config)
-        live = tickets(path)
-        if os.path.exists(path) and not live:
-            # A cache that exists but holds nothing live is the common case,
-            # and falling through quietly beats a GSSAPI error five layers down.
-            _log.debug("credential cache %s has no unexpired ticket", path)
-            return None
+        profile = Profile.load()
+        path = resolve_ccache(profile=profile)
         try:
-            import gssapi  # noqa: F401
-        except ImportError as exc:
-            if live:
-                # There is a ticket sitting right there. Saying nothing and
-                # falling through to `unix` would be the unhelpful answer.
-                raise CredentialError(
-                    f"a Kerberos ticket for {live[0].client} is available but the gssapi "
-                    "module is not installed: pip install xrdclient[krb5]"
-                ) from exc
-            _log.debug("krb5 offered, but there is no ticket and no gssapi")
+            client, found = read_ccache(path)
+        except FileNotFoundError:
+            _log.debug("no credential cache at %s", path)
             return None
-        return cls(service_principal(offer, host))
+        except (OSError, ValueError) as exc:
+            raise CredentialError(
+                f"the Kerberos credential cache {path} is unreadable: {exc}"
+            ) from exc
+        live = [ticket for ticket in found if not ticket.expired]
+        if not live:
+            if found:
+                raise _expired(path, found)
+            return None
+        target = _target(offer, host, profile, client)
+        ticket = _service_ticket(path, client, live, target, profile)
+        forward = _forwarded_tgt(path, client, live, profile) if wants_forwarding(offer) else None
+        return cls(str(target), ticket, forward=forward)
 
     def __repr__(self) -> str:
         return f"KerberosCredential(principal={self.principal!r})"

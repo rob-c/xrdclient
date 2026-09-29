@@ -82,8 +82,10 @@ which is where that work now lives.
 - **The reference server is `xrdclient.testing.FakeServer`**, written fresh rather
   than grown from `pyxrdcp/tests/_refserver.py`, and is tested in its own
   right (`tests/test_testing.py`) because it is public API.
-- **The `(status, result)` compat shim is dropped.** It is the one piece of
-  pyxrootd whose absence is the point: see the decision log.
+- **The `(status, result)` compat shim was dropped, then built after all**
+  (2026-09-28), as `xrdclient.compat` beside the native API rather than in
+  it: the native API still raises, and code written for the official
+  bindings ports by changing one import. See the decision log.
 - **No `httpx`, and so no `[http]` extra.** `http.client` does everything
   Phase 6 needs — keep-alive, ranged `GET`, chunked `PUT`, arbitrary verbs for
   WebDAV — so taking a dependency would buy HTTP/2 at the cost of the property
@@ -520,8 +522,9 @@ code*, which is how it actually gets adopted.
 **Done when:** `uproot.open("root://...")` reads a real ROOT file through our
 fsspec backend, and a pyxrootd script runs unmodified against `compat`. **v0.6.**
 
-**Status: done**, minus the compat shim, which the decision log dropped on
-purpose. As built:
+**Status: done.** The compat shim was dropped at first and built on
+2026-09-28 as `xrdclient.compat.client`, parity-tested against the official
+bindings. As built:
 
 - **`fsspec_impl.py`** — `XRootDFileSystem` for `root`, `roots` and `xroot`,
   plus `HTTPXRootDFileSystem` for `dav`, `davs` and `webdav`: six registered

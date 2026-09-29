@@ -11,10 +11,10 @@ a stock destination cannot parse it, and a stock source cannot match its
 
 from __future__ import annotations
 
+import dataclasses
 import secrets
 import time
 
-from ..client import FileSystem
 from ..config import Config
 from ..flags import Access, OpenFlags
 from ..proto import constants as c
@@ -23,7 +23,7 @@ from ..proto import responses as rp
 from ..proto.frames import Request
 from ..session import Router
 from ..url import XRootDURL, parse
-from .engine import CopyResult
+from .engine import CopyResult, _compare_ends
 
 __all__ = ["third_party"]
 
@@ -71,6 +71,8 @@ def third_party(
     posc: bool = True,
     token_mode: str = "",
     timeout: float | None = None,
+    verify: bool = False,
+    algorithm: str | None = None,
 ) -> CopyResult:
     """Ask the destination server to pull ``source`` directly.
 
@@ -88,59 +90,113 @@ def third_party(
     The transfer is complete when this returns; over ``root://`` the final
     ``kXR_sync`` blocks until the destination has finished, which the server
     may report through a ``kXR_waitresp`` deferral.
+
+    No byte passes through this process, so there is no stream to digest.
+    ``verify`` instead asks both servers for their checksum of the file once
+    the transfer is done - ``algorithm``, or ``config.preferred_checksum`` -
+    and raises :class:`~xrdclient.errors.ChecksumMismatchError` if they
+    differ, or the server's error if either end cannot answer: verification
+    asked for by name is never skipped quietly.
     """
     cfg = config or Config()
     su, du = parse(source), parse(target)
     if su.is_http and du.is_http:
-        return _http_copy(su, du, cfg, overwrite, token_mode, timeout)
-    _require_root_pair(su, du)
-    cfg = _timeout_config(cfg, timeout)
+        result = _http_copy(su, du, cfg, overwrite, token_mode, timeout)
+    else:
+        _require_root_pair(su, du)
+        cfg = _timeout_config(cfg, timeout)
+        result = _root_copy(su, du, cfg, overwrite=overwrite, posc=posc, token_mode=token_mode)
+    if not verify:
+        return result
+    checksum = _compare_ends(su, du, cfg, algorithm or cfg.preferred_checksum, strict=True)
+    return dataclasses.replace(result, checksum=checksum)
 
+
+def _root_copy(
+    su: XRootDURL, du: XRootDURL, cfg: Config, *, overwrite: bool, posc: bool, token_mode: str
+) -> CopyResult:
+    """The ``XrdOucTPC`` rendezvous, in the order ``XrdCl`` runs it.
+
+    Both routers here are sticky - a redirect moves the router, not just the
+    one request - because what the rendezvous needs to know is where each
+    end *landed*: the source is told which host will pull (``tpc.dst``) and
+    the destination which host to pull from (``tpc.src``), and behind a
+    redirector neither is the host named in the URL.
+    """
     key = secrets.token_hex(16)
     started = time.monotonic()
 
-    # 1. Placement: the source session follows any cluster redirect, so its
-    #    live endpoint is the data server the destination must pull from.
-    with FileSystem(su.with_path("/"), cfg) as src_fs:
-        size = src_fs.stat(su.path).st_size
-        src_endpoint = src_fs.endpoint
+    src_router = Router(su.with_path("/"), cfg)
+    dst_router = Router(du.with_path("/"), cfg)
+    try:
+        # 1. Placement: open the source as XrdCl does (``tpc.stage=placement``)
+        #    and keep the data server it was redirected to - ``tpcSource``.
+        size = _place_source(src_router, su)
+        opaque = _dst_opaque(key, su, src_router.endpoint, size, token_mode)
+        result = dst_router.execute(
+            r.Open(f"{du.path}?{opaque}", _dst_flags(overwrite, posc), _MODE), path=du.path
+        )
+        # The handle exists only on the server that answered the open, and
+        # the pinned router takes the connection over: the name it is bound
+        # to here is the only one left holding it. That server is also the
+        # host that will connect to the source to pull, which is what a stock
+        # source checks ``tpc.dst`` against - XrdCl's ``realTarget``, taken
+        # from the open's last URL.
+        dst_router = dst_router.pin(transfer=True)
+        handle, _, _ = rp.parse_open(result.data, du.path)
+        puller = dst_router.url.host
+        _rendezvous(src_router, dst_router, handle, su, _src_opaque(key, puller, token_mode))
+        dst_router.execute(r.Close(handle))
+    finally:
+        dst_router.close()
+        src_router.close()
 
-        dst_router = Router(du.with_path("/"), cfg)
-        try:
-            flags = OpenFlags.UPDATE | (OpenFlags.DELETE if overwrite else OpenFlags.NEW)
-            if posc:
-                flags |= OpenFlags.POSC
-            opaque = _dst_opaque(key, su, src_endpoint, size, token_mode)
-            result = dst_router.execute(
-                r.Open(f"{du.path}?{opaque}", int(flags) | c.kXR_retstat, _MODE),
-                path=du.path,
-            )
-            # The handle exists only on the server that answered the open, and
-            # the pinned router takes the connection over: the name it is
-            # bound to here is the only one left holding it.
-            dst_router = dst_router.pin(transfer=True)
-            handle, _, _ = rp.parse_open(result.data, du.path)
+    return CopyResult(
+        source=str(su), target=str(du), size=max(size, 0), seconds=time.monotonic() - started
+    )
 
-            # 2. Arm the rendezvous, then register the key at the source. The
-            #    source open may be deferred until the pull completes.
-            dst_router.execute(r.Sync(handle))
-            src_router = src_fs._router.pin()
-            src_result = src_router.execute(
-                r.Open(f"{su.path}?{_src_opaque(key, du.host, token_mode)}", int(OpenFlags.READ)),
-                path=su.path,
-            )
-            src_handle, _, _ = rp.parse_open(src_result.data, su.path)
 
-            # 3. Trigger the pull and wait for the destination to finish.
-            try:
-                dst_router.execute(r.Sync(handle))
-            finally:
-                _quietly(src_router, r.Close(src_handle))
-            dst_router.execute(r.Close(handle))
-        finally:
-            dst_router.close()
+def _dst_flags(overwrite: bool, posc: bool) -> int:
+    """The destination open's options: create or replace, persist on close."""
+    flags = OpenFlags.UPDATE | (OpenFlags.DELETE if overwrite else OpenFlags.NEW)
+    if posc:
+        flags |= OpenFlags.POSC
+    return int(flags) | c.kXR_retstat
 
-    return CopyResult(source=str(su), target=str(du), size=size, seconds=time.monotonic() - started)
+
+def _place_source(router: Router, source: XRootDURL) -> int:
+    """Open ``source`` for placement, leaving ``router`` on its data server.
+
+    Returns the size the open's ``kXR_retstat`` reported, or ``-1`` for a
+    server that sent none. The handle is closed straight away; the source is
+    opened again, with the key, once the destination has armed the pull.
+    """
+    result = router.execute(
+        r.Open(f"{source.path}?tpc.stage=placement", int(OpenFlags.READ) | c.kXR_retstat),
+        path=source.path,
+    )
+    handle, info, _ = rp.parse_open(result.data, source.path)
+    _quietly(router, r.Close(handle))
+    return info.st_size if info is not None else -1
+
+
+def _rendezvous(
+    src_router: Router, dst_router: Router, handle: bytes, source: XRootDURL, opaque: str
+) -> None:
+    """Arm the pull, register the key at the source, then trigger and wait.
+
+    The source open may be deferred until the pull completes; the final
+    ``kXR_sync`` blocks until the destination has finished.
+    """
+    dst_router.execute(r.Sync(handle))
+    src_result = src_router.execute(
+        r.Open(f"{source.path}?{opaque}", int(OpenFlags.READ)), path=source.path
+    )
+    src_handle, _, _ = rp.parse_open(src_result.data, source.path)
+    try:
+        dst_router.execute(r.Sync(handle))
+    finally:
+        _quietly(src_router, r.Close(src_handle))
 
 
 def _http_copy(

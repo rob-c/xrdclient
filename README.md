@@ -18,21 +18,32 @@ xrdclient.copy("root://a.example.org//store/f.root", "davs://b.example.org/store
 
 It is a Python library first and an XRootD binding second: files are real
 `io` objects, errors are `OSError` subclasses, paths are `PurePath`-shaped,
-and nothing returns a `(status, result)` pair.
+and nothing returns a `(status, result)` pair - except where you ask for
+exactly that. Code written for the official bindings runs by changing one
+import:
+
+```python
+from xrdclient.compat import client        # was: from XRootD import client
+
+status, info = client.FileSystem("root://eos.example.org").stat("/store/f.root")
+```
+
+`xrdclient.compat.client` has every class, method, keyword, flag and response
+field of `XRootD.client`, and a parity suite holds its answers equal to the
+official bindings' on a real server - see
+[docs/compat.md](docs/compat.md).
 
 ## Install
 
 ```console
-$ pip install xrdclient                 # the whole library
-$ pip install xrdclient[fsspec]         # pandas / dask / pyarrow URLs
-$ pip install xrdclient[krb5]           # the Kerberos mechanism
+$ pip install xrdclient                 # the whole library, and nothing else
 ```
 
 Requires Python 3.9+, which is what RHEL 9 and AlmaLinux 9 ship, so the
 system interpreter on a grid login node is enough. Almost nothing needs an
 extra: `http://`, `https://` and WebDAV are `http.client`, S3 is that plus
-`hmac`, and GSI/X.509 proxies are pure Python down to the AES and RSA.
-Kerberos is the one exception — see below.
+`hmac`, and GSI/X.509 proxies and Kerberos are pure Python down to the AES
+and RSA.
 
 ## What it does
 
@@ -195,10 +206,10 @@ timeout an hour into a job) and WLCG / SciTokens / macaroons. TLS on
 `roots://`, `xroots://` and `davs://` — all three present the same proxy as
 the client certificate, so mutual TLS costs no argument.
 
-`krb5` is the one mechanism that needs an extra: it reads your credential
-cache with no help at all, and will tell you when your ticket expired, but the
-exchange itself goes through `gssapi` because a Kerberos token can only
-honestly be tested against a live KDC.
+`krb5` needs nothing but `kinit`: it reads your credential cache, fetches
+the service ticket from the KDC itself when the cache holds only your TGT,
+and will tell you when your ticket expired. It is pure Python too, and
+tested against a real MIT KDC and a real `xrootd`.
 
 At a terminal, a login with no proxy and no token asks for one — naming what
 is missing, where it looked, and the command that produces it — instead of
@@ -245,8 +256,9 @@ in `~/.config/xrd/config.ini` and be selected with `--alias`.
 
 ## fsspec
 
-With the `[fsspec]` extra, `root://`, `roots://`, `xroot://`, `dav://`,
-`davs://` and `webdav://` are registered URL schemes:
+Wherever `fsspec` is installed - pandas, dask and pyarrow bring it - `root://`,
+`roots://`, `xroot://`, `dav://`, `davs://` and `webdav://` are registered URL
+schemes, with nothing to import:
 
 ```python
 import pandas as pd

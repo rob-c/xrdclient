@@ -35,7 +35,7 @@ Same daemon, same files, both clients, field by field. Anything this library
 reports that `XRootD.client` does not is a bug in one of them, and the
 disagreement is worth more than either answer alone.
 
-The two libraries deliberately differ in shape - exceptions here, `(status,
+The native API deliberately differs in shape - exceptions here, `(status,
 result)` tuples there; `bytes` here, buffers there - so the suite asserts that
 the *values* agree: the same size, the same mtime, the same flags, the same
 checksum, the same directory listing, the same bytes at the same offsets.
@@ -188,3 +188,11 @@ them - by name, which is more than the language said.
 ## Coming from `pyxrootd`
 
 See [Coming from pyxrootd](migrating.md) for the call-by-call mapping.
+
+## The compatibility layer
+
+[`xrdclient.compat.client`](compat.md) is the one place the shapes are meant
+to match too, and `tests/test_pyxrootd_compat.py` holds it to that: every
+covered call goes through both libraries against the same daemon, and the
+`(XRootDStatus, response)` pairs must be equal attribute for attribute,
+statuses' codes and errnos included. It runs under the same `-m parity`.

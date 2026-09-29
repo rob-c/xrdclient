@@ -49,9 +49,44 @@ be undone on cancellation belongs in a `finally:`.
 
 ## What is mirrored
 
-Everything: `FileSystem` and all of its methods, `File`, `open`, `copy`,
-`copy_tree`, `third_party`. The scheme still selects the implementation, so
-`davs://` works here exactly as it does synchronously.
+Everything: `FileSystem` and all of its methods (the `move` and `unlink`
+spellings included), `File`, `open`, `copy`, `copy_tree`, `third_party`, and
+every one-line verb from [the easy API](easy.md) under the same name. The
+scheme still selects the implementation, so `davs://` works here exactly as it
+does synchronously. A test compares the two surfaces name by name, so a sync
+method added without its mirror fails the suite rather than going missing here.
+
+```python
+import xrdclient.aio as aio
+
+if await aio.exists("root://host//store/f.root"):
+    blob = await aio.read_bytes("root://host//store/f.root")
+paths = await aio.glob("root://host//store/run7/**/*.root")   # a list, not an iterator
+await aio.mkdir("root://host//store/out")
+await aio.move("root://host//store/tmp.root", "root://host//store/out/f.root")
+request = await aio.stage(paths, priority=1)
+```
+
+An open file has the positional and per-handle calls too. `pread` and `pwrite`
+go to the server past the file's buffer, leaving the cursor alone; pending
+buffered writes are flushed first so they land in order, but bytes already
+read ahead into the buffer are not refreshed, so open with `buffering=0` to
+mix `pwrite` with cursor reads of the same range.
+
+```python
+async with xrdclient.aio.open(url, "r+b") as fh:
+    header = await fh.pread(64, 0)       # the cursor has not moved
+    await fh.pwrite(b"v2", 4)
+    await fh.setxattr("run", b"7")       # on the open handle, not the path
+    print(await fh.listxattr(), await fh.size())
+    await fh.verify("1a0b045d")          # adler32 unless told otherwise
+```
+
+`File.size` is a property synchronously and a coroutine here, `await fh.size()`,
+because it can cost a round trip. Only `open`, `handle` and `session` have no
+mirror: an `AsyncFile` is born open, and the other two are protocol plumbing
+reachable through `fh.file`. `fs.walk` takes `os.walk`'s arguments; its
+`onerror` is called on the worker thread, not the event loop.
 
 ```python
 result = await xrdclient.aio.copy("root://a//store/f.root", "/scratch/f.root")

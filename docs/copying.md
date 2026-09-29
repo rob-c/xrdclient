@@ -239,6 +239,17 @@ server asking another for the file in a language it understands. A mixed
 pair raises, and `copy()` is the answer - it streams through this process,
 which is what a mixed pair needs anyway.
 
+Over `root://` the rendezvous names the servers that actually hold each end,
+as `XrdCl` does: `tpc.src` is the data server the source stat was redirected
+to, and `tpc.dst` is the host the destination open landed on - not the
+redirector in either URL, which the source would not recognise as the host
+pulling from it.
+
+`verify=True` (with an optional `algorithm=`) asks both servers for their
+checksum once the transfer is done, since no byte passed through here to be
+digested, and raises `ChecksumMismatchError` if they differ - or the server's
+error if either end cannot answer.
+
 `root://` takes `token_mode` (the delegation style) and `posc`. HTTP takes
 rather more, because the header set is the protocol:
 

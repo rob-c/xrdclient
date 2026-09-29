@@ -1,14 +1,50 @@
 # Coming from pyxrootd
 
-The official bindings hand you a `(status, result)` pair from every call and a
-`.buffer` you have to remember to slice. This library raises and returns
-`bytes`. The mapping is mechanical; the only real change is deleting the
-status checks.
+There are two ways over, and they combine: change one import and keep every
+line of the old code, or move to the native API a call at a time. Most ports
+do the first on day one and the second where it pays.
 
-## The shape of a call
+## Step one: change the import
+
+`xrdclient.compat.client` is `XRootD.client` - the same classes, methods,
+keyword arguments and flags, returning the same `(XRootDStatus, response)`
+pairs with the same field names and the same numbers in them:
 
 ```python
-# XRootD.client
+from xrdclient.compat import client        # was: from XRootD import client
+
+fs = client.FileSystem("root://eos.example.org")
+status, info = fs.stat("/store/f.root")
+if not status.ok:
+    raise RuntimeError(status.message)
+print(info.size, info.modtimestr, info.modeoctstr)
+
+with client.File() as f:
+    f.open("root://eos.example.org//store/f.root")
+    status, head = f.read(0, 1024)          # offset, then size - as in the bindings
+    for line in f:
+        ...
+
+process = client.CopyProcess()
+process.add_job("root://a//store/f.root", "/tmp/f.root", checksummode="end2end")
+process.prepare()
+status, results = process.run(handler)
+```
+
+Submodules port the same way - `from xrdclient.compat.client.flags import
+OpenFlags` for `from XRootD.client.flags import OpenFlags` - and for code that
+cannot be edited at all, `xrdclient.compat.install()` makes `import XRootD`
+itself resolve to this package. See [Compatibility layer](compat.md) for what
+is covered, how it is checked, and the handful of places it differs.
+
+## Step two: the native API
+
+The native API raises instead of returning a status, and returns `bytes`
+rather than a `.buffer` to slice. The mapping is mechanical; the only real
+change is deleting the status checks.
+
+```python
+# XRootD.client, or xrdclient.compat.client
 from XRootD import client
 fs = client.FileSystem("root://host")
 status, info = fs.stat("/store/f.root")
@@ -18,16 +54,35 @@ size = info.size
 ```
 
 ```python
-# here
+# native
 import xrdclient
 fs = xrdclient.FileSystem("root://host")
 size = fs.stat("/store/f.root").st_size
 ```
 
-There is no compatibility shim, deliberately. A `(status, result)` tuple you
-can forget to check is a bug that reaches production silently; every failure
-here is an exception, and the one you catch is the `OSError` subclass you
-already know - see [Errors](errors.md).
+A `(status, result)` tuple you can forget to check is a bug that reaches
+production silently; every native failure is an exception, and the one you
+catch is the `OSError` subclass you already know - see [Errors](errors.md).
+Every compat object keeps its native one as `.native`, so the two can be
+mixed in the same program while a port is under way.
+
+### Traps when porting by hand
+
+A handful of names are the same in both APIs and mean something different.
+The compat layer has the bindings' meaning; these are for code moving to the
+native one:
+
+| | `XRootD.client` / compat | native `xrdclient` |
+| --- | --- | --- |
+| `File.read` | `read(offset, size)`, `size=0` means "to the end" | `read(size, offset)`, `size=-1` means "to the end" |
+| `File` | `File()`, then `open(url, flags, mode)` | `File(url)`, then `open(flags, mode)` |
+| `File.is_open` | a method: `f.is_open()` | a property: `f.is_open` |
+| `DirListFlags` | XrdCl's client switches: `STAT=1`, `LOCATE=2`, `RECURSIVE=4` | the wire's bits: `ONLINE=1`, `STAT=2`, `CKSUM=4` |
+| `set_property` | a client-side setting such as `FollowRedirects` | sends `kXR_set` to the server |
+| Flag spellings | `X_BIT_SET`, `WRITEMODE`, `CHECKSUMCANCEL`, `OPAQUEFILE`, `AccessMode.UR` | `X_SET`, `WRITE_MODE`, `CHECKSUM_CANCEL`, `OPAQUE_FILE`, `Access.OWNER_READ` |
+
+Passing flags by name rather than by number avoids the second-to-last row
+altogether, and the native API takes words too: `fs.scandir(path, stat=True)`.
 
 ## Filesystem calls
 
@@ -121,7 +176,9 @@ See [Configuration](config.md).
 
 `xrdclient.OpenFlags`, `xrdclient.MkDirFlags`, `xrdclient.DirListFlags`, `xrdclient.Access`,
 `xrdclient.QueryCode`, `xrdclient.StatInfoFlags`, `xrdclient.LocateFlags` and `xrdclient.PrepareFlags`
-exist with the same members, for the cases where you want the raw protocol.
+carry the wire protocol's names and numbers, for the cases where you want the
+raw protocol. They are not the bindings' flags - see the table above; those are
+in `xrdclient.compat.client.flags`, value for value.
 Most code should not need them: mode
 strings cover opening, `makedirs(exist_ok=True)` covers `MAKEPATH`, and
 `scandir` always asks for stat information, and
@@ -146,8 +203,7 @@ Things the bindings do not offer at all:
 
 ## What you give up
 
-Nothing at the protocol level, and one thing at the API level: the
-`(status, result)` pair. If you have a large codebase built around it, the
-translation is `status.ok` checks becoming `try`/`except` - usually a net
-deletion of lines, since most call sites either checked and re-raised, or did
-not check at all.
+Nothing, if you take step one: the `(status, result)` shape is kept, in
+`xrdclient.compat`. Taking step two as well gives up that shape for
+exceptions - usually a net deletion of lines, since most call sites either
+checked and re-raised, or did not check at all.

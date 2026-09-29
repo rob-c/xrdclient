@@ -8,6 +8,7 @@ go-hep ``xrootd/xrdproto/<op>`` and XRootD.jl ``Wire/requests.jl``. Every
 from __future__ import annotations
 
 import os
+import struct
 from collections.abc import Sequence
 
 from ..errors import ProtocolError
@@ -23,6 +24,17 @@ __all__ = [
     "Open", "Close", "Read", "Write", "Sync",
     "ReadV", "WriteV", "Clone", "PgRead", "PgWrite", "ChkPoint", "Fattr", "Sigver",
 ]
+
+
+#: Precomputed parameter layouts for the requests every operation sends; each
+#: packs to the same 16 bytes its ``params`` writes (``4s`` NUL-pads and
+#: truncates exactly as :meth:`Writer.padded` does).
+_ZERO_PARAMS = bytes(16)
+_STAT_PARAMS = struct.Struct(">B11x4s")
+_OPEN_PARAMS = struct.Struct(">HH12x")
+_HANDLE_PARAMS = struct.Struct(">4s12x")
+_READ_PARAMS = struct.Struct(">4sqi")
+_WRITE_PARAMS = struct.Struct(">4sqB3x")
 
 
 def _encode_path(path: str) -> bytes:
@@ -104,6 +116,9 @@ class Ping(Request):
     __slots__ = ()
     opcode = c.kXR_ping
 
+    def header_params(self) -> bytes:
+        return _ZERO_PARAMS
+
 
 class EndSession(Request):
     """``kXR_endsess`` - graceful session teardown."""
@@ -153,6 +168,9 @@ class Stat(Request):
 
     def params(self, w: Writer) -> None:
         w.u8(self.options).zeros(11).padded(self.fhandle, 4)
+
+    def header_params(self) -> bytes:
+        return _STAT_PARAMS.pack(self.options, self.fhandle)
 
     def payload(self) -> bytes:
         return _encode_path(self.path)
@@ -518,6 +536,9 @@ class Open(Request):
     def params(self, w: Writer) -> None:
         w.u16(self.mode).u16(self.options).zeros(12)
 
+    def header_params(self) -> bytes:
+        return _OPEN_PARAMS.pack(self.mode, self.options)
+
     def payload(self) -> bytes:
         return _encode_path(self.path)
 
@@ -538,6 +559,9 @@ class Close(Request):
     def params(self, w: Writer) -> None:
         w.padded(self.fhandle, 4).zeros(12)
 
+    def header_params(self) -> bytes:
+        return _HANDLE_PARAMS.pack(self.fhandle)
+
 
 class Read(Request):
     """``kXR_read``."""
@@ -554,6 +578,9 @@ class Read(Request):
 
     def params(self, w: Writer) -> None:
         w.padded(self.fhandle, 4).i64(self.offset).i32(self.length)
+
+    def header_params(self) -> bytes:
+        return _READ_PARAMS.pack(self.fhandle, self.offset, self.length)
 
     def payload(self) -> bytes:
         # ``read_args``: the path to answer on, then seven reserved bytes.
@@ -585,6 +612,9 @@ class Write(Request):
     def params(self, w: Writer) -> None:
         w.padded(self.fhandle, 4).i64(self.offset).u8(self.pathid).zeros(3)
 
+    def header_params(self) -> bytes:
+        return _WRITE_PARAMS.pack(self.fhandle, self.offset, self.pathid)
+
     def payload(self) -> bytes:
         return b"" if self.pathid else self.data
 
@@ -607,6 +637,9 @@ class Sync(Request):
 
     def params(self, w: Writer) -> None:
         w.padded(self.fhandle, 4).zeros(12)
+
+    def header_params(self) -> bytes:
+        return _HANDLE_PARAMS.pack(self.fhandle)
 
 
 class ReadV(Request):
@@ -700,6 +733,9 @@ class Clone(Request):
     def params(self, w: Writer) -> None:
         w.padded(self.fhandle, 4).zeros(12)
 
+    def header_params(self) -> bytes:
+        return _HANDLE_PARAMS.pack(self.fhandle)
+
     def payload(self) -> bytes:
         w = Writer()
         for source, offset, length, target in self.items:
@@ -728,6 +764,9 @@ class PgRead(Request):
 
     def params(self, w: Writer) -> None:
         w.padded(self.fhandle, 4).i64(self.offset).i32(self.length)
+
+    def header_params(self) -> bytes:
+        return _READ_PARAMS.pack(self.fhandle, self.offset, self.length)
 
     def payload(self) -> bytes:
         if not self.reqflags and not self.pathid:

@@ -125,9 +125,15 @@ def test_the_request_target_is_encoded_and_keeps_no_secrets():
     assert request_target(url) == "/store/a%20b?cks.type=adler32"
 
 
-def test_the_request_target_preserves_valid_percent_escapes_only():
-    url = parse("https://h/resolve/refs%2Fconvert/a%zz b")
-    assert request_target(url) == "/resolve/refs%2Fconvert/a%25zz%20b"
+def test_the_request_target_encodes_a_url_path_once_and_keeps_an_escaped_slash():
+    """A URL's escapes are decoded once; ``%2F`` stays a slash inside a segment."""
+    url = parse("https://h/resolve/refs%2Fconvert/a%zz b%41")
+    assert request_target(url) == "/resolve/refs%2Fconvert/a%25zz%20bA"
+
+
+def test_a_path_argument_is_a_name_and_every_percent_in_it_is_escaped():
+    url = parse("https://h/").with_path("/d/a%41b c")
+    assert request_target(url) == "/d/a%2541b%20c"
 
 
 def test_the_request_target_preserves_a_signed_query_byte_for_byte():
@@ -233,6 +239,23 @@ def test_reading_again_after_eof_does_not_request_an_unsatisfiable_range(dav):
     assert dav.seen.count(("GET", "/d/a.root")) == 1
 
 
+def test_reading_at_the_end_after_seeking_there_is_eof_without_a_request(dav):
+    with open_http(dav.url / "d/a.root", "rb", buffering=0) as fh:
+        assert fh.seek(0, io.SEEK_END) == len(BODY)
+        assert fh.read() == b""
+        assert fh.read(4) == b""
+    assert ("GET", "/d/a.root") not in dav.seen
+
+
+def test_reading_past_the_end_is_eof_even_though_the_server_says_416(dav):
+    with open_http(dav.url / "d/a.root", "rb", buffering=0) as fh:
+        assert fh.seek(len(BODY) + 10) == len(BODY) + 10
+        assert fh.read(4) == b""
+        assert fh.read() == b""
+        fh.seek(0)
+        assert fh.read() == BODY
+
+
 def test_a_server_that_ignores_ranges_still_gives_the_right_bytes(dav):
     dav.ignore_ranges = True
     with open_http(dav.url / "d/a.root", "rb") as fh:
@@ -286,6 +309,39 @@ def test_a_large_write_streams_as_a_chunked_put(dav):
     with open_http(dav.url / "d/big.bin", "wb", config=Config(chunk_size=64)) as fh:
         fh.write(payload)
     assert dav.contents("/d/big.bin") == payload
+
+
+def test_an_empty_write_does_not_end_a_streamed_upload(dav):
+    """A zero-length chunk is the end-of-body marker in chunked encoding."""
+    with open_http(dav.url / "d/w.bin", "wb", buffering=0, config=Config(chunk_size=4)) as fh:
+        for piece in (b"AAAAAA", b"", b"BBBB"):
+            fh.write(piece)
+        assert fh.write(b"") == 0
+    assert dav.contents("/d/w.bin") == b"AAAAAABBBB"
+
+
+def test_a_read_abandoned_mid_body_does_not_corrupt_the_next_request(fs, dav):
+    """A POST is never retried, so it must not be sent down a connection
+    that still has the rest of an abandoned body waiting on it."""
+    dav.add_file("/d/big.bin", b"x" * (4 << 20))
+    fh = fs.open("/d/big.bin", "rb", buffering=0)
+    assert fh.read(10) == b"x" * 10
+    fh.seek(100)
+    assert fs.prepare(["/d/big.bin"])
+    assert fh.read(10) == b"x" * 10
+    fh.close()  # abandons the second body the same way
+    assert fs.prepare(["/d/big.bin"])
+
+
+def test_a_small_remainder_is_drained_and_the_connection_kept(fs, dav):
+    dav.add_file("/d/small.bin", bytes(range(200)))
+    with fs.open("/d/small.bin", "rb", buffering=0) as fh:
+        assert fh.read(10) == bytes(range(10))
+        (conn,) = fs.client._pool.values()
+        sock = conn.sock
+        fh.seek(100)
+        assert fh.read(10) == bytes(range(100, 110))
+        assert conn.sock is sock
 
 
 def test_exclusive_creation_refuses_an_existing_resource(dav):
@@ -1082,3 +1138,75 @@ def test_a_locality_that_is_neither_disk_nor_tape_is_a_file_you_cannot_have(fs, 
 def test_an_empty_reply_body_leaves_every_path_unaccounted_for(fs, dav):
     dav.handlers["POST"] = lambda *_: (200, b"", {})
     assert fs.archive_info(["/d/a.root"])[0].error == "not part of this request"
+
+
+# -- abandoning a response ---------------------------------------------------
+
+
+def test_abandoning_a_large_body_closes_its_connection(dav):
+    dav.add_file("/d/big.bin", b"x" * (4 << 20))
+    with HTTPClient(Config()) as client:
+        response = client.open("GET", dav.url / "d/big.bin")
+        assert response.read(10) == b"x" * 10
+        client.abandon(response)
+        assert response.isclosed()
+        assert not client._pool
+        # Not retried, so this only works on a connection with nothing left
+        # on it; the fake refuses the empty request, which is an answer.
+        stage = dav.url / "api/v1/stage"
+        assert client.request("POST", stage, body=b"{}", expect=(400,)).status == 400
+
+
+def test_abandoning_a_short_remainder_keeps_the_connection(dav):
+    dav.add_file("/d/small.bin", bytes(200))
+    with HTTPClient(Config()) as client:
+        response = client.open("GET", dav.url / "d/small.bin")
+        response.read(10)
+        (conn,) = client._pool.values()
+        client.abandon(response)
+        assert response.isclosed()
+        assert list(client._pool.values()) == [conn]
+
+
+def test_abandoning_a_finished_response_is_harmless(dav):
+    with HTTPClient(Config()) as client:
+        response = client.open("GET", dav.url / "d/a.root")
+        response.read()
+        client.abandon(response)
+        client.abandon(response)
+        assert len(client._pool) == 1
+
+
+# -- URLs handed to another server -------------------------------------------
+
+
+def test_a_rename_to_a_name_with_a_space_arrives_intact(fs, dav):
+    fs.rename("/d/a.root", "/d/a b.root")
+    assert dav.contents("/d/a b.root") == BODY
+
+
+def test_a_rename_to_a_name_outside_latin_1_arrives_intact(fs, dav):
+    fs.rename("/d/a.root", "/d/данные.root")
+    assert dav.contents("/d/данные.root") == BODY
+
+
+def test_a_rename_names_the_destination_in_http_not_dav(dav):
+    seen = []
+    dav.handlers["MOVE"] = lambda method, path, headers: seen.append(headers["Destination"])
+    token = dav.url.evolve(scheme="dav", query={"authz": "T"})
+    with xrdclient.FileSystem(token) as filesystem:
+        filesystem.rename("/d/a.root", "/d/b c.root")
+    assert seen == [f"http://{dav.url.netloc}/d/b%20c.root"]
+
+
+def test_a_third_party_copy_names_a_source_with_a_space_intact(dav, elsewhere):
+    dav.add_file("/d/a b.root", BODY)
+    xrdclient.third_party(dav.url / "d/a b.root", elsewhere.url / "d/c d.root")
+    assert elsewhere.copies[-1]["Source"] == f"{dav.url.http_url}d/a%20b.root"
+    assert elsewhere.contents("/d/c d.root") == BODY
+
+
+def test_the_far_url_is_percent_encoded():
+    assert _remote_url(parse("davs://a.example/a b/ü?authz=t&x=h:1")) == (
+        "https://a.example:443/a%20b/%C3%BC?x=h:1"
+    )

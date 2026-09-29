@@ -7,30 +7,90 @@
     >>> pd.read_parquet("root://eos.example.org//store/t.parquet")
 
 Registered through the ``fsspec.specs`` entry points for ``root``, ``roots``
-and ``xroot``, so nothing has to be imported by hand. ``fsspec`` is an optional
-extra (``pip install xrdclient[fsspec]``); the rest of the package never
-imports this module.
+and ``xroot``, so nothing has to be imported by hand. This package does not
+depend on ``fsspec``: the module is loaded by ``fsspec`` itself, wherever it
+is installed, and the rest of the package never imports it.
 """
 
 from __future__ import annotations
 
+import io
 import posixpath
-from typing import Any
+from typing import IO, Any
 
 try:
     from fsspec.spec import AbstractFileSystem
+    from fsspec.utils import stringify_path
 except ImportError as exc:  # pragma: no cover - exercised by the extra, not by us
     raise ImportError(
-        "fsspec is not installed; pip install 'xrdclient[fsspec]'"
+        "fsspec is not installed; pip install fsspec"
     ) from exc
 
 from ._compat import zip_strict
 from .client import FileSystem
 from .config import Config
 from .types import StatInfo
-from .url import parse
+from .url import XRootDURL, parse
 
 __all__ = ["XRootDFileSystem", "HTTPXRootDFileSystem", "S3XRootDFileSystem"]
+
+
+class _ClassOrInstance:
+    """One name that means one method on the class and another on an instance.
+
+    fsspec calls ``_strip_protocol`` and ``_parent`` both ways. On the class
+    - which is how it builds the path it hands the instance it made for a URL
+    - no endpoint is known, and the path alone is the answer. An instance
+    knows its own endpoint, and it alone can tell that a URL names some
+    *other* server, which a bare path would silently send back to its own.
+    """
+
+    def __init__(self, on_class: str, on_instance: str) -> None:
+        self.on_class = on_class
+        self.on_instance = on_instance
+
+    def __get__(self, instance: object, owner: type) -> Any:
+        if instance is None:
+            return getattr(owner, self.on_class)
+        return getattr(instance, self.on_instance)
+
+
+def _trimmed(path: str) -> str:
+    """``path`` without the trailing slash fsspec's comparisons assume gone."""
+    return path.rstrip("/") or "/"
+
+
+def _span(start: int | None, end: int | None, size: int) -> tuple[int, int]:
+    """The offset and length of the slice ``[start:end]`` of ``size`` bytes.
+
+    fsspec defines ``cat_file``'s bounds as a Python slice's: ``None`` is the
+    matching end of the file, a negative bound counts back from the end, and
+    either is clamped to the file, so a range that ends before it starts is
+    simply empty.
+    """
+    offset, stop, _step = slice(start, end).indices(size)
+    return offset, max(0, stop - offset)
+
+
+def _read_span(handle: IO[bytes], start: int | None, end: int | None) -> bytes:
+    """``[start:end]`` of an open file, in as many reads as the file needs.
+
+    With no ``end`` the read runs to whatever end the file has now, rather
+    than to the size the open reported, which a file still growing outruns.
+    """
+    offset, length = _span(start, end, handle.seek(0, io.SEEK_END))
+    handle.seek(offset)
+    if end is None:
+        return handle.read()
+    chunks: list[bytes] = []
+    while length > 0:
+        # An unbuffered read may return less than was asked for.
+        chunk = handle.read(length)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        length -= len(chunk)
+    return b"".join(chunks)
 
 
 class XRootDFileSystem(AbstractFileSystem):
@@ -69,11 +129,47 @@ class XRootDFileSystem(AbstractFileSystem):
     # ------------------------------------------------------------------
 
     @classmethod
-    def _strip_protocol(cls, path: str) -> str:
-        """fsspec hands paths around bare; keep the path, drop the endpoint."""
-        if "://" in str(path):
-            return parse(path).path or "/"
-        return "/" + str(path).lstrip("/")
+    def _bare_path(cls, path: Any) -> Any:
+        """The path alone, as the class - which knows no endpoint - sees it."""
+        if isinstance(path, list):
+            return [cls._bare_path(one) for one in path]
+        text = stringify_path(path)
+        if "://" in text:
+            return _trimmed(parse(text).path)
+        return _trimmed("/" + text.lstrip("/"))
+
+    def _local_name(self, path: Any) -> Any:
+        """The name fsspec should carry for ``path`` between calls.
+
+        A bare path on this instance's own endpoint, as fsspec-xrootd names
+        them; the whole URL for anywhere else, so that the name finds its way
+        back to the server it came from.
+        """
+        if isinstance(path, list):
+            return [self._local_name(one) for one in path]
+        url = self._foreign(path)
+        if url is None:
+            return self._bare_path(path)
+        return str(url.with_path(_trimmed(url.path)))
+
+    @classmethod
+    def _bare_parent(cls, path: Any) -> str:
+        return posixpath.dirname(str(cls._bare_path(path)))
+
+    def _local_parent(self, path: Any) -> str:
+        url = self._foreign(path)
+        if url is None:
+            return self._bare_parent(path)
+        return str(url.with_path(posixpath.dirname(_trimmed(url.path))))
+
+    _strip_protocol = _ClassOrInstance("_bare_path", "_local_name")
+    _parent = _ClassOrInstance("_bare_parent", "_local_parent")
+
+    def unstrip_protocol(self, name: str) -> str:
+        """``name`` as a URL any fsspec call could be handed on its own."""
+        if "://" in name or not self.endpoint:
+            return str(super().unstrip_protocol(name))
+        return str(parse(self.endpoint).with_path(name))
 
     @staticmethod
     def _get_kwargs_from_urls(path: str) -> dict[str, str]:
@@ -81,10 +177,20 @@ class XRootDFileSystem(AbstractFileSystem):
         url = parse(path)
         return {"endpoint": str(url.with_path("/"))} if url.host else {}
 
+    def _foreign(self, path: Any) -> XRootDURL | None:
+        """The URL ``path`` spells, if it names a server other than this one's."""
+        text = stringify_path(path)
+        if "://" not in text:
+            return None
+        url = parse(text)
+        if url.host and (self._fs is None or url.netloc != parse(self.endpoint).netloc):
+            return url
+        return None
+
     def _target(self, path: str) -> tuple[FileSystem, str]:
         """The filesystem to use for ``path``, and the path within it."""
-        url = parse(path)
-        if url.host and (self._fs is None or url.netloc != parse(self.endpoint).netloc):
+        url = self._foreign(path)
+        if url is not None:
             # A fully-qualified path to somewhere else: honour it rather than
             # silently reading the wrong server.
             key = str(url.with_path("/"))
@@ -94,7 +200,19 @@ class XRootDFileSystem(AbstractFileSystem):
             return found, url.path or "/"
         if self._fs is None:
             raise ValueError("no endpoint: give a full URL or construct with endpoint=")
-        return self._fs, self._strip_protocol(path)
+        return self._fs, str(self._bare_path(path))
+
+    def _named(self, path: str, target: str) -> str:
+        """``target`` named the way ``path`` was: on its endpoint, if foreign."""
+        url = self._foreign(path)
+        return target if url is None else str(url.with_path(target))
+
+    def _url_of(self, path: str) -> XRootDURL:
+        """``path`` as a whole URL, for the calls that take no filesystem."""
+        url = self._foreign(path)
+        if url is not None:
+            return url
+        return parse(self.endpoint).with_path(str(self._bare_path(path)))
 
     def invalidate_cache(self, path: str | None = None) -> None:
         self.dircache.clear()
@@ -129,16 +247,40 @@ class XRootDFileSystem(AbstractFileSystem):
 
     def info(self, path: str, **kwargs: Any) -> dict[str, Any]:
         filesystem, target = self._target(path)
-        return self._info_of(filesystem.stat(target), target)
+        return self._info_of(filesystem.stat(target), self._named(path, target))
 
     def ls(self, path: str, detail: bool = True, **kwargs: Any) -> list[Any]:
+        """The entries of a directory, or - fsspec's convention - a file itself."""
         filesystem, target = self._target(path)
-        listing: list[Any] = [
-            self._info_of(entry.stat or StatInfo(), posixpath.join(target, entry.name))
-            for entry in filesystem.scandir(target)
-        ]
-        listing.sort(key=lambda item: str(item["name"]))
+        try:
+            entries = filesystem.scandir(target)
+        except OSError as exc:
+            listing = [self._file_listed(path, filesystem, target, exc)]
+        else:
+            listing = [
+                self._info_of(
+                    entry.stat or StatInfo(),
+                    self._named(path, posixpath.join(target, entry.name)),
+                )
+                for entry in entries
+            ]
+            listing.sort(key=lambda item: str(item["name"]))
         return listing if detail else [str(item["name"]) for item in listing]
+
+    def _file_listed(
+        self, path: str, filesystem: FileSystem, target: str, failure: OSError
+    ) -> dict[str, Any]:
+        """``path``'s own entry, once a listing of it has failed.
+
+        A server answers a listing of a file with an error - XRootD's says
+        "not found" - so the stat is what tells a file apart from nothing. A
+        stat that fails raises its own, truer error; a directory whose listing
+        failed re-raises the listing's.
+        """
+        info = filesystem.stat(target)
+        if info.is_dir():
+            raise failure
+        return self._info_of(info, self._named(path, target))
 
     def exists(self, path: str, **kwargs: Any) -> bool:
         filesystem, target = self._target(path)
@@ -205,11 +347,48 @@ class XRootDFileSystem(AbstractFileSystem):
                 filesystem.remove(target)
         self.invalidate_cache()
 
-    def mv(self, path1: str, path2: str, **kwargs: Any) -> None:
+    def mv(
+        self,
+        path1: str,
+        path2: str,
+        recursive: bool = False,
+        maxdepth: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Rename on one server; copy, verify, and delete between two.
+
+        A rename cannot cross endpoints, and handing the destination's path
+        to the source's server would rename the file there instead. The copy
+        is checksum-verified before the source goes, as
+        :func:`xrdclient.move` does, since a move is the one copy that
+        destroys the original.
+        """
         filesystem, source = self._target(path1)
-        _other, destination = self._target(path2)
-        filesystem.rename(source, destination)
+        other, destination = self._target(path2)
+        if filesystem is other:
+            filesystem.rename(source, destination)
+        elif filesystem.isdir(source):
+            self._move_tree(path1, path2, recursive)
+            filesystem.rmtree(source)
+        else:
+            from .copy import copy
+
+            copy(
+                self._url_of(path1),
+                self._url_of(path2),
+                config=self.config,
+                verify=True,
+                remove_source=True,
+            )
         self.invalidate_cache()
+
+    def _move_tree(self, path1: str, path2: str, recursive: bool) -> None:
+        """Copy a directory to another endpoint, as the first half of a move."""
+        if not recursive:
+            raise IsADirectoryError(f"{path1} is a directory; pass recursive=True to move it")
+        from .copy import copy_tree
+
+        copy_tree(self._url_of(path1), self._url_of(path2), config=self.config, verify=True)
 
     def touch(self, path: str, truncate: bool = True, **kwargs: Any) -> None:
         filesystem, target = self._target(path)
@@ -224,41 +403,55 @@ class XRootDFileSystem(AbstractFileSystem):
     def cat_file(
         self, path: str, start: int | None = None, end: int | None = None, **kw: Any
     ) -> bytes:
+        """``[start:end]`` of the file, bounds read as a Python slice's."""
         filesystem, target = self._target(path)
         with filesystem.open(target, "rb", buffering=0) as handle:
-            if start:
-                handle.seek(start)
-            data: bytes = handle.read() if end is None else handle.read(end - (start or 0))
-        return data
+            return _read_span(handle, start, end)
 
     def cat_ranges(
         self,
         paths: list[str],
-        starts: list[int],
-        ends: list[int],
+        starts: list[int | None] | int | None,
+        ends: list[int | None] | int | None,
         max_gap: int | None = None,
         **kwargs: Any,
     ) -> list[bytes]:
-        """One ``kXR_readv`` per file, which is the point of this method."""
-        from .types import ReadRange
+        """One ``kXR_readv`` per file, which is the point of this method.
 
-        wanted: dict[str, list[tuple[int, int, int]]] = {}
+        The bounds are :meth:`cat_file`'s, and, as in fsspec, a single value
+        rather than a list applies to every path.
+        """
+        if not isinstance(starts, list):
+            starts = [starts] * len(paths)
+        if not isinstance(ends, list):
+            ends = [ends] * len(paths)
+        wanted: dict[str, list[tuple[int, int | None, int | None]]] = {}
         for index, (path, start, end) in enumerate(zip_strict(paths, starts, ends)):
             wanted.setdefault(path, []).append((index, start, end))
         out: list[bytes] = [b""] * len(paths)
         for path, items in wanted.items():
             filesystem, target = self._target(path)
             with filesystem.open(target, "rb", buffering=0) as handle:
-                file = getattr(handle, "file", None)
-                if file is not None and hasattr(file, "readv"):
-                    ranges = [ReadRange(offset=s, length=e - s) for _i, s, e in items]
-                    for (index, _s, _e), chunk in zip_strict(items, file.readv(ranges)):
-                        out[index] = bytes(chunk)
-                else:  # pragma: no cover - HTTP has no vector read
-                    for index, start, end in items:
-                        handle.seek(start)
-                        out[index] = handle.read(end - start)
+                for index, chunk in self._ranges_of(handle, items):
+                    out[index] = chunk
         return out
+
+    @staticmethod
+    def _ranges_of(
+        handle: IO[bytes], items: list[tuple[int, int | None, int | None]]
+    ) -> list[tuple[int, bytes]]:
+        """Each ``(index, start, end)`` of one open file, read in one go if it can."""
+        from .types import ReadRange
+
+        file = getattr(handle, "file", None)
+        if file is None or not hasattr(file, "readv"):  # pragma: no cover - HTTP
+            return [(index, _read_span(handle, start, end)) for index, start, end in items]
+        size = handle.seek(0, io.SEEK_END)
+        spans = [(index, *_span(start, end, size)) for index, start, end in items]
+        # An empty range has nothing to ask the server for.
+        ranges = [ReadRange(offset=offset, length=length) for _i, offset, length in spans if length]
+        chunks = iter(file.readv(ranges))
+        return [(index, bytes(next(chunks)) if length else b"") for index, _o, length in spans]
 
     def pipe_file(self, path: str, value: bytes, **kwargs: Any) -> None:
         filesystem, target = self._target(path)

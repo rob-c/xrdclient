@@ -166,3 +166,9 @@ class Writer:
 
     def bytes(self) -> builtins.bytes:
         return builtins.bytes(self._buf)
+
+    @property
+    def buffer(self) -> bytearray:
+        """What has been written so far, uncopied - for a caller that only
+        reads it before the builder is dropped."""
+        return self._buf

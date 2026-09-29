@@ -20,6 +20,7 @@ import json
 import posixpath
 import socketserver
 import threading
+import time
 import urllib.parse
 from collections.abc import Callable
 from email.utils import formatdate
@@ -43,10 +44,21 @@ _DIGESTS = ("adler32", "md5", "sha256", "crc32c", "crc64")
 
 
 def _clean(path: str) -> str:
-    """The stored form of a path: absolute, unquoted, no trailing slash."""
-    plain = urllib.parse.unquote(urllib.parse.urlsplit(path).path)
-    normal = posixpath.normpath("/" + plain.strip("/")) if plain.strip("/") else "/"
-    return normal
+    """The stored form of a plain path: absolute, no trailing slash.
+
+    A plain path is a name, as a test or a tape request writes it, so a
+    ``%`` or a ``#`` in it is part of the name and is not decoded here.
+    """
+    return posixpath.normpath("/" + path.strip("/")) if path.strip("/") else "/"
+
+
+def _decoded(target: str) -> str:
+    """The plain path a request target or an absolute URL names.
+
+    Its escapes are decoded exactly once, which is the other half of the
+    client encoding a name exactly once.
+    """
+    return _clean(urllib.parse.unquote(urllib.parse.urlsplit(target).path))
 
 
 def _endpoint(server: socketserver.BaseServer) -> tuple[str, int]:
@@ -103,6 +115,9 @@ class FakeDAVServer:
         self.tpc_failure: str | None = None
         #: How many performance markers a ``COPY`` sends before the outcome.
         self.tpc_markers = 2
+        #: Seconds to wait before each marker and the outcome of a ``COPY``:
+        #: a transfer that is slow but alive, the way a long one looks.
+        self.tpc_marker_gap = 0.0
         #: The headers of every ``COPY`` served, in order.
         self.copies: list[dict[str, str]] = []
         #: Files that live on tape rather than on disk. A staging request for
@@ -218,7 +233,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     @property
     def target(self) -> str:
-        return _clean(self.path)
+        return _decoded(self.path)
 
     def _body(self) -> bytes:
         """Read the request body, chunked or not, recording it as we go."""
@@ -335,6 +350,11 @@ class _Handler(BaseHTTPRequestHandler):
     def _send_range(self, span: str, data: bytes, extra: dict[str, str]) -> None:
         """Serve the requested inclusive HTTP byte range."""
         start, end = _range(span, len(data))
+        if start >= len(data):
+            # RFC 9110: a range that starts at or past the end cannot be
+            # satisfied, and says how long the representation really is.
+            self._send(416, b"", Content_Range=f"bytes */{len(data)}")
+            return
         piece = data[start:end]
         extra["Content-Range"] = f"bytes {start}-{start + len(piece) - 1}/{len(data)}"
         self._send(206, piece, **extra)
@@ -388,7 +408,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._gate():
             return
         source = self.target
-        destination = _clean(self.headers.get("Destination", ""))
+        destination = _decoded(self.headers.get("Destination", ""))
         if source in self.fake.files:
             existed = destination in self.fake.files
             self.fake.add_file(destination, self.fake.files.pop(source))
@@ -457,10 +477,12 @@ class _Handler(BaseHTTPRequestHandler):
         count = max(self.fake.tpc_markers, 0)
         for step in range(1, count + 1):
             done = size * step // count if count else size
+            time.sleep(self.fake.tpc_marker_gap)
             self._chunk(
                 f"Perf Marker\nTimestamp: {step}\nStripe Index: 0\n"
                 f"Stripe Bytes Transferred: {done}\nTotal Stripe Count: 1\nEnd\n"
             )
+        time.sleep(self.fake.tpc_marker_gap)
         self._chunk(f"failure: {failure}\n" if failure else "success: Created\n")
         self.wfile.write(b"0\r\n\r\n")
 

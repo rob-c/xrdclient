@@ -651,9 +651,15 @@ confused. `ChecksumMismatchError` is deliberately **not** an `OSError` — no
 `errno` describes "the bytes disagree", and catching it should be a conscious
 act, not a side effect of `except OSError`.
 
-The `(status, result)` compat shim in the decision log was **dropped**.
-Returning a status tuple is precisely the ergonomics this library exists to
-replace, and a caller who wants one can write the `try`/`except` once.
+The `(status, result)` compat shim in the decision log was **dropped**, and
+later **reinstated** (2026-09-28) as a separate package, `xrdclient.compat`.
+Returning a status tuple is still not what the native API does - that is the
+ergonomics this library exists to replace - but the cost of porting was the
+larger obstacle to adoption: code written against `XRootD.client` should run
+by changing an import and nothing else, then move to the native API a call at
+a time. Keeping the shim beside the native API rather than inside it keeps
+both honest; `tests/test_pyxrootd_compat.py` holds it equal to the official
+bindings on a real server.
 
 ---
 

@@ -66,6 +66,18 @@ implementation: the file holds shared secrets in the clear, so mode `0o077`
 bits are fatal. The failure is logged at `WARNING`, not swallowed, because
 silently falling through to a weaker mechanism is how that goes unnoticed.
 
+**Kerberos keys stay in memory and are checked before use.** The session
+keys read from a credential cache, and those the KDC returns, live only in
+the process: they are left out of every `repr`, never logged, and a service
+ticket fetched from the KDC is never written back to the cache. A TGS reply
+is used only after its integrity check passes under the TGT session key and
+its nonce and service principal match the request, so a reply replayed from
+another exchange, or issued for another service, is refused. Only the AES
+enctypes are implemented; DES, triple-DES and RC4 are refused by name. The
+cryptography is pinned to every RFC 3961, RFC 3962 and RFC 8009 test vector,
+and the messages to bytes captured from MIT krb5 and accepted by a real
+`xrootd`.
+
 **Directory listings cannot escape their directory.** Every consumer joins
 server-supplied names onto a path - `walk()` to recurse, `copy_tree()` to
 build a local destination - so `parse_dirlist()` refuses any entry containing
@@ -111,6 +123,15 @@ the real daemon. They are not offered as a general-purpose crypto library and
   its credentials there. If your token must not leave a known set of hosts,
   set `require_tls=True` and point at those hosts directly rather than at a
   redirector.
+- **HTTP redirects keep credentials within one origin.** Over `https://` and
+  `davs://`, an `Authorization`, cookie or `TransferHeader*` header follows a
+  redirect only when the scheme, host and port are unchanged, and never onto
+  plain `http://`; once dropped it stays dropped for the rest of the chain.
+  Storage that redirects from a head node to data nodes on other hosts, as
+  dCache and EOS do, is named with `trusted_redirect_domains`, which trusts a
+  domain and everything under it. A token the redirect's own `Location`
+  carries (`?authz=`) is kept, since the redirecting server chose to send it.
+  See [HTTP and WebDAV](docs/http.md).
 - **Checksum verification is a data-integrity check, not authentication.** A
   server that serves you wrong bytes can serve you the matching checksum.
   `verify=True` catches corruption in transit and on disk; it does not catch a

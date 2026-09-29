@@ -93,8 +93,16 @@ class StatInfo:
 
     @property
     def st_mode(self) -> int:
-        """POSIX mode bits, synthesised from the XRootD flag set."""
+        """POSIX mode bits: the server's own, or synthesised from the flag set.
+
+        A protocol-5 server sends the permission bits (:attr:`mode_str`), and
+        those are what ``ls`` shows on the server. An older one sends only
+        "readable" and "writable", which are this client's access rather than
+        the file's mode, and are the best there is then.
+        """
         mode = _stat.S_IFDIR if self.is_dir() else _stat.S_IFREG
+        if self.mode_str:
+            return mode | (int(self.mode_str, 8) & 0o7777)
         if self.flags & StatInfoFlags.IS_READABLE:
             mode |= 0o444
         if self.flags & StatInfoFlags.IS_WRITABLE:

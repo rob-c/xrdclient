@@ -25,13 +25,14 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from .._compat import SLOTS
+from .._compat import SLOTS, TIMEOUTS
 from .._log import get_logger
 from ..config import Config
 from ..copy.engine import CopyResult
 from ..errors import ProtocolError, kXR_ServerError, raise_for_status
+from ..errors import TimeoutError as XRDTimeoutError
 from ..url import XRootDURL, parse
-from .client import HTTPClient, bearer_token, status_code
+from .client import HTTPClient, absolute_url, bearer_token, status_code
 
 __all__ = ["third_party", "Marker"]
 
@@ -112,9 +113,12 @@ def third_party(
 
     The call returns when the transfer is over, because the response body is
     only complete when the far side says ``success:`` - a ``failure:`` raises
-    the exception the quoted status maps to.
+    the exception the quoted status maps to. ``timeout`` is the longest to
+    wait between two performance markers (by default
+    :attr:`Config.request_timeout`), not a limit on the whole transfer: a
+    copy that keeps reporting progress is alive however long it runs.
     """
-    cfg = _copy_config(config, timeout)
+    cfg = config or Config()
     su, du = parse(source), parse(target)
     _require_http(su, du)
     near, far = (du, su) if mode == "pull" else (su, du)
@@ -125,16 +129,11 @@ def third_party(
     started = time.monotonic()
     _log.debug("COPY %s %s -> %s", mode, su, du)
     try:
-        size = _run_copy(owned, near, headers, progress)
+        size = _run_copy(owned, near, headers, progress, timeout)
     finally:
         if client is None:
             owned.close()
     return CopyResult(source=str(su), target=str(du), size=size, seconds=time.monotonic() - started)
-
-
-def _copy_config(config: Config | None, timeout: float | None) -> Config:
-    made = config or Config()
-    return made.evolve(request_timeout=timeout) if timeout is not None else made
 
 
 def _require_http(source: XRootDURL, target: XRootDURL) -> None:
@@ -194,10 +193,23 @@ def _run_copy(
     near: XRootDURL,
     headers: dict[str, str],
     progress: Callable[[int, int | None], None] | None,
+    timeout: float | None,
 ) -> int:
-    response = client.open("COPY", near, headers=headers, expect=(200, 201, 202))
+    """Issue the ``COPY`` and follow it to its outcome.
+
+    ``timeout`` is passed per request rather than folded into a config,
+    because a borrowed client keeps its own - and it bounds each read, which
+    is the gap between two markers: a long transfer that keeps reporting is
+    alive, however long it takes.
+    """
+    response = client.open("COPY", near, headers=headers, expect=(200, 201, 202), timeout=timeout)
     try:
         return _follow(response, near, progress)
+    except BaseException:
+        # A copy given up mid-body leaves the rest of its markers on the
+        # socket, where the next request on the connection would read them.
+        client.abandon(response)
+        raise
     finally:
         response.close()
 
@@ -207,8 +219,11 @@ def _remote_url(url: XRootDURL) -> str:
 
     ``dav``/``davs`` are this package's spelling; on the wire they are
     ``http``/``https``, and a server handed ``davs://`` will not resolve it.
+    The path is percent-encoded and the rest of the query kept as written,
+    since the near side makes a request of its own with this string.
     """
-    return url.evolve(query={k: v for k, v in url.query.items() if k not in _TOKEN_KEYS}).http_url
+    tokenless = url.evolve(query={k: v for k, v in url.query.items() if k not in _TOKEN_KEYS})
+    return absolute_url(tokenless)
 
 
 def _remote_token(url: XRootDURL, explicit: str | None, config: Config) -> str | None:
@@ -241,7 +256,17 @@ def _follow(
 
 
 def _marker_line(stream: _Lines, url: XRootDURL) -> str:
-    line = stream.readline(MAX_LINE)
+    """The next line of the ``COPY`` body, stripped.
+
+    Silence for longer than the read timeout is a copy that has stopped
+    reporting, raised as this package's timeout like any other request's.
+    """
+    try:
+        line = stream.readline(MAX_LINE)
+    except TIMEOUTS as exc:
+        raise XRDTimeoutError(
+            f"{url.host} sent nothing for longer than the timeout during a copy"
+        ) from exc
     if not line:
         raise ProtocolError(
             f"{url.host} closed the connection before reporting the outcome of the copy"

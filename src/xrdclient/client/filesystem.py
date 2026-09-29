@@ -14,30 +14,20 @@ know: :meth:`stat`, :meth:`listdir`, :meth:`makedirs`, :meth:`remove`,
 from __future__ import annotations
 
 import errno
-import os
 import posixpath
 import re
 import urllib.parse
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import IO, Any
 
 from .._compat import zip_strict
 from .._log import get_logger
 from ..config import Config
 from ..errors import (
-    AttrNotFoundError,
     ExistsError,
     InvalidArgumentError,
-    IOError_,
     NotFoundError,
-    PermissionError_,
     ProtocolError,
-    ServerError,
-    kXR_AttrNotFound,
-    kXR_IOError,
-    kXR_ItExists,
-    kXR_NotAuthorized,
-    kXR_NotFound,
 )
 from ..flags import (
     Access,
@@ -67,6 +57,7 @@ from ..types import (
     VFSInfo,
 )
 from ..url import XRootDURL, parse
+from . import _fattr
 
 __all__ = ["FileSystem"]
 
@@ -130,21 +121,149 @@ def _split_cgi(path: str) -> tuple[str, str]:
     return base, (sep + cgi if sep else "")
 
 
-def _cgi(explicit: str, inherited: dict[str, str]) -> str:
-    """The opaque suffix for a path: what was asked for, plus what was implied."""
-    if not inherited:
-        return f"?{explicit}" if explicit else ""
+def _cgi(explicit: str, inherited: XRootDURL) -> str:
+    """The opaque suffix for a path: what was asked for, plus what was implied.
+
+    The inherited fields go on as the filesystem's URL spelled them, byte for
+    byte: decoding and re-encoding would turn ``authz=Bearer%20...`` into
+    ``Bearer+...``, which a token-checking server does not accept.
+    """
     named = {key for key, _ in urllib.parse.parse_qsl(explicit, keep_blank_values=True)}
-    extra = urllib.parse.urlencode({k: v for k, v in inherited.items() if k not in named})
+    extra = inherited.cgi_except(named)
     if not extra:
         return f"?{explicit}" if explicit else ""
     return f"?{explicit}&{extra}" if explicit else f"?{extra}"
 
 
-def _partition(entries: Sequence[DirEntry]) -> tuple[list[str], list[str]]:
-    dirs = [entry.name for entry in entries if entry.is_dir()]
-    files = [entry.name for entry in entries if not entry.is_dir()]
-    return dirs, files
+def _not_empty(exc: OSError) -> bool:
+    """Whether a refused ``rmdir`` said "that directory has something in it".
+
+    Stock xrootd reports ``ENOTEMPTY`` as ``kXR_ItExists``, which arrives as
+    an ``EEXIST``; the POSIX spelling is accepted as well.
+    """
+    return exc.errno in (errno.EEXIST, errno.ENOTEMPTY)
+
+
+class _Links:
+    """Whether a path is a symbolic link, from the one source that can say.
+
+    :meth:`FileSystem.is_symlink` is a ``kXR_readlink``, a vendor opcode, and a
+    stock server answers it with an error that reads as "not a link" - for a
+    link too. So it is believed only from a server whose :meth:`extensions`
+    list it, or from a subclass that answers it without asking (WebDAV and S3
+    have no links at all). Anywhere else the answer is ``None``: unknown. The
+    decision costs one ``kXR_query``, made the first time it is needed.
+    """
+
+    def __init__(self, fs: FileSystem) -> None:
+        self._fs = fs
+        self._trusted: bool | None = None
+
+    def __call__(self, path: str) -> bool | None:
+        if self._trusted is None:
+            self._trusted = self._decide()
+        return self._fs.is_symlink(path) if self._trusted else None
+
+    def _decide(self) -> bool:
+        if type(self._fs).is_symlink is not FileSystem.is_symlink:
+            return True
+        try:
+            return "readlink" in self._fs.extensions()
+        except OSError:
+            return False
+
+
+class _Descent:
+    """Which directories one :meth:`FileSystem.walk` goes into.
+
+    ``os.walk`` does not enter a link to a directory unless told to, and a
+    walk that does - by request, or because the server cannot say which
+    entries are links - still enters each directory once: the stat id is the
+    server's device and inode, so a link cycle is seen coming round again.
+    """
+
+    def __init__(self, links: _Links, followlinks: bool) -> None:
+        self._links = links
+        self._follow = followlinks
+        self._seen: set[str] = set()
+
+    def enters(self, path: str, ident: str) -> bool:
+        if not self._follow and self._links(path):
+            return False
+        if ident in self._seen:
+            return False
+        if ident:  # an entry with no id (an S3 prefix) is never a repeat
+            self._seen.add(ident)
+        return True
+
+
+class _TreeRemoval:
+    """One :meth:`FileSystem.rmtree`: what to remove, and what to do on failure.
+
+    A link is removed with ``kXR_rm``, as ``unlink(2)`` removes a link, and
+    never descended into: a listing describes what a link points at, so a
+    link to a directory is indistinguishable from one, and following it would
+    delete whatever it named, inside the tree or not. Where :class:`_Links`
+    cannot tell, the directory is first sent a ``kXR_rmdir``, which never
+    follows a link: an empty directory goes, a full one answers "not empty"
+    and is cleared, and any other answer means it is not a directory we may
+    enter, so it is unlinked instead.
+    """
+
+    def __init__(self, fs: FileSystem, cgi: str, ignore_errors: bool) -> None:
+        self._fs = fs
+        self._cgi = cgi
+        self._ignore = ignore_errors
+        self._links = _Links(fs)
+
+    def run(self, target: str) -> None:
+        link = self._links(target)
+        if link:
+            # ``shutil.rmtree`` refuses a link as its root rather than choose
+            # between deleting the link and deleting through it.
+            self._fail(NotADirectoryError(errno.ENOTDIR, "rmtree on a symbolic link", target))
+        elif link is False or self._full(target, self._fail):
+            self._clear(target)
+
+    def _entry(self, path: str, entry: DirEntry) -> None:
+        info = entry.stat if entry.stat is not None else self._fs._stat_or_none(path)
+        link = self._links(path) if info is not None and info.is_dir() else True
+        if link:
+            self._attempt(self._fs.remove, path)
+        elif link is False or self._full(path, lambda _: self._attempt(self._fs.remove, path)):
+            self._clear(path)
+
+    def _full(self, path: str, refused: Callable[[OSError], None]) -> bool:
+        """``kXR_rmdir`` as a question: is this a directory with things in it?"""
+        try:
+            self._fs.rmdir(path)
+        except OSError as exc:
+            if _not_empty(exc):
+                return True
+            refused(exc)
+        return False
+
+    def _clear(self, path: str) -> None:
+        """Remove what is in the directory ``path``, then the directory."""
+        try:
+            entries = self._fs.scandir(path)
+        except OSError as exc:
+            self._fail(exc)
+            return
+        base, _ = _split_cgi(path)
+        for entry in entries:
+            self._entry(posixpath.join(base, entry.name) + self._cgi, entry)
+        self._attempt(self._fs.rmdir, path)
+
+    def _attempt(self, operation: Callable[[str], None], path: str) -> None:
+        try:
+            operation(path)
+        except OSError as exc:
+            self._fail(exc)
+
+    def _fail(self, exc: OSError) -> None:
+        if not self._ignore:
+            raise exc
 
 
 class FileSystem:
@@ -181,7 +300,10 @@ class FileSystem:
     def __init__(self, url: str | XRootDURL, config: Config | None = None) -> None:
         self.url = parse(url) if isinstance(url, str) else url
         self.config = config or Config()
-        self._router = Router(self.url, self.config)
+        # Not sticky: every request starts at this URL - the manager, in a
+        # federation - and a redirect sends that one request on, not the
+        # filesystem. The next path may well live on another data server.
+        self._router = Router(self.url, self.config, sticky=False)
 
     # ------------------------------------------------------------------
     # Plumbing
@@ -198,7 +320,7 @@ class FileSystem:
         base, sep, cgi = path.partition("?")
         if not base.startswith("/"):
             base = posixpath.join(self.url.path or "/", base)
-        return posixpath.normpath(base) + _cgi(cgi if sep else "", self.url.query)
+        return posixpath.normpath(base) + _cgi(cgi if sep else "", self.url)
 
     def _url_for(self, path: str) -> XRootDURL:
         """The URL of ``path`` under this filesystem, with the CGI on it once.
@@ -363,22 +485,40 @@ class FileSystem:
         yield from self.scandir(path)
 
     def walk(
-        self, top: str = "", *, topdown: bool = True, onerror: object = None
+        self,
+        top: str = "",
+        *,
+        topdown: bool = True,
+        onerror: object = None,
+        followlinks: bool = False,
     ) -> Iterator[tuple[str, list[str], list[str]]]:
-        """``os.walk`` over the remote namespace."""
+        """``os.walk`` over the remote namespace.
+
+        As in ``os.walk``, a link to a directory is listed among the
+        directories but not entered unless ``followlinks`` says so. A stock
+        server cannot say which entries are links (``kXR_readlink`` is a
+        vendor extension), and there the walk follows them - reading, not
+        deleting - but enters each directory once, so a link cycle ends.
+        """
         root = self._abs(top or "/")
+        yield from self._walk(root, topdown, onerror, _Descent(_Links(self), followlinks))
+
+    def _walk(
+        self, root: str, topdown: bool, onerror: object, descent: _Descent
+    ) -> Iterator[tuple[str, list[str], list[str]]]:
         entries = self._walk_entries(root, onerror)
         if entries is None:
             return
         # Opaque data belongs on the request, not in the name of a directory:
         # what is yielded is a path, and what descends carries the token.
         base, cgi = _split_cgi(root)
-        dirs, files = _partition(entries)
+        dirs, files, ids = self._partition(base, cgi, entries)
         if topdown:
             yield base, dirs, files
         for name in list(dirs):
             child = posixpath.join(base, name) + cgi
-            yield from self.walk(child, topdown=topdown, onerror=onerror)
+            if descent.enters(child, ids.get(name, "")):
+                yield from self._walk(child, topdown, onerror, descent)
         if not topdown:
             yield base, dirs, files
 
@@ -388,6 +528,36 @@ class FileSystem:
         except OSError as exc:
             if callable(onerror):
                 onerror(exc)
+            return None
+
+    def _partition(
+        self, base: str, cgi: str, entries: Sequence[DirEntry]
+    ) -> tuple[list[str], list[str], dict[str, str]]:
+        """Directories, everything else, and each directory's stat id.
+
+        A server that ignores ``kXR_dstat`` lists names alone, and an entry
+        without a stat is not known to be a file: it is asked about, as
+        ``os.walk`` falls back to a ``stat`` when ``d_type`` says nothing.
+        """
+        dirs: list[str] = []
+        files: list[str] = []
+        ids: dict[str, str] = {}
+        for entry in entries:
+            info = entry.stat
+            if info is None:
+                info = self._stat_or_none(posixpath.join(base, entry.name) + cgi)
+            if info is not None and info.is_dir():
+                dirs.append(entry.name)
+                ids[entry.name] = info.id
+            else:
+                files.append(entry.name)
+        return dirs, files, ids
+
+    def _stat_or_none(self, path: str) -> StatInfo | None:
+        """A stat, or ``None`` for an entry that is gone or a dangling link."""
+        try:
+            return self.stat(path)
+        except NotFoundError:
             return None
 
     def glob(self, pattern: str, *, root: str = "") -> Iterator[str]:
@@ -468,35 +638,17 @@ class FileSystem:
     unlink = remove
 
     def rmtree(self, path: str, *, ignore_errors: bool = False) -> None:
-        """Recursively remove a directory. There is no server-side primitive."""
+        """``shutil.rmtree``. There is no server-side primitive.
+
+        Symbolic links are removed, never followed: nothing outside the tree
+        is touched, and a link as ``path`` itself is refused. Stock xrootd
+        will not unlink a link, so a tree holding one fails to go rather
+        than be emptied through it; see :class:`_TreeRemoval` for how a link
+        is told from a directory on a server that cannot say.
+        """
         target = self._abs(path)
         _, cgi = _split_cgi(target)
-        for dirpath, dirs, files in self.walk(target, topdown=False):
-            self._remove_names(self.remove, dirpath, files, cgi, ignore_errors)
-            self._remove_names(self.rmdir, dirpath, dirs, cgi, ignore_errors)
-        self._remove_tree_root(target, ignore_errors)
-
-    def _remove_names(
-        self,
-        operation: Any,
-        directory: str,
-        names: Sequence[str],
-        cgi: str,
-        ignore_errors: bool,
-    ) -> None:
-        for name in names:
-            try:
-                operation(posixpath.join(directory, name) + cgi)
-            except OSError:
-                if not ignore_errors:
-                    raise
-
-    def _remove_tree_root(self, target: str, ignore_errors: bool) -> None:
-        try:
-            self.rmdir(target)
-        except OSError:
-            if not ignore_errors:
-                raise
+        _TreeRemoval(self, cgi, ignore_errors).run(target)
 
     def rename(self, src: str, dst: str) -> None:
         """Rename within the same storage element."""
@@ -599,7 +751,7 @@ class FileSystem:
         from .file import File
 
         flags = OpenFlags.NEW | OpenFlags.UPDATE | OpenFlags.MAKEPATH
-        fh = File(self._url_for(path), self.config, router=self._router)
+        fh = File(self._url_for(path), self.config, router=self._router.lend())
         try:
             fh.open(flags=flags, mode=Access.OWNER_READ | Access.OWNER_WRITE)
         except ExistsError:
@@ -882,24 +1034,24 @@ class FileSystem:
         for item in result.items:
             if item.code == 0 and item.value is not None:
                 return item.value
-        raise _attr_error(name, target)
+        raise _fattr.missing(name, target)
 
     def setxattr(self, path: str, name: str, value: bytes, *, create_only: bool = False) -> None:
         target = self._abs(path)
         res = self._router.execute(
             r.Fattr.set(target, name, value, create_only=create_only), path=target
         )
-        _check_fattr(rp.parse_fattr(res.data, values=False), target)
+        _fattr.check(rp.parse_fattr(res.data, values=False), target)
 
     def removexattr(self, path: str, name: str) -> None:
         target = self._abs(path)
         res = self._router.execute(r.Fattr.delete(target, name), path=target)
-        _check_fattr(rp.parse_fattr(res.data, values=False), target)
+        _fattr.check(rp.parse_fattr(res.data, values=False), target)
 
     def listxattr(self, path: str) -> list[str]:
         target = self._abs(path)
         res = self._router.execute(r.Fattr.list(target), path=target)
-        return [item.name for item in rp.parse_fattr(res.data, values=False).items]
+        return [item.name for item in rp.parse_fattr_list(res.data).items]
 
     def listxattr_tree(self, path: str) -> dict[str, list[str]]:
         """Attribute names for a whole subtree: ``relative path -> names``.
@@ -922,7 +1074,7 @@ class FileSystem:
         """Every attribute and its value, in one round trip."""
         target = self._abs(path)
         res = self._router.execute(r.Fattr.list(target, values=True), path=target)
-        return rp.parse_fattr(res.data).as_dict()
+        return rp.parse_fattr_list(res.data, values=True).as_dict()
 
     # ------------------------------------------------------------------
     # Files
@@ -955,7 +1107,7 @@ class FileSystem:
             errors=errors,
             newline=newline,
             config=self.config,
-            router=self._router,
+            router=self._router.lend(),
             posc=posc,
         )
 
@@ -980,25 +1132,3 @@ class FileSystem:
         with self.open(path, "w", encoding=encoding) as fh:
             written: int = fh.write(text)
         return written
-
-
-def _attr_error(name: str, path: str) -> ServerError:
-    return AttrNotFoundError(kXR_AttrNotFound, f"no attribute {name!r}", path=path)
-
-
-#: ``kXR_fattr`` reports one ``errno`` per attribute, not a ``kXR_`` code, and
-#: a whole-request ``kXR_ok`` can still carry a failed attribute inside it.
-_ATTR_ERRNO: dict[int, tuple[type[ServerError], int]] = {
-    errno.EEXIST: (ExistsError, kXR_ItExists),
-    errno.ENODATA: (AttrNotFoundError, kXR_AttrNotFound),
-    errno.ENOENT: (NotFoundError, kXR_NotFound),
-    errno.EACCES: (PermissionError_, kXR_NotAuthorized),
-}
-
-
-def _check_fattr(result: rp.FattrResult, path: str) -> None:
-    """Raise for the first attribute the server refused."""
-    for item in result.items:
-        if item.code:
-            kind, code = _ATTR_ERRNO.get(item.code, (IOError_, kXR_IOError))
-            raise kind(code, f"{os.strerror(item.code)}: attribute {item.name!r}", path=path)

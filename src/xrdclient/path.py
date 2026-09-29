@@ -18,6 +18,7 @@ inheriting from it would trade a stable surface for a fragile one.
 
 from __future__ import annotations
 
+import dataclasses
 import posixpath
 from collections.abc import Iterator, Sequence
 from typing import IO, TYPE_CHECKING, Any
@@ -115,9 +116,38 @@ class XRootDPath:
     def joinpath(self, *parts: str) -> XRootDPath:
         return self._derive(posixpath.join(self._url.path, *parts))
 
-    def relative_to(self, other: str | XRootDPath) -> str:
-        base = other._url.path if isinstance(other, XRootDPath) else str(other)
-        return posixpath.relpath(self._url.path, base)
+    def relative_to(self, other: str | XRootDPath, *, walk_up: bool = False) -> str:
+        """This path below ``other``, as a relative string.
+
+        :meth:`pathlib.PurePath.relative_to` semantics: ``other`` must be an
+        ancestor (or this path itself) on the same endpoint, or this raises
+        :class:`ValueError` rather than answering with ``..`` components that
+        would silently point somewhere else. ``walk_up=True`` is 3.12's opt-in
+        to the ``..`` form; this class is not a ``pathlib`` subclass, so it
+        offers it on every interpreter. ``other`` may be another path, a URL,
+        or a bare path taken to be on this path's endpoint.
+        """
+        base = other._url if isinstance(other, XRootDPath) else self._base_url(str(other))
+        if base.endpoint != self._url.endpoint:
+            raise ValueError(f"{str(self)!r} and {str(base)!r} are on a different endpoint")
+        # A relative base is refused outright: relpath would resolve it
+        # against this process's working directory, which means nothing here.
+        absolute = base.path.startswith("/")
+        relative = posixpath.relpath(self._url.path, base.path) if absolute else ""
+        climbs = relative == ".." or relative.startswith("../")
+        if relative and (walk_up or not climbs):
+            return relative
+        raise ValueError(f"{self._url.path!r} is not in the subpath of {base.path!r}")
+
+    def _base_url(self, other: str) -> XRootDURL:
+        """``other`` as a URL, a bare path being one on this path's endpoint.
+
+        The bare path is not normalised: a relative one must stay relative so
+        that it is refused, as :mod:`pathlib` refuses mixing the two.
+        """
+        if "://" in other:
+            return parse(other)
+        return dataclasses.replace(self._url, path=other)
 
     def _derive(self, path: str) -> XRootDPath:
         """Another path on the same endpoint, sharing this one's connection.

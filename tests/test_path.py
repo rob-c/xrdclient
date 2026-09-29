@@ -110,6 +110,34 @@ def test_a_string_on_the_left_of_the_slash_rebases_the_path():
 def test_relative_to_gives_a_plain_string(p):
     assert p.relative_to(XRootDPath(BASE)) == "runs/run1.root"
     assert p.relative_to("/store/user") == "me/runs/run1.root"
+    assert p.relative_to(BASE) == "runs/run1.root"
+    assert p.relative_to(p) == "."
+
+
+def test_relative_to_refuses_a_path_that_is_not_an_ancestor(p):
+    """``pathlib`` raises rather than walking up with ``..``."""
+    with pytest.raises(ValueError, match="not in the subpath"):
+        XRootDPath("root://h//a/b").relative_to("/c")
+    with pytest.raises(ValueError, match="not in the subpath"):
+        p.relative_to("/store/us")
+    with pytest.raises(ValueError, match="not in the subpath"):
+        p.relative_to("store/user")
+
+
+def test_relative_to_refuses_another_endpoint():
+    with pytest.raises(ValueError, match="different endpoint"):
+        XRootDPath("root://h1//a/b").relative_to("root://h2//a")
+    with pytest.raises(ValueError, match="different endpoint"):
+        XRootDPath("root://h1//a/b").relative_to(XRootDPath("root://h1:1095//a"))
+
+
+def test_relative_to_can_walk_up_when_asked():
+    """``walk_up`` is 3.12's opt-in to the ``..`` form, offered everywhere."""
+    path = XRootDPath("root://h//a/b")
+    assert path.relative_to("/c", walk_up=True) == "../a/b"
+    assert path.relative_to("/a/b/c", walk_up=True) == ".."
+    with pytest.raises(ValueError, match="different endpoint"):
+        path.relative_to("root://other//a", walk_up=True)
 
 
 def test_str_and_fspath_are_the_url(p):

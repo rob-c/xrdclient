@@ -101,6 +101,21 @@ def _no_pooled_connections():
     SESSIONS.clear()
 
 
+@pytest.fixture(autouse=True)
+def _no_configured_defaults():
+    """Put the process-wide configuration back after every test.
+
+    :func:`~xrdclient.configure` changes what every later ``Config()`` in the
+    process resolves to - that is its job - so a test that calls it would
+    otherwise decide the defaults of whichever test the scheduler runs next.
+    """
+    from xrdclient import config as cfgmod
+
+    saved = (cfgmod._configured, cfgmod._default)
+    yield
+    cfgmod._configured, cfgmod._default = saved
+
+
 @pytest.fixture
 def config() -> Config:
     """A config that never reaches the network or the local filesystem.

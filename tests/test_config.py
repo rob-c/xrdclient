@@ -58,12 +58,87 @@ def test_repr_keeps_an_absent_token_readable():
 
 
 def test_configure_replaces_the_current_config():
-    saved = current()
-    try:
-        configure(username="scoped")
-        assert current().username == "scoped"
-    finally:
-        cfgmod._current.set(saved)
+    # The conftest puts the process-wide configuration back afterwards.
+    configure(username="scoped")
+    assert current().username == "scoped"
+
+
+def test_an_override_reaches_a_config_built_inside_it():
+    """The documented order: explicit > override > environment > default."""
+    baseline = Config().request_timeout
+    with override(request_timeout=5.0, wait_cap=7.0):
+        assert Config().request_timeout == 5.0
+        assert Config().wait_cap == 7.0
+        assert Config(request_timeout=9.0).request_timeout == 9.0
+        with override(wait_cap=3.0):
+            assert (Config().request_timeout, Config().wait_cap) == (5.0, 3.0)
+    assert Config().request_timeout == baseline
+
+
+def test_an_override_beats_the_environment(monkeypatch):
+    monkeypatch.setenv("XRD_REQUESTTIMEOUT", "12")
+    with override(request_timeout=5.0):
+        assert Config().request_timeout == 5.0
+    assert Config().request_timeout == 12.0
+
+
+def test_configure_is_seen_by_every_thread():
+    import threading
+
+    configure(chunk_size=123)
+    seen = []
+    worker = threading.Thread(target=lambda: seen.append((current(), Config())))
+    worker.start()
+    worker.join()
+    ((there, built),) = seen
+    assert there.chunk_size == built.chunk_size == 123
+
+
+def test_an_override_does_not_leak_into_other_threads():
+    import threading
+
+    seen = []
+    baseline = Config().chunk_size
+    with override(chunk_size=5):
+        worker = threading.Thread(target=lambda: seen.append(Config().chunk_size))
+        worker.start()
+        worker.join()
+    assert seen == [baseline]
+
+
+def test_configuring_nonsense_changes_nothing():
+    before = current()
+    with pytest.raises(TypeError):
+        configure(no_such_setting=1)
+    assert current() is before
+    assert "no_such_setting" not in cfgmod._configured
+
+
+def test_an_override_outranks_the_file(tmp_path):
+    ini = tmp_path / "x.ini"
+    ini.write_text("[defaults]\npool_size = 3\nrequest_timeout = 60\n")
+    with override(request_timeout=5.0):
+        loaded = Config.from_file(ini)
+    assert (loaded.pool_size, loaded.request_timeout) == (3, 5.0)
+
+
+def test_the_retry_backoff_does_not_read_the_stream_error_window(monkeypatch):
+    """``XRD_STREAMERRORWINDOW`` is XrdCl's 1800 s memory of an error, not a sleep."""
+    monkeypatch.setenv("XRD_STREAMERRORWINDOW", "1800")
+    assert Config().retry_backoff == 0.5
+    monkeypatch.setenv("XRD_RETRYBACKOFF", "0.1")
+    assert Config().retry_backoff == 0.1
+
+
+def test_a_subclass_inherits_the_ambient_defaults():
+    import dataclasses as dc
+
+    @dc.dataclass(frozen=True)
+    class Wider(Config):
+        extra: int = 1
+
+    with override(request_timeout=4.0):
+        assert Wider().request_timeout == 4.0
 
 
 def test_override_restores_on_exit():

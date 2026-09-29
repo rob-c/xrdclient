@@ -15,7 +15,7 @@ from ..errors import ProtocolError
 from . import constants as c
 from .buffer import Writer
 
-__all__ = ["HANDSHAKE", "Request", "ResponseHeader", "encode", "decode_header"]
+__all__ = ["HANDSHAKE", "Request", "ResponseHeader", "encode", "decode_header", "header_fields"]
 
 # Three zero words, then 4, then ROOTD_PQ (2012).
 HANDSHAKE = bytes(12) + struct.pack(">II", 4, c.ROOTD_PQ)
@@ -47,9 +47,29 @@ class Request:
     #: answered on the control link.
     reply_on_path: bool = False
 
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+        # A class that redefines ``params`` but not ``header_params`` must not
+        # inherit a parent's precomputed layout: its own ``params`` is the
+        # truth, so it gets the general path back.
+        if "params" in cls.__dict__ and "header_params" not in cls.__dict__:
+            cls.header_params = Request.header_params  # type: ignore[method-assign]
+
     def params(self, w: Writer) -> None:
         """Write the 16 parameter bytes. Default: all zero."""
         w.zeros(16)
+
+    def header_params(self) -> bytes | bytearray:
+        """The 16 parameter bytes exactly as :meth:`params` writes them.
+
+        What :func:`encode` puts on the wire. The requests sent on every
+        operation - a read, a stat, an open - override it with a single
+        ``struct`` pack of the same layout; everything else goes through
+        :meth:`params` and a :class:`~xrdclient.proto.buffer.Writer`.
+        """
+        w = Writer()
+        self.params(w)
+        return w.buffer
 
     def payload(self) -> bytes:
         """Bytes after the header, counted in ``dlen``."""
@@ -92,9 +112,7 @@ class Request:
 
 def encode(req: Request, streamid: int) -> bytes:
     """Serialise ``req`` into a complete wire frame."""
-    w = Writer()
-    req.params(w)
-    params = w.bytes()
+    params = req.header_params()
     if len(params) != 16:
         raise ProtocolError(
             f"{type(req).__name__}.params wrote {len(params)} bytes, expected 16"
@@ -121,14 +139,24 @@ class ResponseHeader:
         )
 
 
-def decode_header(data: bytes | bytearray | memoryview) -> ResponseHeader:
-    """Decode the leading 8 bytes of a response frame."""
-    if len(data) < c.RESPONSE_HDRLEN:
-        raise ProtocolError(f"response header needs 8 bytes, got {len(data)}")
-    streamid, status, dlen = _RESP_HDR.unpack(bytes(data[:8]))
+def header_fields(data: bytes | bytearray | memoryview, offset: int = 0) -> tuple[int, int, int]:
+    """``(streamid, status, dlen)`` of the response header at ``offset``.
+
+    The allocation-free form of :func:`decode_header`, for the receive path,
+    which reads one of these per reply. The caller has checked that eight
+    bytes are there.
+    """
+    streamid, status, dlen = _RESP_HDR.unpack_from(data, offset)
     if dlen > c.MAX_RESPONSE_BODY:
         raise ProtocolError(
             f"response declares a body of {dlen} bytes, past the "
             f"{c.MAX_RESPONSE_BODY} this client will buffer"
         )
-    return ResponseHeader(streamid, status, dlen)
+    return streamid, status, dlen
+
+
+def decode_header(data: bytes | bytearray | memoryview) -> ResponseHeader:
+    """Decode the leading 8 bytes of a response frame."""
+    if len(data) < c.RESPONSE_HDRLEN:
+        raise ProtocolError(f"response header needs 8 bytes, got {len(data)}")
+    return ResponseHeader(*header_fields(data))

@@ -498,6 +498,16 @@ def test_renaming_something_that_is_not_there_says_so(fs):
         fs.rename("/not-here.txt", "/anywhere.txt")
 
 
+def test_a_copy_that_fails_inside_its_200_keeps_the_source(bucket, fs):
+    """S3 may answer ``CopyObject`` with 200 and put the failure in the body;
+    deleting the source on the strength of the status alone would lose it."""
+    bucket.copy_fails = True
+    with pytest.raises(ProtocolError, match="failed to copy"):
+        fs.rename("/top.txt", "/moved.txt")
+    assert bucket.contents("top.txt") == b"top"
+    assert [method for method, _p, _q in bucket.seen] == ["PUT"]
+
+
 def test_the_etag_is_the_checksum_when_it_is_one(fs):
     digest = fs.checksum("/runs/2024/a.root")
     assert (digest.algorithm, digest.value) == ("md5", "5d41402abc4b2a76b9719d911017c592")
@@ -584,6 +594,67 @@ def _refusing_after(verb, real):
         return real(self, method, url, **kwargs)
 
     return request
+
+
+def test_a_part_that_fails_abandons_the_upload_rather_than_leave_a_hole(bucket, fs, small_parts):
+    bucket.failing_parts = {2}
+    handle = fs.open("/big.bin", "wb", buffering=0)
+    handle.write(b"a" * 8)
+    handle.write(b"b" * 8)  # the first part: sixteen bytes
+    with pytest.raises(ServerError):
+        handle.write(b"c" * 8)  # the second, which the endpoint loses
+    assert bucket.aborted == ["upload-0001"] and bucket.uploads == {}
+    # Neither more data nor a close may complete what is now missing a part.
+    with pytest.raises(ServerError):
+        handle.write(b"d" * 8)
+    with pytest.raises(ServerError):
+        handle.close()
+    assert handle.closed
+    assert "big.bin" not in bucket.objects
+    assert [m for m, _p, q in bucket.seen if q.startswith("uploadId=")] == ["DELETE"]
+
+
+def test_a_part_that_fails_inside_a_with_block_stores_nothing(bucket, fs, small_parts):
+    bucket.failing_parts = {2}
+    with pytest.raises(ServerError):
+        with fs.open("/big.bin", "wb", buffering=0) as handle:
+            for letter in b"abcdef":
+                handle.write(bytes([letter]) * 8)
+    assert "big.bin" not in bucket.objects
+    assert bucket.aborted == ["upload-0001"]
+
+
+def test_the_last_part_failing_abandons_the_upload_too(bucket, fs, small_parts):
+    bucket.failing_parts = {2}
+    handle = fs.open("/big.bin", "wb", buffering=0)
+    handle.write(b"a" * 20)
+    handle.write(b"b" * 4)  # held for the tail, which close sends
+    with pytest.raises(ServerError):
+        handle.close()
+    assert "big.bin" not in bucket.objects
+    assert bucket.aborted == ["upload-0001"]
+
+
+def test_parts_grow_so_the_part_count_limit_is_never_reached():
+    assert s3fs._part_size(0) == s3fs.MIN_PART_SIZE
+    assert s3fs._part_size(899) == s3fs.MIN_PART_SIZE
+    assert s3fs._part_size(900) == 2 * s3fs.MIN_PART_SIZE
+    # Ten thousand parts - all S3 allows - hold more than the five
+    # terabytes S3 allows an object to be, and no part is over five gigabytes.
+    total = sum(s3fs._part_size(n) for n in range(s3fs.MAX_PARTS))
+    assert total >= 5 << 40
+    assert s3fs._part_size(s3fs.MAX_PARTS - 1) == s3fs.MAX_PART_SIZE == 5 << 30
+
+
+def test_a_long_upload_sends_larger_parts_as_it_goes(bucket, fs, small_parts, monkeypatch):
+    monkeypatch.setattr(s3fs, "_PARTS_PER_DOUBLING", 1)
+    payload = bytes(range(120))
+    with fs.open("/big.bin", "wb", buffering=0) as handle:
+        for start in range(0, len(payload), 2):
+            handle.write(payload[start : start + 2])
+    assert bucket.contents("big.bin") == payload
+    parts = [q for m, _p, q in bucket.seen if m == "PUT" and q.startswith("partNumber=")]
+    assert len(parts) == 4  # 10, 16, 32 and the 62-byte tail
 
 
 def test_the_raw_layer_says_what_it_is(fs):

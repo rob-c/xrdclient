@@ -206,3 +206,111 @@ def test_a_stat_knows_when_and_in_which_zone(server, config):
 
 def test_a_listing_entry_prints_where_it_is():
     assert str(DirEntry(name="f.root", parent="/store")) == "/store/f.root"
+
+
+# ---------------------------------------------------------------------------
+# Local paths
+# ---------------------------------------------------------------------------
+#
+# A plain path names a file on this machine. Before these, every verb handed
+# it to a FileSystem for a host called "" on port 0, so a local move either
+# failed outright or - worse - copied the file and then failed to remove the
+# source with an error about connecting to ":0".
+
+
+def test_move_between_two_local_paths_is_a_rename(tmp_path):
+    source, target = tmp_path / "a.txt", tmp_path / "b.txt"
+    source.write_text("moved")
+    xrdclient.move(str(source), str(target))
+    assert (source.exists(), target.read_text()) == (False, "moved")
+
+
+def test_move_between_local_filesystems_copies_then_removes(tmp_path, monkeypatch):
+    """``rename`` cannot cross a mount point; that becomes a copy and a delete."""
+    import errno
+    import os
+
+    source, target = tmp_path / "a.txt", tmp_path / "b.txt"
+    source.write_text("far")
+
+    def cross_device(src, dst):
+        raise OSError(errno.EXDEV, "Invalid cross-device link", src)
+
+    monkeypatch.setattr(os, "replace", cross_device)
+    xrdclient.move(str(source), str(target))
+    assert (source.exists(), target.read_text()) == (False, "far")
+
+
+def test_move_from_a_local_path_to_a_server_removes_the_local_file(server, config, tmp_path):
+    source = tmp_path / "up.txt"
+    source.write_bytes(b"upload")
+    target = server.url.with_path("/data/up.txt")
+    xrdclient.move(str(source), target, config=config)
+    assert server.contents("/data/up.txt") == b"upload"
+    assert not source.exists()
+
+
+def test_move_from_a_server_to_a_local_path_removes_the_remote_file(server, config, tmp_path):
+    target = tmp_path / "down.root"
+    xrdclient.move(server.url.with_path("/data/a.root"), str(target), config=config)
+    assert target.read_bytes() == b"hello world"
+    assert "/data/a.root" not in server.files
+
+
+def test_a_move_whose_copy_fails_verification_keeps_the_source(server, config, tmp_path):
+    """The source is the only copy left if the new one is wrong."""
+    from xrdclient.errors import ChecksumMismatchError
+    from xrdclient.proto import constants as c
+    from xrdclient.testing import frame
+
+    source = tmp_path / "precious.bin"
+    source.write_bytes(b"precious")
+    server.handlers[c.kXR_query] = lambda conn, sid, params, body: iter(
+        [frame(sid, c.kXR_ok, b"adler32 00000001\x00")]
+    )
+    with pytest.raises(ChecksumMismatchError):
+        xrdclient.move(str(source), server.url.with_path("/data/p.bin"), config=config)
+    assert source.read_bytes() == b"precious"
+
+
+def test_the_asking_verbs_answer_for_a_local_path(tmp_path):
+    here = tmp_path / "f.bin"
+    here.write_bytes(b"12345")
+    assert xrdclient.exists(str(here)) and not xrdclient.exists(str(tmp_path / "no"))
+    assert xrdclient.size(str(here)) == 5
+    info = xrdclient.stat(str(here))
+    assert info.is_file() and info.is_readable() and not info.is_dir()
+    assert info.st_mtime == int(here.stat().st_mtime)
+    assert xrdclient.stat(str(tmp_path)).is_dir()
+    assert xrdclient.is_online(str(here))
+    assert xrdclient.checksum(str(here), "adler32").value == "02f80100"
+
+
+def test_the_changing_verbs_work_on_a_local_path(tmp_path):
+    deep = tmp_path / "x" / "y"
+    xrdclient.mkdir(str(deep), "rwxr-x---")
+    xrdclient.mkdir(str(deep))  # forgiven the second time, as remotely
+    assert deep.is_dir() and (deep.stat().st_mode & 0o777) == 0o750
+
+    leaf = deep / "sub" / "leaf.txt"
+    assert xrdclient.write_text(str(leaf), "héllo") == 5
+    assert xrdclient.read_text(str(leaf)) == "héllo"
+    assert xrdclient.write_bytes(str(leaf), b"\x00") == 1
+    assert xrdclient.read_bytes(str(leaf)) == b"\x00"
+
+    with pytest.raises(OSError):
+        xrdclient.remove(str(deep))  # not empty: has to be asked for
+    xrdclient.remove(str(leaf))
+    xrdclient.remove(str(leaf), missing_ok=True)
+    xrdclient.remove(str(tmp_path / "x"), recursive=True)
+    assert not (tmp_path / "x").exists()
+
+
+def test_listing_a_local_directory_says_where_to_look_instead(tmp_path):
+    """The answer is a list of remote paths; a local one could not be used."""
+    with pytest.raises(ValueError, match="pathlib"):
+        xrdclient.ls(str(tmp_path))
+    with pytest.raises(ValueError, match="pathlib"):
+        xrdclient.glob(str(tmp_path / "*"))
+    with pytest.raises(ValueError, match="local"):
+        xrdclient.stage(str(tmp_path / "f"))

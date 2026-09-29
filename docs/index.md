@@ -33,9 +33,7 @@ It is a Python library first and an XRootD binding second.
 ## Install
 
 ```console
-$ pip install xrdclient                 # the whole library
-$ pip install xrdclient[fsspec]         # pandas / dask / pyarrow URLs
-$ pip install xrdclient[krb5]           # the Kerberos mechanism
+$ pip install xrdclient                 # the whole library, Kerberos included
 ```
 
 Python 3.9 or newer - the version RHEL 9 and AlmaLinux 9 ship, so a grid

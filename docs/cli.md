@@ -106,6 +106,7 @@ $ xrd-cp /tmp/f.root root://host//store/f.root
 $ xrd-cp root://host//store/f.root /scratch/
 $ xrd-cp -r /tmp/results davs://dav.example.org/store/results
 $ xrd-cp --tpc root://a//store/f.root root://b//store/f.root
+$ xrd-cp --tpc --verify root://a//store/f.root root://b//store/f.root
 $ xrd-cp -f /tmp/f.root root://host//store/f.root      # overwrite what is there
 $ xrd-cp --verify -a crc32c /tmp/f.root root://host//store/f.root
 $ xrd-cp --chunk-size 8M --progress root://host//store/big.root /scratch/
@@ -113,7 +114,7 @@ $ xrd-cp --in-flight 4 root://host//store/big.root /scratch/   # deeper read-ahe
 $ xrd-cp --stripes 8 root://host//store/big.root /scratch/      # eight spans at once
 $ xrd-cp --streams 2 root://host//store/big.root /scratch/      # two links per span
 $ xrd-cp -r --exclude '*.log' /tmp/results root://host//store/results
-$ xrd-cp -r --include '*.root' --sync size /tmp/results root://host//store/results
+$ xrd-cp -r --include '*.root' --sync size /tmp/results/ root://host//store/results
 $ xrd-cp -r --delete /tmp/results root://host//store/results
 $ xrd-cp -r --dry-run /tmp/results root://host//store/results
 $ xrd-cp -r --parallel 8 /tmp/many-small root://host//store/many-small
@@ -159,9 +160,27 @@ single large file is already spread over several connections by itself. It
 needs `-r`, since without a tree there is nothing to run in parallel.
 
 `cp` semantics decide the destination: a target that already exists as a
-directory is copied *into*, so a second run of `cp -r tree /dest` writes
-`/dest/tree/tree`. Give the target a trailing slash to say "into this" every
-time, which is what makes `--sync` and `--delete` idempotent.
+directory is copied *into*, so a second run of `xrd-cp -r tree /dest` writes
+`/dest/tree/tree`. Two trailing slashes pin it down, so a command gives the
+same answer however many times it runs - which is what makes `--sync` and
+`--delete` idempotent:
+
+| Command | Where `tree/a` lands, every run |
+| --- | --- |
+| `xrd-cp -r tree/ /dest` | `/dest/a` - the slash on the *source* means "the contents of `tree`", as in rsync |
+| `xrd-cp -r tree /dest/` | `/dest/tree/a` - the slash on the *target* means "into this directory" |
+| `xrd-cp -r tree /dest` | `/dest/a` the first time, `/dest/tree/a` once `/dest` exists |
+
+So a mirror you will refresh is `xrd-cp -r --sync size tree/ /dest`: the first
+run copies everything, the next copies nothing, and after a change it copies
+just the files that changed.
+
+`--tpc` asks the servers to move the data, so the flags that tune how bytes
+pass through this process - `--chunk-size`, `--in-flight`, `--stripes`,
+`--streams` - and `-r` are refused with a usage error rather than ignored, as
+are `--dry-run`, `--remove-source` and `--continue`. `--verify` is honoured:
+once the servers are done both are asked for their checksum (`-a` picks
+which, and naming one implies `--verify`), and a mismatch is exit code `1`.
 
 ## `xrd-datasets`
 

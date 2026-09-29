@@ -25,10 +25,9 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-krb5 = ["gssapi>=1.8"]
-fsspec = ["fsspec>=2024.2.0"]
 dev = [
   "complexipy>=6,<7",
+  "fsspec>=2024.2.0",
   "mypy>=1.10",
   "pytest>=8",
   "pytest-cov",
@@ -63,7 +62,7 @@ pythonpath = ["."]
 timeout = 120
 filterwarnings = ["error::ResourceWarning"]
 markers = [
-    "interop: needs a real xrootd daemon on PATH",
+    "interop: needs a real xrootd daemon on PATH (the Kerberos ones, MIT krb5 as well)",
     "parity: needs the official XRootD python bindings as well",
 ]
 
@@ -114,7 +113,7 @@ mypy_path = "src"
 # through narrow, guarded imports, so untyped is the honest description of
 # them rather than a hole in our own checking.
 [[tool.mypy.overrides]]
-module = ["gssapi.*", "google_crc32c.*", "fsspec.*"]
+module = ["google_crc32c.*", "fsspec.*"]
 ignore_missing_imports = true
 
 # ``AbstractFileSystem`` is therefore ``Any``, and subclassing it is the whole

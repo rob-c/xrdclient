@@ -152,3 +152,104 @@ def test_a_file_url_keeps_the_path_it_was_handed():
 def test_a_path_can_be_emptied_back_to_the_root():
     assert parse("root://h:1094//store/f.root").with_path("").path == "/"
     assert parse("root://h:1094//store/").with_path("/store/sub/../f").path == "/store/f"
+
+
+# ---------------------------------------------------------------------------
+# Opaque data goes on the wire exactly as it was written
+# ---------------------------------------------------------------------------
+
+#: What XrdCl sends verbatim, and what a server compares literally:
+#: XrdSciTokens strips a ``Bearer%20`` prefix, and a ``tpc.src`` is a
+#: ``host:port`` that no server percent-decodes.
+WRITTEN = "authz=Bearer%20abc&tpc.src=h:1094&x=a+b"
+
+
+def test_an_unmodified_query_reaches_the_wire_byte_for_byte():
+    url = parse(f"root://h//p?{WRITTEN}")
+    assert url.path_with_cgi == f"/p?{WRITTEN}"
+    assert str(url) == f"root://h:1094//p?{WRITTEN}"
+    assert url.cgi == WRITTEN
+
+
+def test_the_decoded_view_is_still_decoded():
+    url = parse(f"root://h//p?{WRITTEN}")
+    assert url.query == {"authz": "Bearer abc", "tpc.src": "h:1094", "x": "a b"}
+
+
+def test_adding_a_parameter_leaves_the_others_untouched():
+    url = parse(f"root://h//p?{WRITTEN}").with_query(y="1")
+    assert url.path_with_cgi == f"/p?{WRITTEN}&y=1"
+
+
+def test_changing_a_parameter_rewrites_only_that_one_in_place():
+    url = parse(f"root://h//p?{WRITTEN}").with_query(authz="other")
+    assert url.cgi == "authz=other&tpc.src=h:1094&x=a+b"
+
+
+def test_removing_a_parameter_leaves_the_others_untouched():
+    url = parse(f"root://h//p?{WRITTEN}")
+    rest = url.evolve(query={k: v for k, v in url.query.items() if k != "authz"})
+    assert rest.cgi == "tpc.src=h:1094&x=a+b"
+    assert url.without_query().path_with_cgi == "/p"
+
+
+def test_a_rendered_value_escapes_only_what_would_change_its_meaning():
+    url = XRootDURL(host="h", path="/p", query={"tpc.dst": "root://u@h:1094//a,b c"})
+    assert url.path_with_cgi == "/p?tpc.dst=root://u@h:1094//a,b%20c"
+
+
+@pytest.mark.parametrize("value", ["a&b", "a+b", "a%20b", "a#b", "a=b", "ü", "a b"])
+def test_a_rendered_value_parses_back_to_itself(value):
+    url = parse("root://h//p").with_query(k=value)
+    assert parse(str(url)).query == {"k": value}
+
+
+def test_a_query_built_from_a_dict_renders_too():
+    assert XRootDURL(host="h", query={"a": "1", "b": "x:y"}).path_with_cgi == "/?a=1&b=x:y"
+
+
+def test_cgi_except_keeps_the_other_fields_as_written():
+    url = parse(f"root://h//p?{WRITTEN}")
+    assert url.cgi_except({"tpc.src"}) == "authz=Bearer%20abc&x=a+b"
+    assert url.cgi_except({"authz", "tpc.src", "x"}) == ""
+
+
+def test_http_url_keeps_the_query_as_written():
+    assert parse(f"https://h/p?{WRITTEN}").http_url == f"https://h:443/p?{WRITTEN}"
+
+
+def test_http_url_percent_encodes_the_path():
+    """It is handed to another server in a header, where a raw space ends the
+    URL and a non-Latin-1 name cannot be encoded at all."""
+    url = parse("davs://h/store/a b/ü.root")
+    assert url.http_url == "https://h:443/store/a%20b/%C3%BC.root"
+
+
+def test_http_url_leaves_an_encoded_delimiter_alone():
+    assert parse("https://h/a%2Fb").http_url == "https://h:443/a%2Fb"
+
+
+@pytest.mark.parametrize("scheme", ["http", "https", "dav", "davs", "webdav"])
+def test_an_http_urls_path_is_decoded_once(scheme):
+    """``%20`` in a copied link is a space, as it is to a browser."""
+    url = parse(f"{scheme}://h/store/a%20b/%E2%9C%93%2541")
+    assert url.path == "/store/a b/✓%41"
+
+
+@pytest.mark.parametrize("scheme", ["root", "roots", "s3"])
+def test_root_and_s3_paths_are_taken_as_written(scheme):
+    assert parse(f"{scheme}://h//store/a%20b").path.endswith("/store/a%20b")
+
+
+@pytest.mark.parametrize("name", ["a b", "a%20b", "a#b?c", "été+~", "100%"])
+def test_an_http_url_prints_back_to_the_name_it_was_made_with(name):
+    url = parse("https://h/").with_path(f"/d/{name}")
+    assert parse(str(url)).path == f"/d/{name}"
+    assert parse(url.http_url).path == f"/d/{name}"
+
+
+def test_quote_path_escapes_exactly_once_but_keeps_an_escaped_slash():
+    from xrdclient.url import quote_path, unquote_path
+
+    assert quote_path("/a b/%41~_.-/refs%2Fmain") == "/a%20b/%2541~_.-/refs%2Fmain"
+    assert unquote_path("/a%20b/%2541/refs%2fmain") == "/a b/%41/refs%2Fmain"

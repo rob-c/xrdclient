@@ -628,6 +628,12 @@ def test_the_spans_cover_the_file_exactly():
     assert sum(length for _, length in engine._spans(9973, 7)) == 9973
 
 
+def test_an_empty_file_is_one_empty_span():
+    from xrdclient.client import bulk
+
+    assert bulk._spans(0, 4) == [(0, 0)]
+
+
 def test_progress_on_a_parallel_transfer_counts_the_whole_file(src, server):
     seen = []
     xrdclient.copy(
@@ -648,11 +654,12 @@ def test_a_parallel_transfer_still_refuses_to_clobber(src, server):
 
 
 def test_a_source_shorter_than_it_claimed_stops_at_its_end(src, server, monkeypatch):
-    """A span past the end of the file writes nothing rather than looping."""
+    """A span past the end of the file writes nothing rather than looping -
+    and the shortfall is an error, not a finished copy of half a file."""
     monkeypatch.setattr(engine, "_probe", lambda url, config: (len(PAYLOAD) * 2, 0))
-    result = xrdclient.copy(src, server.url / "short.bin", chunk_size=1024, verify=False)
+    with pytest.raises(xrdclient.errors.XRootDError, match="incomplete"):
+        xrdclient.copy(src, server.url / "short.bin", chunk_size=1024, verify=False)
     assert server.contents("/short.bin") == PAYLOAD
-    assert result.size == len(PAYLOAD)
 
 
 def test_a_resumed_transfer_is_not_also_a_divided_one(server, tmp_path):
@@ -937,3 +944,43 @@ def test_progress_and_digests_still_see_the_file_in_order():
 def test_the_window_is_a_setting_and_a_flag(tmp_path):
     assert xrdclient.Config().in_flight == 2
     assert xrdclient.Config(in_flight=1).in_flight == 1
+
+
+def test_third_party_names_the_data_servers_it_landed_on_not_the_redirectors(server):
+    """A stock source matches ``tpc.dst`` against the host that actually pulls.
+
+    Behind a redirector that host is the data server the destination open
+    landed on, not the name in the URL - ``XrdCl`` takes it from the open's
+    last URL - and likewise ``tpc.src`` must be the source's data server.
+    Here both redirectors send a ``localhost`` client to ``127.0.0.1``, so
+    the name in either URL is never the right answer.
+    """
+    with FakeServer(dirs=["/"]) as dst, FakeServer() as src_rdr, FakeServer() as dst_rdr:
+        # XrdCl finds the source's data server with a placement open.
+        src_rdr.redirects[c.kXR_open] = ("127.0.0.1", server.address[1], "")
+        dst_rdr.redirects[c.kXR_open] = ("127.0.0.1", dst.address[1], "")
+        result = xrdclient.third_party(
+            f"root://localhost:{src_rdr.address[1]}//data/a.root",
+            f"root://localhost:{dst_rdr.address[1]}//pulled.root",
+        )
+        (dst_open,) = [p for p in dst.opened if "tpc.key" in p]
+        (src_open,) = [p for p in server.opened if "tpc.key" in p]
+    assert result.size == 11
+    assert f"tpc.src=127.0.0.1:{server.address[1]}&" in dst_open
+    assert "&tpc.dst=127.0.0.1&" in src_open
+
+
+def test_a_verified_third_party_copy_asks_both_ends_afterwards():
+    """No byte passed through here, so both servers are asked for a digest."""
+    with FakeDAVServer(files={"/d/a.root": b"hello"}) as src, FakeDAVServer(dirs=["/d"]) as dst:
+        result = xrdclient.third_party(
+            src.url / "d/a.root", dst.url / "d/b.root", verify=True, algorithm="adler32"
+        )
+    assert result.verified and result.checksum.algorithm == "adler32"
+
+
+def test_an_unverified_third_party_copy_asks_nothing_more(server):
+    with FakeServer(dirs=["/"]) as dst:
+        result = xrdclient.third_party(server.url / "data/a.root", dst.url / "b.root")
+    assert not result.verified
+    assert c.kXR_query not in dst.seen

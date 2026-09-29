@@ -15,7 +15,7 @@ from xrdclient.errors import NoMechanismError, ProtocolError, RedirectLimitError
 from xrdclient.proto import constants as c
 from xrdclient.proto import machine
 from xrdclient.proto import requests as r
-from xrdclient.session.router import Router, _retarget
+from xrdclient.session.router import Router, _path_fields, _retarget
 from xrdclient.session.sync import RedirectRequired, Result, Session
 from xrdclient.testing import FakeServer
 
@@ -178,16 +178,19 @@ def test_an_eos_capability_reaches_the_target_as_one_parameter(config):
 
 
 def test_the_redirect_token_is_folded_into_the_path():
+    """Each hop's token replaces the last one's: it is a capability for the
+    server that hop points at, and stale by the next."""
     request = r.Stat("/data/a.root")
-    _retarget(request, "xrdclient.k=1")
+    original = _path_fields(request)
+    _retarget(request, original, "xrdclient.k=1")
     assert request.path == "/data/a.root?xrdclient.k=1"
-    _retarget(request, "xrdclient.j=2")
-    assert request.path == "/data/a.root?xrdclient.k=1&xrdclient.j=2"
+    _retarget(request, original, "xrdclient.j=2")
+    assert request.path == "/data/a.root?xrdclient.j=2"
 
 
 def test_a_redirect_without_a_token_leaves_the_path_alone():
     request = r.Stat("/data/a.root")
-    _retarget(request, "")
+    _retarget(request, _path_fields(request), "")
     assert request.path == "/data/a.root"
 
 
