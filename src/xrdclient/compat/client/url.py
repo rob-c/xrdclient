@@ -15,6 +15,9 @@ __all__ = ["URL"]
 #: XrdCl's port when a URL names none, whatever its scheme.
 _DEFAULT_PORT = 1094
 
+#: XrdCl's port for a scheme that names none: HTTP's own, else xrootd's.
+_SCHEME_PORTS = {"http": 80, "dav": 80, "https": 443, "davs": 443}
+
 
 class URL:
     """A URL as XrdCl parses it: ``hostid``, ``path``, ``path_with_params``."""
@@ -33,6 +36,7 @@ class URL:
             # A local path is absolute by definition, so its slash is part of
             # the path rather than the authority's separator.
             authority, tail = authority or "localhost", slash + tail
+        self.port = _SCHEME_PORTS.get(protocol, _DEFAULT_PORT)  # case-sensitive, as XrdCl
         if not protocol or not _authority(self, authority):
             self.__clear_parsed()
             return

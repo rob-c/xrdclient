@@ -31,7 +31,13 @@ status, info = client.FileSystem("root://eos.example.org").stat("/store/f.root")
 `xrdclient.compat.client` has every class, method, keyword, flag and response
 field of `XRootD.client`, and a parity suite holds its answers equal to the
 official bindings' on a real server - see
-[docs/compat.md](docs/compat.md).
+[docs/compat.md](docs/compat.md). Code you cannot edit, such as uproot's
+XRootD handler, runs on it after `xrdclient.compat.install()`. The guide to
+switching a codebase over is [docs/porting.md](docs/porting.md), with a
+[method-by-method reference](docs/compat-reference.md), a
+[cookbook](docs/compat-cookbook.md), [troubleshooting](docs/compat-troubleshooting.md),
+and runnable [examples](examples/pyxrootd/) checked against the official
+bindings.
 
 ## Install
 

@@ -43,8 +43,12 @@ nav:
       - Command line: cli.md
       - Safety: safety.md
   - Coming from pyxrootd:
-      - Migrating: migrating.md
       - Compatibility layer: compat.md
+      - Replacing PyXRootD: porting.md
+      - Compatibility reference: compat-reference.md
+      - Cookbook: compat-cookbook.md
+      - Troubleshooting: compat-troubleshooting.md
+      - Migrating to the native API: migrating.md
   - Reference:
       - API: api.md
       - Configuration: config.md

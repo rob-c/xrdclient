@@ -13,7 +13,8 @@ response)` pairs, the response objects' attribute names, the flags' names and
 numbers, `timeout=` and `callback=` on every call, and the progress-handler
 protocol of `CopyProcess`.
 
-For code that cannot be edited at all:
+For code that cannot be edited at all - uproot, coffea, a script you may only
+run:
 
 ```python
 import xrdclient.compat
@@ -24,6 +25,16 @@ from XRootD import client    # now this package
 
 `install()` refuses if the real bindings are already imported, rather than
 swapping one for the other under code holding references to both.
+
+## The pages in this section
+
+| Page | For |
+| --- | --- |
+| [Replacing PyXRootD](porting.md) | making the switch: the import, `install()` for code you cannot edit, environments with both installed, what changes operationally, a step-by-step checklist, verifying the port, and moving on to the native API |
+| [Compatibility reference](compat-reference.md) | every class, method, keyword, response attribute, flag value, environment key and status code, with a note wherever behaviour differs |
+| [Cookbook](compat-cookbook.md) | complete programs: chunked and vector reads, writing, recursive listings, checksums, staging, xattrs, `CopyProcess` progress, callbacks, timeouts, error handling, threads, uproot, tokens, GSI, Kerberos |
+| [Troubleshooting](compat-troubleshooting.md) | `install()` refusing, Kerberos caches, the list of differences, upstream API not yet here, performance, debugging |
+| [Coming from pyxrootd](migrating.md) | the native API, and how each bindings call translates to it |
 
 ## What is covered
 
@@ -38,6 +49,8 @@ swapping one for the other under code holding references to both.
 | `utils` | `CopyProgressHandler`, `AsyncResponseHandler` |
 | module functions | `EnvPutInt`, `EnvGetInt`, `EnvDelInt` and the `String` trio, `EnvGetDefault`, `SetLogLevel`, `SetLogMask`, `glob`, `iglob`, `setXAttrAdler32` |
 
+The method-by-method detail is in the [reference](compat-reference.md).
+
 ## How it is checked
 
 `tests/test_pyxrootd_compat.py` runs every covered call twice against one
@@ -49,8 +62,15 @@ calls anyway (file ids and timestamps) are left out of the comparison.
 Without the bindings installed those tests skip, and the rest of the file
 pins the same behaviour against the in-process `FakeServer`.
 
-Some of what that turns up is the bindings' own behaviour, kept because code
-depends on it:
+Two more checks sit beside it: the programs in
+[`examples/pyxrootd/`](https://github.com/rob-c/xrdclient/tree/main/examples/pyxrootd),
+which `examples/pyxrootd/run_all.py` runs on both the bindings and this
+package and compares, and `tools/pyxrootd_upstream.py`, which runs the
+bindings' own upstream tests against this package. See
+[verifying the port](porting.md#verifying-the-port).
+
+Some of what the parity suite turns up is the bindings' own behaviour, kept
+because code depends on it:
 
 - `readline()` keeps a cursor of its own that `read()` does not move;
   `readline(offset)` moves the cursor to `offset` and leaves it there.
@@ -92,10 +112,16 @@ On purpose, and each one visible in a status rather than silently:
   put keeps this library's default rather than XrdCl's.
 - **`SetLogLevel`** sets the `xrdclient` logger's level; `SetLogMask` is
   accepted and does nothing, since topics are logger names here.
+- **`URL`** gives a scheme that names no port XrdCl's default for it: 80 for
+  `http` and `dav`, 443 for `https` and `davs`, 1094 otherwise.
+
+The full list, with what to do about each, is in
+[Troubleshooting](compat-troubleshooting.md#what-behaves-differently).
 
 ## Mixing in the native API
 
-Every compat `FileSystem` and `File` keeps its native object as `.native`:
+Every compat `FileSystem` and open `File` keeps its native object as
+`.native`:
 
 ```python
 fs = client.FileSystem("root://host")
@@ -104,6 +130,7 @@ for entry in fs.native.walk("/store/run7"):      # something they never had
     ...
 ```
 
-so a port can move over a call at a time. See [Coming from
-pyxrootd](migrating.md) for the native equivalents, and the few names that
+so a port can move over a call at a time. See [Replacing
+PyXRootD](porting.md#moving-on-to-the-native-api) for how, and [Coming from
+pyxrootd](migrating.md) for the native equivalents and the few names that
 mean different things in the two APIs.

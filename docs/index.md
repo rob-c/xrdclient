@@ -53,7 +53,12 @@ live KDC.
 - **[S3 object storage](s3.md)** - the same three entry points over a bucket.
 - **[Authentication](auth.md)** - proxies, tokens, keytabs, and what to do
   when the ladder refuses everything.
-- **[Coming from pyxrootd](migrating.md)** - a translation table.
+- **[Replacing PyXRootD](porting.md)** - run code written for `XRootD.client`
+  on this library by changing one import, or none; with a
+  [reference](compat-reference.md), a [cookbook](compat-cookbook.md) and
+  [troubleshooting](compat-troubleshooting.md).
+- **[Coming from pyxrootd](migrating.md)** - a translation table to the
+  native API.
 - **[Performance](performance.md)** - measured against `xrdcp` and the
   official bindings, with the numbers and the harness.
 - **[Safety](safety.md)** - the guard rails the stock clients do not have.

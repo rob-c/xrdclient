@@ -1361,3 +1361,41 @@ def test_a_local_glob_that_finds_nothing_says_so_with_an_error(tmp_path):
     with pytest.raises(RuntimeError, match=r"\[ERROR\]") as excinfo:
         client.glob(str(tmp_path / "not-there"), raise_error=True)
     assert str(tmp_path) in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("text", "port"),
+    [
+        ("https://h/x", 443),
+        ("davs://h/x", 443),
+        ("http://h/x", 80),
+        ("dav://h/x", 80),
+        ("HTTPS://h/x", 1094),
+        ("root://h//x", 1094),
+        ("https://h:8443/x", 8443),
+    ],
+)
+def test_an_http_url_gets_https_port_as_in_xrdcl(text, port):
+    """XrdCl's default port follows the scheme - looked up as spelled."""
+    assert client.URL(text).port == port
+
+
+def test_cp_parallel_chunks_is_chunks_in_flight_as_in_xrdcl(clean_env, monkeypatch):
+    monkeypatch.undo()
+    monkeypatch.setattr(env, "_ints", {})
+    monkeypatch.setattr(env, "_strings", {})
+    client.EnvPutInt("CPParallelChunks", 7)
+    assert env.config().in_flight == 7
+
+
+def test_a_callback_after_the_pool_has_shut_down_still_arrives(fs, monkeypatch):
+    """At interpreter exit the pool refuses work; the answer comes anyway."""
+    from xrdclient.compat.client import _dispatch
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError("cannot schedule new futures after shutdown")
+
+    monkeypatch.setattr(_dispatch._POOL, "submit", refuse)
+    handler = client.utils.AsyncResponseHandler()
+    assert fs.ping(callback=handler).ok
+    assert handler.wait()[0].ok

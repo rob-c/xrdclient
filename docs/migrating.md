@@ -4,6 +4,13 @@ There are two ways over, and they combine: change one import and keep every
 line of the old code, or move to the native API a call at a time. Most ports
 do the first on day one and the second where it pays.
 
+This page is about the second. For the first - the import change, running
+code you cannot edit through `xrdclient.compat.install()`, a checklist for a
+whole codebase, and how to verify the result - see
+[Replacing PyXRootD](porting.md), with the method-by-method
+[compatibility reference](compat-reference.md), the
+[cookbook](compat-cookbook.md) and [troubleshooting](compat-troubleshooting.md).
+
 ## Step one: change the import
 
 `xrdclient.compat.client` is `XRootD.client` - the same classes, methods,

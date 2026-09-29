@@ -16,6 +16,7 @@ the one place that knows them:
 from __future__ import annotations
 
 import concurrent.futures
+import threading
 from collections.abc import Callable
 from typing import Any, TypeVar
 
@@ -71,7 +72,14 @@ def call(
     if callback is not None:
         if not callable(callback):
             raise TypeError("callback must be callable function, class or lambda")
-        _POOL.submit(_deliver, operation, convert, callback, hosts)
+        try:
+            _POOL.submit(_deliver, operation, convert, callback, hosts)
+        except RuntimeError:
+            # The pool has shut down: the interpreter is exiting, and a
+            # caller cleaning up still gets its answer, on a thread of its own.
+            threading.Thread(
+                target=_deliver, args=(operation, convert, callback, hosts), daemon=True
+            ).start()
         return OK
     if not timeout:
         return now(operation, convert)
