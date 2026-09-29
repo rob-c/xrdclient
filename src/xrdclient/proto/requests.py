@@ -31,7 +31,7 @@ __all__ = [
 #: truncates exactly as :meth:`Writer.padded` does).
 _ZERO_PARAMS = bytes(16)
 _STAT_PARAMS = struct.Struct(">B11x4s")
-_OPEN_PARAMS = struct.Struct(">HH12x")
+_OPEN_PARAMS = struct.Struct(">HHH6x4s")
 _HANDLE_PARAMS = struct.Struct(">4s12x")
 _READ_PARAMS = struct.Struct(">4sqi")
 _WRITE_PARAMS = struct.Struct(">4sqB3x")
@@ -535,21 +535,33 @@ class Set(Request):
 class Open(Request):
     """``kXR_open``."""
 
-    __slots__ = ("path", "options", "mode")
+    __slots__ = ("path", "options", "mode", "optiont", "fhtemplt")
     opcode = c.kXR_open
     signed = True
     idempotent = False
 
-    def __init__(self, path: str, options: int, mode: int = 0) -> None:
+    def __init__(
+        self,
+        path: str,
+        options: int,
+        mode: int = 0,
+        *,
+        optiont: int = 0,
+        fhtemplt: bytes = c.NULL_FHANDLE,
+    ) -> None:
         self.path = path
         self.options = options
         self.mode = mode
+        #: ``kXR_dup`` / ``kXR_samefs``: what to do with the file ``fhtemplt``
+        #: names, a handle open on the same connection.
+        self.optiont = optiont
+        self.fhtemplt = fhtemplt
 
     def params(self, w: Writer) -> None:
-        w.u16(self.mode).u16(self.options).zeros(12)
+        w.u16(self.mode).u16(self.options).u16(self.optiont).zeros(6).padded(self.fhtemplt, 4)
 
     def header_params(self) -> bytes:
-        return _OPEN_PARAMS.pack(self.mode, self.options)
+        return _OPEN_PARAMS.pack(self.mode, self.options, self.optiont, self.fhtemplt)
 
     def payload(self) -> bytes:
         return _encode_path(self.path)

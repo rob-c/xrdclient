@@ -737,3 +737,23 @@ def test_the_easy_mutating_verbs_are_awaitable(server, config):
         assert not await aio.exists(server.url.with_path("/data/new"), config=config)
 
     run(main())
+
+
+def test_fcntl_and_archive_listings_are_mirrored(server):
+    import io
+    import zipfile
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("member", b"m")
+    server.add_file("/data/a.zip", buffer.getvalue())
+    server.fctl = lambda path, data: data[::-1]
+
+    async def main():
+        async with xrdclient.aio.open(server.url / "data/a.root") as handle:
+            assert await handle.fcntl(b"abc") == b"cba"
+        async with AsyncFileSystem(server.url) as fs:
+            entries = await fs.list_archive("/data/a.zip")
+        assert [(e.name, e.stat.st_size) for e in entries] == [("member", 1)]
+
+    run(main())

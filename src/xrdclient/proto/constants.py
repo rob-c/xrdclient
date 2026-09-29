@@ -120,6 +120,10 @@ kXR_tlsGPFA = 0x20000000
 # ---- handshake / kXR_protocol request ----
 ROOTD_PQ = 2012
 kXR_PROTOCOLVERSION = 0x00000520
+#: The first protocol version with ``kXR_clone`` and the open options that
+#: name a template file (``kXR_dup``, ``kXR_samefs``); XrdCl refuses those
+#: opens before sending them to an older server.
+kXR_PROTCLONEVERSION = 0x00000520
 kXR_secreqs = 0x01
 kXR_ableTLS = 0x02
 kXR_wantTLS = 0x04
@@ -159,6 +163,10 @@ kXR_posc = 0x1000
 kXR_nowait = 0x2000
 kXR_seqio = 0x4000
 kXR_open_wrto = 0x8000
+
+# ---- kXR_open optiont (u16): options that need the template in fhtemplt ----
+kXR_dup = 0x0001
+kXR_samefs = 0x0002
 
 # ---- kXR_mkdir options byte ----
 kXR_mkdirpath = 0x01

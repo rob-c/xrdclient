@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import posixpath
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ..errors import ProtocolError
@@ -23,10 +23,27 @@ from ..types import PrepareStatus
 from ..url import XRootDURL
 from .client import HTTPClient
 
-__all__ = ["stage", "status", "cancel", "archive_info"]
+__all__ = [
+    "archive_entries",
+    "archive_info",
+    "cancel",
+    "cancel_files",
+    "discover",
+    "release",
+    "request_status",
+    "stage",
+    "stage_files",
+    "status",
+]
 
 #: Where the API is rooted. Fixed by the WLCG specification, not by the site.
 API = "/api/v1"
+
+#: Where a site describes its tape endpoints, per the same specification.
+WELL_KNOWN = "/.well-known/wlcg-tape-rest-api"
+
+#: The API version this module speaks, and so the endpoint discovery prefers.
+VERSION = "v1"
 
 #: JSON, for a body this client sends and a body it expects back.
 _JSON = {"Content-Type": "application/json"}
@@ -101,9 +118,19 @@ def stage(
     if lifetime:
         for entry in files:
             entry["diskLifetime"] = lifetime
+    return stage_files(client, base, files)
+
+
+def stage_files(client: HTTPClient, base: XRootDURL, files: Sequence[Mapping[str, Any]]) -> str:
+    """:func:`stage` with each file's entry spelt out. Returns the request id.
+
+    Each entry is the specification's: a ``path``, and optionally its own
+    ``diskLifetime`` and ``targetedMetadata`` (a JSON object keyed by the
+    site's name for itself).
+    """
     target = _at(base, "stage")
     res = client.request(
-        "POST", target, body=json.dumps({"files": files}).encode(), headers=_JSON,
+        "POST", target, body=json.dumps({"files": list(files)}).encode(), headers=_JSON,
         expect=(200, 201),
     )
     document = _document(res.body, target)
@@ -116,10 +143,8 @@ def status(
     client: HTTPClient, base: XRootDURL, handle: str, paths: Sequence[str]
 ) -> list[PrepareStatus]:
     """How the staging request ``handle`` is going, one entry per path."""
-    target = _at(base, "stage", handle)
-    res = client.request("GET", target, expect=(200,))
     found = {}
-    for entry in _entries(_document(res.body, target)):
+    for entry in _entries(request_status(client, base, handle)):
         state = str(entry.get("state", ""))
         online = _flag(entry.get("onDisk")) or state == "COMPLETED"
         path = str(entry.get("path", ""))
@@ -139,25 +164,74 @@ def status(
     return _ordered(found, paths)
 
 
+def request_status(client: HTTPClient, base: XRootDURL, handle: str) -> Any:
+    """The staging request ``handle``'s status document, as the site wrote it.
+
+    The specification's shape is ``{"id", "createdAt", "startedAt",
+    "completedAt", "files": [...]}``; :func:`status` reads the files out of it.
+    """
+    target = _at(base, "stage", handle)
+    return _document(client.request("GET", target, expect=(200,)).body, target)
+
+
 def cancel(client: HTTPClient, base: XRootDURL, handle: str) -> None:
     """Withdraw a staging request, files and all."""
     client.request("DELETE", _at(base, "stage", handle), expect=(200, 202, 204))
+
+
+def cancel_files(client: HTTPClient, base: XRootDURL, handle: str, paths: Sequence[str]) -> None:
+    """Withdraw some of the files of staging request ``handle``, leaving the rest."""
+    _paths(client, _at(base, "stage", handle, "cancel"), paths)
+
+
+def release(client: HTTPClient, base: XRootDURL, handle: str, paths: Sequence[str]) -> None:
+    """Tell the site these files of request ``handle`` need not stay on disk for it."""
+    _paths(client, _at(base, "release", handle), paths)
+
+
+def _paths(client: HTTPClient, target: XRootDURL, paths: Sequence[str]) -> None:
+    body = json.dumps({"paths": list(paths)}).encode()
+    client.request("POST", target, body=body, headers=_JSON, expect=(200, 202, 204))
+
+
+def discover(client: HTTPClient, base: XRootDURL) -> dict[str, str]:
+    """The tape endpoint the site advertises: ``{"uri", "version", "sitename"}``.
+
+    The well-known document lists every endpoint the site runs; this picks
+    the one speaking :data:`VERSION`, or the first when none says so.
+    """
+    target = base.with_path(WELL_KNOWN)
+    document = _document(client.request("GET", target, expect=(200,)).body, target)
+    endpoints = document.get("endpoints") if isinstance(document, dict) else None
+    if not endpoints:
+        raise ProtocolError(f"{target} lists no tape endpoints")
+    chosen = next((e for e in endpoints if e.get("version") == VERSION), endpoints[0])
+    return {
+        "uri": str(chosen.get("uri", "")),
+        "version": str(chosen.get("version", "")),
+        "sitename": str(document.get("sitename", "")),
+    }
 
 
 def archive_info(
     client: HTTPClient, base: XRootDURL, paths: Sequence[str]
 ) -> list[PrepareStatus]:
     """Where each of these files lives, without asking for any of it to move."""
+    found = {}
+    for entry in archive_entries(client, base, paths):
+        path = str(entry.get("path", ""))
+        found[path] = _locality(path, str(entry.get("locality", "")), entry)
+    return _ordered(found, paths)
+
+
+def archive_entries(client: HTTPClient, base: XRootDURL, paths: Sequence[str]) -> list[Any]:
+    """The ``archiveinfo`` reply's entries, as the site wrote them."""
     target = _at(base, "archiveinfo")
     res = client.request(
         "POST", target, body=json.dumps({"paths": list(paths)}).encode(), headers=_JSON,
         expect=(200,),
     )
-    found = {}
-    for entry in _entries(_document(res.body, target)):
-        path = str(entry.get("path", ""))
-        found[path] = _locality(path, str(entry.get("locality", "")), entry)
-    return _ordered(found, paths)
+    return _entries(_document(res.body, target))
 
 
 def _locality(path: str, word: str, entry: Any) -> PrepareStatus:

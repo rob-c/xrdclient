@@ -29,7 +29,6 @@ from ._status import (
     OK,
     errErrorResponse,
     errInvalidOp,
-    errNotSupported,
     failure,
     status,
     stOK,
@@ -52,6 +51,12 @@ _LINE_CHUNK = 2 * 1024 * 1024
 
 #: One source file and the ``(offset, length, target offset)`` spans taken from it.
 _CloneGroup = tuple[NativeFile, list[tuple[int, int, int]]]
+
+#: The ``OpenFlags`` that name a template file, and so need one.
+_TEMPLATED = OpenFlags.DUP | OpenFlags.SAMEFS
+
+#: What :meth:`File.__open` passes for an open without a template.
+_PLAIN: tuple[NativeFile | None, bool] = (None, False)
 
 #: The client-side properties a file has, and their defaults.
 _PROPERTIES = {"ReadRecovery": "true", "WriteRecovery": "true", "FollowRedirects": "true"}
@@ -79,29 +84,67 @@ class File:
         callback: Callback = None,
     ) -> Any:
         """Open ``url``; ``flags`` are ``OpenFlags``, where ``NONE`` means read."""
+        wanted = _args.u16(flags, "flags")
+        return self.__open(url, wanted, _args.u16(mode, "mode"), timeout, callback, _PLAIN)
+
+    def openusingtemplate(
+        self,
+        src_file: File,
+        url: str,
+        flags: int = 0,
+        mode: int = 0,
+        timeout: float = 0,
+        callback: Callback = None,
+    ) -> Any:
+        """Open ``url`` next to ``src_file``, an open file: ``OpenFlags.SAMEFS`` / ``DUP``.
+
+        ``SAMEFS`` creates the new file on the filesystem ``src_file`` is on,
+        and ``DUP`` also clones its contents into it, both on the server; the
+        open goes to ``src_file``'s data server, on its connection. Without
+        either flag this is :meth:`open`, and ``src_file`` is not consulted.
+        """
+        template = src_file.native
+        wanted = _args.u32(flags, "flags")
+        mode = _args.u16(mode, "mode")
+        if not wanted & _TEMPLATED:
+            return self.__open(url, wanted & 0xFFFF, mode, timeout, callback, _PLAIN)
+        if self.__failed is None and self.native is None and template is None:
+            return failure(errInvalidOp, "Template file not open"), None
+        dup = bool(wanted & OpenFlags.DUP)
+        return self.__open(url, wanted & 0xFFFF, mode, timeout, callback, (template, dup))
+
+    def __open(
+        self,
+        url: str,
+        wanted: int,
+        mode: int,
+        timeout: float,
+        callback: Callback,
+        template: tuple[NativeFile | None, bool],
+    ) -> Any:
         if self.__failed is not None:
             return self.__failed, None
         if self.native is not None:
             return failure(errInvalidOp), None
         config = env.config()
         native = NativeFile(url, config, router=_channels.router_for(url, config))
-        wanted = _args.u16(flags, "flags") or OpenFlags.READ
+        wanted = wanted or OpenFlags.READ
         if wanted & (OpenFlags.NEW | OpenFlags.DELETE):
             # XrdCl sets ``kXR_async`` on every open, and xrootd has long read
             # that bit on a create or truncate as "make the parent directories"
             # (``XrdXrootdXeq.cc``, do_Open) - so with the bindings, writing
             # ``/a/b/f`` creates ``/a/b``. ``MAKEPATH`` asks for it outright.
             wanted |= OpenFlags.MAKEPATH
-        mode = _args.u16(mode, "mode")
+        source, dup = template
 
         attempt = _Attempt()
 
         def opened() -> None:
             try:
                 if mode:
-                    native.open(NativeOpenFlags(wanted), int(mode))
+                    native.open(NativeOpenFlags(wanted), int(mode), template=source, dup=dup)
                 else:
-                    native.open(NativeOpenFlags(wanted))
+                    native.open(NativeOpenFlags(wanted), template=source, dup=dup)
             except BaseException:
                 native.close()
                 raise
@@ -126,19 +169,6 @@ class File:
     def __fail(self, why: XRootDStatus) -> None:
         """Finish with this file, as XrdCl does after a failed open."""
         self.__failed = why
-
-    def openusingtemplate(
-        self,
-        src_file: File,
-        url: str,
-        flags: int = 0,
-        mode: int = 0,
-        timeout: float = 0,
-        callback: Callback = None,
-    ) -> Any:
-        """Not implemented: ``DUP`` and ``SAMEFS`` opens have no native equivalent."""
-        del src_file, url, flags, mode, timeout, callback
-        return failure(errNotSupported, "openusingtemplate (OpenFlags.DUP/SAMEFS)"), None
 
     def close(self, timeout: float = 0, callback: Callback = None) -> Any:
         """Close the file. Closing one that is not open succeeds, as in XrdCl."""
@@ -291,10 +321,15 @@ class File:
         return self.__run(native.visa, _same, timeout, callback)
 
     def fcntl(self, arg: bytes, timeout: float = 0, callback: Callback = None) -> Any:
-        """Not implemented: this client does not send ``kXR_fctl``."""
-        self.__opened()
-        del arg, timeout, callback
-        return failure(errNotSupported, "fcntl (kXR_fctl)"), None
+        """``(status, bytes)``: ``arg`` for the server's storage plug-in, and its answer.
+
+        As XrdCl's ``File::Fcntl``: a ``kXR_query`` of type ``kXR_Qopaqug``
+        naming this handle. A stock xrootd has no plug-in to take it, and says
+        so with ``errno`` 3013.
+        """
+        native = self.__opened()
+        data = _raw(arg)
+        return self.__run(lambda: native.fcntl(data), _same, timeout, callback)
 
     def clone(
         self, locs: Iterable[dict[str, Any]], timeout: float = 0, callback: Callback = None

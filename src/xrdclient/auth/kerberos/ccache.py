@@ -6,13 +6,16 @@ times, flags, addresses, authorization data and the ticket itself. The key
 is kept, in memory only, because without it a ticket is useless: it is what
 the authenticator in an AP-REQ is encrypted under.
 
+The same marshalled principal and credential are what a KCM daemon
+exchanges over its socket (:mod:`.kcm`) and what MIT stores in a kernel
+keyring (:mod:`.keyring`), so the entry reader - and :func:`marshal_ticket`,
+its inverse - live here and serve all three.
+
 Which cache is "the" cache follows MIT: ``$KRB5CCNAME``, else
 ``default_ccache_name`` from ``krb5.conf``, else ``/tmp/krb5cc_<uid>``.
-``FILE:`` and ``DIR:`` caches are files this module can read. ``KCM:``,
-``KEYRING:``, ``API:`` and ``MEMORY:`` caches live in a daemon, the kernel
-or another process, where a pure-Python client cannot reach; naming one is
-an error that says how to get a FILE cache instead, rather than a silent
-"no ticket".
+:func:`resolve_ccache` answers "which file?" for ``FILE:`` and ``DIR:``
+names, and refuses the rest, which are not files; :func:`.caches.open_ccache`
+opens any name a login can use, ``KCM:`` and ``KEYRING:`` included.
 """
 
 from __future__ import annotations
@@ -30,7 +33,13 @@ __all__ = [
     "CCACHE_VERSION_3",
     "CCACHE_VERSION_4",
     "ccache_name",
+    "is_config_entry",
+    "marshal_principal",
+    "marshal_ticket",
     "read_ccache",
+    "read_credential",
+    "read_credentials",
+    "read_principal",
     "resolve_ccache",
 ]
 
@@ -139,6 +148,73 @@ def _read_entry(reader: _Reader, version: int, kdc_offset: float) -> Ticket:
     )
 
 
+def is_config_entry(ticket: Ticket) -> bool:
+    """Whether an entry is one of MIT's configuration pseudo-credentials."""
+    return ticket.server.realm == _CONFIG_REALM
+
+
+def read_principal(data: bytes) -> Principal:
+    """A marshalled principal, alone: what a KCM daemon or a keyring key holds."""
+    return _read_principal(_Reader(data))
+
+
+def read_credential(data: bytes, kdc_offset: float = 0.0) -> Ticket:
+    """One marshalled (version 4) credential, alone."""
+    return _read_entry(_Reader(data), CCACHE_VERSION_4, kdc_offset)
+
+
+def read_credentials(blobs: list[bytes], kdc_offset: float, where: str) -> list[Ticket]:
+    """Credentials marshalled one per blob, as a KCM daemon or a keyring hands them over.
+
+    One that will not parse is skipped rather than fatal - the FILE reader
+    likewise gives up only what it cannot read - and configuration entries
+    are left out.
+    """
+    out: list[Ticket] = []
+    for blob in blobs:
+        try:
+            ticket = read_credential(blob, kdc_offset)
+        except (ValueError, struct.error) as exc:
+            _log.debug("skipping an unreadable credential in %s: %s", where, exc)
+            continue
+        if not is_config_entry(ticket):
+            out.append(ticket)
+    return out
+
+
+def _blob(data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + data
+
+
+def marshal_principal(principal: Principal) -> bytes:
+    """A principal in the layout versions 3 and 4 share: the inverse of :func:`read_principal`."""
+    head = struct.pack(">II", principal.name_type, len(principal.components))
+    parts = (principal.realm, *principal.components)
+    return head + b"".join(_blob(part.encode("utf-8")) for part in parts)
+
+
+def marshal_ticket(ticket: Ticket) -> bytes:
+    """A credential as a version 4 entry, as MIT's ``k5_marshal_cred`` writes it.
+
+    What a :class:`Ticket` does not keep is written as MIT writes it for a
+    ticket the TGS exchange returned: no addresses, no authorization data,
+    not user-to-user, no second ticket.
+    """
+    times = (ticket.auth_time, ticket.start_time, ticket.end_time, ticket.renew_till)
+    return b"".join(
+        (
+            marshal_principal(ticket.client),
+            marshal_principal(ticket.server),
+            struct.pack(">H", ticket.enctype),
+            _blob(ticket.key),
+            struct.pack(">IIIIBI", *times, 0, ticket.flags),
+            struct.pack(">II", 0, 0),  # addresses, authorization data
+            _blob(ticket.der),
+            _blob(b""),  # second ticket
+        )
+    )
+
+
 def read_ccache(path: str) -> tuple[Principal, list[Ticket]]:
     """Parse a FILE credential cache into its default principal and tickets.
 
@@ -161,7 +237,7 @@ def read_ccache(path: str) -> tuple[Principal, list[Ticket]]:
         except (ValueError, struct.error) as exc:
             _log.debug("credential cache %s ends early: %s", path, exc)
             break
-        if ticket.server.realm != _CONFIG_REALM:
+        if not is_config_entry(ticket):
             out.append(ticket)
     return default, out
 
@@ -204,7 +280,8 @@ def resolve_ccache(name: str | None = None, profile: Profile | None = None) -> s
     """The file a cache name refers to.
 
     Raises :class:`~xrdclient.errors.CredentialError` for a cache type that
-    is not a file, naming the fix.
+    is not a file - ``KCM:`` and ``KEYRING:`` included: a login reads those
+    through :func:`.caches.open_ccache`, but they have no path to give.
     """
     name = name if name is not None else ccache_name(profile)
     kind, sep, rest = name.partition(":")
@@ -221,7 +298,6 @@ def resolve_ccache(name: str | None = None, profile: Profile | None = None) -> s
         else "is not a type this client knows"
     )
     raise CredentialError(
-        f"Kerberos credential cache {name!r} {reason}, and this client reads only FILE: "
-        f"and DIR: caches. Get a ticket into a file with: "
-        f"KRB5CCNAME=FILE:/tmp/krb5cc_$(id -u) kinit"
+        f"Kerberos credential cache {name!r} {reason}, so it has no file to name. "
+        f"Get a ticket into a file with: KRB5CCNAME=FILE:/tmp/krb5cc_$(id -u) kinit"
     )

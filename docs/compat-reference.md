@@ -37,7 +37,7 @@ handed back to the pool when the object is collected.
 | `url` | `URL` | a property |
 | `stat(path, timeout=0, callback=None)` | `(status, StatInfo)` | |
 | `statvfs(path, timeout=0, callback=None)` | `(status, StatInfoVFS)` | |
-| `dirlist(path, flags=0, timeout=0, callback=None)` | `(status, DirectoryList)` | `STAT` fills `statinfo`; `RECURSIVE` names entries by their path below `path`, a level at a time, always with stat. `LOCATE` and `MERGE` list the directory on the server the namespace sends the request to - the same answer for one server. `ZIP` returns `errNotImplemented` (15). |
+| `dirlist(path, flags=0, timeout=0, callback=None)` | `(status, DirectoryList)` | `STAT` fills `statinfo`; `RECURSIVE` names entries by their path below `path`, a level at a time, always with stat. `LOCATE` and `MERGE` list the directory on the server the namespace sends the request to - the same answer for one server. `ZIP` lists the members of the archive `path` names, read from its central directory: each entry's `statinfo` is the archive's own (id, times, mode, owner) with the member's uncompressed size and the writable flag cleared, and `parent` is the archive's path, CGI off, with a `/`. A directory is listed as without the flag; a file that is not an archive is `errDataError` (14) with XrdCl's words. Without a callback, a `path` ending in `.zip` is listed this way whether or not `ZIP` is given, as with XrdCl's synchronous `DirList`. |
 | `mkdir(path, flags=0, mode=0, timeout=0, callback=None)` | `(status, None)` | `mode=0` creates `rwxr-x---`, as the bindings do |
 | `rmdir(path, timeout=0, callback=None)` | `(status, None)` | |
 | `rm(path, timeout=0, callback=None)` | `(status, None)` | |
@@ -69,7 +69,7 @@ open raises `ValueError("I/O operation on closed file")`, as in the bindings.
 | Method | Returns | Notes |
 | --- | --- | --- |
 | `open(url, flags=0, mode=0, timeout=0, callback=None)` | `(status, None)` | `flags=0` means `READ`. `NEW` or `DELETE` also create missing parent directories, as xrootd does for the bindings. Opening an open file is `errInvalidOp` (3). After a failed open, every later `open` and `close` on the same object returns that same failure. |
-| `openusingtemplate(src_file, url, flags=0, mode=0, timeout=0, callback=None)` | `(status, None)` | always `errNotSupported` (13) |
+| `openusingtemplate(src_file, url, flags=0, mode=0, timeout=0, callback=None)` | `(status, None)` | `flags` with `SAMEFS` creates the file on `src_file`'s filesystem, and with `DUP` clones its contents too (`kXR_open` with `kXR_samefs` / `kXR_dup` and `src_file`'s handle), sent to `src_file`'s data server on its connection; the server wants `NEW`, and for `DUP` `UPDATE`. A `src_file` that is not open is `errInvalidOp` (3), "Template file not open"; without `DUP` or `SAMEFS` this is `open` and `src_file` is not looked at. A server that refuses answers as it does the bindings: stock xrootd on storage that cannot clone gives `errno` 3013. |
 | `close(timeout=0, callback=None)` | `(status, None)` | closing a file that is not open succeeds with `code` 4 |
 | `is_open()` | `bool` | a method, as in the bindings |
 | `read(offset=0, size=0, timeout=0, callback=None)` | `(status, bytes)` | offset first; `size=0` reads to the end |
@@ -83,7 +83,7 @@ open raises `ValueError("I/O operation on closed file")`, as in the bindings.
 | `truncate(size, timeout=0, callback=None)` | `(status, None)` | |
 | `stat(force=False, timeout=0, callback=None)` | `(status, StatInfo)` | `force=True` asks the server rather than the cached answer |
 | `visa(timeout=0, callback=None)` | `(status, bytes)` | |
-| `fcntl(arg, timeout=0, callback=None)` | `(status, None)` | always `errNotSupported` (13) |
+| `fcntl(arg, timeout=0, callback=None)` | `(status, bytes)` | `arg` (`bytes` or `str`) goes to the server's storage plug-in in a `kXR_query` of type `kXR_Qopaqug` on this handle, and its answer comes back as it is. Stock xrootd has no such plug-in: status 400, `errno` 3013, "fctl operation not supported". |
 | `clone(locs, timeout=0, callback=None)` | `(status, None)` | `locs` is a list of dicts with `src_file` (an open `File`), `src_offset`, `src_length`, `dest_offset`; `kXR_clone`, done inside the server. Needs both files on the same server. |
 | `set_xattr(attrs, timeout=0, callback=None)` | `(status, [(name, status)])` | as on `FileSystem` |
 | `get_xattr(attrs, timeout=0, callback=None)` | `(status, [(name, value, status)])` | |
@@ -194,6 +194,45 @@ compares them, and `repr` prints `<name: value, ...>` as the bindings do.
 `str(status)` is the message. `status["ok"]` works as well as `status.ok`,
 because the bindings hand some statuses out as plain dicts.
 
+The class carries XrdCl's code names as attributes - `XRootDStatus.errNotFound`
+is 304, `errErrorResponse` 400, and so on through the
+[status codes](#status-codes), plus `suDone` ... `suNotStarted` - without them
+appearing in `vars(status)` or its `repr`. Upstream's newer methods:
+
+| Member | Returns |
+| --- | --- |
+| `error_name` | the name of `code` (`"errNotFound"`), or `None` for a code XrdCl has no name for |
+| `exception()` | `None` when `ok`; else the matching exception below, holding this status |
+| `raise_on_error()` | the status itself when `ok`; else raises `exception()` |
+
+### Exceptions
+
+`responses.raise_on_error(status)` - also `client.raise_on_error` - takes a
+status or a raw status dict and behaves as the method. The exceptions, all
+exported from `client` too, are chosen as upstream chooses them; a server
+`errno` counts only when `code` is `errErrorResponse` (400):
+
+| Exception | `code` | or server `errno` |
+| --- | --- | --- |
+| `XRootDNotFoundError` | `errNotFound` 304 | `kXR_NotFound` 3011 |
+| `XRootDAuthorizationError` | `errAuthFailed` 204, `errLoginFailed` 203 | `kXR_NotAuthorized` 3010, `kXR_AuthFailed` 3030 |
+| `XRootDTimeoutError` | `errSocketTimeout` 103, `errOperationExpired` 206 | `kXR_ReqTimedOut` 3034, `kXR_TimerExpired` 3035 |
+| `XRootDChecksumError` | `errCheckSumError` 305 | `kXR_ChkSumErr` 3019 |
+| `XRootDOperationError` | anything else | |
+
+Each derives from `XRootDError`, a `RuntimeError` whose `str()` is the
+status message and whose `.status` is the status.
+
+### Tape responses
+
+| Class | Attributes |
+| --- | --- |
+| `TapeEndpoint` | `uri`, `version`, `sitename` |
+| `TapeStageResponse` | `requestId`; property `request_id` |
+| `TapeStageStatus` | `id`, `createdAt`, `startedAt`, `completedAt` as the site reports them, `files` (list of `TapeStageFileStatus`); `file_status(path_or_url)`, `is_on_disk(path_or_url)` |
+| `TapeStageFileStatus` | `path`, `state`, `onDisk`, `error`, `startedAt`, `finishedAt` as reported; property `on_disk` (`onDisk`, else `state == "COMPLETED"`) |
+| `TapeArchiveInfo` | `url` (as asked), `path`, `locality` and `error` (each `None` when absent) |
+
 ### StatInfo
 
 | Attribute | Type | Meaning |
@@ -279,16 +318,18 @@ bindings', not the wire protocol's; where they differ from the native
 | `AccessMode` | `NONE` 0, `UR` 256, `UW` 128, `UX` 64, `GR` 32, `GW` 16, `GX` 8, `OR` 4, `OW` 2, `OX` 1 |
 | `MkDirFlags` | `NONE` 0, `MAKEPATH` 1 |
 | `DirListFlags` | `NONE` 0, `STAT` 1, `LOCATE` 2, `RECURSIVE` 4, `MERGE` 8, `CHUNKED` 16, `ZIP` 32 |
-| `PrepareFlags` | `STAGE` 8, `WRITEMODE` 16, `COLOCATE` 32, `FRESH` 64, `EVICT` 256 |
+| `PrepareFlags` | `CANCEL` 1, `STAGE` 8, `WRITEMODE` 16, `COLOCATE` 32, `FRESH` 64, `EVICT` 256 |
 | `QueryCode` | `STATS` 1, `PREPARE` 2, `CHECKSUM` 3, `XATTR` 4, `SPACE` 5, `CHECKSUMCANCEL` 6, `CONFIG` 7, `VISA` 8, `OPAQUE` 16, `OPAQUEFILE` 32 |
 | `StatInfoFlags` | `X_BIT_SET` 1, `IS_DIR` 2, `OTHER` 4, `OFFLINE` 8, `IS_READABLE` 16, `IS_WRITABLE` 32, `POSC_PENDING` 64, `BACKUP_EXISTS` 128 |
 | `LocationType` | `MANAGER_ONLINE` 0, `MANAGER_PENDING` 1, `SERVER_ONLINE` 2, `SERVER_PENDING` 3 |
 | `AccessType` | `READ` 0, `READ_WRITE` 1 |
 | `HostTypes` | `IS_SERVER` 1, `IS_MANAGER` 2, `ATTR_META` 256, `ATTR_PROXY` 512, `ATTR_SUPER` 1024 |
 
-`OpenFlags.DUP` and `SAMEFS` belong to `openusingtemplate`, which is not
-supported. `DirListFlags.CHUNKED` is accepted and has no effect: a listing
-arrives whole. The bindings' `flags.enum` helper function is not provided.
+`OpenFlags.DUP` and `SAMEFS` belong to `openusingtemplate`, which takes
+`flags` up to 32 bits for them; `open` takes 16, as in the bindings. `DirListFlags.CHUNKED` is accepted and has no effect: a listing
+arrives whole. `PrepareFlags.CANCEL` (1) is upstream's newer member; the 6.1
+bindings lack it. `flags.enum(**names)` is the bindings' helper: it returns a
+class named `Enum` with those attributes and their `reverse_mapping`.
 
 ## Environment keys
 
@@ -310,10 +351,11 @@ variable itself.
 | `CPParallelChunks` | `in_flight` | chunks in flight | 2 |
 | `SubStreamsPerChannel` | `data_streams` | minus one: XrdCl counts the control stream, the field does not | 1 extra |
 
-`CPParallelChunks` put through `EnvPutInt` sets `in_flight`, the number of
-chunks a copy keeps in flight, which is what XrdCl's key does. The
-environment variable `XRD_CPPARALLELCHUNKS` is read by `Config` itself into
-`parallel_chunks`, the number of connections one large copy is spread over.
+`CPParallelChunks` sets `in_flight`, the number of chunks a copy keeps in
+flight, which is what XrdCl's key means - whether it is put through
+`EnvPutInt` or set as `$XRD_CPPARALLELCHUNKS` in the environment. The number
+of connections one large copy is spread over is `parallel_chunks`, set by
+`$XRD_CPPARALLELSPANS`.
 
 Other keys can be put and read back but change nothing, except that
 `CopyProcess.add_job` reads three of them for its defaults:
@@ -343,10 +385,46 @@ Other keys can be put and read back but change nothing, except that
 | `AsyncResponseHandler()` | pass as `callback=`, then `status, response, hostlist = handler.wait()`; `wait()` blocks with no timeout |
 | `CopyProgressHandler` | base class with no-op `begin`, `end`, `update` and `should_cancel` (which returns `False`) |
 
-The bindings' `utils` module also exposes `CallbackWrapper`, `Lock`,
-`XRootDStatus` and `HostList` as implementation details. They are not here:
-use `responses.XRootDStatus` and `responses.HostList`, and a plain callable as
-a callback.
+| `CallbackWrapper(callback, responsetype)` | calling it with `(status, response[, hosts])` - raw dicts and lists or the typed objects - calls `callback(XRootDStatus, response, HostList)`, building the response with `responsetype` when both are truthy; a non-callable `callback` is `TypeError` |
+
+`copyprocess.ProgressHandlerWrapper(handler)` is the bindings' adapter too: it
+hands `handler` `URL` objects and an `XRootDStatus` in `results["status"]`,
+and tolerates `handler=None`. `CopyProcess.run` does the same by itself.
+
+## tape
+
+`client.tape.TapeClient(timeout=0)` - also `client.TapeClient` - is
+upstream's WLCG Tape REST API client, call for call. `timeout` is in seconds;
+0 is the configured default.
+
+| Method | Returns |
+| --- | --- |
+| `discover(url)` | `(status, TapeEndpoint)` |
+| `stage(url, files=None, disk_lifetime=None, targeted_metadata=None)` | `(status, TapeStageResponse)`; `files` is a URL, path or dict, or a list of them; with `files=None`, `url` is the list and its first URL names the endpoint |
+| `stage_status(url, request_id)` | `(status, TapeStageStatus)` |
+| `stage_cancel(url, request_id, paths)` | `status` |
+| `stage_delete(url, request_id)` | `status` |
+| `release(url, request_id, paths)` | `status` |
+| `archive_info(urls)` | `(status, [TapeArchiveInfo])` |
+
+A file dict holds `path` or `url`, and optionally `diskLifetime` /
+`disk_lifetime` (seconds, or an ISO 8601 duration) and `targetedMetadata` /
+`targeted_metadata` (a dict or JSON text). Line breaks in a request id, path
+or URL, an empty entry, a bad lifetime or metadata that is not an object are
+`ValueError`, before anything is sent. On failure the response is whatever
+the filesystem call returned - `None` or `""` - rather than a tape object.
+
+Like upstream, each call is a `FileSystem.prepare` or `FileSystem.query`
+with XrdCl's HTTP plug-in's arguments (`tape.discover`,
+`xrdclhttp.tape.stage:{...}`, ...), made on `tape.FileSystem` - the compat
+`FileSystem`, which on an `http(s)`/`dav(s)` endpoint performs them as Tape
+REST API requests (`/.well-known/wlcg-tape-rest-api`, then `/api/v1/stage`,
+`stage/<id>`, `stage/<id>/cancel`, `release/<id>`, `archiveinfo`). The API
+is used at the server's `/api/v1`, as in the native `FileSystem.prepare`;
+`discover` reports what the well-known document advertises. On `root://`
+the calls go to the server's own `kXR_prepare` and `kXR_query`, as with the
+bindings: a cancel sends the request id as the handle, and a full URL in a
+file list is sent as its path.
 
 ## glob
 
@@ -381,12 +459,12 @@ fatal. `shellcode` is `code // 100 + 50`, as in XrdCl.
 | 0 | `errNone` | success | 0 | 0 |
 | 4 | `suAlreadyDone` | `close()` on a file that was not open - still a success | 0 | 0 |
 | 2 | `errUnknown` | a failure with no better description | 1 | 50 |
-| 3 | `errInvalidOp` | `open` on a file that is already open | 1 | 50 |
+| 3 | `errInvalidOp` | `open` on a file that is already open; `openusingtemplate` with a `src_file` that is not open | 1 | 50 |
 | 9 | `errInvalidArgs` | a bad URL in `CopyProcess.prepare`, a bad argument to a callback call, `sendinfo` over 1024 characters | 1 | 50 |
 | 12 | `errOSError` | a local file operation outside a copy failed; `errno` is the OS's | 1 | 50 |
-| 13 | `errNotSupported` | `fcntl`, `openusingtemplate`, any call on a `FileSystem` whose URL did not parse | 1 | 50 |
-| 14 | `errDataError` | a page read failed its CRC32C check | 1 | 50 |
-| 15 | `errNotImplemented` | `dirlist` with `ZIP`; `sendinfo` to a server that is not `root://` | 1 | 50 |
+| 13 | `errNotSupported` | any call on a `FileSystem` whose URL did not parse | 1 | 50 |
+| 14 | `errDataError` | a page read failed its CRC32C check; `dirlist` with `ZIP` of a file that is not a ZIP archive, or a damaged one | 1 | 50 |
+| 15 | `errNotImplemented` | `sendinfo` to a server that is not `root://` | 1 | 50 |
 | 108 | `errConnectionError` | could not connect, or the connection dropped | 3 | 51 |
 | 204 | `errAuthFailed` | no mechanism was accepted; the message says why each one failed | 3 | 52 |
 | 206 | `errOperationExpired` | `timeout=` or a native timeout ran out | 1 | 52 |
@@ -433,12 +511,14 @@ The `errno` values that come with `code` 400 are the server's:
 | 3029 | `kXR_noReplicas` | no replica available |
 | 3030 | `kXR_AuthFailed` | authentication failed |
 
-## Module-level differences
+## Module-level names
 
-Two modules of the bindings have no counterpart:
+`__version__` is this library's version. `XRootD.client._version` holds
+the same. `XRootD.client.finalize` exists and its `finalize()` is registered
+with `atexit`, as upstream's is: it closes every compat `File` still open,
+then the connections compat files share. Calling it early is harmless - the
+next open reconnects.
 
-- `XRootD.client.finalize`, which shuts XrdCl down at exit - there is nothing
-  here to shut down; connections are closed by an `atexit` hook.
-- `XRootD.client._version` - use `importlib.metadata.version("xrdclient")`.
-
-`install()` registers every other submodule under its `XRootD.client.` name.
+`install()` registers every submodule - `_version`, `copyprocess`, `env`,
+`file`, `filesystem`, `finalize`, `flags`, `glob_funcs`, `responses`,
+`tape`, `url`, `utils` - under its `XRootD.client.` name.

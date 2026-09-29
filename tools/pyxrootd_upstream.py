@@ -18,7 +18,10 @@ tool makes that check repeatable:
 
 It exits non-zero if any test that passes on the official bindings does not
 pass on the compat layer. Tests that fail on both (the suite may be newer
-than the installed bindings) are reported but are not held against it.
+than the installed bindings) are reported but are not held against it, and
+tests that pass on the compat layer but not on the bindings - a test file
+for API newer than the installed release will not even import there - are
+reported as improvements.
 
     python tools/pyxrootd_upstream.py [~/src/dev/xrootd] [--python PY] [-k EXPR]
 
@@ -114,6 +117,88 @@ def outcomes(junit: Path) -> dict[str, str]:
     return result
 
 
+def improvements(theirs: dict[str, str], ours: dict[str, str]) -> list[str]:
+    """Tests that pass on compat and not on the bindings, or not there at all.
+
+    A module the bindings cannot import is one ``error`` entry named after
+    the file, where compat has each of its tests; those count here too.
+    """
+    return sorted(n for n, state in ours.items() if state == "passed" and theirs.get(n) != "passed")
+
+
+def uncollected(theirs: dict[str, str], ours: dict[str, str]) -> list[str]:
+    """Modules that erred as a whole on the bindings but whose tests ran on compat."""
+    modules = {n for n, state in theirs.items() if state == "error" and n not in ours}
+    return sorted(m for m in modules if any(n.startswith(f"{m}::") for n in ours))
+
+
+def run_both(
+    upstream: Path, python: str, extra: list[str], timeout: float
+) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+    """Copy the suite twice, rewrite one copy's imports, run both; summaries and outcomes."""
+    with tempfile.TemporaryDirectory(prefix="pyxrootd-upstream-") as scratch:
+        base = Path(scratch)
+        official, compat = base / "official" / "tests", base / "compat" / "tests"
+        ignore = shutil.ignore_patterns("__pycache__", ".pytest_cache")
+        shutil.copytree(upstream, official, ignore=ignore)
+        shutil.copytree(upstream, compat, ignore=ignore)
+
+        changes = rewrite_tree(compat)
+        print(f"rewrote {len(changes)} import line(s) in the compat copy:")
+        for name, number, old, new in changes:
+            print(f"  {name}:{number}")
+            print(f"    - {old}")
+            print(f"    + {new}")
+
+        summaries, results = {}, {}
+        for label, tests in (("official", official), ("compat", compat)):
+            junit = base / f"{label}.xml"
+            print(f"\nrunning the suite on {label} ...", flush=True)
+            summaries[label] = run_pytest(python, tests, junit, extra, timeout)
+            results[label] = outcomes(junit)
+            print(f"  {label}: {summaries[label]}")
+    return summaries, results
+
+
+def print_differences(theirs: dict[str, str], ours: dict[str, str]) -> None:
+    """Every test whose outcome differs between the two runs."""
+    differ = sorted(
+        name for name in theirs.keys() | ours.keys() if theirs.get(name) != ours.get(name)
+    )
+    if not differ:
+        print(f"\nevery one of {len(theirs)} outcomes is the same on both")
+        return
+    print("\nper-test differences (official -> compat):")
+    for name in differ:
+        print(f"  {name}: {theirs.get(name, 'absent')} -> {ours.get(name, 'absent')}")
+
+
+def print_both_bad(theirs: dict[str, str], ours: dict[str, str], modules: list[str]) -> None:
+    """Tests that pass on neither side - not held against compat."""
+    both_bad = sorted(
+        name
+        for name, state in theirs.items()
+        if state in ("failed", "error") and ours.get(name) != "passed" and name not in modules
+    )
+    if both_bad:
+        print("not passing on the official bindings either (not held against compat):")
+        for name in both_bad:
+            print(f"  {name}: {theirs[name]}")
+
+
+def print_classified(theirs: dict[str, str], ours: dict[str, str]) -> list[str]:
+    """Report what fails on both, and what passes on compat only; return the latter."""
+    better, modules = improvements(theirs, ours), uncollected(theirs, ours)
+    print_both_bad(theirs, ours, modules)
+    if better:
+        print("improvements - passing on compat only (API newer than the bindings):")
+        for name in modules:
+            print(f"  {name}: cannot be collected on the official bindings")
+        for name in better:
+            print(f"  {name}: {theirs.get(name, 'absent')} -> passed")
+    return better
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
@@ -133,50 +218,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     extra = ["-k", args.select] if args.select else []
 
-    with tempfile.TemporaryDirectory(prefix="pyxrootd-upstream-") as scratch:
-        base = Path(scratch)
-        official, compat = base / "official" / "tests", base / "compat" / "tests"
-        ignore = shutil.ignore_patterns("__pycache__", ".pytest_cache")
-        shutil.copytree(upstream, official, ignore=ignore)
-        shutil.copytree(upstream, compat, ignore=ignore)
-
-        changes = rewrite_tree(compat)
-        print(f"rewrote {len(changes)} import line(s) in the compat copy:")
-        for name, number, old, new in changes:
-            print(f"  {name}:{number}")
-            print(f"    - {old}")
-            print(f"    + {new}")
-
-        summaries, results = {}, {}
-        for label, tests in (("official", official), ("compat", compat)):
-            junit = base / f"{label}.xml"
-            print(f"\nrunning the suite on {label} ...", flush=True)
-            summaries[label] = run_pytest(args.python, tests, junit, extra, args.timeout)
-            results[label] = outcomes(junit)
-            print(f"  {label}: {summaries[label]}")
+    summaries, results = run_both(upstream, args.python, extra, args.timeout)
 
     theirs, ours = results["official"], results["compat"]
-    differ = sorted(
-        name for name in theirs.keys() | ours.keys() if theirs.get(name) != ours.get(name)
-    )
-    if differ:
-        print("\nper-test differences (official -> compat):")
-        for name in differ:
-            print(f"  {name}: {theirs.get(name, 'absent')} -> {ours.get(name, 'absent')}")
-    else:
-        print(f"\nevery one of {len(theirs)} outcomes is the same on both")
-    both_bad = sorted(name for name, state in theirs.items() if state in ("failed", "error"))
-    if both_bad:
-        print("not passing on the official bindings either (not held against compat):")
-        for name in both_bad:
-            print(f"  {name}: {theirs[name]}")
+    print_differences(theirs, ours)
+    better = print_classified(theirs, ours)
 
     regressions = [
         n for n, state in theirs.items() if state == "passed" and ours.get(n) != "passed"
     ]
     print(
         f"\nsummary: official {summaries['official']} | compat {summaries['compat']}"
-        f" | {len(regressions)} regression(s)"
+        f" | {len(regressions)} regression(s) | {len(better)} improvement(s)"
     )
     return 1 if regressions or not theirs else 0
 

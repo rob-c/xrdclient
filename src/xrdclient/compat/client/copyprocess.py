@@ -55,7 +55,7 @@ from ._status import (
 from .responses import XRootDStatus
 from .url import URL
 
-__all__ = ["CopyProcess"]
+__all__ = ["CopyProcess", "ProgressHandlerWrapper"]
 
 
 class _Cancelled(Exception):
@@ -82,6 +82,38 @@ class _Job:
     retry: int = 0
     cont: bool = False
     rtrplc: str = "force"
+
+
+class ProgressHandlerWrapper:
+    """The bindings' adapter between a copy engine and a progress handler.
+
+    It hands the handler :class:`~.url.URL` objects rather than strings and a
+    ``results["status"]`` that is an :class:`XRootDStatus` rather than a
+    ``dict``, and tolerates no handler at all. :class:`CopyProcess` does
+    both itself; this is here for code that builds one by name.
+    """
+
+    def __init__(self, handler: Any) -> None:
+        self.handler = handler
+
+    def begin(self, jobId: int, total: int, source: Any, target: Any) -> None:
+        if self.handler:
+            self.handler.begin(jobId, total, URL(source), URL(target))
+
+    def end(self, jobId: int, results: dict[str, Any]) -> None:
+        if isinstance(results.get("status"), dict):
+            results["status"] = XRootDStatus(results["status"])
+        if self.handler:
+            self.handler.end(jobId, results)
+
+    def update(self, jobId: int, processed: int, total: int) -> None:
+        if self.handler:
+            self.handler.update(jobId, processed, total)
+
+    def should_cancel(self, jobId: int) -> bool:
+        if self.handler:
+            return bool(self.handler.should_cancel(jobId))
+        return False
 
 
 class CopyProcess:
@@ -184,23 +216,29 @@ def _run(item: tuple[int, _Job], total: int, handler: Any) -> dict[str, Any]:
         # local path, say - which XrdCl reports as a status like any other.
         results = {"status": failure(errInvalidArgs, str(exc))}
     except Exception as exc:
-        results = {"status": _job_failure(exc)}
+        results = {"status": _job_failure(exc, job)}
     _tell(handler, "end", job_id, results)
     return results
 
 
-def _job_failure(exc: Exception) -> XRootDStatus:
+def _job_failure(exc: Exception, job: _Job) -> XRootDStatus:
     """``exc`` as XrdCl reports it: a local file's error is ``errLocalError``.
 
     XrdCl opens a local end through its own file handler, which answers with
     code 402 and the errno translated to the protocol's number
-    (``XProtocol::mapError``): an existing target is ``kXR_ItExists``.
+    (``XProtocol::mapError``): an existing target is ``kXR_ItExists``. Its
+    message names the end that failed - ``file exists:  (destination)``,
+    two spaces and all.
     """
     if not isinstance(exc, OSError) or isinstance(exc, errors.XRootDError):
         return from_exception(exc)
     eno = exc.errno or 0
     detail = (exc.strerror or str(exc)).lower()
-    return status(errLocalError, errno=_LOCAL_ERRNOS.get(eno, eno), message=detail)
+    source = parse(job.source)
+    end = "source" if source.is_local and exc.filename == source.path else "destination"
+    return status(
+        errLocalError, errno=_LOCAL_ERRNOS.get(eno, eno), message=f"{detail}:  ({end})"
+    )
 
 
 #: ``XProtocol::mapError`` for the errors a local copy end meets.
@@ -249,7 +287,7 @@ def _once(job: _Job, job_id: int, handler: Any) -> dict[str, Any]:
     try:
         _verify(job, target, outcome)
     except (errors.XRootDError, OSError) as exc:
-        outcome["status"] = _job_failure(exc)
+        outcome["status"] = _job_failure(exc, job)
     return outcome
 
 

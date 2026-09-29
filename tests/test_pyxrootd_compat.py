@@ -154,7 +154,7 @@ def test_each_native_failure_has_its_xrdcl_code(exc, code):
 
 def test_a_local_os_error_keeps_its_errno():
     status = _status.from_exception(FileNotFoundError(2, "No such file or directory"))
-    assert (status.errno, status.message) == (2, "[ERROR] OS Error: No such file or directory\n")
+    assert (status.errno, status.message) == (2, "[ERROR] OS Error: No such file or directory")
 
 
 def test_a_failure_with_no_detail_is_just_its_description():
@@ -266,9 +266,60 @@ def test_a_recursive_dirlist_goes_a_level_at_a_time_with_stat(fs):
     assert all(e.statinfo is not None for e in listing)
 
 
-def test_a_zip_dirlist_says_it_is_not_implemented(fs):
-    status, listing = fs.dirlist("/d", DirListFlags.ZIP)
-    assert (status.code, listing) == (15, None)
+def _zip_bytes(members: dict[str, bytes]) -> bytes:
+    import io
+    import zipfile
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+    return buffer.getvalue()
+
+
+def test_a_zip_dirlist_lists_the_archives_members(fs, srv):
+    srv.add_file("/d/a.zip", _zip_bytes({"x.txt": b"hello", "sub/": b"", "sub/y": b"yy"}))
+    archive = ok(fs.stat("/d/a.zip"))
+    listing = ok(fs.dirlist("/d/a.zip", DirListFlags.ZIP))
+    assert (listing.parent, listing.size) == ("/d/a.zip/", 3)
+    assert [(e.name, e.statinfo.size) for e in listing] == [("x.txt", 5), ("sub/", 0), ("sub/y", 2)]
+    assert all(e.hostaddr == f"{srv.url.host}:{srv.url.port}" for e in listing)
+    first = listing.dirlist[0].statinfo
+    assert (first.id, first.modtime) == (archive.id, archive.modtime)
+    assert first.flags == archive.flags & ~StatInfoFlags.IS_WRITABLE
+    with_stat = ok(fs.dirlist("/d/a.zip?cgi=1", DirListFlags.ZIP | DirListFlags.STAT))
+    assert with_stat.parent == "/d/a.zip/"
+    assert [e.name for e in with_stat] == ["x.txt", "sub/", "sub/y"]
+
+
+def test_a_path_ending_in_zip_is_listed_inside_unless_there_is_a_callback(fs, srv):
+    """XrdCl's synchronous DirList adds ``Zip`` for ``*.zip``; the asynchronous one does not."""
+    srv.add_file("/d/a.zip", _zip_bytes({"x.txt": b"hello"}))
+    assert [e.name for e in ok(fs.dirlist("/d/a.zip"))] == ["x.txt"]
+    assert [e.name for e in ok(fs.dirlist("/d/a.zip", timeout=5))] == ["x.txt"]
+    done = threading.Event()
+    got = []
+    fs.dirlist("/d/a.zip", callback=lambda st, resp, hosts: (got.append(st), done.set()))
+    assert done.wait(10)
+    assert got[0].code == 400
+
+
+def test_a_zip_dirlist_of_a_directory_is_a_dirlist(fs):
+    plain = ok(fs.dirlist("/d", DirListFlags.STAT))
+    zipped = ok(fs.dirlist("/d", DirListFlags.STAT | DirListFlags.ZIP))
+    assert [e.name for e in zipped] == [e.name for e in plain]
+    deep = ok(fs.dirlist("/d/", DirListFlags.RECURSIVE | DirListFlags.ZIP))
+    assert "sub/deeper/h" in [e.name for e in deep]
+
+
+def test_a_zip_dirlist_reports_what_xrdcl_reports(fs, srv):
+    srv.add_file("/d/bad.zip", b"not an archive")
+    srv.add_file("/d/empty.zip", b"")
+    status, listing = fs.dirlist("/d/bad.zip", DirListFlags.ZIP)
+    assert (status.status, status.code, status.errno, listing) == (1, 14, 0, None)
+    assert "End-of-central-directory signature not found." in status.message
+    assert ok(fs.dirlist("/d/empty.zip")).size == 0
+    assert fs.dirlist("/d/gone.zip")[0].errno == 3011
 
 
 def test_mkdir_rmdir_mv_rm_truncate_chmod(fs, srv):
@@ -630,10 +681,10 @@ def _slow_opens(monkeypatch):
     gate, done, closed = threading.Event(), threading.Event(), []
     real_open, real_close = compat_file.NativeFile.open, compat_file.NativeFile.close
 
-    def slow_open(self, *args):
+    def slow_open(self, *args, **kwargs):
         gate.wait(30)
         try:
-            return real_open(self, *args)
+            return real_open(self, *args, **kwargs)
         finally:
             done.set()
 
@@ -685,9 +736,73 @@ def test_a_callback_on_an_unopened_file_has_no_hosts():
     assert list(File()._File__hosts()) == []  # type: ignore[attr-defined]
 
 
-def test_open_using_a_template_and_fcntl_are_not_implemented(fh, root):
-    assert client.File().openusingtemplate(fh, root + "/x")[0].code == 13
-    assert fh.fcntl(b"x")[0].code == 13
+def test_fcntl_is_the_servers_to_answer(fh, srv):
+    status, response = fh.fcntl(b"x")
+    assert (status.code, status.errno, response) == (400, 3013, None)
+    assert "fctl operation not supported" in status.message
+    srv.fctl = lambda path, data: path.encode() + b":" + data
+    assert ok(fh.fcntl(b"q")) == b"/d/l.txt:q"
+    assert ok(fh.fcntl("text")) == b"/d/l.txt:text"
+    assert ok(fh.fcntl(b"q", timeout=5)) == b"/d/l.txt:q"
+    with pytest.raises(ValueError):
+        client.File().fcntl(b"x")
+
+
+def test_samefs_and_dup_open_next_to_the_template(fh, root, srv):
+    writable = OpenFlags.NEW | OpenFlags.UPDATE
+    new = client.File()
+    ok(new.openusingtemplate(fh, root + "/d/next", writable | OpenFlags.SAMEFS))
+    ok(new.write(b"xy"))
+    ok(new.close())
+    assert srv.colocated["/d/next"] == "/d/l.txt"
+    dup = client.File()
+    ok(dup.openusingtemplate(fh, root + "/d/dup", writable | OpenFlags.DUP, 0o644))
+    assert ok(dup.read()) == TEXT
+    assert dup.get_property("DataServer") == fh.get_property("DataServer")
+    ok(dup.close())
+
+
+def test_a_template_open_without_dup_or_samefs_is_an_open(root):
+    """XrdCl does not look at the template unless the flags need it."""
+    plain = client.File()
+    ok(plain.openusingtemplate(client.File(), root + "/d/l.txt", OpenFlags.READ))
+    assert ok(plain.read()) == TEXT
+    ok(plain.close())
+
+
+def test_a_template_must_be_open_and_the_file_not(fh, root):
+    colocated = OpenFlags.NEW | OpenFlags.SAMEFS
+    status, response = client.File().openusingtemplate(client.File(), root + "/d/x", colocated)
+    assert (status.code, status.errno, response) == (3, 0, None)
+    assert "Template file not open" in status.message
+    status, _ = fh.openusingtemplate(fh, root + "/d/x", colocated)
+    assert (status.code, status.message) == (3, "[ERROR] Invalid operation")
+    with pytest.raises(AttributeError):
+        client.File().openusingtemplate("not a file", root + "/d/x", OpenFlags.NEW)
+    with pytest.raises(OverflowError):
+        client.File().openusingtemplate(fh, root + "/d/x", 1 << 32)
+
+
+def test_a_refused_template_open_is_a_failed_open(fh, root):
+    new = client.File()
+    status, _ = new.openusingtemplate(fh, root + "/d/r", OpenFlags.NEW | OpenFlags.DUP)
+    assert (status.code, status.errno) == (400, 3000)
+    assert new.openusingtemplate(fh, root + "/d/r", OpenFlags.NEW | OpenFlags.SAMEFS)[0] == status
+    assert not new.is_open()
+
+
+def test_a_template_open_can_answer_a_callback(fh, root, srv):
+    done = threading.Event()
+    got = []
+    new = client.File()
+    status = new.openusingtemplate(
+        fh, root + "/d/cb", OpenFlags.NEW | OpenFlags.SAMEFS,
+        callback=lambda st, resp, hosts: (got.append((st, resp)), done.set()),
+    )
+    assert status.ok and done.wait(10)
+    assert got[0][0].ok and got[0][1] is None
+    assert "/d/cb" in srv.colocated
+    ok(new.close())
 
 
 def test_file_xattrs(fh):
@@ -891,7 +1006,8 @@ def test_a_target_that_exists_is_a_local_error_as_in_xrdcl(root, tmp_path):
     _, results = process.run()
     codes = [(r["status"].code, r["status"].errno) for r in results]
     assert codes == [(402, 3018), (402, 3016), (402, 3011)]
-    assert results[0]["status"].message == "[ERROR] Local error: file exists\n"
+    assert results[0]["status"].message == "[ERROR] Local error: file exists:  (destination)"
+    assert results[2]["status"].message.endswith(":  (source)")
 
 
 def test_a_local_error_without_an_errno_the_protocol_names(root, tmp_path, monkeypatch):
@@ -1647,3 +1763,128 @@ def test_a_callback_after_the_pool_has_shut_down_still_arrives(fs, monkeypatch):
     handler = client.utils.AsyncResponseHandler()
     assert fs.ping(callback=handler).ok
     assert handler.wait()[0].ok
+
+
+# -- parity: fcntl, template opens, ZIP listings ------------------------------
+
+
+@pytest.mark.interop
+@pytest.mark.parity
+def test_a_zip_listing_is_the_bindings_listing(official, two_sandboxes):
+    """The same archives through both clients: every field, times and ids included."""
+    import pathlib
+
+    url, sandbox = two_sandboxes
+    here = pathlib.Path(sandbox)
+    (here / "a.zip").write_bytes(
+        _zip_bytes({"hello.txt": b"hello world", "dir/": b"", "dir/inner.bin": os.urandom(999)})
+    )
+    (here / "empty.zip").write_bytes(b"")
+    (here / "not.zip").write_bytes(b"abc")
+    steps = [
+        lambda fs: fs.dirlist(f"{sandbox}/a.zip", DirListFlags.ZIP),
+        lambda fs: fs.dirlist(f"{sandbox}/a.zip"),
+        lambda fs: fs.dirlist(f"{sandbox}/a.zip", DirListFlags.ZIP | DirListFlags.STAT),
+        lambda fs: fs.dirlist(f"{sandbox}/a.zip?x=1", DirListFlags.ZIP | DirListFlags.RECURSIVE),
+        lambda fs: fs.dirlist(f"{sandbox}/empty.zip", DirListFlags.ZIP),
+        lambda fs: fs.dirlist(f"{sandbox}/not.zip", DirListFlags.ZIP),
+        lambda fs: fs.dirlist(f"{sandbox}/nope.zip", DirListFlags.ZIP),
+        lambda fs: fs.dirlist(f"{sandbox}/ours", DirListFlags.ZIP | DirListFlags.STAT),
+        lambda fs: fs.dirlist(f"{sandbox}/ours", DirListFlags.ZIP | DirListFlags.RECURSIVE),
+    ]
+    theirs_fs, ours_fs = official.FileSystem(url), client.FileSystem(url)
+    for n, step in enumerate(steps):
+        mine, want = step(ours_fs), step(theirs_fs)
+        assert _exactly(mine) == _exactly(want), n
+
+
+def _exactly(outcome: Any) -> Any:
+    """Everything, the status's message and each entry's times included."""
+    status, response = outcome
+    fields = (status.status, status.code, status.errno, status.message.rstrip("\n"))
+    if response is None:
+        return fields, None
+    entries = [
+        (e.hostaddr, e.name, e.statinfo and dict(vars(e.statinfo))) for e in response.dirlist
+    ]
+    return fields, (response.parent, response.size, entries)
+
+
+@pytest.mark.interop
+@pytest.mark.parity
+def test_fcntl_is_answered_as_the_bindings_are(official, two_sandboxes):
+    url, sandbox = two_sandboxes
+    answers = []
+    for module in (official, client):
+        f = module.File()
+        ok(f.open(f"{url}/{sandbox}/ours/l.txt"))
+        statuses = [vars(f.fcntl(arg)[0]) for arg in (b"x", b"", b"\x00\xff")]
+        answers.append([*statuses, f.fcntl(b"x")[1]])
+        ok(f.close())
+    assert answers[0] == answers[1]
+
+
+TEMPLATE_STEPS = [
+    ("samefs", OpenFlags.NEW | OpenFlags.UPDATE | OpenFlags.SAMEFS),
+    ("samefs read", OpenFlags.NEW | OpenFlags.SAMEFS),
+    ("dup", OpenFlags.NEW | OpenFlags.UPDATE | OpenFlags.DUP),
+    ("dup read-only", OpenFlags.NEW | OpenFlags.DUP),
+    ("both", OpenFlags.NEW | OpenFlags.UPDATE | OpenFlags.DUP | OpenFlags.SAMEFS),
+    ("not new", OpenFlags.UPDATE | OpenFlags.SAMEFS),
+    ("neither", OpenFlags.NEW | OpenFlags.UPDATE),
+]
+
+
+@pytest.mark.interop
+@pytest.mark.parity
+def test_template_opens_go_as_with_the_bindings(official, two_sandboxes):
+    url, sandbox = two_sandboxes
+    outcomes = {}
+    for side, module in (("theirs", official), ("ours", client)):
+        where = f"{url}/{sandbox}/{side}"
+        template = module.File()
+        ok(template.open(f"{where}/l.txt"))
+        seen = [_template_step(template, module.File(), where, *step) for step in TEMPLATE_STEPS]
+        samefs = TEMPLATE_STEPS[0][1]
+        seen.append(_norm(module.File().openusingtemplate(module.File(), f"{where}/u", samefs)))
+        seen.append(_norm(template.openusingtemplate(template, f"{where}/v", samefs)))
+        ok(template.close())
+        outcomes[side] = seen
+    assert outcomes["ours"] == outcomes["theirs"]
+
+
+def _template_step(template: Any, f: Any, where: str, label: str, flags: int) -> Any:
+    """One template open, then what writing to and closing the new file do."""
+    opened = _outcome(lambda u: f.openusingtemplate(template, f"{u}/{label}", flags), where)
+    is_open = f.is_open()
+    wrote = _outcome(lambda u: f.write(b"xy"), where) if is_open else None
+    same = f.get_property("DataServer") == template.get_property("DataServer")
+    return label, opened, wrote, same if is_open else None, _norm(f.close())
+
+
+def test_prepare_sends_its_entries_as_given(fs, srv):
+    """A cancel's request id, or a full URL, goes to the server untouched."""
+    ok(fs.prepare(["/d/l.txt"], PrepareFlags.STAGE))
+    status, _ = fs.prepare(["req-123", "/d/l.txt"], PrepareFlags.CANCEL)
+    assert status.ok
+    assert srv.cancelled_prepares[-1].split("\n") == ["req-123", "/d/l.txt"]
+
+
+def test_only_a_servers_answer_ends_in_a_newline():
+    assert not _status.failure(_status.errOSError, "No such file").message.endswith("\n")
+    answer = _status.status(_status.errErrorResponse, errno=3011, message="gone")
+    assert answer.message.endswith("\n")
+
+
+def test_prepare_over_http_goes_through_the_native_call(fs, monkeypatch):
+    """With no ``root://`` router, staging is the native (Tape REST) call."""
+    asked = []
+
+    class Http:
+        def prepare(self, paths, *, flags, priority):
+            asked.append((paths, flags, priority))
+            return "req-7"
+
+    monkeypatch.setattr(fs, "native", Http())
+    assert ok(fs.prepare(["/d/l.txt"], PrepareFlags.STAGE, 2)) == b"req-7"
+    assert asked == [(["/d/l.txt"], PrepareFlags.STAGE, 2)]

@@ -228,7 +228,7 @@ def test_tickets_is_quiet_about_a_cache_that_is_not_there(tmp_path, monkeypatch)
     junk = tmp_path / "junk"
     junk.write_bytes(b"\x05\x04nonsense")
     assert tickets(str(junk)) == []
-    monkeypatch.setenv("KRB5CCNAME", "KCM:1000")
+    monkeypatch.setenv("KRB5CCNAME", "API:")
     assert tickets() == []
 
 
@@ -461,9 +461,11 @@ def test_an_unreadable_cache_is_an_error_not_a_silence(monkeypatch, tmp_path, co
         KerberosCredential.available(OFFER, Config(), username="jane", host="srv")
 
 
-def test_a_kcm_cache_is_an_error_not_a_silence(monkeypatch):
-    monkeypatch.setenv("KRB5CCNAME", "KCM:")
-    with pytest.raises(CredentialError, match="KCM"):
+def test_a_macos_api_cache_is_an_error_not_a_silence(monkeypatch):
+    # KCM: and KEYRING: caches are read now (tests/test_krb5_kcm.py,
+    # tests/test_krb5_keyring.py); macOS's XPC-held API: caches are not.
+    monkeypatch.setenv("KRB5CCNAME", "API:")
+    with pytest.raises(CredentialError, match=r"API:.*KRB5CCNAME=FILE:"):
         KerberosCredential.available(OFFER, Config(), username="jane", host="srv")
 
 

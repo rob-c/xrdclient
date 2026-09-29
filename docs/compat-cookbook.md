@@ -296,6 +296,57 @@ print("still offline:", pending)
 `PrepareFlags.EVICT` drops the disk copy again. On a disk-only server
 `prepare` succeeds and nothing happens.
 
+## The Tape REST API
+
+`client.tape.TapeClient` is upstream's newer client for the WLCG Tape REST
+API, the one FTS and Rucio use. Give it the storage element's `https://` or
+`davs://` URL; every call returns `(status, response)` like the rest of the
+bindings. (The installed 6.1 bindings do not have it yet, so this recipe
+needs a newer upstream release there.)
+
+```python
+import time
+
+from xrdclient.compat import client
+
+ENDPOINT = "davs://tape.example.org:8443"
+files = [f"{ENDPOINT}/store/user/me/raw/run7.root", "/store/user/me/raw/run8.root"]
+
+tapes = client.TapeClient(timeout=60)
+status, endpoint = tapes.discover(ENDPOINT)
+print(status.ok and endpoint.uri, status.ok and endpoint.sitename)
+
+status, request = tapes.stage(
+    ENDPOINT, files, disk_lifetime=86400,        # seconds, or "P1D"
+    targeted_metadata={"my-site": {"activity": "reprocessing"}},
+)
+status.raise_on_error()
+print("request", request.request_id)
+
+while True:
+    status, progress = tapes.stage_status(ENDPOINT, request.request_id)
+    status.raise_on_error()
+    waiting = [f.path for f in progress.files if not f.on_disk]
+    if not waiting:
+        break
+    print("waiting for", waiting)
+    time.sleep(60)
+
+tapes.release(ENDPOINT, request.request_id, files)   # done with the disk copies
+
+status, infos = tapes.archive_info(files)
+for info in infos:
+    print(info.url, info.locality or info.error)
+```
+
+A file entry can also be a dict - `{"path": ..., "diskLifetime": "PT1H",
+"targeted_metadata": {...}}` - to give one file its own settings, and
+`tapes.stage([{"url": ...}, ...])` takes the endpoint from the first URL.
+`stage_cancel(url, request_id, paths)` withdraws some files from a request,
+`stage_delete(url, request_id)` the whole request. Given a `root://` URL, the
+client makes the same `prepare` and `query` calls on that server that the
+bindings' does, and the server's own tape support answers them.
+
 ## Extended attributes
 
 Values are strings; each name gets its own status, as a `dict`:
@@ -544,6 +595,40 @@ if not status.ok:
     sys.exit(status.shellcode)                    # 54 for a server refusal
 ```
 
+### Raising instead of checking
+
+Newer upstream releases can turn a failed status into an exception, and so
+can this one: `status.raise_on_error()` returns the status when it is OK
+and otherwise raises an `XRootDError` subclass chosen from `code` - and,
+for a server's refusal, from its `errno`:
+
+```python
+from xrdclient.compat import client
+
+SERVER = "root://eos.example.org"
+BASE = "/store/user/me/cookbook"
+
+fs = client.FileSystem(SERVER)
+try:
+    status, info = fs.stat(f"{BASE}/missing")
+    status.raise_on_error()
+except client.XRootDNotFoundError as exc:
+    print("no such file:", exc.status.errno)          # 3011
+except client.XRootDAuthorizationError:
+    print("permission denied")                        # 3010, 3030, auth/login
+except client.XRootDTimeoutError:
+    print("timed out")                                # socket or operation expiry
+except client.XRootDError as exc:                     # checksum, anything else
+    print(exc.status.error_name, exc)                 # "errErrorResponse", message
+```
+
+`status.exception()` returns that exception without raising it (`None` for
+success), and `client.raise_on_error(status)` does the same as the method
+while also accepting the plain status dicts some calls hand out. Every one
+is a `RuntimeError`, so an existing `except RuntimeError` still catches them.
+
+### Mistakes in the calling code
+
 Mistakes in the calling code still raise, exactly as in the bindings: a
 wrong type is `TypeError`, a number that does not fit is `OverflowError`, and
 I/O on a `File` that is not open is `ValueError`. The
@@ -718,15 +803,14 @@ name. See [Authentication](auth.md#gsi-x509-proxies).
 
 ## Kerberos
 
-Pure Python: `kinit`, then run the program. The one requirement is a
-credential cache that is a file (`FILE:` or `DIR:`) - `KCM:` (the RHEL 9
-default) and `KEYRING:` caches are refused with an error that says so:
+Pure Python: `kinit`, then run the program. `FILE:`, `DIR:`, `KCM:` (RHEL
+9's default) and Linux `KEYRING:` caches are all read; on macOS, whose `API:`
+cache is out of reach, point `kinit` at a file:
 
 ```console
-$ klist | head -1                       # "Ticket cache: KCM:1000" needs the next line
-$ export KRB5CCNAME=FILE:/tmp/krb5cc_$(id -u)
 $ kinit jane@EXAMPLE.ORG
-$ python analysis.py
+$ python analysis.py                    # KCM:, KEYRING:, FILE: - whatever kinit used
+$ export KRB5CCNAME=FILE:/tmp/krb5cc_$(id -u)   # macOS only
 ```
 
 ```python

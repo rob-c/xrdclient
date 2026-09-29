@@ -206,6 +206,44 @@ level up.
             dst.write(src.read(length, offset), offset)
     ```
 
+### Opening next to another file
+
+`open(..., template=other)` creates a file on the same filesystem as `other`,
+an open `File` - `kXR_open` with `kXR_samefs` and `other`'s handle, which is
+XrdCl's `OpenUsingTemplate` with `OpenFlags::Samefs`. `dup=True` has the
+server clone `other`'s contents into it as well (`kXR_dup`), a copy that
+never leaves the storage:
+
+```python
+with xrdclient.File("root://host//store/src.root") as src:
+    copy = xrdclient.File("root://host//store/copy.root")
+    copy.open("new update", template=src, dup=True)
+    with copy:
+        copy.write(b"patched", 0)
+```
+
+The open goes to the template's data server, on the template's connection -
+its handle means nothing anywhere else - and the new file's `url` names that
+server. The server wants `new`, and a `dup` open that can write. Storage that
+cannot place or clone files that way refuses with `UnsupportedError` (a stock
+xrootd on most filesystems clones nothing, and places a file beside another
+only where it can), and so does this client, without asking, a server whose
+protocol predates the options (below 5.2).
+
+### Asking the storage directly
+
+`fcntl(data)` is XrdCl's `File::Fcntl`: `data` goes to the storage plug-in
+behind the server in a `kXR_query` of type `kXR_Qopaqug` on this handle, and
+the bytes it answers come back as they are. What either means is the
+plug-in's business. A stock xrootd has none, and says so:
+
+```python
+try:
+    answer = handle.fcntl(b"my-plugin-command")
+except xrdclient.UnsupportedError:
+    ...    # [3013] fctl operation not supported
+```
+
 ### A second connection for the bytes
 
 `bind_data_path()` opens one more connection to the same server, binds it to

@@ -106,17 +106,31 @@ class FileSystem:
         XrdCl does. ``LOCATE`` and ``MERGE`` ask XrdCl to list every server
         holding the directory and fold the answers together; a listing here
         comes from the server the namespace redirects to, which for a single
-        server is the same answer. ``ZIP`` - listing inside an archive - is
-        not implemented and says so in the status.
+        server is the same answer.
+
+        ``ZIP`` lists the members of the archive ``path`` names, from its
+        central directory, each with the archive's stat and the member's
+        size; a directory is listed as if the flag were not there. As in
+        XrdCl, a call without a callback takes a path ending in ``.zip`` to
+        mean ``ZIP`` whether or not the flag says so.
         """
         wanted = _args.u16(flags, "flags")
+        if callback is None and path.endswith(".zip"):
+            # XrdCl's synchronous DirList does this; the asynchronous one,
+            # which is what a callback gets, does not.
+            wanted |= DirListFlags.ZIP
         if self.__now(timeout, callback):
             return now(self.__list, _same, path, wanted)
         return self.__run(lambda: self.__list(path, wanted), _same, timeout, callback)
 
     def __list(self, path: str, flags: int) -> DirectoryList:
         if flags & DirListFlags.ZIP:
-            raise NotImplementedError("listing inside a ZIP archive (DirListFlags.ZIP)")
+            # XrdCl stats first, and lists a directory as if the flag were not
+            # there; the listing of an archive is named by its path, CGI off.
+            info = self.native.stat(path)
+            if not info.is_dir():
+                members = self.native._archive(path, info)
+                return _convert.listing(path.partition("?")[0], members, self.native.endpoint)
         if flags & DirListFlags.RECURSIVE:
             return _convert.directory_list(path, self.__below(path), self.native.endpoint)
         entries = self.native.scandir(path, stat=bool(flags & DirListFlags.STAT))
@@ -233,12 +247,25 @@ class FileSystem:
         """``(status, bytes)``: stage ``files``; the answer is the request handle."""
         wanted = _args.u16(flags, "flags")
         priority = _args.u16(priority, "priority")
+        entries = [str(entry) for entry in files]
         return self.__run(
-            lambda: self.native.prepare(list(files), flags=wanted, priority=priority),
-            lambda handle: str(handle).encode(),
-            timeout,
-            callback,
+            lambda: self.__prepare(entries, wanted, priority), _same, timeout, callback
         )
+
+    def __prepare(self, entries: list[str], flags: int, priority: int) -> bytes:
+        """``kXR_prepare`` with the list as given, the way XrdCl sends it.
+
+        XrdCl joins the entries and sends them untouched: a cancel's leading
+        request id is not a path, and a full URL is the server's to read, so
+        neither is resolved against this filesystem the way a native
+        :meth:`~xrdclient.FileSystem.prepare` resolves its paths. Over HTTP,
+        where staging is the Tape REST API, the native call is the way in.
+        """
+        router = getattr(self.native, "_router", None)
+        if router is None:
+            return str(self.native.prepare(entries, flags=flags, priority=priority)).encode()
+        request = r.Prepare(entries, flags & 0xFF, priority, extended=flags >> 8)
+        return bytes(router.execute(request).data).split(b"\x00", 1)[0]
 
     def sendinfo(self, info: str, timeout: float = 0, callback: Callback = None) -> Any:
         """``(status, bytes)``: tell the server's monitoring about this client."""

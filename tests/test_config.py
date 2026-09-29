@@ -309,3 +309,15 @@ def test_the_search_order_is_the_documented_one(monkeypatch, tmp_path):
     assert cfgmod.find_config_file() == str(second)
     first.write_text("")
     assert cfgmod.find_config_file() == str(first)
+
+
+def test_cp_parallel_chunks_means_chunks_in_flight_as_in_xrdcl(monkeypatch):
+    """``$XRD_CPPARALLELCHUNKS`` is XrdCl's "chunks in flight", not connections."""
+    monkeypatch.delenv("XRD_CPINFLIGHT", raising=False)
+    monkeypatch.delenv("XRD_CPPARALLELSPANS", raising=False)
+    monkeypatch.setenv("XRD_CPPARALLELCHUNKS", "6")
+    config = Config()
+    assert (config.in_flight, config.parallel_chunks) == (6, 4)
+    monkeypatch.setenv("XRD_CPINFLIGHT", "3")
+    monkeypatch.setenv("XRD_CPPARALLELSPANS", "2")
+    assert (Config().in_flight, Config().parallel_chunks) == (3, 2)

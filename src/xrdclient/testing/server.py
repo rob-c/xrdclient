@@ -244,6 +244,18 @@ class FakeServer:
         #: arrival throughout: the standard split would have this connection's
         #: own thread and its owner's both reading the same socket.
         self.serves_arrivals = False
+        #: What a ``kXR_query`` of type ``kXR_Qopaqug`` - XrdCl's ``Fcntl`` -
+        #: answers: called with the path of the file the query names and the
+        #: bytes it carried. ``None`` is a stock xrootd, which has no storage
+        #: plug-in to take it and refuses with 3013.
+        self.fctl: Callable[[str, bytes], bytes] | None = None
+        #: Whether opens against a template file (``kXR_samefs``,
+        #: ``kXR_dup``) are served, as by storage that can place and clone
+        #: files (``XrdSfs::hasFICL``); off, they are refused with 3013.
+        self.colocates = True
+        #: New file to the template it was opened against, for every open
+        #: that named one.
+        self.colocated: dict[str, str] = {}
 
         self._live: set[object] = set()
         self._live_lock = threading.Lock()
@@ -759,17 +771,34 @@ def _h_set(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[
 
 
 def _h_open(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    _mode, options = struct.unpack(">HH", params[:4])
+    _mode, options, optiont = struct.unpack(">HHH", params[:6])
     raw = body.split(b"\x00", 1)[0].decode()
     conn.s.opened.append(raw)
+    template = params[12:16] if optiont & (c.kXR_dup | c.kXR_samefs) else None
     path = _clean(raw)
+    refusal = _template_refusal(conn, sid, options, optiont, template) if template else b""
+    refusal = refusal or _target_refusal(conn, sid, path, options)
+    if refusal:
+        yield refusal
+        return
+    if template is not None:
+        _colocate(conn, path, conn.handles[template], dup=bool(optiont & c.kXR_dup))
+    handle = struct.pack(">I", conn.next_handle)
+    conn.next_handle += 1
+    conn.handles[handle] = path
+    reply = handle
+    if options & c.kXR_retstat:
+        reply += bytes(8) + conn._stat_line(path) + b"\x00"
+    yield _frame(sid, c.kXR_ok, reply)
+
+
+def _target_refusal(conn: _Connection, sid: int, path: str, options: int) -> bytes:
+    """Why ``path`` cannot be opened with ``options``, or ``b""`` once it is ready."""
     exists = path in conn.s.files
     if path in conn.s.dirs:
-        yield _error(sid, 3016, f"is a directory: {path}")
-        return
+        return _error(sid, 3016, f"is a directory: {path}")
     if options & c.kXR_new and exists:
-        yield _error(sid, 3018, f"already exists: {path}")
-        return
+        return _error(sid, 3018, f"already exists: {path}")
     # Only kXR_new and kXR_delete create; kXR_open_updt and kXR_open_apnd on
     # their own are "open what is there", exactly as stock xrootd has it. The
     # fake used to create for any write flag, which let a client that never
@@ -779,19 +808,39 @@ def _h_open(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator
             raise _NotFound(path)
         parent = posixpath.dirname(path)
         if parent not in conn.s.dirs and not options & c.kXR_mkpath:
-            yield _error(sid, 3011, f"no such file or directory: {parent}")
-            return
+            return _error(sid, 3011, f"no such file or directory: {parent}")
         conn.s.add_file(path)
     elif options & c.kXR_delete:
         conn.s.files[path] = bytearray()
+    return b""
 
-    handle = struct.pack(">I", conn.next_handle)
-    conn.next_handle += 1
-    conn.handles[handle] = path
-    reply = handle
-    if options & c.kXR_retstat:
-        reply += bytes(8) + conn._stat_line(path) + b"\x00"
-    yield _frame(sid, c.kXR_ok, reply)
+
+def _template_refusal(
+    conn: _Connection, sid: int, options: int, optiont: int, template: bytes
+) -> bytes:
+    """Why xrootd would refuse an open against ``template``, or ``b""``.
+
+    The checks, their order and their words are ``do_Open``'s.
+    """
+    dup = optiont & c.kXR_dup
+    if not conn.s.colocates:
+        what = "file cloning" if dup else "colocating with a specified file"
+        return _error(sid, 3013, f"{what} is not supported")
+    writes = not options & c.kXR_open_read and options & (c.kXR_open_updt | c.kXR_open_wrto)
+    if dup and not writes:
+        return _error(sid, 3000, "cloned file is not being opened R/W")
+    if not options & c.kXR_new:
+        return _error(sid, 3000, "file must be opened as a new file in order to colocate")
+    if template not in conn.handles:
+        return _error(sid, 3004, "file template does not refer to an open file")
+    return b""
+
+
+def _colocate(conn: _Connection, path: str, source: str, *, dup: bool) -> None:
+    """Note where ``path`` was placed, and give it ``source``'s bytes for a dup."""
+    conn.s.colocated[path] = source
+    if dup:
+        conn.s.files[path] = bytearray(conn.s.files[source])
 
 
 def _h_close(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
@@ -1097,6 +1146,25 @@ def _h_query(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterato
         yield _error(sid, 3013, f"query {infotype} is not supported")
 
 
+def _h_query_fctl(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
+    """``kXR_query``, with ``kXR_Qopaqug`` - XrdCl's ``Fcntl`` - taken first.
+
+    As xrootd's ``do_Qfh``: the handle is checked before anything is asked of
+    the storage.
+    """
+    if struct.unpack(">H", params[:2])[0] != c.kXR_Qopaqug:
+        yield from _h_query(conn, sid, params, body)
+        return
+    plugin = conn.s.fctl
+    path = conn.handles.get(params[4:8])
+    if path is None:
+        yield _error(sid, 3004, "query does not refer to an open file")
+    elif plugin is None:
+        yield _error(sid, 3013, "fctl operation not supported")
+    else:
+        yield _frame(sid, c.kXR_ok, plugin(path, body))
+
+
 def _h_locate(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
     asked = body.split(b"\x00", 1)[0].decode()
     # A ``*`` in front is create mode: the question is where the file could
@@ -1209,7 +1277,7 @@ _HANDLERS = {
     c.kXR_pgread: _h_pgread,
     c.kXR_pgwrite: _h_pgwrite,
     c.kXR_chkpoint: _h_chkpoint,
-    c.kXR_query: _h_query,
+    c.kXR_query: _h_query_fctl,
     c.kXR_locate: _h_locate,
     c.kXR_prepare: _h_prepare,
     c.kXR_fattr: _h_fattr,

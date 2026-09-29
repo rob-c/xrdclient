@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import ast
 import importlib
+import io
 import os
 import pathlib
 import subprocess
 import sys
+import zipfile
 
 import pytest
 
@@ -26,6 +28,7 @@ import xrdclient
 from xrdclient.client.file import File
 from xrdclient.client.filesystem import FileSystem
 from xrdclient.config import Config
+from xrdclient.errors import UnsupportedError
 from xrdclient.flags import (
     Access,
     DirListFlags,
@@ -110,6 +113,14 @@ def _fs_removexattr(fs):
     return fs.removexattr("f.root", "user.k")
 
 
+def _fs_list_archive(fs):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("member", b"m")
+    fs.write_bytes("a.zip", buffer.getvalue())
+    assert [entry.name for entry in fs.list_archive("a.zip")] == ["member"]
+
+
 FILESYSTEM = {
     "appid": lambda fs: fs.appid("surface-test"),
     "cancel_prepare": lambda fs: fs.cancel_prepare(fs.prepare(["f.root"])),
@@ -130,6 +141,7 @@ FILESYSTEM = {
     "isfile": lambda fs: fs.isfile("f.root"),
     "iterdir": lambda fs: list(fs.iterdir(".")),
     "listdir": lambda fs: fs.listdir("."),
+    "list_archive": _fs_list_archive,
     "hardlink": lambda fs: fs.hardlink("f.root", "hard.root"),
     "link": lambda fs: fs.link("f.root", "linked.root"),
     "listxattr": lambda fs: fs.listxattr("f.root"),
@@ -190,6 +202,11 @@ def test_every_public_filesystem_method_is_exercised():
 # ---------------------------------------------------------------------------
 
 
+def _file_fcntl(fh):
+    with pytest.raises(UnsupportedError, match="fctl operation not supported"):
+        fh.fcntl(b"stock servers have no plug-in for this")
+
+
 def _file_reopen(fh):
     fh.close()
     return fh.open(OpenFlags.READ)
@@ -242,6 +259,7 @@ FILE = {
     "truncate": lambda fh: fh.truncate(4),
     "verify": lambda fh: fh.verify(fh.checksum().value),
     "visa": lambda fh: fh.visa(),
+    "fcntl": _file_fcntl,
     "write": lambda fh: fh.write(b"W", 0),
     "writev": lambda fh: fh.writev([WriteChunk(0, b"a"), (2, b"b")]),
     "clone": lambda fh: fh.clone(fh, [(0, 2, 4)]),

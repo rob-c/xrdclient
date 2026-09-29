@@ -23,6 +23,7 @@ Paths may be absolute or relative to the URL's own path.
 | `iterdir(path)` | the same, as an iterator |
 | `walk(top)` | `os.walk`'s `(root, dirs, files)` triples |
 | `glob(pattern, root="")` | `pathlib` semantics, absolute paths out |
+| `list_archive(path)` | the members of a ZIP archive, from its central directory |
 
 ```python
 for entry in fs.scandir("/store"):
@@ -73,6 +74,27 @@ the pattern - `/store/user/me/**/*.root` never lists `/store/user`.
     to the search root, which quietly returned nothing for an absolute
     pattern. It was found by running the same glob against a real daemon; see
     [interoperability](interop.md).
+
+### Inside a ZIP archive
+
+`list_archive` lists the members of a ZIP archive on the server without
+fetching it - XrdCl's `DirListFlags::Zip`. It reads the end of the file for
+the end-of-central-directory record, follows it (through the ZIP64 locator,
+for a large archive) to the central directory, and parses that: two or three
+ranged reads, whatever the archive's size.
+
+```python
+for entry in fs.list_archive("/store/run7/logs.zip"):
+    print(entry.name, entry.stat.st_size)       # "sub/", "sub/run.log", ...
+```
+
+Names are as the archive stores them, directories with their trailing `/`,
+in the archive's order; `entry.parent` is the archive's path. Each entry's
+`stat` is the one XrdCl gives it: the archive's own `id`, times and mode,
+never writable, with the member's uncompressed size. A file that is not a ZIP
+archive, or a damaged one, raises `xrdclient.client._zip.ZipArchiveError`
+with XrdCl's words for what is wrong ("End-of-central-directory signature not
+found."); an empty file is an empty archive.
 
 ## Changing the namespace
 

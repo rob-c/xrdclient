@@ -312,9 +312,15 @@ class Config:
     bulk: bool = field(default_factory=lambda: _env_flag("XRD_BULK") is not False)
     chunk_size: int = field(default_factory=lambda: _env_int("XRD_CPCHUNKSIZE", 1 << 22))
     readahead: int = field(default_factory=lambda: _env_int("XRD_READAHEAD", 1 << 20))
-    parallel_chunks: int = field(default_factory=lambda: _env_int("XRD_CPPARALLELCHUNKS", 4))
+    #: Connections one large copy is spread over, a span of the file each.
+    parallel_chunks: int = field(default_factory=lambda: _env_int("XRD_CPPARALLELSPANS", 4))
     parallel_files: int = field(default_factory=lambda: _env_int("XRD_CPPARALLELFILES", 1))
-    in_flight: int = field(default_factory=lambda: _env_int("XRD_CPINFLIGHT", 2))
+    #: Chunks a transfer keeps in flight ahead of the write it waits on. XrdCl
+    #: calls this ``CPParallelChunks``, so ``$XRD_CPPARALLELCHUNKS`` sets it,
+    #: as it does for ``xrdcp``; ``$XRD_CPINFLIGHT`` wins when both are set.
+    in_flight: int = field(
+        default_factory=lambda: _env_int("XRD_CPINFLIGHT", _env_int("XRD_CPPARALLELCHUNKS", 2))
+    )
     #: Extra ``kXR_bind`` data sub-streams a file binds at open, so its bulk
     #: reads and writes travel beside the control traffic rather than behind
     #: it. The official client counts the control link in its total, so its

@@ -32,8 +32,8 @@ swapping one for the other under code holding references to both.
 | --- | --- |
 | [Replacing PyXRootD](porting.md) | making the switch: the import, `install()` for code you cannot edit, environments with both installed, what changes operationally, a step-by-step checklist, verifying the port, and moving on to the native API |
 | [Compatibility reference](compat-reference.md) | every class, method, keyword, response attribute, flag value, environment key and status code, with a note wherever behaviour differs |
-| [Cookbook](compat-cookbook.md) | complete programs: chunked and vector reads, writing, recursive listings, checksums, staging, xattrs, `CopyProcess` progress, callbacks, timeouts, error handling, threads, uproot, tokens, GSI, Kerberos |
-| [Troubleshooting](compat-troubleshooting.md) | `install()` refusing, Kerberos caches, the list of differences, upstream API not yet here, performance, debugging |
+| [Cookbook](compat-cookbook.md) | complete programs: chunked and vector reads, writing, recursive listings, checksums, staging, the Tape REST API, typed exceptions, xattrs, `CopyProcess` progress, callbacks, timeouts, error handling, threads, uproot, tokens, GSI, Kerberos |
+| [Troubleshooting](compat-troubleshooting.md) | `install()` refusing, Kerberos caches, the list of differences, newer upstream API, performance, debugging |
 | [Coming from pyxrootd](migrating.md) | the native API, and how each bindings call translates to it |
 
 ## What is covered
@@ -44,10 +44,13 @@ swapping one for the other under code holding references to both.
 | `File` | every method: `open`, `close`, `is_open`, `read`, `readline`, `readlines`, `readchunks`, iteration, `vector_read`, `write`, `sync`, `truncate`, `stat`, `visa`, `clone`, the xattr methods, `get_property`/`set_property`, `with` |
 | `CopyProcess` | `add_job` with all of its keywords, `parallel`, `prepare`, `run(handler)` |
 | `URL` | every attribute, `is_valid`, `clear`, and XrdCl's parsing rules |
-| `responses` | `XRootDStatus`, `StatInfo`, `StatInfoVFS`, `DirectoryList`, `ListEntry`, `LocationInfo`, `Location`, `ProtocolInfo`, `VectorReadInfo`, `ChunkInfo`, `HostList`, `HostInfo` |
-| `flags` | every namespace, value for value, with `reverse_mapping` |
-| `utils` | `CopyProgressHandler`, `AsyncResponseHandler` |
-| module functions | `EnvPutInt`, `EnvGetInt`, `EnvDelInt` and the `String` trio, `EnvGetDefault`, `SetLogLevel`, `SetLogMask`, `glob`, `iglob`, `setXAttrAdler32` |
+| `responses` | `XRootDStatus` (with `error_name`, `exception()`, `raise_on_error()` and the `err*` code names), `StatInfo`, `StatInfoVFS`, `DirectoryList`, `ListEntry`, `LocationInfo`, `Location`, `ProtocolInfo`, `VectorReadInfo`, `ChunkInfo`, `HostList`, `HostInfo`, the tape responses, `raise_on_error` |
+| exceptions | `XRootDError` and its `XRootDNotFoundError`, `XRootDAuthorizationError`, `XRootDTimeoutError`, `XRootDChecksumError`, `XRootDOperationError` |
+| `tape` | `TapeClient`: `discover`, `stage`, `stage_status`, `stage_cancel`, `stage_delete`, `release`, `archive_info` - the WLCG Tape REST API over `http(s)`/`dav(s)`, the server's own prepare and query over `root://` |
+| `flags` | every namespace, value for value, with `reverse_mapping` (and `PrepareFlags.CANCEL`); the `enum()` helper |
+| `utils` | `CopyProgressHandler`, `AsyncResponseHandler`, `CallbackWrapper` |
+| `copyprocess`, `finalize` | `ProgressHandlerWrapper`; `finalize()`, registered with `atexit` |
+| module names | `EnvPutInt`, `EnvGetInt`, `EnvDelInt` and the `String` trio, `EnvGetDefault`, `SetLogLevel`, `SetLogMask`, `glob`, `iglob`, `setXAttrAdler32`, `__version__` |
 
 The method-by-method detail is in the [reference](compat-reference.md).
 
@@ -66,7 +69,10 @@ Two more checks sit beside it: the programs in
 [`examples/pyxrootd/`](https://github.com/rob-c/xrdclient/tree/main/examples/pyxrootd),
 which `examples/pyxrootd/run_all.py` runs on both the bindings and this
 package and compares, and `tools/pyxrootd_upstream.py`, which runs the
-bindings' own upstream tests against this package. See
+bindings' own upstream tests against this package - including
+`test_responses.py` and `test_tape.py`, which are newer than the 6.1
+bindings and so pass on the compat layer only.
+`tests/test_pyxrootd_compat_newapi.py` pins that newer API by itself. See
 [verifying the port](porting.md#verifying-the-port).
 
 Some of what the parity suite turns up is the bindings' own behaviour, kept
@@ -96,10 +102,7 @@ On purpose, and each one visible in a status rather than silently:
 - **`callback=`** runs on a worker thread and gets `(status, response,
   hostlist)`. The host list names the server that answered, not every hop.
 - **`dirlist` with `LOCATE` or `MERGE`** lists the directory on the server
-  the namespace sends it to; for one server that is the same answer. `ZIP`
-  returns `errNotImplemented`.
-- **`File.fcntl` and `openusingtemplate`** (`DUP`, `SAMEFS`) return
-  `errNotSupported`: this client sends neither request.
+  the namespace sends it to; for one server that is the same answer.
 - **`CopyProcess`** ignores `sourcelimit`, `coerce`, `dynamicsource`,
   `inittimeout`, `cptimeout`, `xrate` and `xrateThreshold`: it reads from one
   source and applies no rate limit.

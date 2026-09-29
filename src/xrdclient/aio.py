@@ -379,6 +379,10 @@ class AsyncFile:
         """``kXR_query`` visa for the open handle. ``root://`` only."""
         return await _run(self._native("visa").visa)
 
+    async def fcntl(self, data: bytes = b"") -> bytes:
+        """``data`` for the storage plug-in, and its answer (``Fcntl``). ``root://`` only."""
+        return await _run(self._native("fcntl").fcntl, data)
+
     # -- extended attributes -------------------------------------------
 
     async def getxattr(self, name: str) -> bytes:
@@ -681,6 +685,10 @@ class AsyncFileSystem:
 
     async def listdir(self, path: str = "") -> list[str]:
         return await _run(self._sync.listdir, path)
+
+    async def list_archive(self, path: str) -> list[DirEntry]:
+        """The members of the ZIP archive at ``path``, from its central directory."""
+        return await _run(self._sync.list_archive, path)
 
     def iterdir(self, path: str = "") -> _Iterating:
         """``async for entry in fs.iterdir("/store")``."""

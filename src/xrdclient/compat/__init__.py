@@ -43,14 +43,17 @@ def install() -> None:
     sys.modules["XRootD"] = package
     sys.modules["XRootD.client"] = client
     for name in (
-        "flags",
-        "responses",
-        "utils",
-        "url",
+        "_version",
+        "copyprocess",
         "env",
         "file",
         "filesystem",
-        "copyprocess",
+        "finalize",
+        "flags",
         "glob_funcs",
+        "responses",
+        "tape",
+        "url",
+        "utils",
     ):
         sys.modules[f"XRootD.client.{name}"] = sys.modules[f"{client.__name__}.{name}"]

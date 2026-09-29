@@ -74,19 +74,78 @@ $ kinit jane@EXAMPLE.ORG
 
 What the server's `krb5` plugin wants is a raw Kerberos AP-REQ for the
 principal it names in its offer (`xrootd/host@REALM`). The client reads the
-FILE credential cache - `$KRB5CCNAME`, else `default_ccache_name` from
+credential cache MIT would - `$KRB5CCNAME`, else `default_ccache_name` from
 `krb5.conf`, else `/tmp/krb5cc_<uid>` - and uses the service ticket there if
 `kvno` or an earlier program already fetched one. If the cache holds only
 your ticket-granting ticket, it asks the KDC for the service ticket itself (a
 TGS exchange, over UDP with a TCP fallback, to the `kdc` listed for the realm
 in `$KRB5_CONFIG` or `/etc/krb5.conf`) and keeps it in memory for the rest of
-the process; the cache file is never written. A server started with
-`-exptkn` (its offer ends `,fwd`) also gets a forwarded TGT, which needs a
-forwardable one: `kinit -f`. As with MIT's default `kdc_timesync`, the
-authenticators carry the local time corrected by the KDC clock offset `kinit`
-recorded in the cache, so a host whose clock has drifted still logs in.
-`include` and `includedir` are followed wherever they start a line of
-`krb5.conf`, as MIT follows them.
+the process. A server started with `-exptkn` (its offer ends `,fwd`) also
+gets a forwarded TGT, which needs a forwardable one: `kinit -f`. As with
+MIT's default `kdc_timesync`, the authenticators carry the local time
+corrected by the KDC clock offset `kinit` recorded in the cache, so a host
+whose clock has drifted still logs in. `include` and `includedir` are
+followed wherever they start a line of `krb5.conf`, as MIT follows them.
+
+### Credential cache types
+
+| Cache | Read how | A service ticket fetched from the KDC |
+| --- | --- | --- |
+| `FILE:path`, a bare path | the file | kept in memory; the file is never written |
+| `DIR:dir`, `DIR::dir/tktX` | the collection's `primary` cache, or the one named | kept in memory |
+| `KCM:`, `KCM:name` (RHEL 9's default, `sssd-kcm`; Heimdal's `kcm`) | the KCM protocol over the daemon's Unix socket | kept in memory **and** stored in the cache (`STORE`), as MIT's library does |
+| `KEYRING:persistent:uid`, `KEYRING:session:name`, `KEYRING:user:name`, `KEYRING:process:name`, `KEYRING:thread:name`, `KEYRING:name` | the Linux `keyctl` system call, through `ctypes` | kept in memory; the keyring is never written |
+| `API:` (macOS) | refused - held by Heimdal's credential service over XPC | - |
+| `MEMORY:`, `MSLSA:` | refused - they live in another process, or Windows | - |
+
+**KCM.** The socket is `kcm_socket` in `[libdefaults]`, else
+`/var/run/.heim_org.h5l.kcm-socket`. `KCM:` asks the daemon for its default
+cache (`GET_DEFAULT_CACHE`) and reads its principal, KDC clock offset and
+credentials - all at once with MIT's `GET_CRED_LIST` where the daemon has it
+(sssd does), else one at a time by UUID (Heimdal's daemon). No daemon, or
+no such cache, is "no Kerberos credential", as a missing file is; a daemon
+that answers with an error is a `CredentialError` naming the cache. A ticket
+fetched from the KDC is stored back because that is what every MIT program
+on the host does with a KCM cache, and because it is safe to: the daemon
+serialises its clients, and the credential is marshalled byte-for-byte as
+MIT marshals it (a test re-marshals MIT's own and compares bytes). A daemon
+that refuses the store costs the next process one TGS exchange; the login
+goes ahead.
+
+**KEYRING.** The residual is MIT's `anchor:collection[:cache]`. The
+collection is the keyring `_krb` in the user's persistent keyring
+(`KEYCTL_GET_PERSISTENT`), or `_krb_<collection>` under the special keyring
+the anchor names; its current cache is named by the `krb_ccache:primary`
+key, and each cache keyring holds `__krb5_princ__`,
+`__krb5_time_offsets__` and one key per credential, in the FILE format's
+marshalling. A bare `KEYRING:name` is MIT's legacy form, and also finds a
+cache a pre-1.12 MIT left in the session keyring under that name. This
+client does not create keyrings, so a missing one is no cache; nor does it
+add keys, so a fetched ticket stays in memory, as for a file. Off Linux,
+`KEYRING:` is a `CredentialError` that says so and names the fix.
+
+### What was tested against what
+
+| Claim | Tested against |
+| --- | --- |
+| KCM wire format: framing, opcodes, status codes, marshalling | MIT krb5 1.22 (Homebrew, macOS) and 1.21 (AlmaLinux 9) `kinit`, `klist` and `kvno` running against the in-process fake daemon (`tests/_kcmd.py`) - with and without MIT's extensions |
+| KCM reading returns exactly what the FILE reader returns | caches MIT wrote (`tests/_krb5_mit.py`), served by the fake daemon |
+| a TGT from KCM logs in to `xrootd`; the stored ticket is one MIT uses | the fake daemon + a real MIT KDC + a real `xrootd`; MIT's `klist` lists the stored ticket and MIT's `kvno` uses it with the KDC stopped |
+| the same, against a **real** `sssd-kcm` | sssd 2.9.8 on AlmaLinux 9 (in a container), with MIT 1.21 and `xrootd` 5.9.7: `tests/test_krb5_kcm.py::test_a_real_kcm_daemon_...`, which runs only with `XRDCLIENT_TEST_SYSTEM_KCM=1` because it uses the machine's daemon |
+| Heimdal's own `kcm` | only as the fake daemon's `heimdal=True` mode (no MIT extensions); not against Heimdal itself |
+| KEYRING layout and resolution, every anchor, the error paths | a fake `keyctl` (`FakeKernel` in `tests/test_krb5_keyring.py`) that is called exactly as the syscall is, ctypes buffers included - runs everywhere |
+| the real `keyctl` syscall; MIT's real keyring layout | Linux only, skipped elsewhere: the syscall reading the session keyring; a cache laid out with `keyutils`' `keyctl`; MIT `kinit` into `KEYRING:session:` and `KEYRING:persistent:` then a login to a real `xrootd` - all run on AlmaLinux 9 (kernel keyrings through Docker with `seccomp=unconfined`) |
+| macOS `API:` | refused; nothing to test beyond the message |
+
+Where MIT's sources were not to hand, the protocol was written from
+knowledge of `cc_kcm.c`, `kcm.h` and `cc_keyring.c`, and confirmed by the
+tests above rather than by reading them: the Homebrew build has headers
+(`krb5.h`, for the error codes used) but no `kcm.h`. The heim-ipc reply
+frame (length, transport status, then the KCM status) was confirmed by
+MIT's `kinit` against the fake daemon; the keyring layout by MIT's `kinit`
+writing a real kernel keyring that this client then read.
+
+### Limits
 
 Supported: the AES enctypes - `aes256-cts-hmac-sha1-96`,
 `aes128-cts-hmac-sha1-96`, `aes256-cts-hmac-sha384-192` and
@@ -95,7 +154,8 @@ Supported: the AES enctypes - `aes256-cts-hmac-sha1-96`,
 
 | Situation | What to do |
 | --- | --- |
-| a `KCM:`, `KEYRING:` or `API:` cache (RHEL 9 defaults to KCM) | `KRB5CCNAME=FILE:/tmp/krb5cc_$(id -u) kinit` |
+| a macOS `API:` cache, or `MEMORY:` | `KRB5CCNAME=FILE:/tmp/krb5cc_$(id -u) kinit` |
+| a `KEYRING:` cache anywhere but Linux | the same |
 | tickets that have expired | `kinit` - the error says how long ago |
 | a realm with no `kdc =` line (DNS SRV lookup is not done) | add `[realms] REALM = { kdc = host }` |
 | a service in another realm than your TGT (cross-realm) | not supported |

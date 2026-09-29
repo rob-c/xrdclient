@@ -194,11 +194,10 @@ The credentials are found where the C++ client finds them -
 tokens; `XrdSecSSSKT` for sss - so a job that authenticated before
 authenticates now. See [Authentication](auth.md) for each mechanism.
 
-Kerberos is pure Python too, and has one limitation that matters on modern
-Linux: it reads credential caches that are files (`FILE:` and `DIR:`) only.
-RHEL 9 and its rebuilds default to a `KCM:` cache, and some sites use
-`KEYRING:`; the client refuses those by name rather than guessing. Point
-`kinit` at a file:
+Kerberos is pure Python too, and reads the credential caches `kinit` writes
+on Linux: `FILE:` and `DIR:` caches, `KCM:` (RHEL 9's default, through
+`sssd-kcm`) and `KEYRING:`. Only macOS's `API:` cache is out of reach from
+Python; there, point `kinit` at a file:
 
 ```console
 $ export KRB5CCNAME=FILE:/tmp/krb5cc_$(id -u)
@@ -246,16 +245,12 @@ either.
     such as `XRootD.client.flags.OpenFlags.READ` after a bare
     `import XRootD.client`.
 
-2. **Look for the handful of things that are not there.** These return an
-   error status rather than failing silently, but it is better to know in
-   advance:
-
-    ```console
-    $ grep -rnE 'fcntl|openusingtemplate|DirListFlags\.ZIP|finalize|CallbackWrapper' --include='*.py' .
-    ```
-
-    and see [troubleshooting](compat-troubleshooting.md#what-behaves-differently)
-    for what each one does here.
+2. **Read the short list of behaviours that differ.** Every name the
+   bindings export is here, the newer upstream API included (typed
+   exceptions, `TapeClient`); what differs is a handful of behaviours -
+   caller-side timeouts, the `CopyProcess` keywords that have no effect - and
+   [troubleshooting](compat-troubleshooting.md#what-behaves-differently) lists
+   them.
 
 3. **Run your tests with `install()`, before touching an import.** Add it to
    the test suite's `conftest.py`:

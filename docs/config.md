@@ -51,9 +51,9 @@ minutes.
 | --- | --- | --- |
 | `chunk_size` | 4 MiB | `XRD_CPCHUNKSIZE` |
 | `readahead` | 1 MiB | `XRD_READAHEAD` |
-| `parallel_chunks` | `4` | `XRD_CPPARALLELCHUNKS` |
+| `parallel_chunks` | `4` | `XRD_CPPARALLELSPANS` |
 | `parallel_files` | `1` | `XRD_CPPARALLELFILES` |
-| `in_flight` | `2` | `XRD_CPINFLIGHT` |
+| `in_flight` | `2` | `XRD_CPINFLIGHT`, else `XRD_CPPARALLELCHUNKS` |
 | `data_streams` | `1` | `XRD_SUBSTREAMSPERCHANNEL` |
 | `data_stream_timeout` | 2 s | `XRD_SUBSTREAMTIMEOUT` |
 | `max_read_size` | 1 GiB | `XRD_MAXREADSIZE` |
@@ -66,6 +66,9 @@ and defaults to one because each of them is already spread over
 `parallel_chunks`. `in_flight` is how many chunks a transfer reads ahead of
 the write it is waiting on, so that the two ends overlap; `1` is the strictly
 sequential pump, and is what a copy between two local disks wants.
+`$XRD_CPPARALLELCHUNKS` sets `in_flight`, because that is what the variable
+means to XrdCl and `xrdcp`: chunks in flight, not connections. (Earlier
+releases read it into `parallel_chunks`; that is `$XRD_CPPARALLELSPANS` now.)
 `data_streams` is how many extra `kXR_bind` sub-streams a file uses, so a
 plain read or write already travels beside the control traffic instead of
 behind it; it is on by default (one extra link). The sub-streams belong to the

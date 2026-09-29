@@ -46,32 +46,25 @@ The alternative is not to need `install()` at all: change the import to
 `from xrdclient.compat import client`, which never touches the name
 `XRootD` and so can live beside the real bindings in one process.
 
-## `ModuleNotFoundError: No module named 'XRootD.client.finalize'`
+## Kerberos: "credential cache ... cannot reach" (`API:` and the like)
 
-`XRootD.client.finalize` shuts XrdCl down at interpreter exit. There is
-nothing to shut down here - connections are closed by an `atexit` hook - so
-the module does not exist. Delete the import; if the code calls
-`finalize.finalize()`, delete that too. The same holds for
-`XRootD.client._version`: use `importlib.metadata.version("xrdclient")`.
-
-## Kerberos: "this client reads only FILE: and DIR: caches"
-
-The pure-Python Kerberos reads credential caches that are files - `FILE:`
-and `DIR:` - and refuses the ones held by a daemon or the kernel. RHEL 9 and
-its rebuilds default to `KCM:`; some sites use `KEYRING:`; macOS uses `API:`.
-The error names the cache it found:
+The pure-Python Kerberos reads `FILE:` and `DIR:` caches, `KCM:` caches
+(RHEL 9's default, through `sssd-kcm`'s socket) and Linux `KEYRING:` caches
+(through the `keyctl` system call). It refuses macOS's `API:` caches, which
+Heimdal's credential service holds behind XPC, and `MEMORY:` caches, which
+live in another process. The error names the cache it found:
 
 ```
-CredentialError: Kerberos credential cache 'KCM:1000' lives outside the
-filesystem, and this client reads only FILE: and DIR: caches. Get a ticket into a file with:
-KRB5CCNAME=FILE:/tmp/krb5cc_$(id -u) kinit
+CredentialError: Kerberos credential cache 'API:ABCD-1234' is a macOS API: cache,
+held by the system's Heimdal credential service over XPC, which this pure-Python
+client cannot reach. Get a ticket into a file with: KRB5CCNAME=FILE:/tmp/krb5cc_$(id -u) kinit
 ```
 
 `klist` shows which kind you have:
 
 ```console
 $ klist | head -1
-Ticket cache: KCM:1000
+Ticket cache: API:ABCD-1234
 ```
 
 Get a ticket into a file instead, and point the job at it:
@@ -81,9 +74,20 @@ $ export KRB5CCNAME=FILE:/tmp/krb5cc_$(id -u)
 $ kinit jane@EXAMPLE.ORG
 ```
 
+A `KEYRING:` name on a host that is not Linux is refused the same way.
+
+A `KCM:` cache that finds no daemon on its socket - `sssd-kcm` not
+installed, or `kcm_socket` in `krb5.conf` pointing elsewhere - is treated as
+no cache at all, like a missing file, so the login moves on to the next
+mechanism; the authentication error then says Kerberos had nothing. Check
+with `klist`, which uses the same socket. A daemon that answers with an
+error is reported as "the Kerberos credential cache KCM:1000 is unreadable",
+with the daemon's code (`KRB5_CC_IO`, `KRB5_FCC_NOFILE`, ...).
+
 For a site that sets `default_ccache_name` in `krb5.conf`, the variable
 overrides it for your session only. The other Kerberos limits - AES only, no
-DNS lookup of the KDC, no cross-realm tickets - are in
+DNS lookup of the KDC, no cross-realm tickets - and which cache types were
+tested against which real implementations are in
 [Authentication](auth.md#krb5-kerberos).
 
 ## Authentication fails where it used to work
@@ -121,12 +125,16 @@ answer.
   UTF-8 raises `UnicodeDecodeError`; a `float` timeout raises `TypeError`.
 - The per-name statuses in an xattr result, and `FileSystem.cat`'s status,
   are dicts; `XRootDStatus` answers `status["ok"]` too.
+- `dirlist` of a path ending in `.zip`, with no callback, lists the members
+  of the archive rather than failing on a file - XrdCl's synchronous
+  `DirList` adds `DirListFlags.ZIP` for that suffix by itself. With a
+  callback it does not, and the server says the path is not a directory.
+- `fcntl` against a stock xrootd returns status 400, `errno` 3013 ("fctl
+  operation not supported"): the request goes out, and there is no storage
+  plug-in to take it.
 
 **Not supported, and says so:**
 
-- `File.fcntl` and `File.openusingtemplate` (`OpenFlags.DUP`, `SAMEFS`)
-  return `errNotSupported` (13).
-- `dirlist` with `DirListFlags.ZIP` returns `errNotImplemented` (15).
 - `CopyProcess.add_job` accepts `sourcelimit`, `coerce`, `dynamicsource`,
   `inittimeout`, `cptimeout`, `xrate` and `xrateThreshold` and ignores them:
   one source is read, no rate limit is applied, and a copy is bounded by the
@@ -164,25 +172,25 @@ With a non-zero `offset` the bindings hang; here it returns the lines from
 that offset. Code that works on the bindings never passes one, so nothing
 changes for it.
 
-## Newer upstream API that is not here yet
+## Newer upstream API
 
 The compat layer follows the `XRootD.client` API that the parity suite runs
-against (the 5.x and 6.x releases). Some newer upstream releases add API that
-is not yet reproduced:
+against (the 5.x and 6.x releases), and also the API upstream has added
+since, which the installed 6.1 bindings do not have yet:
 
-- **`client.tape`** and the other tape-specific helpers. Stage with
-  `FileSystem.prepare(files, PrepareFlags.STAGE)` and watch
-  `StatInfoFlags.OFFLINE`, as in the
-  [cookbook](compat-cookbook.md#staging-from-tape), or use the native
-  `fs.native.prepare`, `query_prepare` and `archive_info`.
-- **Typed exceptions** such as `XRootDNotFoundError`. The compat layer keeps
-  the `(status, response)` shape and never raises for a server's answer;
-  test `status.errno` instead. For exceptions, move that call to the native
-  API, where a missing file is a `FileNotFoundError` subclass - see
-  [Errors](errors.md).
+- **Typed exceptions** - `status.raise_on_error()`, `status.exception()`,
+  `status.error_name`, `client.raise_on_error(status)` and the
+  `XRootDError` family. Calls still return `(status, response)` and never
+  raise for a server's answer; these are for code that would rather raise.
+  See the [cookbook](compat-cookbook.md#raising-instead-of-checking).
+- **`client.tape.TapeClient`** for the WLCG Tape REST API; see the
+  [cookbook](compat-cookbook.md#the-tape-rest-api).
+- **`XRootD.client.finalize`** and **`XRootD.client._version`** exist, so
+  code that imports them ports unchanged; `finalize.finalize()` closes open
+  files and the shared connections, and runs at exit by itself.
 
 An `AttributeError` or `ImportError` naming an upstream name not listed in
-the [reference](compat-reference.md) means the same thing. Please report it,
+the [reference](compat-reference.md) means that name is newer still. Please report it,
 with the upstream version that has it.
 
 ## Is it slower?

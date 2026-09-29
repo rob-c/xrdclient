@@ -13,6 +13,7 @@ know: :meth:`stat`, :meth:`listdir`, :meth:`makedirs`, :meth:`remove`,
 
 from __future__ import annotations
 
+import dataclasses
 import errno
 import posixpath
 import re
@@ -57,7 +58,7 @@ from ..types import (
     VFSInfo,
 )
 from ..url import XRootDURL, parse
-from . import _fattr
+from . import _fattr, _zip
 
 __all__ = ["FileSystem"]
 
@@ -465,6 +466,9 @@ class FileSystem:
         read. A server that ignores the option answers an ordinary listing, so
         every entry comes back with ``None``; an algorithm it does not have is
         an error on the listing rather than a listing without digests.
+
+        To list inside a ZIP archive, as XrdCl's ``DirListFlags::Zip`` does,
+        see :meth:`list_archive`.
         """
         target = self._abs(path or "/")
         options = dirlist_flags(stat=stat, online=online, algorithm=algorithm, flags=flags)
@@ -475,6 +479,52 @@ class FileSystem:
             r.Dirlist(target, int(options) & ~int(DirListFlags.RECURSIVE)), path=target
         )
         return rp.parse_dirlist(res.data, target, with_stat=with_stat)
+
+    def list_archive(self, path: str) -> list[DirEntry]:
+        """The members of the ZIP archive at ``path``, read from its central directory.
+
+            for entry in fs.list_archive("/store/run7/logs.zip"):
+                print(entry.name, entry.stat.st_size)
+
+        This is XrdCl's ``DirListFlags::Zip`` listing. Only the end of the
+        archive is read - the directory records, found through the
+        end-of-central-directory record in two or three ranged reads - so a
+        large archive costs what a small one does. Names are as stored,
+        directories included (``"sub/"``), in the archive's own order.
+
+        Each entry's stat is the one XrdCl gives it: the archive's own, never
+        writable, with the member's uncompressed size in place of the
+        archive's. A file that is not an archive, or is a damaged one, raises
+        :class:`~xrdclient.client._zip.ZipArchiveError` in XrdCl's words for
+        what is wrong with it; an empty file is an empty archive.
+        """
+        return self._archive(path, self.stat(path))
+
+    def _archive(self, path: str, archive: StatInfo) -> list[DirEntry]:
+        """:meth:`list_archive`, for an archive already stat-ed as ``archive``."""
+        with self.open(path, "rb") as fh:
+
+            def read(at: int, length: int) -> bytes:
+                fh.seek(at)
+                data: bytes = fh.read(length)
+                return data
+
+            found = _zip.members(read, archive.st_size)
+        parent = self._abs(path).partition("?")[0]
+        flags = archive.flags & ~StatInfoFlags.IS_WRITABLE
+        return [
+            DirEntry(
+                name=member.name,
+                parent=parent,
+                stat=dataclasses.replace(
+                    archive,
+                    st_size=member.size,
+                    flags=flags,
+                    path=f"{parent.rstrip('/')}/{member.name}",
+                ),
+            )
+            for member in found
+        ]
 
     def listdir(self, path: str = "") -> list[str]:
         """Entry names only, like :func:`os.listdir`."""

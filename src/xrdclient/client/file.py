@@ -117,6 +117,9 @@ class File:
         self._size_hint = 0
         self._flags = OpenFlags.NONE
         self._mode = 0
+        #: ``(optiont, fhtemplt)`` of an open made against a template file:
+        #: ``kXR_dup`` or ``kXR_samefs``, and that file's handle.
+        self._template: tuple[int, bytes] = (0, c.NULL_FHANDLE)
         self._checkpoint = False
         self._pathid = 0
         #: Data sub-streams bound automatically at open for bulk transfer, and
@@ -308,6 +311,9 @@ class File:
         self,
         flags: OpenFlags | int | str = OpenFlags.READ,
         mode: Access | int | str = Access.OWNER_READ | Access.OWNER_WRITE,
+        *,
+        template: File | None = None,
+        dup: bool = False,
     ) -> StatInfo | None:
         """``kXR_open``. Returns the stat the server volunteered, if any.
 
@@ -320,11 +326,28 @@ class File:
 
         A string of mode letters is a mode; any other string is read as
         option names. ``mode`` is the permission set for a file this creates.
+
+        ``template`` is another open :class:`File`, and makes this a new file
+        placed on the same filesystem as that one (``kXR_samefs``); with
+        ``dup=True`` the server also gives it that file's contents
+        (``kXR_dup``, a server-side clone). The open goes out on the
+        template's connection, since its handle means nothing anywhere else,
+        and the server wants ``NEW`` - and, for ``dup``, a writable open::
+
+            copy = File(url_of_copy)
+            copy.open("new update", template=original, dup=True)
+
+        A server whose storage cannot place or clone files that way refuses
+        with :class:`~xrdclient.errors.UnsupportedError`, and so does this
+        method, without asking, for one whose protocol predates the options.
         """
         if self._handle is not None:
             raise ValueError(f"{self.url} is already open")
         self._flags, self._mode = open_flags(flags), permissions(mode)
+        self._template = (0, c.NULL_FHANDLE)
         try:
+            if template is not None:
+                self._join(template, dup)
             self._do_open()
             self._bind_data_streams()
         except BaseException:
@@ -337,9 +360,40 @@ class File:
             raise
         return self._stat
 
+    def _join(self, template: File, dup: bool) -> None:
+        """Move onto ``template``'s connection, where its handle is valid.
+
+        The file takes the template's data server as its own address, as
+        XrdCl does: that is where it is going to be, whatever server the URL
+        it was made with named.
+        """
+        handle = template.handle  # open, or this raises
+        router = template._router
+        version = getattr(router.session.protocol, "version", 0)
+        if version < c.kXR_PROTCLONEVERSION:
+            raise UnsupportedError(
+                kXR_Unsupported,
+                f"{router.endpoint} speaks protocol {version:#x}, older than the "
+                f"{c.kXR_PROTCLONEVERSION:#x} that brought opens against a template file",
+            )
+        shared = router.pin()
+        if self._owns_router:
+            self._router.close()
+        self._router, self._owns_router = shared, True
+        where = router.url
+        self.url = self.url.evolve(host=where.host, port=where.port, username=where.username)
+        self._template = (c.kXR_dup if dup else c.kXR_samefs, handle)
+
     def _do_open(self) -> bytes:
         """Issue the ``kXR_open`` and adopt the handle it returns."""
-        request = r.Open(self.url.path_with_cgi, int(self._flags) | c.kXR_retstat, self._mode)
+        optiont, fhtemplt = self._template
+        request = r.Open(
+            self.url.path_with_cgi,
+            int(self._flags) | c.kXR_retstat,
+            self._mode,
+            optiont=optiont,
+            fhtemplt=fhtemplt,
+        )
         result = self._router.execute(request, path=self.url.path)
         # The open may have been redirected; every later operation on this
         # handle must stay on the server that issued it. A connection this
@@ -522,6 +576,21 @@ class File:
     def visa(self) -> bytes:
         """``kXR_query`` visa - opaque server metadata about this handle."""
         return self._execute(lambda handle: r.Query(c.kXR_Qvisa, fhandle=handle)).data
+
+    def fcntl(self, data: bytes = b"") -> bytes:
+        """A storage-specific operation on this handle, as XrdCl's ``File::Fcntl``.
+
+        ``data`` goes to the server as it is, in a ``kXR_query`` of type
+        ``kXR_Qopaqug`` that names this handle; the answer comes back as it
+        is. What either means is up to the storage plug-in behind the server:
+        a stock xrootd has none, and refuses with
+        :class:`~xrdclient.errors.UnsupportedError` ("fctl operation not
+        supported").
+        """
+        payload = bytes(data)
+        return self._execute(
+            lambda handle: r.Query(c.kXR_Qopaqug, payload, fhandle=handle)
+        ).data
 
     # ------------------------------------------------------------------
     # Reading

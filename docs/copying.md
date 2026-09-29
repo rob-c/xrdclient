@@ -300,7 +300,7 @@ simpler and, on a fast network, not obviously slower - see
 | --- | --- |
 | `config.chunk_size` | bytes per request, default 4 MiB (`XRD_CPCHUNKSIZE`) |
 | `config.in_flight` | chunks read ahead of the write, `1` to disable (`XRD_CPINFLIGHT`) |
-| `config.parallel_chunks` | connections a long copy is spread over, `1` to disable (`XRD_CPPARALLELCHUNKS`) |
+| `config.parallel_chunks` | connections a long copy is spread over, `1` to disable (`XRD_CPPARALLELSPANS`) |
 | `config.parallel_files` | files of a tree copied at once (`XRD_CPPARALLELFILES`) |
 | `config.verify_checksums` | default for `verify` |
 | `config.preferred_checksum` | default for `algorithm` |

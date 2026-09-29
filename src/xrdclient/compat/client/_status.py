@@ -15,6 +15,7 @@ left to propagate rather than being dressed up as a server's answer.
 from __future__ import annotations
 
 from ... import errors as e
+from ...client._zip import ZipArchiveError
 from .responses import XRootDStatus
 
 __all__ = ["OK", "UnsupportedURLError", "failure", "from_exception", "guard", "status"]
@@ -81,6 +82,7 @@ class UnsupportedURLError(Exception):
 _CLASS_CODES: tuple[tuple[type[BaseException], int, int], ...] = (
     (e.ChecksumMismatchError, errCheckSumError, stError),
     (e.PageIntegrityError, errDataError, stError),
+    (ZipArchiveError, errDataError, stError),
     (e.RedirectLimitError, errRedirectLimit, stError),
     (e.AuthenticationError, errAuthFailed, stFatal),
     (e.TimeoutError, errOperationExpired, stError),
@@ -119,7 +121,9 @@ def _message(level: int, code: int, errno: int, detail: str) -> str:
     text = prefix + _DESCRIPTIONS.get(code, "Unknown error")
     if code == errErrorResponse:
         return f"{text}: [{errno}] {detail}\n"
-    return f"{text}: {detail}\n" if detail else text
+    # Only a server's answer ends in a newline, because the server's text
+    # does; XrdCl renders its own errors without one.
+    return f"{text}: {detail}" if detail else text
 
 
 #: The status of everything that went right; statuses are never mutated.

@@ -15,7 +15,7 @@ builds, so ``OpenFlags.reverse_mapping[16]`` is ``"READ"`` in either library.
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import Any, ClassVar
 
 __all__ = [
     "AccessMode",
@@ -28,7 +28,17 @@ __all__ = [
     "PrepareFlags",
     "QueryCode",
     "StatInfoFlags",
+    "enum",
 ]
+
+
+def enum(**enums: int) -> Any:
+    """The bindings' own helper: a class of these names, plus a ``reverse_mapping``.
+
+    ``enum(A=1, B=2).reverse_mapping[2]`` is ``"B"``, as with every namespace here.
+    """
+    reverse = {value: key for key, value in enums.items()}
+    return type("Enum", (), {**enums, "reverse_mapping": reverse})
 
 
 class _Namespace:
@@ -102,6 +112,7 @@ class DirListFlags(_Namespace):
 class PrepareFlags(_Namespace):
     """``XrdCl::PrepareFlags``."""
 
+    CANCEL = 1
     STAGE = 8
     WRITEMODE = 16
     COLOCATE = 32

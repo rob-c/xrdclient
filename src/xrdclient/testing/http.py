@@ -25,7 +25,7 @@ import urllib.parse
 from collections.abc import Callable
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Optional, cast
+from typing import Any, Optional, cast
 
 from ..crypto import checksum_bytes
 from ..url import XRootDURL, parse
@@ -128,6 +128,12 @@ class FakeDAVServer:
         self.staged: dict[str, list[str]] = {}
         #: Answer ``/api/v1`` at all - ``False`` is a site with no tape.
         self.no_tape = False
+        #: ``(request id, path)`` for each file withdrawn from a request.
+        self.cancelled: set[tuple[str, str]] = set()
+        #: ``(request id, path)`` for each file released from a request.
+        self.released: set[tuple[str, str]] = set()
+        #: The name the well-known discovery document gives the site.
+        self.sitename = "fake-site"
 
         for path, data in (files or {}).items():
             self.add_file(path, data)
@@ -313,6 +319,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if not self._gate():
+            return
+        if self.target == "/.well-known/wlcg-tape-rest-api":
+            self._discovery()
             return
         rest = self._api
         if rest is not None:
@@ -555,32 +564,66 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._tape_get(rest)
 
+    def _discovery(self) -> None:
+        """The well-known document naming the site's tape endpoints."""
+        if self.fake.no_tape:
+            self._json(404, {"message": "there is no tape behind this endpoint"})
+            return
+        endpoint = {"uri": str(self.fake.url.with_path("/api/v1")), "version": "v1", "metadata": {}}
+        self._json(200, {"sitename": self.fake.sitename, "endpoints": [endpoint]})
+
     def _tape_post(self, rest: list[str], body: bytes) -> None:
         try:
             document = json.loads(body or b"{}")
         except ValueError:
             self._json(400, {"message": "that is not a JSON document"})
             return
-        if rest == ["stage"]:
-            paths = [str(entry.get("path", "")) for entry in document.get("files", [])]
-            if not paths:
-                self._json(400, {"message": "a staging request names at least one file"})
-                return
-            handle = f"stage-{len(self.fake.staged) + 1:04d}"
-            self.fake.staged[handle] = paths
-            self._json(201, {"requestId": handle}, Location=f"/api/v1/stage/{handle}")
+        subset = self._subset_log(rest)
+        if subset is not None:
+            self._tape_subset(rest[1], document, subset.update)
+        elif rest == ["stage"]:
+            self._tape_stage(document)
         elif rest == ["archiveinfo"]:
             given = [str(path) for path in document.get("paths", [])]
             self._json(200, [self._locality(path) for path in given])
         else:
             self._json(404, {"message": "no such endpoint"})
 
+    def _subset_log(self, rest: list[str]) -> set[tuple[str, str]] | None:
+        """Where ``stage/<id>/cancel`` or ``release/<id>`` is recorded; ``None`` for others."""
+        if len(rest) == 3 and rest[0] == "stage" and rest[2] == "cancel":
+            return self.fake.cancelled
+        if len(rest) == 2 and rest[0] == "release":
+            return self.fake.released
+        return None
+
+    def _tape_stage(self, document: Any) -> None:
+        paths = [str(entry.get("path", "")) for entry in document.get("files", [])]
+        if not paths:
+            self._json(400, {"message": "a staging request names at least one file"})
+            return
+        handle = f"stage-{len(self.fake.staged) + 1:04d}"
+        self.fake.staged[handle] = paths
+        self._json(201, {"requestId": handle}, Location=f"/api/v1/stage/{handle}")
+
+    def _tape_subset(
+        self, handle: str, document: Any, record: Callable[[set[tuple[str, str]]], None]
+    ) -> None:
+        """Cancel or release some of request ``handle``'s files."""
+        paths = [str(path) for path in document.get("paths", [])]
+        if handle not in self.fake.staged:
+            self._json(404, {"message": "no such staging request"})
+            return
+        record({(handle, path) for path in paths})
+        self._send(200)
+
     def _tape_get(self, rest: list[str]) -> None:
         paths = self.fake.staged.get(rest[1]) if rest[:1] == ["stage"] and len(rest) == 2 else None
         if paths is None:
             self._json(404, {"message": "no such staging request"})
             return
-        self._json(200, {"files": [self._staging(path) for path in paths]})
+        files = [self._staging(rest[1], path) for path in paths]
+        self._json(200, {"id": rest[1], "createdAt": 1, "startedAt": 1, "files": files})
 
     def _tape_delete(self, rest: list[str]) -> None:
         known = rest[:1] == ["stage"] and len(rest) == 2
@@ -589,8 +632,10 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._json(404, {"message": "no such staging request"})
 
-    def _staging(self, given: str) -> dict[str, object]:
+    def _staging(self, handle: str, given: str) -> dict[str, object]:
         """One file of a staging request, as its poll reply describes it."""
+        if (handle, given) in self.fake.cancelled:
+            return {"path": given, "state": "CANCELLED", "onDisk": False}
         path = _clean(given)
         if path not in self.fake.files:
             return {"path": given, "state": "FAILED", "onDisk": False, "error": "no such file"}

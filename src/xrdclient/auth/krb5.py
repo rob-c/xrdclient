@@ -8,13 +8,15 @@ against its keytab. It is not a GSS-API token: the plugin never calls
 GSS-API, and would reject one.
 
 Building it takes a service ticket and its session key. Both come from the
-FILE credential cache ``kinit`` wrote; if the cache holds only the
-ticket-granting ticket, a TGS exchange with the KDC named in ``krb5.conf``
-gets the service ticket first - the step ``kinit`` leaves to the first
-program that needs it. The new ticket is kept in memory for this process
-and never written back to the cache. When the server runs with ``-exptkn``
-(its offer ends ``,fwd``) it then asks for the TGT itself, and gets a
-forwarded one in a KRB-CRED.
+credential cache ``kinit`` wrote - a ``FILE:`` or ``DIR:`` cache, a ``KCM:``
+cache in ``sssd-kcm`` or Heimdal's ``kcm`` (RHEL 9's default), or a Linux
+``KEYRING:`` cache; if the cache holds only the ticket-granting ticket, a
+TGS exchange with the KDC named in ``krb5.conf`` gets the service ticket
+first - the step ``kinit`` leaves to the first program that needs it. The
+new ticket is kept in memory for this process; a KCM cache is also given a
+copy, as MIT's library gives it one, while a file or a keyring is never
+written. When the server runs with ``-exptkn`` (its offer ends ``,fwd``) it
+then asks for the TGT itself, and gets a forwarded one in a KRB-CRED.
 
 This is all done here rather than through a system GSS-API library, which
 is what makes the package installable with no compiler and no extra - and
@@ -24,8 +26,8 @@ what it builds (``tests/test_krb5_interop.py``).
 
 What is not supported, each with an error that says so: ``kinit`` itself
 (the AS exchange), cross-realm service tickets, KDC discovery through DNS,
-credential caches that are not files (``KCM:``, ``KEYRING:``, ``API:``),
-and single-DES, triple-DES and RC4 keys.
+macOS ``API:`` credential caches and ``MEMORY:`` ones, and single-DES,
+triple-DES and RC4 keys.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ from .._log import get_logger
 from ..config import Config
 from ..errors import CredentialError
 from .base import Credential, Offer
+from .kerberos.caches import CredentialCache, FileCache, open_ccache
 
 # The cache format's names were this module's before the reader moved into
 # :mod:`.kerberos.ccache`; they are re-exported so that code naming them here
@@ -91,9 +94,14 @@ def default_ccache_path(config: Config | None = None) -> str:
 
 
 def tickets(path: str | None = None) -> list[Ticket]:
-    """Every unexpired ticket in the credential cache. Empty if there is none."""
+    """Every unexpired ticket in the credential cache. Empty if there is none.
+
+    ``path`` is a FILE cache; by default it is whichever cache MIT would use,
+    ``KCM:`` and ``KEYRING:`` included.
+    """
     try:
-        _default, found = read_ccache(path or default_ccache_path())
+        cache = FileCache(path) if path else open_ccache()
+        _default, found = cache.read()
     except (OSError, ValueError, CredentialError) as exc:
         _log.debug("no usable credential cache: %s", exc)
         return []
@@ -159,20 +167,30 @@ def _tgt(path: str, client: Principal, live: list[Ticket]) -> Ticket:
 
 
 def _service_ticket(
-    path: str, client: Principal, live: list[Ticket], target: Principal, profile: Profile
+    cache: CredentialCache,
+    client: Principal,
+    live: list[Ticket],
+    target: Principal,
+    profile: Profile,
 ) -> Ticket:
-    """A ticket for ``target``: from the cache, from memory, or from the KDC."""
+    """A ticket for ``target``: from the cache, from memory, or from the KDC.
+
+    One from the KDC is kept in memory, and offered to the cache - which a
+    KCM cache takes, as MIT's library stores it there.
+    """
     for ticket in live:
         if ticket.server.same_name(target) and ticket.key:
             return ticket
-    slot = (path, str(client), str(target))
+    slot = (cache.name, str(client), str(target))
     with _FETCHED_LOCK:
         held = _FETCHED.get(slot)
     if held is not None and held.remaining() > 60:
         return held
-    ticket = request_ticket(_tgt(path, client, live), target, profile, etypes=_etypes(profile))
+    tgt = _tgt(cache.name, client, live)
+    ticket = request_ticket(tgt, target, profile, etypes=_etypes(profile))
     with _FETCHED_LOCK:
         _FETCHED[slot] = ticket
+    cache.store(ticket)
     return ticket
 
 
@@ -229,24 +247,25 @@ class KerberosCredential(Credential):
         cls, offer: Offer, config: Config, *, username: str, host: str
     ) -> KerberosCredential | None:
         profile = Profile.load()
-        path = resolve_ccache(profile=profile)
+        cache = open_ccache(profile=profile)
         try:
-            client, found = read_ccache(path)
-        except FileNotFoundError:
-            _log.debug("no credential cache at %s", path)
+            client, found = cache.read()
+        except FileNotFoundError as exc:
+            _log.debug("no credential cache: %s", exc)
             return None
         except (OSError, ValueError) as exc:
             raise CredentialError(
-                f"the Kerberos credential cache {path} is unreadable: {exc}"
+                f"the Kerberos credential cache {cache.name} is unreadable: {exc}"
             ) from exc
         live = [ticket for ticket in found if not ticket.expired]
         if not live:
             if found:
-                raise _expired(path, found)
+                raise _expired(cache.name, found)
             return None
         target = _target(offer, host, profile, client)
-        ticket = _service_ticket(path, client, live, target, profile)
-        forward = _forwarded_tgt(path, client, live, profile) if wants_forwarding(offer) else None
+        ticket = _service_ticket(cache, client, live, target, profile)
+        forwarding = wants_forwarding(offer)
+        forward = _forwarded_tgt(cache.name, client, live, profile) if forwarding else None
         return cls(str(target), ticket, forward=forward)
 
     def __repr__(self) -> str:
