@@ -501,7 +501,13 @@ NAMES = {
     "stage": lambda srv, tmp: xrdclient.stage(_one_file(srv), config=CONFIG),
     "is_online": lambda srv, tmp: xrdclient.is_online(_one_file(srv), config=CONFIG),
     "human_bytes": lambda srv, tmp: xrdclient.human_bytes(1536),
+    "deadline": lambda srv, tmp: _within_a_deadline(srv),
 }
+
+
+def _within_a_deadline(srv):
+    with xrdclient.deadline(30):
+        return xrdclient.stat(_one_file(srv), config=CONFIG)
 
 
 @pytest.mark.parametrize("name", sorted(NAMES))

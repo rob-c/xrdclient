@@ -149,6 +149,77 @@ in-flight digest to verify against and the two files are compared instead.
 `progress=` still counts the whole file: `done` is bytes moved across all the
 workers, not a position in any one span.
 
+## Several sources at once
+
+A file with replicas on several servers can be read from more than one of
+them together, as `xrdcp --sources N` does:
+
+```python
+xrdclient.copy("root://redirector//store/f.root", "/scratch/f.root", sources=4)
+```
+
+The redirector is asked where every replica is - a `kXR_locate` with
+`kXR_compress | kXR_prefname`, managers followed down to the servers behind
+them, which is XrdCl's `DeepLocate` - and up to `sources` of those servers are
+read from at once. The file is handed out in blocks (at most 128 MiB, at least
+one per reader and never less than a chunk), so a fast server comes back for
+more while a slow one is still busy; a server that fails part way through a
+block, or turns out to hold a shorter file, gives the rest of the block back
+and its reader moves on to a replica nobody has tried. Only when every replica
+has failed does the copy, with `NoMoreReplicasError`.
+
+It needs a `root://` source and a target written at offsets - a local path or
+`root://`; any other pair is copied from the one source as usual. Blocks
+arrive out of order, so it verifies by comparing the two ends, like a spread
+copy. It cannot continue a partial target: `sources` with `resume=True` raises
+`NotImplementedError`, as XrdCl answers `errNotImplemented`.
+
+## A source still being written
+
+`dynamic_source=True` is `xrdcp --dynamic-src`: the source's size is neither
+trusted nor checked, and it is read in order, one chunk at a time, until a
+read comes back short. A file that grows while it is copied arrives with what
+was there by then; one that shrank is not the error it otherwise is.
+
+```python
+xrdclient.copy("root://host//store/live.log", "/scratch/live.log", dynamic_source=True)
+```
+
+## Rate limits and deadlines
+
+```python
+xrdclient.copy(src, dst, max_rate=50 << 20)    # at most 50 MiB/s
+xrdclient.copy(src, dst, min_rate=1 << 20)     # fail below 1 MiB/s
+xrdclient.copy(src, dst, timeout=600)          # fail after ten minutes
+```
+
+These are XrdCl's `xrate`, `xrateThreshold` and `cpTimeout`, and are measured
+the way XrdCl's classic copy measures them, as each chunk arrives:
+
+- **`max_rate`** sleeps off whatever a chunk puts the transfer ahead of that
+  many bytes a second since the data started to flow.
+- **`min_rate`** fails the copy with `RateThresholdError` if the rate since
+  the start has fallen below it - judged once every `config.in_flight + 1`
+  chunks, XrdCl's `parallelChunks + 1`. It is a `TransientError`, as XrdCl
+  retries it.
+- **`timeout`** fails the copy with `CopyTimeoutError` (a `TimeoutError`) once
+  it has run longer than that many seconds - checked before the data flows, as
+  each chunk arrives and before verification. A single read that never
+  answers is bounded by `config.request_timeout`, not by this.
+
+Because they are per chunk, a copy with any of them is read as one stream of
+`chunk_size` pieces (with `in_flight` read ahead) rather than over the bulk
+plane or spread over connections; with `sources` they apply to the chunks of
+every replica together.
+
+## Ignoring file usage rules
+
+`coerce=True` is `xrdcp --coerce`: a `root://` target is opened with
+`kXR_force`, so the server ignores its usage rules - a stock `xrootd` refuses
+to open a file for writing while another client has it open (`kXR_FileLocked`,
+3003) unless forced. `third_party(..., coerce=True)` does the same for the
+destination of a server-to-server copy.
+
 ## Recursive copies
 
 ```python
@@ -250,7 +321,10 @@ checksum once the transfer is done, since no byte passed through here to be
 digested, and raises `ChecksumMismatchError` if they differ - or the server's
 error if either end cannot answer.
 
-`root://` takes `token_mode` (the delegation style) and `posc`. HTTP takes
+`root://` takes `token_mode` (the delegation style), `posc`, `coerce`, and
+two timeouts: `timeout` for the transfer itself and `init_timeout` for
+everything before it - opening both ends and arming the pull, each step
+checked as XrdCl's `initTimeout` is, raising `CopyTimeoutError`. HTTP takes
 rather more, because the header set is the protocol:
 
 ```python
@@ -319,6 +393,8 @@ $ xrd-cp --remove-source /tmp/f.root root://host//store/f.root
 $ xrd-cp -c root://host//store/big.root /scratch/big.root   # carry on
 $ xrd-cp --stripes 8 root://host//store/big.root /scratch/   # eight spans at once
 $ xrd-cp --streams 2 root://host//store/big.root /scratch/   # two links per span
+$ xrd-cp --sources 4 root://redirector//store/f.root /scratch/   # four replicas at once
+$ xrd-cp --xrate 50M --cptimeout 600 root://host//store/f.root /scratch/
 ```
 
 See [the command line](cli.md#xrd-cp) for the flag table, including why a

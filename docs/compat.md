@@ -103,9 +103,10 @@ On purpose, and each one visible in a status rather than silently:
   hostlist)`. The host list names the server that answered, not every hop.
 - **`dirlist` with `LOCATE` or `MERGE`** lists the directory on the server
   the namespace sends it to; for one server that is the same answer.
-- **`CopyProcess`** ignores `sourcelimit`, `coerce`, `dynamicsource`,
-  `inittimeout`, `cptimeout`, `xrate` and `xrateThreshold`: it reads from one
-  source and applies no rate limit.
+- **`CopyProcess`** does what `sourcelimit`, `coerce`, `dynamicsource`,
+  `inittimeout`, `cptimeout`, `xrate` and `xrateThreshold` name, where the
+  official bindings (v6.1.1) hand the last of them to XrdCl out of order -
+  see the [`add_job` keywords](compat-reference.md#add_job-keywords).
 - **`readlines(offset)`** with a non-zero offset returns the lines from there;
   the bindings hang.
 - **`EnvPutInt`** changes the settings of objects created afterwards, mapped

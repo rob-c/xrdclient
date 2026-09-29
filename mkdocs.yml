@@ -63,6 +63,7 @@ nav:
   - Design notes:
       - Design: superpowers/specs/2026-07-31-pyxrootd-client-design.md
       - Roadmap: superpowers/plans/2026-07-31-pyxrootd-client-roadmap.md
+      - XrdCl functionality plan: superpowers/plans/2026-09-29-xrdcl-functionality-plan.md
 
 markdown_extensions:
   - admonition

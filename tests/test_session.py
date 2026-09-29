@@ -265,7 +265,7 @@ def test_repr_says_whether_it_is_connected(server, config):
 def scripted(session, *batches):
     """Replace the session's I/O turn with a fixed script of event batches."""
     turns = iter(batches)
-    session._pump = lambda pathid=0, deadline=None: next(turns)
+    session._pump = lambda pathid=0, deadline=None, expires=None: next(turns)
 
 
 def test_events_for_another_stream_are_kept_until_that_stream_asks(server, config):

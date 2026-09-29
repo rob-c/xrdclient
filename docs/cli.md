@@ -120,6 +120,8 @@ $ xrd-cp -r --dry-run /tmp/results root://host//store/results
 $ xrd-cp -r --parallel 8 /tmp/many-small root://host//store/many-small
 $ xrd-cp --remove-source /tmp/f.root root://host//store/f.root   # a move
 $ xrd-cp -c root://host//store/big.root /scratch/big.root   # carry on, do not restart
+$ xrd-cp -y 4 root://redirector//store/f.root /scratch/      # read four replicas at once
+$ xrd-cp -X 20M root://host//store/f.root /scratch/          # at most 20 MiB/s
 ```
 
 Several sources are allowed when the destination is a directory. Progress is
@@ -135,6 +137,21 @@ how much was skipped. It works on a tree too, and refuses to combine with
 An existing destination is an error unless `-f`, `--force` says to replace it,
 which is what `cp -i` would ask and what `xrdcp` needs `-f` for too; `-c`
 implies it. See [Safety](safety.md).
+
+The transfer controls `xrdcp` has keep `xrdcp`'s names and ranges (see
+[Copying](copying.md#several-sources-at-once) for what each does):
+
+| Option | Meaning |
+| --- | --- |
+| `-y`, `--sources N` | read a `root://` file from up to N of its located replicas at once (1 to 32) |
+| `-X`, `--xrate RATE` | cap the transfer at RATE bytes a second, e.g. `20M` (at least `10k`) |
+| `--xrate-threshold RATE` | fail a transfer that runs slower than RATE (at least `10k`) |
+| `--cptimeout SECONDS` | fail a transfer still running after SECONDS |
+| `-Z`, `--dynamic-src` | the source may still be growing: read to its end, not to its size |
+| `-F`, `--coerce` | open DEST with `kXR_force`, ignoring the server's file usage rules |
+
+`--sources` cannot combine with `-c` (a copy from several sources cannot
+continue a partial one), and `--coerce` also applies to `--tpc`.
 
 For a tree:
 
@@ -177,7 +194,8 @@ just the files that changed.
 
 `--tpc` asks the servers to move the data, so the flags that tune how bytes
 pass through this process - `--chunk-size`, `--in-flight`, `--stripes`,
-`--streams` - and `-r` are refused with a usage error rather than ignored, as
+`--streams`, `--sources`, `--xrate`, `--xrate-threshold`, `--cptimeout`,
+`--dynamic-src` - and `-r` are refused with a usage error rather than ignored, as
 are `--dry-run`, `--remove-source` and `--continue`. `--verify` is honoured:
 once the servers are done both are asked for their checksum (`-a` picks
 which, and naming one implies `--verify`), and a mismatch is exit code `1`.

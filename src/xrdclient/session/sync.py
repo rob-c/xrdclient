@@ -30,6 +30,7 @@ from ..proto.frames import Request
 from ..transport.base import Transport
 from ..transport.sync import SocketTransport
 from ..url import XRootDURL, parse
+from . import deadline as dl
 from .bulk import WAITRESP_GRACE, BulkReader, BulkUnsupported
 
 __all__ = ["Session", "Result", "RedirectRequired"]
@@ -72,7 +73,31 @@ class _AwaitState:
     waits: int
     parked: float
     streamed: int
+    #: When the stall clock (``Config.stall_deadline``) runs out.
     deadline: float | None
+    #: When the caller's own :func:`~xrdclient.deadline` runs out, if it set one.
+    expires: float | None = None
+
+
+def _expiry() -> float | None:
+    """The caller's deadline as an absolute time on the monotonic clock."""
+    left = dl.remaining()
+    return None if left is None else time.monotonic() + left
+
+
+def _sooner(stall: float | None, expires: float | None) -> tuple[float | None, bool]:
+    """Whichever of the two clocks runs out first, and whether it is the caller's."""
+    if expires is None or (stall is not None and stall < expires):
+        return stall, False
+    return expires, True
+
+
+def _bounded(config: Config) -> Config:
+    """``config`` with its connect timeout cut to what the caller's deadline leaves."""
+    left = dl.remaining()
+    if left is None or left >= config.connect_timeout:
+        return config
+    return config.evolve(connect_timeout=max(left, 0.001))
 
 
 class Session:
@@ -112,7 +137,8 @@ class Session:
         """Connect, negotiate, upgrade to TLS if required, log in, authenticate."""
         target = parse(url) if isinstance(url, str) else url
         config = config or Config()
-        transport = SocketTransport.connect(target.host, target.port, config)
+        dl.check(f"connecting to {target.host}:{target.port}")
+        transport = SocketTransport.connect(target.host, target.port, _bounded(config))
         machine = m.SessionMachine(
             host=target.host,
             port=target.port,
@@ -130,8 +156,9 @@ class Session:
         return session
 
     def _bringup(self) -> None:
+        expires = _expiry()
         while self._m.state not in (m.State.READY, m.State.FAILED, m.State.CLOSED):
-            for event in self._pump():
+            for event in self._pump(0, None, expires):
                 if isinstance(event, m.NeedTLS):
                     self._flush()
                     self._t.start_tls(self._m.host, self.config)
@@ -169,6 +196,15 @@ class Session:
     @property
     def protocol(self) -> object:
         return self._m.protocol_info
+
+    @property
+    def handshake_version(self) -> int:
+        """The protocol version the server's handshake reply gave.
+
+        What XrdCl reports as a host's protocol in a ``HostInfo``; the
+        ``kXR_protocol`` answer's own version is :attr:`protocol`.
+        """
+        return self._m.handshake_version
 
     @property
     def mechanism(self) -> str:
@@ -347,7 +383,7 @@ class Session:
         asks the server outright - see :meth:`_ask_arrival_routing` - so a
         server with an answer never costs the trial-and-timeout.
         """
-        with self._lock:
+        with self._held():
             pathid = request.pathid
             if self._m.state in _DEAD:
                 raise XrdConnectionError(f"session to {self.endpoint} is closed")
@@ -358,6 +394,23 @@ class Session:
                 return self._await_arrival(sid, on_chunk, pathid)
             sid = self._m.submit(request, path=path)
             return self._await(sid, on_chunk, pathid if request.reply_on_path else 0)
+
+    @contextmanager
+    def _held(self) -> Iterator[None]:
+        """The session lock, waited for no longer than the caller's deadline allows."""
+        left = dl.remaining()
+        if left is None:
+            with self._lock:
+                yield
+            return
+        if not self._lock.acquire(timeout=max(left, 0.0)):
+            raise dl.OperationExpiredError(
+                f"the request expired waiting its turn on {self.endpoint}"
+            )
+        try:
+            yield
+        finally:
+            self._lock.release()
 
     def _use_arrival_path(self, request: Request) -> bool:
         """Whether a request that asked to arrive on its data path may."""
@@ -432,9 +485,9 @@ class Session:
 
     def _answer(self, sid: int, on_chunk: Callable[[bytes], None] | None, pathid: int) -> Result:
         # Absolute, over the whole logical operation: see Config.stall_deadline.
-        state = _AwaitState(0, 0.0, 0, self._armed())
+        state = _AwaitState(0, 0.0, 0, self._armed(), _expiry())
         while True:
-            for event in self._events_for(sid, pathid, state.deadline):
+            for event in self._events_for(sid, pathid, state.deadline, state.expires):
                 if type(event) is m.Completed:
                     # Completed carries the whole body; stream only its unseen tail.
                     if on_chunk is not None and len(event.data) > state.streamed:
@@ -476,6 +529,14 @@ class Session:
         if not event.resend:
             state.deadline = self._armed(event.seconds)
             return
+        if state.expires is not None and time.monotonic() + event.seconds >= state.expires:
+            # XrdCl's rule: a resend that would go out after the request has
+            # expired is not waited for - it expires now.
+            self._m.release(sid)
+            raise dl.OperationExpiredError(
+                f"{type(event.request).__name__} expired: the server asked for "
+                f"{event.seconds:.0f}s more than the deadline left"
+            )
         state.waits += 1
         if state.waits > self.config.redirect_limit:
             self._give_up(
@@ -518,15 +579,26 @@ class Session:
             if queued:
                 transport.send(queued)
 
-    def _receive(self, pathid: int, deadline: float | None) -> bytes:
-        """Read once from ``pathid``'s link, never past ``deadline``."""
+    def _receive(
+        self, pathid: int, deadline: float | None, expires: float | None = None
+    ) -> bytes:
+        """Read once from ``pathid``'s link, never past ``deadline`` or ``expires``.
+
+        ``deadline`` is the stall clock, and running into it means the
+        connection has gone quiet: a :class:`~xrdclient.errors.TimeoutError`
+        that costs the connection. ``expires`` is the caller's own deadline,
+        and running into that costs only the request -
+        :class:`~xrdclient.session.deadline.OperationExpiredError`. A timed-out
+        ``recv`` has taken nothing off the wire, so the link is still in step.
+        """
         transport = self._paths[pathid] if pathid else self._t
         resting = self.config.data_stream_timeout if pathid else self.config.request_timeout
-        if deadline is None:
+        limit, expiring = _sooner(deadline, expires)
+        if limit is None:
             return transport.receive(_RECV)
-        left = deadline - time.monotonic()
+        left = limit - time.monotonic()
         if left <= 0:
-            raise XrdTimeoutError(self._stalled())
+            raise self._out_of_time(expiring)
         if left >= resting:
             # The socket's own timeout already comes in first; leave it be,
             # so a data path keeps the short one its fallback depends on.
@@ -535,9 +607,15 @@ class Session:
         try:
             return transport.receive(_RECV)
         except XrdTimeoutError as exc:
-            raise XrdTimeoutError(self._stalled()) from exc
+            raise self._out_of_time(expiring) from exc
         finally:
             transport.settimeout(resting)
+
+    def _out_of_time(self, expired: bool) -> XrdTimeoutError:
+        """The error for running out of time: the caller's deadline, or a stall."""
+        if expired:
+            return dl.OperationExpiredError(f"no answer from {self.endpoint} before the deadline")
+        return XrdTimeoutError(self._stalled())
 
     def _stalled(self) -> str:
         return (
@@ -545,7 +623,9 @@ class Session:
             f"{self.config.stall_deadline:.0f}s stall deadline"
         )
 
-    def _pump(self, pathid: int = 0, deadline: float | None = None) -> list[m.Event]:
+    def _pump(
+        self, pathid: int = 0, deadline: float | None = None, expires: float | None = None
+    ) -> list[m.Event]:
         """One send/receive turn; returns whatever events it produced."""
         try:
             self._flush()
@@ -553,7 +633,12 @@ class Session:
             self._broken = True
             raise
         try:
-            self._m.receive_data(self._receive(pathid, deadline), pathid=pathid)
+            self._m.receive_data(self._receive(pathid, deadline, expires), pathid=pathid)
+        except dl.OperationExpiredError:
+            # The caller's time ran out, not the connection's: nothing was
+            # taken off the wire, and the request's stream id is abandoned
+            # by whoever was waiting on it.
+            raise
         except (XrdConnectionError, XrdTimeoutError):
             if pathid:
                 # A data path that failed or went quiet takes only itself
@@ -567,21 +652,26 @@ class Session:
         return self._m.drain()
 
     def _events_for(
-        self, sid: int, pathid: int = 0, deadline: float | None = None
+        self,
+        sid: int,
+        pathid: int = 0,
+        deadline: float | None = None,
+        expires: float | None = None,
     ) -> list[m.Event]:
         """Block until at least one event for ``sid`` is available.
 
         ``pathid`` says which link the answer is expected on: a read that
         named a data path is answered there, and waiting on the control link
         for it would wait forever. ``deadline`` is the whole operation's, so
-        a peer that dribbles cannot renew it one byte at a time.
+        a peer that dribbles cannot renew it one byte at a time; ``expires``
+        is the caller's :func:`~xrdclient.deadline`.
         """
         if self._inbox:
             queued = self._inbox.pop(sid, None)
             if queued:
                 return queued
         while True:
-            events = self._pump(pathid, deadline)
+            events = self._pump(pathid, deadline, expires)
             if len(events) == 1 and getattr(events[0], "streamid", None) == sid:
                 # One reply, and it is the one being waited for: nearly every
                 # turn of a request-at-a-time caller.
@@ -634,8 +724,13 @@ class Session:
         flight would take the other's reply off the wire. Nothing else may use
         this session until the block ends, which is why the reader is given
         out by a context manager rather than returned.
+
+        A reader whose caller's :func:`~xrdclient.deadline` runs out leaves the
+        connection in step - it stops between frames and hands the replies
+        still owed back to the machine to drop - so, as on the event path,
+        running out of time costs the request and not the connection.
         """
-        with self._lock:
+        with self._held():
             # The lock is reentrant, so it alone would let one thread open a
             # second reader inside the first; two readers would then take each
             # other's replies off the wire. This flag is the real invariant.
@@ -661,6 +756,10 @@ class Session:
                 # and the suspended iterator has not been closed yet.
                 with BulkReader(self, handle, chunk=chunk, depth=depth) as reader:
                     yield reader
+            except dl.OperationExpiredError:
+                # Settled already: in step and left to the machine, or marked
+                # broken by the reader itself if it stopped part-way through.
+                raise
             except (XrdConnectionError, XrdTimeoutError):
                 # The reader drives the socket itself, so this is where its
                 # failures reach the session that owns it.

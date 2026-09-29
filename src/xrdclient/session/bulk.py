@@ -43,6 +43,7 @@ from ..proto import constants as c
 from ..proto import requests as r
 from ..proto import responses as rp
 from ..proto.frames import Request, ResponseHeader, decode_header
+from . import deadline as dl
 
 __all__ = ["BulkReader", "BulkUnsupported"]
 
@@ -123,6 +124,8 @@ class BulkReader:
         "_owed",
         "_torn",
         "_expires",
+        "_deadline",
+        "_resting",
         "delivered",
     )
 
@@ -150,6 +153,10 @@ class BulkReader:
         #: next byte on it is not a header and nothing more can be read.
         self._torn = False
         self._expires: float | None = None
+        #: When the caller's :func:`~xrdclient.deadline` runs out, if it set one.
+        self._deadline: float | None = None
+        #: The link's own read timeout, put back after a deadline shortens it.
+        self._resting: float = session.config.request_timeout  # type: ignore[attr-defined]
         #: Bytes handed to the caller so far, over every call to :meth:`stream`.
         self.delivered = 0
 
@@ -347,14 +354,31 @@ class BulkReader:
         if not sids:
             return
         try:
-            if self._owed and not self._torn:
+            if self._owed and not self._torn and not self._expired():
                 self._drain()
         finally:
-            if self._torn or self._owed:
-                self._owed.clear()
-                self._session.mark_broken()  # type: ignore[attr-defined]
-            else:
-                self._machine.release_sids(sids)
+            self._hand_back(sids)
+
+    def _hand_back(self, sids: list[int]) -> None:
+        """Return this call's stream ids, or mark the session broken.
+
+        Replies still owed after the caller's deadline ran out, with the wire
+        stopped between frames, are the machine's to drop: the ids go back as
+        abandoned, and the event path discards each reply as it arrives - the
+        connection stays in step and in use. Anything else still owed, or a
+        wire stopped part-way through a frame, cannot be trusted again.
+        """
+        owed, self._owed = self._owed, set()
+        if not owed and not self._torn:
+            self._machine.release_sids(sids)
+        elif not self._torn and self._expired():
+            self._machine.retire_sids(sids, owed)
+        else:
+            self._session.mark_broken()  # type: ignore[attr-defined]
+
+    def _expired(self) -> bool:
+        """Whether the caller's deadline has passed."""
+        return self._deadline is not None and time.monotonic() >= self._deadline
 
     def _scratch(self) -> list[memoryview]:
         """The rotating buffers :meth:`stream` lands pieces in, made on first use."""
@@ -371,6 +395,8 @@ class BulkReader:
             raise ProtocolError("this bulk reader already has a read in progress")
         deadline = self._session.config.stall_deadline  # type: ignore[attr-defined]
         self._expires = time.monotonic() + deadline if deadline else None
+        left = dl.remaining()
+        self._deadline = None if left is None else time.monotonic() + left
         self._torn = False
         self._leased = self._machine.lease_sids(self._depth)
         return list(self._leased)
@@ -486,8 +512,7 @@ class BulkReader:
 
         ``None`` when the frame was a notice, which is off the wire already.
         """
-        self._torn = True
-        self._exact(header, _HEADER)
+        self._exact(header, _HEADER, fresh=True)
         reply = decode_header(bytes(header))
         if reply.status != c.kXR_attn:
             return reply
@@ -553,20 +578,51 @@ class BulkReader:
             if reply.status != c.kXR_oksofar:
                 self._owed.discard(reply.streamid)
 
-    def _exact(self, view: memoryview, size: int) -> None:
-        """Fill exactly ``size`` bytes of ``view``, or raise."""
+    def _exact(self, view: memoryview, size: int, *, fresh: bool = False) -> None:
+        """Fill exactly ``size`` bytes of ``view``, or raise.
+
+        ``fresh`` says nothing of this frame is off the wire yet: the wire is
+        torn from its first byte, and not before, so running out of time while
+        waiting for a frame to start leaves the connection in step.
+        """
         got = 0
         while got < size:
-            if self._expires is not None and time.monotonic() > self._expires:
-                raise XrdTimeoutError(
-                    f"bulk read stalled with {size - got} bytes of a frame outstanding"
-                )
-            read = self._transport.receive_into(view[got:size])
+            self._check_clocks(size - got)
+            read = self._receive_into(view[got:size])
             if not read:
                 raise XrdTimeoutError(
                     f"connection closed with {size - got} bytes of a reply outstanding"
                 )
+            if fresh:
+                self._torn = True
             got += read
+
+    def _check_clocks(self, outstanding: int) -> None:
+        """Raise if the caller's deadline or the stall clock has run out."""
+        if self._expired():
+            raise dl.OperationExpiredError("the bulk transfer expired before it completed")
+        if self._expires is not None and time.monotonic() > self._expires:
+            raise XrdTimeoutError(
+                f"bulk read stalled with {outstanding} bytes of a frame outstanding"
+            )
+
+    def _receive_into(self, view: memoryview) -> int:
+        """One ``recv`` into ``view``, cut short by the caller's deadline."""
+        transport = self._transport
+        if self._deadline is None:
+            return int(transport.receive_into(view))
+        left = self._deadline - time.monotonic()
+        if left >= self._resting:
+            return int(transport.receive_into(view))
+        transport.settimeout(max(left, 0.001))
+        try:
+            return int(transport.receive_into(view))
+        except XrdTimeoutError as exc:
+            raise dl.OperationExpiredError(
+                "the bulk transfer expired before it completed"
+            ) from exc
+        finally:
+            transport.settimeout(self._resting)
 
 
 def _refuse(status: int, body: bytearray) -> NoReturn:

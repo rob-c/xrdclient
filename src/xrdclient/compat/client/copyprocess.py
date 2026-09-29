@@ -20,10 +20,15 @@ What the keywords do here:
   mode), the target's for ``"end2end"`` and ``"target"``, and compares them
   only when it has both - so any other mode, ``"end"`` included, checks
   nothing; and ``target`` names the file itself, a trailing ``/`` or all.
-- ``sourcelimit``, ``coerce``, ``dynamicsource``, ``inittimeout``,
-  ``cptimeout``, ``xrate`` and ``xrateThreshold`` are accepted and have no
-  effect: this client reads from one source, applies no rate limit, and bounds
-  a copy by :class:`~xrdclient.config.Config`'s own timeouts.
+- ``sourcelimit`` above 1 reads a ``root://`` file from that many of its
+  located replicas at once (XrdCl's extreme copy), ``dynamicsource`` reads
+  until a read comes back short instead of trusting the size, ``xrate`` caps
+  the rate, ``xrateThreshold`` fails a copy slower than it every
+  ``parallelchunks + 1`` chunks (``errThresholdExceeded``), ``cptimeout``
+  fails one that has run longer (``errOperationExpired``, whole seconds, as
+  XrdCl counts them), and ``coerce`` opens the target with ``kXR_force``.
+  ``inittimeout`` bounds a third-party copy's set-up, and - as in XrdCl -
+  nothing about a classic one.
 """
 
 from __future__ import annotations
@@ -39,6 +44,8 @@ from ... import errors
 from ...client.filesystem import FileSystem
 from ...copy.engine import _digest_of
 from ...copy.engine import copy as _copy_file
+from ...copy.limits import RateThresholdError
+from ...copy.replicas import NoMoreReplicasError
 from ...copy.tpc import third_party as _third_party
 from ...url import parse
 from . import env
@@ -82,6 +89,13 @@ class _Job:
     retry: int = 0
     cont: bool = False
     rtrplc: str = "force"
+    sourcelimit: int = 1
+    coerce: bool = False
+    dynamicsource: bool = False
+    inittimeout: int = 0
+    cptimeout: int = 0
+    xrateThreshold: int = 0
+    xrate: int = 0
 
 
 class ProgressHandlerWrapper:
@@ -154,7 +168,6 @@ class CopyProcess:
         rtrplc: str | None = None,
     ) -> None:
         """Queue a copy of ``source`` to the file ``target``."""
-        del sourcelimit, coerce, dynamicsource, inittimeout, cptimeout, xrateThreshold, xrate
         self.__jobs.append(
             _Job(
                 source=str(source),
@@ -168,11 +181,19 @@ class CopyProcess:
                 checksumpreset=checksumpreset,
                 chunksize=chunksize or 0,
                 parallelchunks=parallelchunks or 0,
-                tpctimeout=tpctimeout if tpctimeout is not None else _int("CPTPCTimeout"),
+                tpctimeout=_given(tpctimeout, "CPTPCTimeout"),
                 rmBadCksum=rmBadCksum,
-                retry=retry if retry is not None else _int("CpRetry"),
+                retry=_given(retry, "CpRetry"),
                 cont=cont,
                 rtrplc=rtrplc or env.EnvGetString("CpRetryPolicy") or "force",
+                sourcelimit=sourcelimit,
+                coerce=coerce,
+                dynamicsource=dynamicsource,
+                inittimeout=_given(inittimeout, "CPInitTimeout"),
+                cptimeout=_given(cptimeout, "CPTimeout"),
+                # XrdCl takes a threshold of 0 as "not given" and uses the default.
+                xrateThreshold=xrateThreshold or _int("XRateThreshold"),
+                xrate=xrate,
             )
         )
 
@@ -203,6 +224,11 @@ def _int(key: str) -> int:
     return env.EnvGetInt(key) or 0
 
 
+def _given(value: int | None, key: str) -> int:
+    """``value``, or XrdCl's setting ``key`` where the caller left it out."""
+    return value if value is not None else _int(key)
+
+
 def _run(item: tuple[int, _Job], total: int, handler: Any) -> dict[str, Any]:
     """One job, start to end, with the handler told at each step."""
     job_id, job = item
@@ -230,6 +256,9 @@ def _job_failure(exc: Exception, job: _Job) -> XRootDStatus:
     message names the end that failed - ``file exists:  (destination)``,
     two spaces and all.
     """
+    named = _ENGINE_CODES.get(type(exc))
+    if named is not None:
+        return _named(*named)
     if not isinstance(exc, OSError) or isinstance(exc, errors.XRootDError):
         return from_exception(exc)
     eno = exc.errno or 0
@@ -238,6 +267,32 @@ def _job_failure(exc: Exception, job: _Job) -> XRootDStatus:
     end = "source" if source.is_local and exc.filename == source.path else "destination"
     return status(
         errLocalError, errno=_LOCAL_ERRNOS.get(eno, eno), message=f"{detail}:  ({end})"
+    )
+
+
+#: What XrdCl reports for the engine's own failures that have no status of
+#: their own elsewhere: code, XrdCl's words for it, and the job's detail.
+_ENGINE_CODES: dict[type, tuple[int, str, str]] = {
+    RateThresholdError: (
+        208, "Threshold exceeded", "The transfer rate dropped below requested threshold!"
+    ),
+    NoMoreReplicasError: (16, "No more replicas to try", " (source)"),
+}
+
+
+def _named(code: int, words: str, detail: str) -> XRootDStatus:
+    """An error status with XrdCl's words for ``code`` and the job's ``detail``."""
+    return XRootDStatus(
+        {
+            "status": 1,
+            "code": code,
+            "errno": 0,
+            "message": f"[ERROR] {words}: {detail}",
+            "shellcode": code // 100 + 50,
+            "error": True,
+            "fatal": False,
+            "ok": False,
+        }
     )
 
 
@@ -339,16 +394,27 @@ def _transfer(job: _Job, job_id: int, target: str, handler: Any) -> Any:
                 overwrite=job.force,
                 posc=job.posc,
                 timeout=job.tpctimeout or None,
+                init_timeout=job.inittimeout or None,
+                coerce=job.coerce,
             )
         except (errors.UnsupportedError, ValueError):
             if job.thirdparty == "only":
                 raise
+    return _classic(job, job_id, target, handler, config)
+
+
+def _classic(job: _Job, job_id: int, target: str, handler: Any, config: Any) -> Any:
+    """The copy through this process, reporting to ``handler`` as it goes."""
 
     def progress(done: int, size: int | None) -> None:
         if _tell(handler, "should_cancel", job_id):
             raise _Cancelled
         _tell(handler, "update", job_id, done, size or 0)
 
+    if job.xrateThreshold:
+        # The threshold is judged every ``parallelChunks + 1`` chunks, and
+        # XrdCl's ``parallelChunks`` defaults to four.
+        config = dataclasses.replace(config, in_flight=job.parallelchunks or _PARALLEL_CHUNKS)
     return _copy_file(
         job.source,
         target,
@@ -360,7 +426,25 @@ def _transfer(job: _Job, job_id: int, target: str, handler: Any) -> Any:
         progress=progress,
         config=config,
         resume=job.cont,
+        **_limits(job),
     )
+
+
+def _limits(job: _Job) -> dict[str, Any]:
+    """``add_job``'s transfer controls, as :func:`xrdclient.copy` takes them."""
+    return {
+        "sources": job.sourcelimit,
+        "dynamic_source": job.dynamicsource,
+        "max_rate": job.xrate or None,
+        "min_rate": job.xrateThreshold or None,
+        # XrdCl counts whole seconds, so ``cptimeout=N`` expires at N + 1.
+        "timeout": job.cptimeout + 1 if job.cptimeout else None,
+        "coerce": job.coerce,
+    }
+
+
+#: XrdCl's ``DefaultCPParallelChunks``.
+_PARALLEL_CHUNKS = 4
 
 
 def _destination(job: _Job) -> str:

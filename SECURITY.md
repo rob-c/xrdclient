@@ -131,7 +131,7 @@ the real daemon. They are not offered as a general-purpose crypto library and
   dCache and EOS do, is named with `trusted_redirect_domains`, which trusts a
   domain and everything under it. A token the redirect's own `Location`
   carries (`?authz=`) is kept, since the redirecting server chose to send it.
-  See [HTTP and WebDAV](docs/http.md).
+  See [HTTP and WebDAV](https://rob-c.github.io/xrdclient/http/).
 - **Checksum verification is a data-integrity check, not authentication.** A
   server that serves you wrong bytes can serve you the matching checksum.
   `verify=True` catches corruption in transit and on disk; it does not catch a

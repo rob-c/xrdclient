@@ -15,7 +15,6 @@ back as one.
 from __future__ import annotations
 
 import contextlib
-import threading
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from functools import partial
 from typing import Any, Optional, TypeVar
@@ -23,8 +22,9 @@ from typing import Any, Optional, TypeVar
 from ...client.file import File as NativeFile
 from ...errors import ServerError
 from ...flags import OpenFlags as NativeOpenFlags
+from ...session.router import Hop, trace
 from . import _args, _channels, _convert, env
-from ._dispatch import call, no_answer, now
+from ._dispatch import call, no_answer, now, quick
 from ._status import (
     OK,
     errErrorResponse,
@@ -35,6 +35,7 @@ from ._status import (
 )
 from .flags import OpenFlags
 from .responses import HostList, XRootDStatus
+from .url import URL
 
 __all__ = ["File"]
 
@@ -69,6 +70,9 @@ class File:
         self.native: NativeFile | None = None
         self.__cursor = 0
         self.__properties = dict(_PROPERTIES)
+        #: How XrdCl spells where this file's requests start: the URL an open
+        #: was given while it is under way, then the data server it reached.
+        self.__origin = ""
         #: Why an open failed. An XrdCl file whose open failed is finished
         #: with: every later open and close answers with this same status.
         self.__failed: XRootDStatus | None = None
@@ -128,6 +132,9 @@ class File:
             return failure(errInvalidOp), None
         config = env.config()
         native = NativeFile(url, config, router=_channels.router_for(url, config))
+        native.follow_redirects = self.__flag("FollowRedirects")
+        native.recover_handles = self.__flag("ReadRecovery")
+        origin = self.__origin = str(URL(url))
         wanted = wanted or OpenFlags.READ
         if wanted & (OpenFlags.NEW | OpenFlags.DELETE):
             # XrdCl sets ``kXR_async`` on every open, and xrootd has long read
@@ -137,34 +144,33 @@ class File:
             wanted |= OpenFlags.MAKEPATH
         source, dup = template
 
-        attempt = _Attempt()
-
         def opened() -> None:
             try:
-                if mode:
-                    native.open(NativeOpenFlags(wanted), int(mode), template=source, dup=dup)
-                else:
-                    native.open(NativeOpenFlags(wanted), template=source, dup=dup)
+                with trace() as hops:
+                    if mode:
+                        native.open(NativeOpenFlags(wanted), int(mode), template=source, dup=dup)
+                    else:
+                        native.open(NativeOpenFlags(wanted), template=source, dup=dup)
             except BaseException:
                 native.close()
                 raise
-            if not attempt.deliver(partial(self.__install, native)):
-                _close_quietly(native)  # its caller gave up on it: nobody else will
+            # A timeout expires the open where it stands, so an open that got
+            # this far is the caller's: nothing can land after it gave up.
+            self.__install(native, _convert.hop_url(hops[-1], origin) if hops else origin)
 
-        outcome = self.__run(opened, timeout=timeout, callback=_marking(self.__fail, callback))
+        outcome = call(
+            opened,
+            timeout=_args.u16(timeout),
+            callback=_marking(self.__fail, callback),
+            hosts=lambda hops: _convert.host_list(hops, origin),
+        )
         if callback is None and not outcome[0].ok:
-            # An open that failed stays failed - and one that timed out may
-            # still succeed later, so it must not install the handle then, and
-            # must give it back if it did so in the moment before this.
-            attempt.abandon()
-            if self.native is native:
-                self.native = None
-                _close_quietly(native)
+            # An open that failed stays failed.
             self.__fail(outcome[0])
         return outcome
 
-    def __install(self, native: NativeFile) -> None:
-        self.native, self.__cursor = native, 0
+    def __install(self, native: NativeFile, reached: str) -> None:
+        self.native, self.__cursor, self.__origin = native, 0, reached
 
     def __fail(self, why: XRootDStatus) -> None:
         """Finish with this file, as XrdCl does after a failed open."""
@@ -212,7 +218,7 @@ class File:
         """``(status, bytes)``: ``size`` bytes at ``offset``, or to the end for ``0``."""
         native = self.__opened()
         start, count = _args.u64(offset), _args.u32(size) or -1
-        if callback is None and timeout.__class__ is int and not timeout:
+        if quick(timeout, callback):
             return now(native.read, _same, count, start)
         return self.__run(lambda: native.read(count, start), _same, timeout, callback)
 
@@ -291,7 +297,7 @@ class File:
         start, size = _args.u64(offset), _args.u32(size)
         if size:
             data = data[:size]
-        if callback is None and timeout.__class__ is int and not timeout:
+        if quick(timeout, callback):
             return now(native.write, no_answer, data, start)
         return self.__run(lambda: native.write(data, start), timeout=timeout, callback=callback)
 
@@ -311,7 +317,7 @@ class File:
     def stat(self, force: bool = False, timeout: float = 0, callback: Callback = None) -> Any:
         """``(status, StatInfo)``; ``force`` asks the server rather than the cache."""
         native = self.__opened()
-        if callback is None and timeout.__class__ is int and not timeout:
+        if quick(timeout, callback):
             return now(_stat, _convert.stat_info, native, force)
         return self.__run(lambda: _stat(native, force), _convert.stat_info, timeout, callback)
 
@@ -392,15 +398,32 @@ class File:
         if name == "DataServer":
             return self.native.endpoint if self.native is not None else None
         if name == "LastURL":
-            return str(self.native.url) if self.native is not None else None
+            return self.__origin if self.native is not None else None
         return self.__properties.get(name)
 
     def set_property(self, name: str, value: str) -> bool:
-        """Set a client-side property; ``False`` for one this client does not have."""
+        """Set a client-side property; ``False`` for one this client does not have.
+
+        Each is ``"true"`` or, for any other value, ``"false"``, as XrdCl
+        reads them, and takes effect at once. ``FollowRedirects`` off makes a
+        redirect the open's answer - ``errRedirect`` (401). ``ReadRecovery``
+        off stops a read-only file being re-opened when its server is lost.
+        ``WriteRecovery`` is kept but changes nothing: a file open for writing
+        is never re-opened here, since what the server had not yet committed
+        could not be put back.
+        """
         if name not in self.__properties:
             return False
-        self.__properties[name] = str(value)
+        self.__properties[name] = "true" if str(value) == "true" else "false"
+        native = self.native
+        if native is not None:
+            native.follow_redirects = self.__flag("FollowRedirects")
+            native._router.follow_redirects = native.follow_redirects
+            native.recover_handles = self.__flag("ReadRecovery")
         return True
+
+    def __flag(self, name: str) -> bool:
+        return self.__properties[name] == "true"
 
     # -- plumbing ------------------------------------------------------------
 
@@ -420,36 +443,28 @@ class File:
             operation, convert, timeout=_args.u16(timeout), callback=callback, hosts=self.__hosts
         )
 
-    def __hosts(self) -> HostList:
+    def __hosts(self, hops: list[Hop]) -> HostList:
         native = self.native
-        if native is None:
-            return HostList({"hosts": []})
-        session = getattr(native._router, "_session", None)
-        info = getattr(session, "protocol", None)
-        return _convert.host_list(f"{native.url.scheme}://{native.endpoint}/", info)
+        if not hops and native is not None:
+            # Answered without a request going through the router - off the
+            # bulk data plane, or from what the open already said - but by
+            # the data server all the same, and XrdCl names it.
+            hops = [_answering(native)]
+        return _convert.host_list(hops, self.__origin)
 
     def __repr__(self) -> str:
         where = str(self.native.url) if self.native is not None else "not open"
         return f"<XRootD.client.File {where}>"
 
 
-class _Attempt:
-    """One open, whose handle goes to the caller unless the caller gave up first."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._abandoned = False
-
-    def deliver(self, install: Callable[[], None]) -> bool:
-        """Install the opened handle, or say the caller is no longer waiting for it."""
-        with self._lock:
-            if not self._abandoned:
-                install()
-            return not self._abandoned
-
-    def abandon(self) -> None:
-        with self._lock:
-            self._abandoned = True
+def _answering(native: NativeFile) -> Hop:
+    """The data server an open file's requests go to, as a hop that answered."""
+    router = native._router
+    session = router._session
+    if session is None:
+        return Hop(router.url)
+    flags = getattr(session.protocol, "flags", 0)
+    return Hop(router.url, flags=flags, version=session.handshake_version)
 
 
 def _close_quietly(native: NativeFile) -> None:

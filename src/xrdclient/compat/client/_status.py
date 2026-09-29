@@ -16,6 +16,9 @@ from __future__ import annotations
 
 from ... import errors as e
 from ...client._zip import ZipArchiveError
+from ...session.deadline import OperationExpiredError
+from ...session.sync import RedirectRequired
+from ._convert import redirect_url
 from .responses import XRootDStatus
 
 __all__ = ["OK", "UnsupportedURLError", "failure", "from_exception", "guard", "status"]
@@ -27,6 +30,8 @@ stFatal = 3
 
 # XrdCl::XRootDStatus::code - the ones a native failure can map to.
 errNone = 0
+suContinue = 1
+suPartial = 3
 errUnknown = 2
 errInvalidOp = 3
 errInvalidArgs = 9
@@ -45,7 +50,9 @@ errOperationInterrupted = 207
 errInvalidResponse = 303
 errCheckSumError = 305
 errRedirectLimit = 306
+errNotFound = 304
 errErrorResponse = 400
+errRedirect = 401
 errLocalError = 402
 
 #: XrdCl's words for each code, which lead every status message.
@@ -69,7 +76,9 @@ _DESCRIPTIONS = {
     errInvalidResponse: "Invalid response",
     errCheckSumError: "CheckSum error",
     errRedirectLimit: "Redirect limit has been reached",
+    errNotFound: "Resource not found",
     errErrorResponse: "Server responded with an error",
+    errRedirect: "Unhandled redirect",
     errLocalError: "Local error",
 }
 
@@ -116,7 +125,7 @@ def status(
 def _message(level: int, code: int, errno: int, detail: str) -> str:
     """XrdCl's rendering: ``[ERROR] <what>: [<errno>] <detail>``."""
     if level == stOK:
-        return "[SUCCESS] "
+        return "[SUCCESS] Continue" if code == suContinue else "[SUCCESS] "
     prefix = "[FATAL] " if level == stFatal else "[ERROR] "
     text = prefix + _DESCRIPTIONS.get(code, "Unknown error")
     if code == errErrorResponse:
@@ -139,6 +148,12 @@ def from_exception(exc: BaseException) -> XRootDStatus:
     """The status the bindings would have reported for ``exc``."""
     if isinstance(exc, e.ServerError):
         return status(errErrorResponse, errno=exc.code, message=exc.message)
+    if isinstance(exc, OperationExpiredError):
+        # XrdCl says no more than that: the request ran out of time.
+        return status(errOperationExpired)
+    if isinstance(exc, RedirectRequired):
+        # A redirect not followed, and so the answer: where it points.
+        return status(errRedirect, message=redirect_url(exc.target))
     for cls, code, level in _CLASS_CODES:
         if isinstance(exc, cls):
             return status(code, message=str(exc), level=level)

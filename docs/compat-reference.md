@@ -11,14 +11,23 @@ them and are not repeated per row:
 
 - **`timeout`** is whole seconds, `0` meaning no limit. Like the bindings, it
   must be an `int` from 0 to 65535: a `float` or a `bool` raises `TypeError`,
-  a larger number `OverflowError`. When it runs out the call returns
-  `errOperationExpired` (206); the request is not recalled. See
-  [timeouts](compat-cookbook.md#timeouts).
+  a larger number `OverflowError`. When it runs out the request *expires*,
+  as XrdCl's does: the call returns `errOperationExpired` (206,
+  `"[ERROR] Operation expired"`), the request's stream id is abandoned so a
+  late reply is dropped rather than mistaken for another's, and nothing more
+  is done for it - no retry, no redirect followed, no `kXR_wait` sat out. The
+  connection is not touched. With `timeout=0`, a call is given
+  `RequestTimeout` instead once that has been put (see
+  [environment keys](#environment-keys)). The native form is
+  `with xrdclient.deadline(seconds):`, raising
+  `xrdclient.OperationExpiredError`. See [timeouts](compat-cookbook.md#timeouts).
 - **`callback`** makes the call asynchronous: it returns a status at once,
   and later calls `callback(status, response, hostlist)` on a worker thread.
   A bad argument that would have raised in the caller's thread arrives as an
-  `errInvalidArgs` status instead, since the caller has gone. The host list
-  names the server that answered, not every hop on the way.
+  `errInvalidArgs` status instead, since the caller has gone. A `timeout`
+  given with a callback expires the request too, counted from the call. The
+  host list names every server the request went through - see
+  [HostList](#hostlist-and-hostinfo).
 - **Integer arguments** - offsets, sizes, flags, modes - are checked as the
   bindings' C parser checks them: a non-`int` is `TypeError`, a value that
   does not fit the C type (64 bits for offsets, 32 for sizes, 16 for flags
@@ -37,7 +46,7 @@ handed back to the pool when the object is collected.
 | `url` | `URL` | a property |
 | `stat(path, timeout=0, callback=None)` | `(status, StatInfo)` | |
 | `statvfs(path, timeout=0, callback=None)` | `(status, StatInfoVFS)` | |
-| `dirlist(path, flags=0, timeout=0, callback=None)` | `(status, DirectoryList)` | `STAT` fills `statinfo`; `RECURSIVE` names entries by their path below `path`, a level at a time, always with stat. `LOCATE` and `MERGE` list the directory on the server the namespace sends the request to - the same answer for one server. `ZIP` lists the members of the archive `path` names, read from its central directory: each entry's `statinfo` is the archive's own (id, times, mode, owner) with the member's uncompressed size and the writable flag cleared, and `parent` is the archive's path, CGI off, with a `/`. A directory is listed as without the flag; a file that is not an archive is `errDataError` (14) with XrdCl's words. Without a callback, a `path` ending in `.zip` is listed this way whether or not `ZIP` is given, as with XrdCl's synchronous `DirList`. |
+| `dirlist(path, flags=0, timeout=0, callback=None)` | `(status, DirectoryList)` | `STAT` fills `statinfo`; `RECURSIVE` names entries by their path below `path`, a level at a time, always with stat. `MERGE` sorts the listing by name and drops duplicates (same name, size and flags), as XrdCl's merge does. `LOCATE`, without a callback, deep-locates the directory from a manager and lists it on every data server found, one after another, each entry's `hostaddr` naming its server; merged with `MERGE`. Some servers failing is status 0 with `code` 3 (`suPartial`), all of them the last failure with an empty listing, none found `errno` 3011 "No valid location found". Asked of a data server - or with a callback, as in XrdCl - `LOCATE` is a plain listing. `CHUNKED` with a callback calls it once per part of the listing as the server sends it (`kXR_oksofar`), each with `code` 1, `"[SUCCESS] Continue"` and that part's entries, then once more with the last part and the final status; with `MERGE`, each part merged less what earlier parts had. `CHUNKED` without a callback is `errNotSupported` (13), as XrdCl refuses it. `hostaddr` is the server that answered - the data server a redirect led to. `ZIP` lists the members of the archive `path` names, read from its central directory: each entry's `statinfo` is the archive's own (id, times, mode, owner) with the member's uncompressed size and the writable flag cleared, and `parent` is the archive's path, CGI off, with a `/`. A directory is listed as without the flag; a file that is not an archive is `errDataError` (14) with XrdCl's words. Without a callback, a `path` ending in `.zip` is listed this way whether or not `ZIP` is given, as with XrdCl's synchronous `DirList`. |
 | `mkdir(path, flags=0, mode=0, timeout=0, callback=None)` | `(status, None)` | `mode=0` creates `rwxr-x---`, as the bindings do |
 | `rmdir(path, timeout=0, callback=None)` | `(status, None)` | |
 | `rm(path, timeout=0, callback=None)` | `(status, None)` | |
@@ -57,8 +66,8 @@ handed back to the pool when the object is collected.
 | `list_xattr(path, timeout=0, callback=None)` | `(status, [(name, value, status)])` | |
 | `copy(source, target, force=False)` | `(status, None)` | both full URLs; no checksum comparison |
 | `cat(path)` | `status` | writes the file to standard output; the status is a plain `XRootDStatus` that also answers `status["ok"]` |
-| `get_property(name)` | `str` or `None` | only `FollowRedirects` exists |
-| `set_property(name, value)` | `bool` | `False` for a property that does not exist; stored, but redirects are always followed |
+| `get_property(name)` | `str` or `None` | only `FollowRedirects` exists; `"true"` or `"false"` |
+| `set_property(name, value)` | `bool` | `False` for a property that does not exist. `FollowRedirects` is `"true"` or, for any other value, `"false"`, as XrdCl reads it. Off, a redirect ends the request: status 1, `code` 401 (`errRedirect`), `message` `"[ERROR] Unhandled redirect: root://host:port/?<cgi>"` naming where it pointed, response `None` |
 
 ## File
 
@@ -89,8 +98,8 @@ open raises `ValueError("I/O operation on closed file")`, as in the bindings.
 | `get_xattr(attrs, timeout=0, callback=None)` | `(status, [(name, value, status)])` | |
 | `del_xattr(attrs, timeout=0, callback=None)` | `(status, [(name, status)])` | |
 | `list_xattr(timeout=0, callback=None)` | `(status, [(name, value, status)])` | |
-| `get_property(name)` | `str` or `None` | `ReadRecovery`, `WriteRecovery`, `FollowRedirects`; and, once open, `DataServer` (`host:port`) and `LastURL` |
-| `set_property(name, value)` | `bool` | the three settable properties are stored; they do not change behaviour |
+| `get_property(name)` | `str` or `None` | `ReadRecovery`, `WriteRecovery`, `FollowRedirects` (`"true"` or `"false"`); and, once open, `DataServer` (`host:port`) and `LastURL` - the data server's URL with the path and the redirect's CGI, as XrdCl records it |
+| `set_property(name, value)` | `bool` | each is `"true"` or, for any other value, `"false"`, and takes effect at once. `FollowRedirects` off makes a redirected `open` fail with `errRedirect` (401), as on `FileSystem`. `ReadRecovery` off stops a read-only file being re-opened when its server is lost (it is re-opened on a fresh connection otherwise). `WriteRecovery` is stored and changes nothing: a file open for writing is never re-opened here |
 | `with client.File() as f:` | | closes on exit if open |
 
 Files opened on the same `root://` server share one connection, as XrdCl's
@@ -111,24 +120,24 @@ do; a file redirected to a data server gets a connection of its own.
 
 | Keyword | Default | Here |
 | --- | --- | --- |
-| `sourcelimit` | `1` | accepted, no effect - one source is read |
+| `sourcelimit` | `1` | honoured: above 1, the source's replicas are located (`kXR_locate` with `kXR_compress \| kXR_prefname`, managers followed down) and the file is read from up to that many at once, in blocks a failing server hands on; every replica failing is `errNoMoreReplicas` (16), and with `cont` it is `errNotImplemented` (15), as in XrdCl |
 | `force` | `False` | honoured: overwrite the target |
 | `posc` | `False` | honoured for third-party copies (persist-on-successful-close) |
-| `coerce` | `False` | accepted, no effect |
+| `coerce` | `False` | honoured: the target is opened with `kXR_force`, so a file another client has open can be replaced rather than refused with `kXR_FileLocked` (3003) |
 | `mkdir` | `False` | honoured: create the target's parent directories |
 | `thirdparty` | `"none"` | honoured: `"none"`, `"first"` (try server-to-server, fall back to streaming through this process), `"only"` |
 | `checksummode` | `"none"` | honoured, as XrdCl reads it: `"end2end"` and `"source"` ask the source for its checksum, `"end2end"` and `"target"` the target (a local one is digested here), and the two are compared only when both exist. Any other value - `"end"` included - takes no checksum. An end that cannot checksum fails the job with its error |
 | `checksumtype` | `""` | honoured: the algorithm, e.g. `"adler32"`; empty takes the default |
 | `checksumpreset` | `""` | honoured: stands in for the source's checksum in any mode, so it is compared when the target's is taken (`"end2end"`, `"target"`); a mismatch fails the job with `errCheckSumError` (305) |
-| `dynamicsource` | `False` | accepted, no effect |
+| `dynamicsource` | `False` | honoured: the source's size is not trusted; it is read chunk by chunk until a read comes back short, and progress reports a total of 0 |
 | `chunksize` | the bindings: 8 MiB | honoured; when not given, `Config.chunk_size` (4 MiB unless `XRD_CPCHUNKSIZE` or `EnvPutInt("CPChunkSize")` says otherwise) |
 | `parallelchunks` | the bindings: 4 | honoured, as the number of chunks in flight (`Config.in_flight`) |
-| `inittimeout` | `600` | accepted, no effect - `Config`'s connect and request timeouts apply |
+| `inittimeout` | `600` (`CPInitTimeout`) | honoured for third-party copies, as in XrdCl: bounds the set-up before the transfer (`errOperationExpired`, 206); a classic copy ignores it there too |
 | `tpctimeout` | `1800` (`CPTPCTimeout`) | honoured: bounds a third-party copy |
 | `rmBadCksum` | `False` | honoured: delete a target whose checksum did not match |
-| `cptimeout` | `0` | accepted, no effect - `Config.stall_deadline` bounds a copy |
-| `xrateThreshold` | `0` | accepted, no effect |
-| `xrate` | `0` | accepted, no effect - no rate limit is applied |
+| `cptimeout` | `0` (`CPTimeout`) | honoured: checked as each chunk arrives, in whole seconds as XrdCl counts them; `errOperationExpired` (206), "CPTimeout exceeded.", which a `retry` retries |
+| `xrateThreshold` | `0` (`XRateThreshold`) | honoured: every `parallelchunks + 1` chunks, a copy slower than this many bytes a second fails with `errThresholdExceeded` (208), which a `retry` retries. XrdCl first tries another server when the file was opened through a redirector; this fails at once |
+| `xrate` | `0` | honoured: the transfer is held to this many bytes a second. The official bindings (v6.1.1) pass their last keywords to XrdCl out of order - their `xrate` lands in `retry`, `xrateThreshold` in `xrate` and `retry` in `xrateThreshold`; this layer does what the keywords name |
 | `retry` | `0` (`CpRetry`) | honoured: retry a transient failure this many times |
 | `cont` | `False` | honoured: resume a partial target |
 | `rtrplc` | `"force"` (`CpRetryPolicy`) | honoured: a retry under `"continue"` resumes the partial target; under anything else it overwrites it, as XrdCl sets `force` for the retry |
@@ -299,11 +308,11 @@ The third argument of a callback.
 
 | Class | Attribute | Meaning |
 | --- | --- | --- |
-| `HostList` | `hosts` | list of `HostInfo`; also iterable. One entry - the server that answered - or none when the call failed before connecting |
-| `HostInfo` | `url` | `URL` of the server |
-| | `protocol` | its protocol version, not byte-swapped |
-| | `flags` | its server flags |
-| | `load_balancer` | always `False` |
+| `HostList` | `hosts` | list of `HostInfo`, one per server the request passed through, in order; also iterable. Empty when nothing was sent |
+| `HostInfo` | `url` | `URL` of the server: the `FileSystem`'s own, or the `File`'s open URL (its `LastURL` once open), for where the request started; for a server a redirect led to, `root://host:port/` with the request's path and the redirect's CGI, as XrdCl records it |
+| | `protocol` | the protocol version the server's handshake gave, not byte-swapped; 0 for a server that never answered this request |
+| | `flags` | the server's `kXR_protocol` flags (`HostTypes`); 0 for a server that never answered |
+| | `load_balancer` | `True` for the manager that redirected the request - the first one met, or a meta-manager, which supersedes it |
 
 ## flags
 
@@ -326,30 +335,36 @@ bindings', not the wire protocol's; where they differ from the native
 | `HostTypes` | `IS_SERVER` 1, `IS_MANAGER` 2, `ATTR_META` 256, `ATTR_PROXY` 512, `ATTR_SUPER` 1024 |
 
 `OpenFlags.DUP` and `SAMEFS` belong to `openusingtemplate`, which takes
-`flags` up to 32 bits for them; `open` takes 16, as in the bindings. `DirListFlags.CHUNKED` is accepted and has no effect: a listing
-arrives whole. `PrepareFlags.CANCEL` (1) is upstream's newer member; the 6.1
+`flags` up to 32 bits for them; `open` takes 16, as in the bindings. `PrepareFlags.CANCEL` (1) is upstream's newer member; the 6.1
 bindings lack it. `flags.enum(**names)` is the bindings' helper: it returns a
 class named `Enum` with those attributes and their `reverse_mapping`.
 
 ## Environment keys
 
 `client.EnvPutInt(key, value)` and `client.EnvPutString(key, value)` store a
-setting for objects created afterwards; the keys below are translated to the
-native [`Config`](config.md) field they mean. Keys are case-insensitive. As in
-XrdCl, a variable already set in the process environment as `XRD_<KEY>` wins:
-the put returns `False` and changes nothing - and the `Config` reads that
-variable itself.
+setting for objects created afterwards; the keys with a native equivalent are
+translated to the [`Config`](config.md) field they mean. Keys are
+case-insensitive. The keys XrdCl registers, and their defaults, are XrdCl's:
+before anything is put, `EnvGetInt` and `EnvGetString` answer with XrdCl's
+default, which is not necessarily what is in force here. For those keys, as in
+XrdCl, a variable already set in the process environment as `XRD_<KEY>` wins -
+the put returns `False` - while for any other key the environment is not
+consulted. `EnvGetDefault` answers from XrdCl's table of defaults, as a
+string, `None` for a key it lacks.
 
-| XrdCl key | `Config` field | Conversion | This library's default |
-| --- | --- | --- | --- |
-| `ConnectionWindow` | `connect_timeout` | seconds | 30 |
-| `ConnectionRetry` | `connect_retries` | count | 3 |
-| `RequestTimeout` | `request_timeout` | seconds | 300 |
-| `StreamTimeout` | `stream_timeout` | seconds | 60 |
-| `RedirectLimit` | `redirect_limit` | count | 16 |
-| `CPChunkSize` | `chunk_size` | bytes | 4 MiB |
-| `CPParallelChunks` | `in_flight` | chunks in flight | 2 |
-| `SubStreamsPerChannel` | `data_streams` | minus one: XrdCl counts the control stream, the field does not | 1 extra |
+| XrdCl key | Here | Conversion |
+| --- | --- | --- |
+| `ConnectionWindow` | `Config.connect_timeout` | seconds |
+| `ConnectionRetry` | `Config.connect_retries` | count |
+| `RequestTimeout` | a deadline on every call made with `timeout=0` - the request expires with 206 after it, as XrdCl's does - and `Config.stall_deadline` | seconds |
+| `StreamTimeout` | `Config.request_timeout`, how long a connection with a request outstanding may stay silent | seconds |
+| `RedirectLimit` | `Config.redirect_limit` | count |
+| `SubStreamsPerChannel` | `Config.data_streams` | minus one: XrdCl counts the control stream, the field does not |
+| `CPChunkSize` | `Config.chunk_size` | bytes |
+| `CPParallelChunks` | `Config.in_flight` | chunks in flight |
+| `DataServerTTL` | `Config.pool_idle_ttl` | seconds an idle connection is kept |
+| `ReadRecovery` (string) | `Config.recover_handles`, which `CopyProcess` sources use; a `File`'s own `ReadRecovery` property is separate, as in XrdCl | `"true"` or not |
+| `CPInitTimeout`, `CPTPCTimeout`, `CPTimeout`, `XRateThreshold`, `CpRetry`, `CpRetryPolicy` | the matching `CopyProcess.add_job` defaults | |
 
 `CPParallelChunks` sets `in_flight`, the number of chunks a copy keeps in
 flight, which is what XrdCl's key means - whether it is put through
@@ -357,26 +372,62 @@ flight, which is what XrdCl's key means - whether it is put through
 of connections one large copy is spread over is `parallel_chunks`, set by
 `$XRD_CPPARALLELSPANS`.
 
-Other keys can be put and read back but change nothing, except that
-`CopyProcess.add_job` reads three of them for its defaults:
+Every other key XrdCl registers is stored and read back, and changes nothing;
+`env.EFFECTS` says why for each one:
 
-| Key | XrdCl default | Used by |
-| --- | --- | --- |
-| `CPTPCTimeout` | 1800 | `add_job(tpctimeout=...)` default |
-| `CpRetry` | 0 | `add_job(retry=...)` default |
-| `CpRetryPolicy` | `"force"` | `add_job(rtrplc=...)` default |
-| `StreamErrorWindow`, `TimeoutResolution`, `CPInitTimeout`, `CPTimeout`, `XRateThreshold`, `PollerPreference` | 1800, 15, 600, 0, 0, `"built-in"` | nothing |
+| Keys | Why they change nothing |
+| --- | --- |
+| `TimeoutResolution` | deadlines are exact here, not checked on a timer tick |
+| `StreamErrorWindow` | a failed connection is not remembered as failed |
+| `LoadBalancerTTL` | the connection pool keeps managers and data servers alike (`DataServerTTL` applies to both) |
+| `WorkerThreads`, `ParallelEvtLoop`, `RunForkHandler`, `AioSignal` | there are no worker threads, event loops, fork handler or POSIX AIO to configure; `PollerPreference`, which XrdCl does not register, is accepted too |
+| `TCPKeepAlive`, `TCPKeepAliveTime`, `TCPKeepAliveInterval`, `TCPKeepProbes`, `NoDelay` | TCP keepalive and `TCP_NODELAY` are always on, with the operating system's timings |
+| `NetworkStack`, `PreferIPv4`, `IPNoShuffle` | a connection takes the addresses in the resolver's order |
+| `MultiProtocol` | every connection negotiates its own protocol |
+| `MetalinkProcessing`, `LocalMetalinkFile`, `MaxMetalinkWait`, `TlsMetalink`, `ZipMtlnCksum`, `XCpBlockSize` | metalinks and extreme copy are not supported |
+| `PreserveLocateTried`, `NotAuthorizedRetryLimit`, `RetryWrtAtLBLimit`, `OpenRecovery`, `WriteRecovery` | those retries are not made: a refusal is final, and a file open for writing is never re-opened |
+| `PreserveXAttrs`, `CpUsePgWrtRd`, `CpTarget` | copies decide these themselves |
+| `NoTlsOK`, `TlsNoData`, `WantTlsOnNoPgrw`, `TlsDbgLvl` | TLS is always available, encrypts everything once on, and logs under `TlsMsg` |
+| `ClientMonitor`, `ClientMonitorParam`, `PlugIn`, `PlugInConfDir`, `GlfnRedirector` | there are no client plug-ins or global logical file names |
 
 | Function | Returns | Notes |
 | --- | --- | --- |
-| `EnvPutInt(key, value)` | `bool` | `False` when `XRD_<KEY>` is set in the environment |
+| `EnvPutInt(key, value)` | `bool` | `False` when `XRD_<KEY>` is set in the environment for a key XrdCl registers |
 | `EnvPutString(key, value)` | `bool` | as above |
-| `EnvGetInt(key)` | `int` or `None` | the environment's value, else a put one, else **XrdCl's** default - not necessarily what is in force |
+| `EnvGetInt(key)` | `int` or `None` | the environment's value, else a put one, else XrdCl's registered default |
 | `EnvGetString(key)` | `str` or `None` | as above |
 | `EnvDelInt(key)`, `EnvDelString(key)` | `bool` | forget a put value; `False` when the environment holds it |
-| `EnvGetDefault(key)` | `int`, `str` or `None` | XrdCl's built-in default |
+| `EnvGetDefault(key)` | `str` or `None` | XrdCl's built-in default, as a string (`"1800"`) |
 | `SetLogLevel(level)` | `None` | sets the `xrdclient` logger: `"Error"`, `"Warning"`, `"Info"`, `"Debug"`, `"Dump"` (case-insensitive); anything else is `ValueError` |
-| `SetLogMask(level, mask)` | `None` | accepted, no effect; choose a child logger such as `xrdclient.session` instead |
+| `SetLogMask(level, mask)` | `None` | logs only the topics `mask` names at `level`, below |
+
+### Log topics
+
+`SetLogMask(level, mask)` takes XrdCl's mask: topic names joined by `|`,
+where `All` and `None` reset the set, `^Topic` takes one out, an unknown name
+is ignored and `""` means every topic. `level` is `Error`, `Warning`, `Info`,
+`Debug`, `Dump` or `All` (case-sensitive, as in XrdCl; any other is
+ignored), and a record at that level from a logger outside the masked topics
+is dropped. Each topic is the part of this package's `xrdclient` logger
+hierarchy that does that topic's work:
+
+| Topic | Loggers |
+| --- | --- |
+| `AppMsg` | `xrdclient.cli`, `.compat`, `.easy`, `.io`, `.path`, `.aio`, `.fsspec_impl` |
+| `UtilityMsg` | `xrdclient.copy`, `.config`, `.url` |
+| `FileMsg` | `xrdclient.client.file`, `.client.bulk`, `.http.file` |
+| `PostMasterMsg` | `xrdclient.session.pool` |
+| `XRootDTransportMsg` | `xrdclient.proto`, `.auth` |
+| `XRootDMsg` | `xrdclient.session.sync`, `.session.router`, `.session.bulk` |
+| `FileSystemMsg` | `xrdclient.client.filesystem`, `.http.dav`, `.s3` |
+| `AsyncSockMsg` | `xrdclient.transport` |
+| `PlugInMgrMsg` | `xrdclient.http.client`, `.http.tpc` |
+| `TlsMsg` | `xrdclient.crypto` |
+| `PollerMsg`, `TaskMgrMsg`, `JobMgrMsg`, `ExDbgMsg` | none - there is no counterpart here |
+
+`Dump` is XrdCl's level below `Debug`, which nothing here logs at. `ZipMsg`
+is not a mask name in XrdCl, and is not one here. The table is
+`env.TOPICS`.
 
 ## utils
 
@@ -462,17 +513,20 @@ fatal. `shellcode` is `code // 100 + 50`, as in XrdCl.
 | 3 | `errInvalidOp` | `open` on a file that is already open; `openusingtemplate` with a `src_file` that is not open | 1 | 50 |
 | 9 | `errInvalidArgs` | a bad URL in `CopyProcess.prepare`, a bad argument to a callback call, `sendinfo` over 1024 characters | 1 | 50 |
 | 12 | `errOSError` | a local file operation outside a copy failed; `errno` is the OS's | 1 | 50 |
-| 13 | `errNotSupported` | any call on a `FileSystem` whose URL did not parse | 1 | 50 |
+| 1 | `suContinue` | a part of a `CHUNKED` listing, with more to come - a success | 0 | 0 |
+| 3 | `suPartial` | a `LOCATE` listing some of whose servers failed - a success | 0 | 0 |
+| 13 | `errNotSupported` | any call on a `FileSystem` whose URL did not parse; `dirlist` with `CHUNKED` and no callback | 1 | 50 |
 | 14 | `errDataError` | a page read failed its CRC32C check; `dirlist` with `ZIP` of a file that is not a ZIP archive, or a damaged one | 1 | 50 |
 | 15 | `errNotImplemented` | `sendinfo` to a server that is not `root://` | 1 | 50 |
 | 108 | `errConnectionError` | could not connect, or the connection dropped | 3 | 51 |
 | 204 | `errAuthFailed` | no mechanism was accepted; the message says why each one failed | 3 | 52 |
-| 206 | `errOperationExpired` | `timeout=` or a native timeout ran out | 1 | 52 |
+| 206 | `errOperationExpired` | `timeout=` (or a put `RequestTimeout`) ran out, and the request expired; or a native timeout ran out | 1 | 52 |
 | 207 | `errOperationInterrupted` | a copy job cancelled by `should_cancel` | 1 | 52 |
 | 303 | `errInvalidResponse` | the server's answer did not parse | 3 | 53 |
 | 305 | `errCheckSumError` | a copy's checksums did not match, or `checksumpreset` was not met | 1 | 53 |
 | 306 | `errRedirectLimit` | more redirects than `RedirectLimit` | 1 | 53 |
 | 400 | `errErrorResponse` | the server refused the request; `errno` is its `kXR_*` number | 1 | 54 |
+| 401 | `errRedirect` | a redirect not followed, with `FollowRedirects` off; the message names where it pointed | 1 | 54 |
 | 402 | `errLocalError` | a copy's local end failed; `errno` is the protocol's number for the OS error (`XProtocol::mapError`) | 1 | 54 |
 
 XrdCl's `errInvalidAddr` (101), `errSocketTimeout` (103), `errTlsError`

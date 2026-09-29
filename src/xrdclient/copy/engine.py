@@ -28,6 +28,8 @@ from ..errors import ChecksumMismatchError, UnsupportedError, XRootDError, kXR_U
 from ..session.bulk import BulkUnsupported
 from ..types import ChecksumInfo
 from ..url import XRootDURL, parse
+from . import replicas
+from .limits import Limits, Pace, _Stop
 
 __all__ = ["copy", "copy_tree", "CopyResult", "SyncMode"]
 
@@ -117,16 +119,20 @@ def _reader(url: XRootDURL, config: Config, stack: ExitStack) -> tuple[IO[bytes]
     raise UnsupportedError(kXR_Unsupported, f"cannot read from {url.scheme}://")
 
 
-def _writer(url: XRootDURL, config: Config, stack: ExitStack, *, overwrite: bool) -> IO[bytes]:
-    """A binary writer for ``url``. ``overwrite=False`` means exclusive create."""
+def _writer(
+    url: XRootDURL, config: Config, stack: ExitStack, *, overwrite: bool, coerce: bool = False
+) -> IO[bytes]:
+    """A binary writer for ``url``. ``overwrite=False`` means exclusive create.
+
+    ``coerce`` opens a ``root://`` target with ``kXR_force``, which tells the
+    server to ignore its file usage rules - another client's open of the same
+    file - as XrdCl's ``coerce`` does. Nothing else has such rules to ignore.
+    """
     mode = "wb" if overwrite else "xb"
     if url.is_local:
         return stack.enter_context(open(url.path, mode))
     if url.is_root:
-        from ..io import open_url
-
-        raw = stack.enter_context(open_url(url, mode, buffering=0, config=config))
-        return cast("IO[bytes]", raw)
+        return _root_writer(url, mode, config, stack, coerce=coerce)
     if url.is_http:
         from ..http import open_http
 
@@ -138,7 +144,32 @@ def _writer(url: XRootDURL, config: Config, stack: ExitStack, *, overwrite: bool
     raise UnsupportedError(kXR_Unsupported, f"cannot write to {url.scheme}://")
 
 
-def _resumer(url: XRootDURL, config: Config, stack: ExitStack, offset: int) -> IO[bytes]:
+def _root_writer(
+    url: XRootDURL, mode: str, config: Config, stack: ExitStack, *, coerce: bool
+) -> IO[bytes]:
+    """``url`` opened for writing in ``mode``, with ``kXR_force`` if ``coerce``."""
+    if not coerce:
+        from ..io import open_url
+
+        raw = stack.enter_context(open_url(url, mode, buffering=0, config=config))
+        return cast("IO[bytes]", raw)
+    from ..client.file import File
+    from ..flags import Access, OpenFlags, flags_for_mode
+    from ..io.raw import XRootDRawIO
+
+    handle = File(url, config)
+    access = Access.OWNER_READ | Access.OWNER_WRITE | Access.GROUP_READ
+    try:
+        handle.open(flags_for_mode(mode) | OpenFlags.FORCE, access)
+    except BaseException:
+        handle.close()
+        raise
+    return cast("IO[bytes]", stack.enter_context(XRootDRawIO(handle, mode, opened=True)))
+
+
+def _resumer(
+    url: XRootDURL, config: Config, stack: ExitStack, offset: int, *, coerce: bool = False
+) -> IO[bytes]:
     """A writer for ``url`` positioned at ``offset``, keeping what is there.
 
     An HTTP target has no such thing: a ``PUT`` replaces the whole resource,
@@ -149,11 +180,9 @@ def _resumer(url: XRootDURL, config: Config, stack: ExitStack, offset: int) -> I
         handle.seek(offset)
         return handle
     if url.is_root:
-        from ..io import open_url
-
-        raw = stack.enter_context(open_url(url, "r+b", buffering=0, config=config))
+        raw = _root_writer(url, "r+b", config, stack, coerce=coerce)
         raw.seek(offset)
-        return cast("IO[bytes]", raw)
+        return raw
     raise UnsupportedError(kXR_Unsupported, f"cannot resume a copy into {url.scheme}://")
 
 
@@ -237,11 +266,18 @@ def _spans(size: int, workers: int) -> list[tuple[int, int]]:
 
 
 def _in_parallel(
-    plan: _Spread, config: Config, chunk: int, progress: Progress | None, *, overwrite: bool
+    plan: _Spread,
+    config: Config,
+    chunk: int,
+    progress: Progress | None,
+    *,
+    overwrite: bool,
+    coerce: bool = False,
 ) -> int:
     """Move every byte, one span per worker, and report the total as it goes."""
     with ExitStack() as stack:
-        _writer(plan.target, config, stack, overwrite=overwrite)  # create it, then fill it in
+        # Create it, then fill it in.
+        _writer(plan.target, config, stack, overwrite=overwrite, coerce=coerce)
     reported = 0
     lock = threading.Lock()
 
@@ -252,7 +288,7 @@ def _in_parallel(
         with ExitStack() as stack:
             reader, _ = _reader(plan.source, config, stack)
             reader.seek(offset)
-            writer = _resumer(plan.target, config, stack, offset)
+            writer = _resumer(plan.target, config, stack, offset, coerce=coerce)
             while moved < length:
                 data = reader.read(min(chunk, length - moved))
                 if not data:
@@ -577,39 +613,264 @@ def _pump(
     return done
 
 
+class _Dynamic:
+    """A source read as XrdCl reads a dynamic one: until a read comes back short.
+
+    Its size is not asked for and not trusted - it is a file still being
+    written - so the copy takes whatever there is when the reads run out.
+    """
+
+    def __init__(self, reader: IO[bytes]) -> None:
+        self._reader = reader
+        self._done = False
+
+    def readinto(self, buffer: bytearray) -> int:
+        if self._done:
+            return 0
+        count = _fill(self._reader, buffer)
+        self._done = count < len(buffer)
+        return count
+
+
+@dataclass(frozen=True, **SLOTS)
+class _Job:
+    """One transfer, as :func:`copy` was asked for it."""
+
+    source: Any
+    target: Any
+    src_url: XRootDURL | None
+    dst_url: XRootDURL | None
+    config: Config
+    chunk: int
+    overwrite: bool
+    coerce: bool = False
+    dynamic: bool = False
+    #: A rate or time limit applies, which XrdCl measures chunk by chunk.
+    paced: bool = False
+
+    def names(self) -> tuple[str, str]:
+        """The two ends as a :class:`CopyResult` names them."""
+        return (
+            str(self.src_url) if self.src_url else repr(self.source),
+            str(self.dst_url) if self.dst_url else repr(self.target),
+        )
+
+
+@dataclass(frozen=True, **SLOTS)
+class _Plan:
+    """Which way the bytes go, and what that leaves to compare afterwards."""
+
+    resuming: _Resume | None = None
+    bulking: bool = False
+    spread: _Spread | None = None
+    #: More than one: read from that many replicas at once.
+    sources: int = 0
+    #: The two files to compare, for a transfer nobody read in order.
+    ends: _Ends | None = None
+
+    @property
+    def offset(self) -> int:
+        return self.resuming.offset if self.resuming is not None else 0
+
+
+def _plan(job: _Job, *, resume: bool, sources: int) -> _Plan:
+    """Choose the transfer: several replicas, a resume, the bulk plane, spans, or one stream.
+
+    Several replicas win over everything, as XrdCl's extreme copy does over
+    a dynamic source, and cannot continue a partial target (XrdCl answers
+    that with ``errNotImplemented``). A dynamic source is read in order and
+    to its end, so it keeps to the single stream; so does a paced one, whose
+    limits XrdCl applies as each chunk of the one stream arrives.
+    """
+    several = _several(job, sources, resume=resume)
+    if several is not None:
+        return several
+    src, dst, cfg = job.src_url, job.dst_url, job.config
+    resuming = _continue_from(src, dst, cfg, overwrite=job.overwrite) if resume else None
+    if resuming is not None:
+        return _Plan(resuming=resuming, ends=resuming)
+    if job.dynamic or job.paced:
+        return _Plan()
+    if _bulk_usable(src, dst, cfg):
+        # Workers fill the file in whatever order the network answers, so
+        # there is no stream to digest; the two ends are compared instead.
+        return _Plan(bulking=True, ends=_both_ends(src, dst))
+    spread = _spread(src, dst, cfg, job.chunk)
+    return _Plan(spread=spread, ends=spread)
+
+
+def _several(job: _Job, sources: int, *, resume: bool) -> _Plan | None:
+    """The plan for reading several replicas, or ``None`` if this copy cannot.
+
+    Replicas are located over ``root://``, and the target has to be one that
+    is written at offsets.
+    """
+    src, dst = job.src_url, job.dst_url
+    if sources < 2 or src is None or not src.is_root or dst is None:
+        return None
+    if not (dst.is_local or dst.is_root):
+        return None
+    if resume:
+        raise NotImplementedError("a copy from several sources cannot continue a partial one")
+    return _Plan(sources=sources, ends=_Ends(src, dst))
+
+
+def _both_ends(source: XRootDURL | None, target: XRootDURL | None) -> _Ends | None:
+    """The two files to compare, if both are files rather than streams."""
+    return _Ends(source, target) if source is not None and target is not None else None
+
+
+@dataclass(**SLOTS)
+class _Verify:
+    """What checking a copy will take, settled before the first byte moves."""
+
+    ends: _Ends | None
+    wanted: bool
+    strict: bool
+    algorithm: str
+    checkable: XRootDURL | None
+    digest: Any | None = None
+    expected: ChecksumInfo | None = None
+
+
+def _verification(job: _Job, ends: _Ends | None, algorithm: str, verify: bool | None) -> _Verify:
+    """How this copy will be checked, asking the source first where that helps.
+
+    Only a transfer that reads the file from the beginning, in order, can
+    digest it on the way past; the others ask both ends afterwards. And a
+    digest is only worth taking at all if some server can be asked to compare
+    it with what it holds.
+    """
+    src, dst = job.src_url, job.dst_url
+    checkable = next((u for u in (dst, src) if u is not None and not u.is_local), None)
+    check = _Verify(
+        ends=_strict_ends(src, dst, ends, checkable, verify=verify),
+        wanted=job.config.verify_checksums if verify is None else verify,
+        strict=verify is True,
+        algorithm=algorithm,
+        checkable=checkable,
+    )
+    if check.wanted and checkable is not None and check.ends is None:
+        check.digest = new_checksum(algorithm)
+        if checkable is src:
+            _source_first(check, checkable, job.config)
+    return check
+
+
+def _source_first(check: _Verify, source: XRootDURL, config: Config) -> None:
+    """Ask the source for its checksum before the transfer, where it can answer.
+
+    Reading a remote file, the answer to compare against exists before the
+    transfer does: a server that cannot checksum is worth finding out about
+    before digesting a gigabyte that nothing will read. Only the two schemes
+    that can answer one, and only ones the reader will accept - anything else
+    would reach for a server before the scheme itself has been rejected.
+    """
+    if not (source.is_root or source.is_http):
+        return
+    check.expected = _ask_first(source, config, check.algorithm, strict=check.strict)
+    if check.expected is None:
+        check.digest = None
+
+
+def _checked(check: _Verify, config: Config) -> ChecksumInfo | None:
+    """The copy's checksum once it has been compared, or ``None`` if it was not."""
+    if check.ends is not None:
+        if not check.wanted:
+            return None
+        return _compare_ends(
+            check.ends.source, check.ends.target, config, check.algorithm, strict=check.strict
+        )
+    if check.digest is None or check.checkable is None:
+        return None
+    ours = check.digest.hexdigest()
+    if check.expected is not None:
+        return _matched(check.expected, check.algorithm, ours)
+    return _compare(check.checkable, config, check.algorithm, ours, strict=check.strict)
+
+
+def _move(job: _Job, plan: _Plan, progress: Progress | None, digest: Any) -> int:
+    """Move the bytes the way ``plan`` says; how many this call moved."""
+    if plan.bulking:
+        moved = _bulk(job, progress, digest)
+        if moved is not None:
+            return moved
+    if plan.sources:
+        return _from_replicas(job, plan.sources, progress)
+    if plan.spread is not None:
+        return _in_parallel(
+            plan.spread, job.config, job.chunk, progress, overwrite=job.overwrite,
+            coerce=job.coerce,
+        )  # fmt: skip
+    return _one_stream(job, plan.resuming, progress, digest)
+
+
+def _bulk(job: _Job, progress: Progress | None, digest: Any) -> int | None:
+    """The download over the bulk data plane, or ``None`` if the server declined it."""
+    source = cast("XRootDURL", job.src_url)
+    try:
+        if job.dst_url is not None:
+            return _bulk_to_file(source, job.dst_url, job.config, progress, overwrite=job.overwrite)
+        return _bulk_to_stream(source, cast("IO[bytes]", job.target), job.config, progress, digest)
+    except BulkUnsupported as exc:
+        # A server that answers a read with a conversation rather than
+        # bytes; the general pump knows how to hold that conversation.
+        _log.debug("%s declined the bulk path (%s); using the pump", source, exc)
+        return None
+
+
+def _from_replicas(job: _Job, sources: int, progress: Progress | None) -> int:
+    """Read the file from up to ``sources`` of its replicas at once."""
+    source, target = cast("XRootDURL", job.src_url), cast("XRootDURL", job.dst_url)
+    # Where the replicas are is the source's question, asked before the
+    # target is touched: no such file leaves the destination as it was.
+    found = replicas.locate(source, job.config)
+    with ExitStack() as stack:
+        writer = _writer(target, job.config, stack, overwrite=job.overwrite, coerce=job.coerce)
+        return replicas.fetch(
+            found, writer, job.config, chunk=job.chunk, sources=sources, progress=progress
+        )
+
+
 def _one_stream(
-    source: tuple[Any, XRootDURL | None],
-    target: tuple[Any, XRootDURL | None],
-    resuming: _Resume | None,
-    config: Config,
-    chunk: int,
-    progress: Progress | None,
-    digest: Any,
-    *,
-    overwrite: bool,
+    job: _Job, resuming: _Resume | None, progress: Progress | None, digest: Any
 ) -> int:
     """Move the file through one reader and one writer, in order.
 
-    Each side is ``(what the caller passed, its URL or None for a stream)``.
     Returns the bytes this call moved, which for a resumed transfer is only
     the tail - but the tail is checked against the whole file, since what has
     to be complete at the end is the target, not this call's share of it.
     """
-    (src_obj, src_url), (dst_obj, dst_url) = source, target
     offset = resuming.offset if resuming is not None else 0
     with ExitStack() as stack:
-        reader, total = (src_obj, None) if src_url is None else _reader(src_url, config, stack)
+        reader, total = _source_stream(job, stack)
         if resuming is not None:
             reader.seek(offset)
-            writer = _resumer(resuming.target, config, stack, offset)
-        elif dst_url is None:
-            writer = dst_obj
+            writer = _resumer(resuming.target, job.config, stack, offset, coerce=job.coerce)
+        elif job.dst_url is None:
+            writer = job.target
         else:
-            writer = _writer(dst_url, config, stack, overwrite=overwrite)
+            writer = _writer(
+                job.dst_url, job.config, stack, overwrite=job.overwrite, coerce=job.coerce
+            )
         report = progress if resuming is None else _shifted(progress, offset)
-        moved = _pump(reader, writer, total, chunk, report, digest, config.in_flight)
-    _require_whole(dst_url or repr(dst_obj), offset + moved, total)
+        depth = job.config.in_flight
+        if job.dynamic:
+            # One read at a time, each when the last has been written, as
+            # XrdCl's dynamic source reads: reading ahead would find the end
+            # of a growing file before its writer had got there.
+            reader, depth = cast("IO[bytes]", _Dynamic(reader)), 1
+        moved = _pump(reader, writer, total, job.chunk, report, digest, depth)
+    _require_whole(job.dst_url or repr(job.target), offset + moved, total)
     return moved
+
+
+def _source_stream(job: _Job, stack: ExitStack) -> tuple[IO[bytes], int | None]:
+    """The source as a stream, and the size it is trusted to have, if any."""
+    if job.src_url is None:
+        return job.source, None
+    reader, total = _reader(job.src_url, job.config, stack)
+    return reader, None if job.dynamic else total
 
 
 def copy(
@@ -625,6 +886,12 @@ def copy(
     dry_run: bool = False,
     remove_source: bool = False,
     resume: bool = False,
+    sources: int = 1,
+    dynamic_source: bool = False,
+    max_rate: float | None = None,
+    min_rate: float | None = None,
+    timeout: float | None = None,
+    coerce: bool = False,
 ) -> CopyResult:
     """Copy ``source`` to ``target`` and report what happened.
 
@@ -648,9 +915,13 @@ def copy(
     A source that said how long it was and then stopped sending early raises
     :class:`~xrdclient.errors.XRootDError` rather than leaving a truncated
     target that looks finished, and ``remove_source`` does not run.
+    ``dynamic_source=True`` is for a file still being written: its size is
+    not trusted, and it is read in order until a read comes back short.
 
     ``overwrite=False`` creates the target exclusively, raising
-    :class:`FileExistsError` if it is already there.
+    :class:`FileExistsError` if it is already there. ``coerce`` opens a
+    ``root://`` target with ``kXR_force``, so the server ignores its file
+    usage rules - another client having the file open.
 
     ``dry_run`` reports the transfer it would have made without moving a byte;
     ``remove_source`` deletes the source once the copy is on disk and has
@@ -670,111 +941,65 @@ def copy(
     it. That too is a transfer nobody read in order, so it verifies the same
     way; ``parallel_chunks=1`` keeps the single stream and its cheaper
     in-flight digest.
+
+    ``sources=N`` reads a ``root://`` file from up to ``N`` of its replicas
+    at once, as ``xrdcp --sources`` does: the redirector is asked where they
+    all are, and each server is given blocks of the file to send until none
+    are left - a failing one hands its block to the others. It needs a
+    target that can be written at offsets (a local path or ``root://``), is
+    verified by comparing the two ends, and cannot be combined with
+    ``resume``; for any other pair the copy reads one source as usual.
+
+    ``max_rate`` caps the transfer at that many bytes a second, ``min_rate``
+    fails it with :class:`~xrdclient.copy.RateThresholdError` if it runs
+    slower, measured every ``config.in_flight + 1`` chunks, and ``timeout``
+    fails it with :class:`~xrdclient.copy.CopyTimeoutError` once it has run
+    for longer than that many seconds - checked as each chunk arrives and
+    around the transfer, as XrdCl checks ``cpTimeout``, so a single stalled
+    read is bounded by ``config.request_timeout`` rather than by this. XrdCl
+    measures all three chunk by chunk, so a copy with any of them is read as
+    one stream of ``chunk_size`` pieces rather than spread over connections.
     """
     cfg = config or Config()
-    chunk = chunk_size or cfg.chunk_size
-    algo = algorithm or cfg.preferred_checksum
-    src_url, dst_url = _target_url(source), _target_url(target)
-
-    if dry_run:
-        known = _probe(src_url, cfg) if src_url is not None else None
-        return CopyResult(
-            source=str(src_url) if src_url else repr(source),
-            target=str(dst_url) if dst_url else repr(target),
-            size=known[0] if known else 0,
-            seconds=0.0,
-        )
-
-    resuming = _continue_from(src_url, dst_url, cfg, overwrite=overwrite) if resume else None
-    # The bulk data plane takes every download it can: pipelined, landed
-    # straight in the destination, and several connections wide when the
-    # target is a file that can be written at an offset.
-    bulking = resuming is None and _bulk_usable(src_url, dst_url, cfg)
-    spread = None if resuming is not None or bulking else _spread(src_url, dst_url, cfg, chunk)
-    # Only a transfer that reads the file from the beginning, in order, can
-    # digest it on the way past; the other two ask both ends afterwards.
-    ends: _Ends | None = resuming if resuming is not None else spread
-    if bulking and dst_url is not None and src_url is not None:
-        # Workers fill the file in whatever order the network answers, so
-        # there is no stream to digest; the two ends are compared instead,
-        # exactly as a spread transfer's are.
-        ends = _Ends(src_url, dst_url)
-    wanted = cfg.verify_checksums if verify is None else verify
-    # And a digest is only worth taking at all if some server can be asked to
-    # compare it with what it holds.
-    checkable = next((u for u in (dst_url, src_url) if u is not None and not u.is_local), None)
-    ends = _strict_ends(src_url, dst_url, ends, checkable, verify=verify)
-    digest = new_checksum(algo) if wanted and checkable is not None and ends is None else None
-    # Reading a remote file, the answer to compare against exists before the
-    # transfer does, so ask for it now: a server that cannot checksum is worth
-    # finding out about before digesting a gigabyte that nothing will read.
-    expected: ChecksumInfo | None = None
-    if (
-        digest is not None
-        and src_url is not None
-        and checkable is src_url
-        # Only the two schemes that can answer a checksum, and only ones the
-        # reader will accept: asking anything else would reach for a server
-        # before the scheme itself has been rejected.
-        and (src_url.is_root or src_url.is_http)
-    ):
-        expected = _ask_first(src_url, cfg, algo, strict=verify is True)
-        if expected is None:
-            digest = None
-
-    started = time.monotonic()
-    moved: int | None = None
-    if bulking and src_url is not None:
-        try:
-            moved = (
-                _bulk_to_file(src_url, dst_url, cfg, progress, overwrite=overwrite)
-                if dst_url is not None
-                else _bulk_to_stream(src_url, cast("IO[bytes]", target), cfg, progress, digest)
-            )
-        except BulkUnsupported as exc:
-            # A server that answers a read with a conversation rather than
-            # bytes; the general pump knows how to hold that conversation.
-            _log.debug("%s declined the bulk path (%s); using the pump", src_url, exc)
-            moved = None
-    if moved is not None:
-        size = moved
-    elif spread is not None:
-        size = _in_parallel(spread, cfg, chunk, progress, overwrite=overwrite)
-    else:
-        size = _one_stream(
-            (source, src_url),
-            (target, dst_url),
-            resuming,
-            cfg,
-            chunk,
-            progress,
-            digest,
-            overwrite=overwrite,
-        )
-    elapsed = time.monotonic() - started
-
-    checksum = None
-    if ends is not None:
-        if wanted:
-            checksum = _compare_ends(ends.source, ends.target, cfg, algo, strict=verify is True)
-    elif digest is not None and checkable is not None:
-        checksum = (
-            _matched(expected, algo, digest.hexdigest())
-            if expected is not None
-            else _compare(checkable, cfg, algo, digest.hexdigest(), strict=verify is True)
-        )
-
-    if remove_source and src_url is not None:
-        _remove(src_url, cfg)  # only now: a failed verification kept the original
-
-    return CopyResult(
-        source=str(src_url) if src_url else repr(source),
-        target=str(dst_url) if dst_url else repr(target),
-        size=size,
-        seconds=elapsed,
-        checksum=checksum,
-        resumed_at=resuming.offset if resuming is not None else 0,
+    pace = Pace(Limits(max_rate, min_rate, timeout, interval=cfg.in_flight))
+    job = _Job(
+        source,
+        target,
+        _target_url(source),
+        _target_url(target),
+        cfg,
+        chunk_size or cfg.chunk_size,
+        overwrite,
+        coerce=coerce,
+        dynamic=dynamic_source,
+        paced=pace.limited,
     )
+    if dry_run:
+        return _dry_run(job)
+    try:
+        plan = _plan(job, resume=resume, sources=sources)
+        check = _verification(job, plan.ends, algorithm or cfg.preferred_checksum, verify)
+        pace.check()
+        report = pace.watch(progress, start=plan.offset) if pace.limited else progress
+        started = time.monotonic()
+        pace.begin()
+        size = _move(job, plan, report, check.digest)
+        elapsed = time.monotonic() - started
+        pace.check()
+    except _Stop as stop:
+        raise stop.error from None
+    checksum = _checked(check, cfg)
+    if remove_source and job.src_url is not None:
+        _remove(job.src_url, cfg)  # only now: a failed verification kept the original
+    return CopyResult(
+        *job.names(), size=size, seconds=elapsed, checksum=checksum, resumed_at=plan.offset
+    )
+
+
+def _dry_run(job: _Job) -> CopyResult:
+    """The transfer :func:`copy` would make, with nothing moved."""
+    known = _probe(job.src_url, job.config) if job.src_url is not None else None
+    return CopyResult(*job.names(), size=known[0] if known else 0, seconds=0.0)
 
 
 def _strict_ends(
@@ -1043,7 +1268,7 @@ def copy_tree(
     algo = options.get("algorithm") or cfg.preferred_checksum
     wanted = [rel for rel in _walk(src_url, cfg) if _selected(rel, include, exclude)]
     count = cfg.parallel_files if workers is None else workers
-    total = _Total(progress) if progress is not None and count > 1 else None
+    total = _tree_total(progress, count)
     options = _sync_options(options, sync)
 
     def move(rel: str) -> CopyResult | None:
@@ -1055,10 +1280,21 @@ def copy_tree(
         report = progress if total is None else total.worker()
         return copy(src_url / rel, destination, config=cfg, progress=report, **options)
 
-    if count > 1:
-        results = _in_order(wanted, count, move)
-    else:
-        results = [done for rel in wanted if (done := move(rel)) is not None]
+    results = _each(wanted, count, move)
     if delete:
         _prune(dst_url, cfg, set(wanted), dry_run=bool(options.get("dry_run")))
     return results
+
+
+def _tree_total(progress: Progress | None, count: int) -> _Total | None:
+    """Where a tree's workers add up their progress, when there are several."""
+    return _Total(progress) if progress is not None and count > 1 else None
+
+
+def _each(
+    items: Sequence[str], workers: int, run: Callable[[str], CopyResult | None]
+) -> list[CopyResult]:
+    """``run`` over ``items``, ``workers`` at a time, keeping what it copied."""
+    if workers > 1:
+        return _in_order(items, workers, run)
+    return [done for item in items if (done := run(item)) is not None]

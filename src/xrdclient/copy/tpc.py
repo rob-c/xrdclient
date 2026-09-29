@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import secrets
 import time
+from collections.abc import Callable
 
 from ..config import Config
 from ..flags import Access, OpenFlags
@@ -24,6 +25,7 @@ from ..proto.frames import Request
 from ..session import Router
 from ..url import XRootDURL, parse
 from .engine import CopyResult, _compare_ends
+from .limits import CopyTimeoutError
 
 __all__ = ["third_party"]
 
@@ -73,6 +75,8 @@ def third_party(
     timeout: float | None = None,
     verify: bool = False,
     algorithm: str | None = None,
+    init_timeout: float | None = None,
+    coerce: bool = False,
 ) -> CopyResult:
     """Ask the destination server to pull ``source`` directly.
 
@@ -97,6 +101,12 @@ def third_party(
     and raises :class:`~xrdclient.errors.ChecksumMismatchError` if they
     differ, or the server's error if either end cannot answer: verification
     asked for by name is never skipped quietly.
+
+    Over ``root://``, ``timeout`` bounds the wait for the transfer itself and
+    ``init_timeout`` everything before it - opening both ends and arming the
+    pull - raising :class:`~xrdclient.copy.CopyTimeoutError` when it runs out,
+    as XrdCl's ``initTimeout`` does; ``coerce`` opens the destination with
+    ``kXR_force``, so the server ignores its file usage rules.
     """
     cfg = config or Config()
     su, du = parse(source), parse(target)
@@ -105,15 +115,46 @@ def third_party(
     else:
         _require_root_pair(su, du)
         cfg = _timeout_config(cfg, timeout)
-        result = _root_copy(su, du, cfg, overwrite=overwrite, posc=posc, token_mode=token_mode)
+        result = _root_copy(
+            su,
+            du,
+            cfg,
+            _Options(overwrite, posc, coerce, token_mode),
+            _starting(init_timeout),
+        )
     if not verify:
         return result
     checksum = _compare_ends(su, du, cfg, algorithm or cfg.preferred_checksum, strict=True)
     return dataclasses.replace(result, checksum=checksum)
 
 
+@dataclasses.dataclass(frozen=True)
+class _Options:
+    """How the destination is opened, and what the rendezvous carries."""
+
+    overwrite: bool
+    posc: bool
+    coerce: bool
+    token_mode: str
+
+
+def _starting(init_timeout: float | None) -> Callable[[], None]:
+    """A check that the copy is still within ``init_timeout`` of starting.
+
+    XrdCl's ``InitTimeoutCalc``: asked after each step of the set-up, and
+    ``errOperationExpired`` once the time is gone.
+    """
+    started = time.monotonic()
+
+    def check() -> None:
+        if init_timeout and time.monotonic() - started > init_timeout:
+            raise CopyTimeoutError("the third-party copy took longer than init_timeout to start")
+
+    return check
+
+
 def _root_copy(
-    su: XRootDURL, du: XRootDURL, cfg: Config, *, overwrite: bool, posc: bool, token_mode: str
+    su: XRootDURL, du: XRootDURL, cfg: Config, options: _Options, check: Callable[[], None]
 ) -> CopyResult:
     """The ``XrdOucTPC`` rendezvous, in the order ``XrdCl`` runs it.
 
@@ -132,10 +173,10 @@ def _root_copy(
         # 1. Placement: open the source as XrdCl does (``tpc.stage=placement``)
         #    and keep the data server it was redirected to - ``tpcSource``.
         size = _place_source(src_router, su)
-        opaque = _dst_opaque(key, su, src_router.endpoint, size, token_mode)
-        result = dst_router.execute(
-            r.Open(f"{du.path}?{opaque}", _dst_flags(overwrite, posc), _MODE), path=du.path
-        )
+        check()
+        opaque = _dst_opaque(key, su, src_router.endpoint, size, options.token_mode)
+        flags = _dst_flags(options.overwrite, options.posc, coerce=options.coerce)
+        result = dst_router.execute(r.Open(f"{du.path}?{opaque}", flags, _MODE), path=du.path)
         # The handle exists only on the server that answered the open, and
         # the pinned router takes the connection over: the name it is bound
         # to here is the only one left holding it. That server is also the
@@ -145,7 +186,9 @@ def _root_copy(
         dst_router = dst_router.pin(transfer=True)
         handle, _, _ = rp.parse_open(result.data, du.path)
         puller = dst_router.url.host
-        _rendezvous(src_router, dst_router, handle, su, _src_opaque(key, puller, token_mode))
+        check()
+        opaque = _src_opaque(key, puller, options.token_mode)
+        _rendezvous(src_router, dst_router, handle, su, opaque, check)
         dst_router.execute(r.Close(handle))
     finally:
         dst_router.close()
@@ -156,11 +199,13 @@ def _root_copy(
     )
 
 
-def _dst_flags(overwrite: bool, posc: bool) -> int:
-    """The destination open's options: create or replace, persist on close."""
+def _dst_flags(overwrite: bool, posc: bool, *, coerce: bool = False) -> int:
+    """The destination open's options: create or replace, persist on close, force."""
     flags = OpenFlags.UPDATE | (OpenFlags.DELETE if overwrite else OpenFlags.NEW)
     if posc:
         flags |= OpenFlags.POSC
+    if coerce:
+        flags |= OpenFlags.FORCE
     return int(flags) | c.kXR_retstat
 
 
@@ -181,19 +226,27 @@ def _place_source(router: Router, source: XRootDURL) -> int:
 
 
 def _rendezvous(
-    src_router: Router, dst_router: Router, handle: bytes, source: XRootDURL, opaque: str
+    src_router: Router,
+    dst_router: Router,
+    handle: bytes,
+    source: XRootDURL,
+    opaque: str,
+    check: Callable[[], None],
 ) -> None:
     """Arm the pull, register the key at the source, then trigger and wait.
 
     The source open may be deferred until the pull completes; the final
-    ``kXR_sync`` blocks until the destination has finished.
+    ``kXR_sync`` blocks until the destination has finished. Everything before
+    that sync is set-up, and ``check`` is asked after each step of it.
     """
     dst_router.execute(r.Sync(handle))
+    check()
     src_result = src_router.execute(
         r.Open(f"{source.path}?{opaque}", int(OpenFlags.READ)), path=source.path
     )
     src_handle, _, _ = rp.parse_open(src_result.data, source.path)
     try:
+        check()
         dst_router.execute(r.Sync(handle))
     finally:
         _quietly(src_router, r.Close(src_handle))

@@ -14,6 +14,8 @@ from collections.abc import Iterable, Sequence
 from typing import Any, TypeVar
 
 from ... import types as t
+from ...proto.responses import RedirectInfo
+from ...session.router import Hop
 from .responses import (
     ChunkInfo,
     DirectoryList,
@@ -32,8 +34,11 @@ from .url import URL
 
 __all__ = [
     "directory_list",
+    "gathered",
     "host_list",
+    "hop_url",
     "listing",
+    "redirect_url",
     "location_info",
     "protocol_info",
     "stat_info",
@@ -170,6 +175,11 @@ def listing(parent: str, entries: Iterable[t.DirEntry], hostaddr: str) -> Direct
     return _listing(parent, listed)
 
 
+def gathered(parent: str, entries: Iterable[ListEntry]) -> DirectoryList:
+    """A listing of entries already converted: merged, or from several servers."""
+    return _listing(parent, list(entries))
+
+
 def _listing(parent: str, listed: list[ListEntry]) -> DirectoryList:
     folder = parent if parent.endswith("/") else f"{parent}/"
     return _new(DirectoryList, {"size": len(listed), "parent": folder, "dirlist": listed})
@@ -208,12 +218,52 @@ def _swapped(value: int) -> int:
     return int.from_bytes((value & 0xFFFFFFFF).to_bytes(4, "big"), "little")
 
 
-def host_list(url: str, info: t.ProtocolInfo | None) -> HostList:
-    """The servers a request visited; the one that answered, here."""
-    version = info.version if info is not None else 0
-    flags = info.flags if info is not None else 0
-    host = HostInfo({"url": URL(url), "protocol": version, "flags": flags, "load_balancer": False})
-    return HostList({"hosts": [host]})
+def host_list(hops: Sequence[Hop], first: str) -> HostList:
+    """XrdCl's ``HostList``: every server the request passed through, in order.
+
+    ``first`` is how the request's own starting point is spelled - the
+    filesystem's URL, or the file's - and any later hop a redirect led to is
+    that server with the path the request named there and the redirect's
+    CGI, as XrdCl records it. A server that never answered has ``protocol``
+    and ``flags`` of 0; the manager that redirected is the load balancer.
+    """
+    return HostList(
+        {
+            "hosts": [
+                HostInfo(
+                    {
+                        "url": URL(hop_url(hop, first)),
+                        "protocol": hop.version,
+                        "flags": hop.flags,
+                        "load_balancer": hop.load_balancer,
+                    }
+                )
+                for hop in hops
+            ]
+        }
+    )
+
+
+def hop_url(hop: Hop, first: str) -> str:
+    """How XrdCl spells the URL of one hop: ``first`` unless a redirect led there."""
+    if not hop.redirected:
+        return first
+    url = hop.url
+    user = f"{url.username}@" if url.username else ""
+    query = f"?{hop.token}" if hop.token else ""
+    return f"{url.scheme}://{user}{url.host}:{url.port}/{hop.path}{query}"
+
+
+def redirect_url(target: RedirectInfo) -> str:
+    """Where an unfollowed redirect points, as XrdCl puts it in the status message.
+
+    ``root://host:port/`` for a redirect by host and port, the URL itself -
+    normalised as XrdCl's ``URL`` does - for one naming a URL, and then the
+    redirect's CGI.
+    """
+    base = f"{target.host}:{target.port}/" if target.port > 0 else target.host
+    query = f"?{target.token}" if target.token else ""
+    return f"{URL(base)}{query}"
 
 
 def vector_read_info(ranges: Sequence[tuple[int, int]], data: Sequence[bytes]) -> VectorReadInfo:

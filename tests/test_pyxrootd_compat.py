@@ -472,12 +472,23 @@ def test_a_callback_must_be_callable(fs):
         fs.stat("/d/l.txt", callback="not a function")
 
 
-def test_a_call_that_outlives_its_timeout_is_expired(fs, monkeypatch):
-    gate = threading.Event()
-    monkeypatch.setattr(fs.native, "ping", lambda: gate.wait(10))
+def test_a_call_that_outlives_its_timeout_is_expired(fs, srv):
+    from xrdclient.proto import constants as c
+    from xrdclient.testing.server import frame
+
+    def slow(conn, sid, params, body):
+        time.sleep(2.5)
+        yield frame(sid, c.kXR_ok)
+
+    ok(fs.ping())
+    srv.handlers[c.kXR_ping] = slow
+    started = time.monotonic()
     status, _ = fs.ping(timeout=1)  # whole seconds, as the bindings take them
-    gate.set()
-    assert (status.code, status.error) == (206, True)
+    assert time.monotonic() - started < 2.4  # expired, not waited out
+    assert (status.code, status.error, status.message) == (206, True, "[ERROR] Operation expired")
+    del srv.handlers[c.kXR_ping]
+    # The connection is untouched: the late reply is dropped when it comes.
+    assert ok(fs.stat("/d/l.txt")).size == len(TEXT)
 
 
 def test_a_call_within_its_timeout_answers(fs):
@@ -715,25 +726,26 @@ def test_an_open_that_times_out_stays_failed_when_it_later_succeeds(root, monkey
         f.read()
 
 
-def test_an_open_that_lands_as_its_caller_gives_up_is_given_back(root, monkeypatch):
-    """The open finished just before the timeout was acted on: it is undone, not kept."""
-    from xrdclient.compat.client import _status
-    from xrdclient.compat.client import file as compat_file
+def test_an_open_that_expires_leaves_the_file_failed(root, srv):
+    """The open expires where it stands: no handle, and the failure sticks."""
+    from xrdclient.proto import constants as c
+    from xrdclient.testing.server import _HANDLERS
 
-    def late(operation, convert, *, timeout, callback, hosts):
-        operation()  # the open succeeds and installs its handle...
-        return _status.failure(_status.errOperationExpired), None  # ...as time runs out
+    def slow_open(conn, sid, params, body):
+        time.sleep(2.5)
+        yield from _HANDLERS[c.kXR_open](conn, sid, params, body)
 
-    monkeypatch.setattr(compat_file, "call", late)
+    srv.handlers[c.kXR_open] = slow_open
     f = client.File()
     assert f.open(root + "/d/l.txt", timeout=1)[0].code == 206
     assert not f.is_open() and f.native is None
+    assert f.open(root + "/d/l.txt")[0].code == 206
 
 
 def test_a_callback_on_an_unopened_file_has_no_hosts():
     from xrdclient.compat.client.file import File
 
-    assert list(File()._File__hosts()) == []  # type: ignore[attr-defined]
+    assert list(File()._File__hosts([])) == []  # type: ignore[attr-defined]
 
 
 def test_fcntl_is_the_servers_to_answer(fh, srv):
@@ -1203,12 +1215,14 @@ def test_the_base_progress_handler_does_nothing():
 def clean_env(monkeypatch):
     monkeypatch.setattr(env, "_ints", {})
     monkeypatch.setattr(env, "_strings", {})
+    monkeypatch.setattr(env, "_request_timeout", 0)
     for key in ("XRD_REQUESTTIMEOUT", "XRD_POLLERPREFERENCE", "XRD_NETWORKSTACK"):
         monkeypatch.delenv(key, raising=False)
 
 
 def test_an_int_setting_can_be_put_read_and_deleted(clean_env):
-    assert client.EnvGetInt("RequestTimeout") == 1800 == client.EnvGetDefault("requesttimeout")
+    assert client.EnvGetInt("RequestTimeout") == 1800
+    assert client.EnvGetDefault("requesttimeout") == "1800"  # a string, as XrdCl gives it
     assert client.EnvPutInt("RequestTimeout", 60) is True
     assert client.EnvGetInt("RequestTimeout") == 60
     assert client.EnvDelInt("RequestTimeout") is True
@@ -1216,10 +1230,23 @@ def test_an_int_setting_can_be_put_read_and_deleted(clean_env):
 
 
 def test_a_string_setting_can_be_put_read_and_deleted(clean_env):
-    assert client.EnvGetString("PollerPreference") == "built-in"
-    assert client.EnvPutString("PollerPreference", "libevent") is True
-    assert client.EnvGetString("PollerPreference") == "libevent"
-    assert client.EnvDelString("PollerPreference") is True
+    assert client.EnvGetString("NetworkStack") == "IPAuto"
+    assert client.EnvPutString("NetworkStack", "IPv4") is True
+    assert client.EnvGetString("NetworkStack") == "IPv4"
+    assert client.EnvDelString("NetworkStack") is True
+    assert client.EnvGetString("NetworkStack") == "IPAuto"
+
+
+def test_a_key_xrdcl_does_not_register_has_only_a_default(clean_env, monkeypatch):
+    """``PollerPreference`` is in XrdCl's table of defaults but never registered."""
+    monkeypatch.setenv("XRD_POLLERPREFERENCE", "libevent")  # not imported: not registered
+    assert client.EnvGetString("PollerPreference") is None
+    assert client.EnvGetDefault("PollerPreference") == "built-in"
+    assert client.EnvPutString("PollerPreference", "x") is True
+    assert client.EnvGetString("PollerPreference") == "x"
+    assert client.EnvGetInt("CpRetry") == 0 and client.EnvGetDefault("CpRetry") is None
+    assert client.EnvGetInt("TCPKeepProbes") == 9 and client.EnvGetDefault("TCPKeepProbes") is None
+    assert client.EnvGetDefault("TCPKeepAliveProbes") == "9"
 
 
 def test_a_setting_xrdcl_does_not_have_reads_as_none(clean_env):
@@ -1236,8 +1263,8 @@ def test_the_shell_wins_over_a_put(clean_env, monkeypatch):
     assert client.EnvDelString("NetworkStack") is False
     assert client.EnvGetInt("RequestTimeout") == 7
     assert client.EnvGetString("NetworkStack") == "IPv4"
-    monkeypatch.setenv("XRD_REQUESTTIMEOUT", "soon")
-    assert client.EnvGetInt("RequestTimeout") is None
+    monkeypatch.setenv("XRD_REQUESTTIMEOUT", "soon")  # not a number: XrdCl keeps the default
+    assert client.EnvGetInt("RequestTimeout") == 1800
 
 
 def test_puts_reach_the_native_configuration(clean_env, monkeypatch):
@@ -1245,11 +1272,18 @@ def test_puts_reach_the_native_configuration(clean_env, monkeypatch):
     monkeypatch.setattr(env, "_ints", {})
     monkeypatch.setattr(env, "_strings", {})
     monkeypatch.delenv("XRD_REQUESTTIMEOUT", raising=False)
+    monkeypatch.setattr(env, "_request_timeout", 0)
     client.EnvPutInt("RequestTimeout", 42)
+    client.EnvPutInt("StreamTimeout", 9)
     client.EnvPutInt("SubStreamsPerChannel", 3)
+    client.EnvPutInt("DataServerTTL", 30)
+    client.EnvPutString("ReadRecovery", "false")
     client.EnvPutString("PollerPreference", "built-in")  # no native field: ignored
+    client.EnvPutInt("TimeoutResolution", 1)  # no native equivalent: ignored
     cfg = env.config()
-    assert (cfg.request_timeout, cfg.data_streams) == (42.0, 2)
+    assert (cfg.stall_deadline, cfg.request_timeout, cfg.data_streams) == (42.0, 9.0, 2)
+    assert (cfg.pool_idle_ttl, cfg.recover_handles) == (30.0, False)
+    assert env.request_timeout() == 42
 
 
 def test_set_log_level(monkeypatch):

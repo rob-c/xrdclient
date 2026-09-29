@@ -45,7 +45,7 @@ from . import responses as rp
 from .frames import HANDSHAKE, Request, encode, header_fields
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Collection, Iterable, Iterator
 
     from ..auth.base import Credential
 
@@ -267,6 +267,9 @@ class SessionMachine:
 
         self.state = State.NEW
         self.protocol_info = ProtocolInfo()
+        #: The protocol version the server gave in its handshake reply: what
+        #: XrdCl reports as a host's protocol (``XRootDQuery::ProtocolVersion``).
+        self.handshake_version = 0
         self.session_id = b""
         self.mechanism = ""
         self.signer: Signer | None = None
@@ -421,6 +424,20 @@ class SessionMachine:
         for sid in sids:
             self._leased.discard(sid)
             self._free.append(sid)
+
+    def retire_sids(self, sids: Iterable[int], owed: Collection[int]) -> None:
+        """Return leased ids whose caller gave up, some still owed a reply.
+
+        The ones in ``owed`` are abandoned as :meth:`abandon` abandons a
+        submitted request's: kept out of circulation until their reply has
+        arrived and been dropped. The rest go straight back to the pool.
+        """
+        for sid in sids:
+            self._leased.discard(sid)
+            if sid in owed:
+                self._retired.add(sid)
+            else:
+                self._free.append(sid)
 
     def frame_for(self, request: Request, sid: int) -> bytes:
         """The exact bytes ``request`` would go out as on ``sid``.
@@ -673,7 +690,7 @@ class SessionMachine:
             return
 
         if self.state is State.HANDSHAKE:
-            self.state = State.PROTOCOL
+            self._handshaken(body)
             return
 
         if self.state is State.PROTOCOL:
@@ -703,6 +720,11 @@ class SessionMachine:
             self._auth_step(body)
         else:
             self._become_ready()
+
+    def _handshaken(self, body: bytes) -> None:
+        """Take the handshake reply - its protocol version - and move on."""
+        self.handshake_version = int.from_bytes(body[:4], "big")
+        self.state = State.PROTOCOL
 
     def _after_protocol(self) -> None:
         flags = self.protocol_info.flags

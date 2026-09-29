@@ -198,6 +198,33 @@ class _Descent:
         return True
 
 
+class _Batches:
+    """Each part of a listing, parsed and handed on as the server sends it.
+
+    Only the first part of a stat-ed listing opens with the dot entry that
+    says the stat lines are there, so the first part decides how every later
+    one is read.
+    """
+
+    def __init__(
+        self, target: str, with_stat: bool, deliver: Callable[[list[DirEntry]], None]
+    ) -> None:
+        self._target = target
+        self._with_stat = with_stat
+        self._deliver = deliver
+        self._started = False
+
+    def __call__(self, piece: bytes) -> None:
+        if not self._started:
+            self._started = True
+            self._with_stat = self._with_stat and piece.startswith(b".\n")
+        elif self._with_stat:
+            # A later part is pairs of lines with no dot entry of its own:
+            # lend it one, which the parser reads as the directory and drops.
+            piece = b".\n.\n" + piece
+        self._deliver(rp.parse_dirlist(piece, self._target, with_stat=self._with_stat))
+
+
 class _TreeRemoval:
     """One :meth:`FileSystem.rmtree`: what to remove, and what to do on failure.
 
@@ -470,14 +497,38 @@ class FileSystem:
         To list inside a ZIP archive, as XrdCl's ``DirListFlags::Zip`` does,
         see :meth:`list_archive`.
         """
+        return self._scandir_parts(
+            path, None, stat=stat, online=online, algorithm=algorithm, flags=flags
+        )
+
+    def _scandir_parts(
+        self,
+        path: str,
+        on_batch: Callable[[list[DirEntry]], None] | None,
+        *,
+        stat: bool = True,
+        online: bool = False,
+        algorithm: str = "",
+        flags: DirListFlags | int | str | None = None,
+    ) -> list[DirEntry]:
+        """:meth:`scandir`, calling ``on_batch`` with each part as it arrives.
+
+        A server answers a big directory in several ``kXR_oksofar``
+        instalments; each is parsed and handed to ``on_batch`` as it comes
+        in - what XrdCl's ``DirListFlags::Chunked`` delivers - and the whole
+        listing is still returned at the end.
+        """
         target = self._abs(path or "/")
         options = dirlist_flags(stat=stat, online=online, algorithm=algorithm, flags=flags)
         if algorithm:
             target += ("&" if "?" in target else "?") + f"cks.type={algorithm}"
         with_stat = bool(options & DirListFlags.STAT)
-        res = self._router.execute(
-            r.Dirlist(target, int(options) & ~int(DirListFlags.RECURSIVE)), path=target
-        )
+        request = r.Dirlist(target, int(options) & ~int(DirListFlags.RECURSIVE))
+        if on_batch is None:
+            res = self._router.execute(request, path=target)
+        else:
+            batches = _Batches(target, with_stat, on_batch)
+            res = self._router.execute(request, path=target, on_chunk=batches)
         return rp.parse_dirlist(res.data, target, with_stat=with_stat)
 
     def list_archive(self, path: str) -> list[DirEntry]:
@@ -962,10 +1013,16 @@ class FileSystem:
 
     def deep_locate(self, path: str, *, create: bool = False) -> list[LocationInfo]:
         """Locate, resolving managers down to the servers behind them."""
+        return self._deep_locate(path, create=create)
+
+    def _deep_locate(
+        self, path: str, *, create: bool = False, flags: LocateFlags | int | None = None
+    ) -> list[LocationInfo]:
+        """:meth:`deep_locate`, with :meth:`locate`'s ``flags`` on every locate it makes."""
         seen: dict[str, LocationInfo] = {}
-        pending = list(self.locate(path, create=create))
+        pending = list(self.locate(path, create=create, flags=flags))
         while pending:
-            loc = pending.pop()
+            loc = pending.pop(0)  # in the order the servers were named, as XrdCl lists them
             known = seen.get(loc.address)
             if known is not None:
                 # A supervisor answers as a manager to the tier above it and as
@@ -978,7 +1035,7 @@ class FileSystem:
             if loc.is_manager:
                 child = FileSystem(self.url.evolve(host=loc.host, port=loc.port), self.config)
                 try:
-                    pending.extend(child.locate(path, create=create))
+                    pending.extend(child.locate(path, create=create, flags=flags))
                 except OSError:
                     pass
                 finally:

@@ -133,36 +133,46 @@ answer.
   operation not supported"): the request goes out, and there is no storage
   plug-in to take it.
 
-**Not supported, and says so:**
-
-- `CopyProcess.add_job` accepts `sourcelimit`, `coerce`, `dynamicsource`,
-  `inittimeout`, `cptimeout`, `xrate` and `xrateThreshold` and ignores them:
-  one source is read, no rate limit is applied, and a copy is bounded by the
-  `Config` timeouts.
-
 **Different underneath:**
 
-- **Timeouts are caller-side.** `timeout=` bounds how long the caller waits;
-  when it runs out the call returns `errOperationExpired` (206) and the
-  request carries on or fails by itself. It is not recalled - which XrdCl
-  cannot do either - so a timed-out write may still complete.
-- **Callbacks** run on a shared pool of eight threads, and their host list
-  names the server that answered, not every hop.
-- **`dirlist` with `LOCATE` or `MERGE`** lists the directory on the server
-  the request is routed to, rather than on every server and merged. For a
-  single server that is the same answer.
-- **Defaults** are this library's where nobody set one: a 300 s request
-  timeout rather than XrdCl's 1800 s, for instance. `EnvGetInt` still
+- **`CopyProcess.add_job(xrateThreshold=...)`** fails a copy that falls
+  below the rate at once (`errThresholdExceeded`, 208); XrdCl first asks a
+  redirector for another server, when the file was opened through one.
+- **Callbacks** run on a shared pool of eight threads.
+- **`xrdcl.requuid`**: XrdCl tags each open with a request id in the URL's
+  CGI, which then shows in its `LastURL`, in the host list's URLs and in an
+  unfollowed redirect's message. No such id is made here, so those strings
+  lack it; they are otherwise the same. Likewise an unfollowed redirect's
+  message leaves out any `xrd.*` or `xrdcl.*` CGI of the caller's own URL,
+  which XrdCl appends.
+- **`WriteRecovery`** is stored and read back, but a file open for writing is
+  never re-opened here, whatever it says: what the lost server had not yet
+  committed could not be put back. `ReadRecovery` is honoured.
+- **A `CHUNKED` listing's last part** is known to be the last only once the
+  answer is complete, so each part reaches the callback when the next one
+  arrives, and a listing whose final frame is empty ends with its last
+  non-empty part as the final answer rather than an empty one. `RECURSIVE`
+  with `CHUNKED` arrives whole.
+- **Defaults** are this library's where nobody set one: a 300 s read timeout
+  and a 1800 s ceiling on a whole operation, for instance, rather than
+  XrdCl's 60 s stream timeout and 1800 s request expiry. `EnvGetInt` still
   answers XrdCl's number for an unset key, because code reads it expecting
-  that, so it may not be what is in force. Set `XRD_REQUESTTIMEOUT` or call
-  `EnvPutInt` to be sure.
-- **`SetLogMask`** does nothing; `XRD_LOGLEVEL`, `XRD_LOGFILE` and
-  `XRD_LOGMASK` are not read. See [debugging](#debugging).
+  that, so it may not be what is in force. Call `EnvPutInt` (or set
+  `XRD_REQUESTTIMEOUT`) to be sure: a put `RequestTimeout` expires every call
+  made without a `timeout`, as XrdCl's does.
+- **Log masks** mute parts of the `xrdclient` logger hierarchy
+  ([topics](compat-reference.md#log-topics)); `XRD_LOGLEVEL`, `XRD_LOGFILE`
+  and `XRD_LOGMASK` are not read. See [debugging](#debugging).
+- **Keys with no effect**: every `EnvPutInt` key XrdCl registers can be put
+  and read back, but only those with a native equivalent change anything -
+  `env.EFFECTS` says which, and why not for the rest
+  ([environment keys](compat-reference.md#environment-keys)).
 
 ## `EnvPutInt` returns `False`
 
 The same key is set in the process environment as `XRD_<KEY>`, and as in
-XrdCl the environment wins. The native `Config` reads that variable itself,
+XrdCl the environment wins - for a key XrdCl registers; any other is not
+looked for there. The native `Config` reads that variable itself,
 so its value is already in force; unset it in the shell if the code should
 decide.
 

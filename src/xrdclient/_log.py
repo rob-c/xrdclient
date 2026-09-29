@@ -2,14 +2,19 @@
 
 Everything logs under the ``xrdclient.`` hierarchy through a filter that redacts
 credential material, so enabling DEBUG never leaks a token into a log file.
+
+The same filter can mute parts of the hierarchy at some levels and not
+others (:func:`mute`) - what XrdCl's per-level topic masks do, and what the
+compatibility layer's ``SetLogMask`` is built on.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterable
 
-__all__ = ["get_logger", "redact"]
+__all__ = ["get_logger", "mute", "redact"]
 
 _PATTERNS = (
     re.compile(r"(authz=)[^&\s'\"]+", re.I),
@@ -38,6 +43,8 @@ class _RedactingFilter(logging.Filter):
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
+        if _muted and _is_muted(record):
+            return False
         try:
             message = record.getMessage()
         except (TypeError, ValueError):
@@ -47,6 +54,34 @@ class _RedactingFilter(logging.Filter):
             record.msg = cleaned
             record.args = ()
         return True
+
+
+#: ``(lowest level, level above the highest) -> logger prefixes`` whose
+#: records in that band of levels are dropped. Replaced, never mutated, so
+#: the filter reads it without a lock.
+_muted: dict[tuple[int, int], tuple[str, ...]] = {}
+
+
+def mute(low: int, high: int, loggers: Iterable[str]) -> None:
+    """Drop records from ``loggers`` with a level from ``low`` up to ``high``.
+
+    Each name covers its logger and every logger below it, and replaces what
+    was muted in that band before; no names un-mutes it.
+    """
+    global _muted
+    prefixes = tuple(f"{name}." for name in loggers)
+    changed = {band: names for band, names in _muted.items() if band != (low, high)}
+    if prefixes:
+        changed[(low, high)] = prefixes
+    _muted = changed
+
+
+def _is_muted(record: logging.LogRecord) -> bool:
+    name = f"{record.name}."
+    return any(
+        low <= record.levelno < high and name.startswith(prefixes)
+        for (low, high), prefixes in _muted.items()
+    )
 
 
 _filter = _RedactingFilter()

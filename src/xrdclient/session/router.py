@@ -19,25 +19,35 @@ were in the middle of using.
 
 from __future__ import annotations
 
+import contextvars
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from .._compat import SLOTS
 from .._log import get_logger
 from ..config import Config
 from ..errors import ConnectionError as XrdConnectionError
-from ..errors import ProtocolError, RedirectLimitError, TransientError, WaitLimitError
+from ..errors import (
+    ProtocolError,
+    RedirectLimitError,
+    ServerError,
+    TransientError,
+    WaitLimitError,
+)
 from ..errors import TimeoutError as XrdTimeoutError
 from ..proto import constants as c
 from ..proto import requests as r
 from ..proto.frames import Request
 from ..proto.responses import RedirectInfo
 from ..url import ROOT_SCHEMES, XRootDURL, parse
+from . import deadline as dl
 from .pool import SESSIONS, same_server
 from .sync import RedirectRequired, Result, Session
 
-__all__ = ["Router"]
+__all__ = ["Hop", "Router", "trace"]
 
 _log = get_logger(__name__)
 
@@ -156,6 +166,105 @@ def _repath(original: PathFields, path: str) -> None:
             return
 
 
+def _base_path(original: PathFields | None) -> str:
+    """The path a request names, CGI off, from its snapshot of path fields."""
+    for value in (original or {}).values():
+        if isinstance(value, str) and value:
+            return value.partition("?")[0]
+    return ""
+
+
+@dataclass(**SLOTS)
+class Hop:
+    """One server a request passed through, as XrdCl's ``HostInfo`` records it.
+
+    The first hop is where the router sends everything; each redirect adds
+    the server it pointed at. ``flags`` and ``version`` are the server's
+    ``kXR_protocol`` flags and handshake protocol version, filled in once it
+    has answered the request - they stay 0 for a server that never did.
+    """
+
+    #: The server, as a URL: the router's own for the first hop, and for a
+    #: redirect the router's URL moved to the host and port it named.
+    url: XRootDURL
+    #: For a hop a redirect led to, the path the request named there (CGI
+    #: off) and the CGI token the redirect carried.
+    path: str = ""
+    token: str = ""
+    flags: int = 0
+    version: int = 0
+    #: Whether this server is the request's load balancer: the manager -
+    #: or, superseding it, the meta-manager - that redirected it on.
+    load_balancer: bool = False
+    #: Whether a redirect led here, rather than this being where it started.
+    redirected: bool = False
+
+    @property
+    def endpoint(self) -> str:
+        return f"{self.url.host}:{self.url.port}"
+
+
+#: The hop list :func:`trace` is filling in this context, if any.
+_trace: contextvars.ContextVar[list[Hop] | None] = contextvars.ContextVar(
+    "xrdclient_route_trace", default=None
+)
+
+
+@contextmanager
+def trace() -> Iterator[list[Hop]]:
+    """Record the servers each request made inside the block passes through.
+
+    The list yielded holds the hops of the most recent request, replaced as
+    each new one starts, so after a single call it describes that call - the
+    manager it asked, the data server it was sent to - the way XrdCl's
+    ``HostList`` does for a callback. A block inside another shares its list,
+    so the outer one still sees the last request made anywhere inside it.
+    """
+    hops = _trace.get()
+    if hops is not None:
+        yield hops
+        return
+    hops = []
+    token = _trace.set(hops)
+    try:
+        yield hops
+    finally:
+        _trace.reset(token)
+
+
+def _start_trace(url: XRootDURL) -> list[Hop] | None:
+    hops = _trace.get()
+    if hops is not None:
+        hops[:] = [Hop(url)]
+    return hops
+
+
+def _mark_balancer(hops: list[Hop]) -> None:
+    """Make the hop that just redirected the load balancer, if XrdCl would.
+
+    A manager becomes the request's load balancer when it is the first one
+    met; a meta-manager supersedes any earlier one.
+    """
+    hop = hops[-1]
+    if not hop.flags & c.kXR_isManager:
+        return
+    if hop.flags & c.kXR_attrMeta or not any(h.load_balancer for h in hops):
+        for each in hops:
+            each.load_balancer = False
+        hop.load_balancer = True
+
+
+def _hop(hops: list[Hop] | None, destination: XRootDURL, path: str, token: str) -> None:
+    """Record the server a redirect sent a traced request to, naming ``path`` there."""
+    if hops is None:
+        return
+    _mark_balancer(hops)
+    last = hops[-1].url
+    if (destination.host, destination.port) == (last.host, last.port):
+        return  # XrdCl adds a host only when the redirect changes where it is
+    hops.append(Hop(destination, path, token, redirected=True))
+
+
 @dataclass(**SLOTS)
 class _Route:
     """Where one request has been sent, and how often."""
@@ -172,6 +281,8 @@ class _Route:
     session: Session | None = None
     hops: int = 0
     attempts: int = 0
+    #: The servers this request has been through, when a :func:`trace` asked.
+    trace: list[Hop] | None = None
 
 
 class _Loan:
@@ -234,6 +345,11 @@ class Router:
         #: Whether a redirect moves the router (a file) or only the request
         #: that got it (a filesystem, which asks its manager every time).
         self.sticky = sticky
+        #: Whether redirects are followed at all. When they are not, a
+        #: redirect ends the request: :meth:`execute` raises the
+        #: :class:`~xrdclient.session.sync.RedirectRequired` it got, naming
+        #: where the server said to go - XrdCl's ``FollowRedirects=false``.
+        self.follow_redirects = True
         self._session: Session | None = None
         #: Set while the connection is shared with other routers - a lender
         #: and the files it lent to - and ``None`` while this router is its
@@ -338,20 +454,49 @@ class Router:
         return self.session.bind_data_path()
 
     def execute(self, request: Request, *, path: str = "", **kwargs: object) -> Result:
-        """Run ``request``, following redirects and retrying dropped connections."""
-        route = _Route(None)
+        """Run ``request``, following redirects and retrying dropped connections.
+
+        Within a :func:`~xrdclient.deadline`, the request expires where it
+        stands when the time is up: nothing further is sent for it - no
+        retry, no redirect followed - and
+        :class:`~xrdclient.session.deadline.OperationExpiredError` is raised.
+        """
+        route = _Route(None, trace=_start_trace(self.url))
         while True:
+            dl.check(type(request).__name__)
             try:
-                return self._attempt(request, route, path=path, **kwargs)
+                result = self._attempt(request, route, path=path, **kwargs)
             except RedirectRequired as redirect:
+                self._answered(route)
+                if not self.follow_redirects:
+                    raise
                 self._redirect(request, path, route, redirect)
-            except WaitLimitError:
+            except (WaitLimitError, dl.OperationExpiredError):
                 # A busy server is not a broken connection: the budget for
                 # "come back later" has already been spent once here, and
-                # reconnecting would only spend it again on a new socket.
+                # reconnecting would only spend it again on a new socket. An
+                # expired request is over, by definition.
                 raise
             except XrdConnectionError as exc:
+                # Before the server's refusals: one saying it timed out is
+                # both, and is retried as it always has been.
                 self._recover(request, route, exc)
+            except ServerError:
+                self._answered(route)
+                raise
+            else:
+                self._answered(route)
+                return result
+
+    @staticmethod
+    def _answered(route: _Route) -> None:
+        """Note, on a traced request's current hop, who answered it there."""
+        hops, session = route.trace, route.session
+        if not hops or session is None:
+            return
+        hop = hops[-1]
+        hop.flags = getattr(session.protocol, "flags", 0)
+        hop.version = session.handshake_version
 
     def _attempt(self, request: Request, route: _Route, **kwargs: object) -> Result:
         """Send ``request`` once, to wherever ``route`` says it is going."""
@@ -364,7 +509,7 @@ class Router:
         # request redirected to the same data server finds it waiting.
         try:
             return session.execute(request, **kwargs)  # type: ignore[arg-type]
-        except WaitLimitError:
+        except (WaitLimitError, dl.OperationExpiredError):
             raise
         except XrdConnectionError:
             # Failed under a live request: whoever picks it up next deserves
@@ -396,6 +541,7 @@ class Router:
             # retry at the manager, builds on the path this one moved it to.
             _repath(route.original, path)
         _retarget(request, route.original, redirect.target.token)
+        _hop(route.trace, destination, _base_path(route.original), redirect.target.token)
         _log.debug("redirected to %s:%s", destination.host, destination.port)
 
     @staticmethod
@@ -437,6 +583,11 @@ class Router:
         return True
 
     def _recover(self, request: Request, route: _Route, error: XrdConnectionError) -> None:
+        left = dl.remaining()
+        if left is not None and left <= 0:
+            raise dl.OperationExpiredError(
+                f"{type(request).__name__} expired before it could be retried: {error}"
+            ) from error
         route.attempts += 1
         where = route.target or self.url
         if not self._retryable(request, route.attempts):
@@ -456,6 +607,8 @@ class Router:
             # A target is only ever set by a redirect, which took the snapshot.
             assert route.original is not None
             _retarget(request, route.original, "")
+            if route.trace is not None:
+                route.trace.append(Hop(self.url))
         else:
             self._drop(route.session)
         self._pause(route.attempts)
@@ -472,7 +625,9 @@ class Router:
         """
         backoff = self.config.retry_backoff
         if backoff > 0:
-            time.sleep(min(backoff * 2 ** (attempts - 1), self.config.wait_cap))
+            pause = min(backoff * 2 ** (attempts - 1), self.config.wait_cap)
+            left = dl.remaining()
+            time.sleep(pause if left is None else max(min(pause, left), 0.0))
 
     def _drop(self, failed: Session | None = None) -> None:
         """Let go of the current connection after it failed.
@@ -507,6 +662,7 @@ class Router:
         """
         lent = Router(self.url, self.config)
         lent._lender, lent._lent = self, True
+        lent.follow_redirects = self.follow_redirects
         return lent
 
     def pin(self, *, transfer: bool = False) -> Router:
@@ -527,6 +683,7 @@ class Router:
         made for the one open, and its caller keeps only the pinned router.
         """
         pinned = Router(self.url, self.config, reconnect=False)
+        pinned.follow_redirects = self.follow_redirects
         with self._lock:
             session = self._session
             if session is None:

@@ -15,10 +15,24 @@ from typing import Any, Optional, TypeVar
 
 from ...client.filesystem import FileSystem as NativeFileSystem
 from ...errors import ServerError
+from ...flags import LocateFlags
+from ...proto import constants as c
 from ...proto import requests as r
+from ...session.router import Hop, trace
+from ...types import DirEntry
 from . import _args, _convert, env
-from ._dispatch import call, no_answer, now
-from ._status import OK, UnsupportedURLError, errErrorResponse, errInvalidArgs, failure, status
+from ._dispatch import call, no_answer, now, quick, stream
+from ._status import (
+    OK,
+    UnsupportedURLError,
+    errErrorResponse,
+    errInvalidArgs,
+    errNotSupported,
+    failure,
+    status,
+    stOK,
+    suPartial,
+)
 from .copyprocess import CopyProcess
 from .flags import AccessMode, DirListFlags, MkDirFlags
 from .responses import DirectoryList, HostList, XRootDStatus
@@ -37,6 +51,10 @@ _DEFAULT_DIR_MODE = AccessMode.UR | AccessMode.UW | AccessMode.UX | AccessMode.G
 #: The client-side properties a filesystem has, and their defaults.
 _PROPERTIES = {"FollowRedirects": "true"}
 
+#: What XrdCl's ``DirList`` with ``Locate`` locates with: prefer host names,
+#: ``kXR_compress``'s bit, and "this is for a directory listing".
+_LOCATE_FOR_LISTING = LocateFlags.PREFER_NAME | LocateFlags.FOR_DIRLIST | LocateFlags.ADD_PEERS
+
 
 class FileSystem:
     """Filesystem operations on one server, in the bindings' shape.
@@ -53,6 +71,8 @@ class FileSystem:
         self.__valid = parsed.is_valid()
         target = str(parsed) if self.__valid else "root://invalid/"
         self.native = NativeFileSystem(target, env.config())
+        #: How XrdCl spells where this filesystem's requests start.
+        self.__origin = target if self.__valid else ""
         self.__properties = dict(_PROPERTIES)
 
     @property
@@ -75,13 +95,16 @@ class FileSystem:
 
     def __now(self, timeout: object, callback: Callback) -> bool:
         """Whether a call can skip :meth:`__run`: no timeout, no callback, a valid URL."""
-        return callback is None and timeout.__class__ is int and not timeout and self.__valid
+        return self.__valid and quick(timeout, callback)
 
-    def __hosts(self) -> HostList:
-        router = getattr(self.native, "_router", None)
-        session = getattr(router, "_session", None) if router is not None else None
-        info = getattr(session, "protocol", None)
-        return _convert.host_list(f"{self.native.url.scheme}://{self.native.endpoint}/", info)
+    def __hosts(self, hops: list[Hop]) -> HostList:
+        return _convert.host_list(hops, self.__origin)
+
+    def __answerer(self, hops: list[Hop]) -> str:
+        """The ``hostaddr`` of a listing: the server that answered it, as XrdCl names it."""
+        if not hops:
+            return str(self.native.endpoint)
+        return URL(_convert.hop_url(hops[-1], self.__origin)).hostid
 
     # -- namespace -----------------------------------------------------------
 
@@ -103,10 +126,14 @@ class FileSystem:
         """``(status, DirectoryList)``; ``DirListFlags.STAT`` fills in ``statinfo``.
 
         ``RECURSIVE`` names each entry by its path below ``path``, the way
-        XrdCl does. ``LOCATE`` and ``MERGE`` ask XrdCl to list every server
-        holding the directory and fold the answers together; a listing here
-        comes from the server the namespace redirects to, which for a single
-        server is the same answer.
+        XrdCl does. ``MERGE`` sorts the listing by name and drops duplicates.
+        ``LOCATE``, without a callback, lists the directory on every data
+        server a manager locates it on and puts the answers together - merged
+        with ``MERGE`` - each entry naming its server in ``hostaddr``; asked
+        of a data server it is a plain listing. ``CHUNKED`` hands a callback
+        each part of the listing as the server sends it, with
+        ``[SUCCESS] Continue`` until the last; without a callback XrdCl
+        refuses it, and so does this.
 
         ``ZIP`` lists the members of the archive ``path`` names, from its
         central directory, each with the archive's stat and the member's
@@ -115,26 +142,118 @@ class FileSystem:
         mean ``ZIP`` whether or not the flag says so.
         """
         wanted = _args.u16(flags, "flags")
-        if callback is None and path.endswith(".zip"):
-            # XrdCl's synchronous DirList does this; the asynchronous one,
-            # which is what a callback gets, does not.
-            wanted |= DirListFlags.ZIP
+        if callback is None:
+            if wanted & DirListFlags.CHUNKED:
+                # XrdCl's synchronous DirList cannot deliver parts.
+                return failure(errNotSupported), None
+            if path.endswith(".zip"):
+                # XrdCl's synchronous DirList does this; the asynchronous one,
+                # which is what a callback gets, does not.
+                wanted |= DirListFlags.ZIP
+            if wanted & DirListFlags.LOCATE:
+                return self.__located(path, wanted, _args.u16(timeout))
+        elif wanted & DirListFlags.CHUNKED and self.__valid:
+            return stream(
+                lambda part: self.__in_parts(path, wanted, part),
+                timeout=_args.u16(timeout),
+                callback=callback,
+                hosts=self.__hosts,
+            )
         if self.__now(timeout, callback):
             return now(self.__list, _same, path, wanted)
         return self.__run(lambda: self.__list(path, wanted), _same, timeout, callback)
 
     def __list(self, path: str, flags: int) -> DirectoryList:
+        with trace() as hops:
+            listed = self.__listed(path, flags)
+        listing = listed(self.__answerer(hops))
+        return _merged(listing) if flags & DirListFlags.MERGE else listing
+
+    def __listed(self, path: str, flags: int) -> Callable[[str], DirectoryList]:
+        """The listing, still to be told which server answered it."""
         if flags & DirListFlags.ZIP:
             # XrdCl stats first, and lists a directory as if the flag were not
             # there; the listing of an archive is named by its path, CGI off.
             info = self.native.stat(path)
             if not info.is_dir():
                 members = self.native._archive(path, info)
-                return _convert.listing(path.partition("?")[0], members, self.native.endpoint)
+                archive = _convert.listing(path.partition("?")[0], members, self.native.endpoint)
+                return lambda _: archive
         if flags & DirListFlags.RECURSIVE:
-            return _convert.directory_list(path, self.__below(path), self.native.endpoint)
+            below = self.__below(path)
+            return lambda host: _convert.directory_list(path, below, host)
         entries = self.native.scandir(path, stat=bool(flags & DirListFlags.STAT))
-        return _convert.listing(path, entries, self.native.endpoint)
+        return lambda host: _convert.listing(path, entries, host)
+
+    def __in_parts(self, path: str, flags: int, part: Callable[[Any], None]) -> DirectoryList:
+        """A listing a part at a time: every part but the last to ``part``, the last returned.
+
+        A part is known to be the last only once the answer is complete, so
+        each is held back until the next one arrives.
+        """
+        if flags & DirListFlags.RECURSIVE:
+            return self.__list(path, flags)  # XrdCl delivers a recursive listing whole
+        merge = _PartMerge() if flags & DirListFlags.MERGE else None
+        held: list[DirectoryList] = []
+        with trace() as hops:
+
+            def arrived(entries: list[DirEntry]) -> None:
+                if held:
+                    part(held.pop())
+                listing = _convert.listing(path, entries, self.__answerer(hops))
+                held.append(merge(listing) if merge is not None else listing)
+
+            self.native._scandir_parts(path, arrived, stat=bool(flags & DirListFlags.STAT))
+        return held.pop() if held else _convert.listing(path, [], self.__answerer(hops))
+
+    def __located(self, path: str, flags: int, timeout: int) -> tuple[XRootDStatus, Any]:
+        """XrdCl's synchronous ``DirList`` with ``Locate``: every server's listing, together."""
+        found, servers = call(lambda: self.__servers(path), _same, timeout=timeout)
+        rest = flags & ~DirListFlags.LOCATE
+        if not found.ok:
+            return found, None
+        if servers is None:
+            # A data server is the only one that can hold the directory.
+            listed: tuple[XRootDStatus, Any] = call(
+                lambda: self.__list(path, rest), _same, timeout=timeout
+            )
+            return listed
+        if not servers:
+            # XrdCl's deep locate, finding no server, says so as a server would.
+            return status(errErrorResponse, errno=3011, message=_NO_LOCATION), None
+        return self.__gathered(path, rest, list(servers), timeout)
+
+    def __servers(self, path: str) -> list[str] | None:
+        """The data servers a deep locate finds ``path`` on, or ``None`` on a data server."""
+        if not self.__valid:
+            raise UnsupportedURLError
+        router = getattr(self.native, "_router", None)
+        if router is None or getattr(router.session.protocol, "flags", 0) & c.kXR_isServer:
+            return None
+        located = self.native._deep_locate(path, create=True, flags=_LOCATE_FOR_LISTING)
+        return [location.address for location in located]
+
+    def __gathered(
+        self, path: str, flags: int, servers: list[str], timeout: int
+    ) -> tuple[XRootDStatus, DirectoryList]:
+        """Each server's listing of ``path``, one after another, as XrdCl asks them."""
+        scheme = self.native.url.scheme
+        entries: list[Any] = []
+        failed: XRootDStatus | None = None
+        failures = 0
+        for server in servers:
+            outcome, listing = FileSystem(f"{scheme}://{server}/").dirlist(path, flags, timeout)
+            if not outcome.ok:
+                failed, failures = outcome, failures + 1
+                continue
+            entries.extend(listing.dirlist)
+        together = _convert.gathered(path, entries)
+        if flags & DirListFlags.MERGE:
+            together = _merged(together)
+        if failed is None:
+            return OK, together
+        # Every server failing is the last failure; some of them, a partial answer.
+        return (failed if failures == len(servers) else _PARTIAL), together
 
     def __below(self, top: str) -> list[tuple[str, Any]]:
         """Everything under ``top``, a level at a time, named relative to it.
@@ -353,10 +472,19 @@ class FileSystem:
         return self.__properties.get(name)
 
     def set_property(self, name: str, value: str) -> bool:
-        """Set a client-side property; ``False`` for one this client does not have."""
+        """Set a client-side property; ``False`` for one this client does not have.
+
+        ``FollowRedirects`` is ``"true"`` or, for any other value, ``"false"``,
+        as XrdCl reads it; off, a redirect is the answer - ``errRedirect``
+        (401), its message naming where the server pointed.
+        """
         if name not in self.__properties:
             return False
-        self.__properties[name] = str(value)
+        follow = str(value) == "true"
+        self.__properties[name] = "true" if follow else "false"
+        router = getattr(self.native, "_router", None)
+        if router is not None:
+            router.follow_redirects = follow
         return True
 
     def __del__(self) -> None:
@@ -375,6 +503,52 @@ class FileSystem:
 def _same(value: T) -> T:
     """The ``convert`` of an operation whose native answer is the response."""
     return value
+
+
+#: How XrdCl's deep locate words finding nothing.
+_NO_LOCATION = "No valid location found"
+
+#: What XrdCl returns when some of the servers a ``LOCATE`` listing asked failed.
+_PARTIAL = status(suPartial, level=stOK)
+
+
+def _key(entry: Any) -> tuple[str, int, int, int]:
+    """How XrdCl's merge orders entries - and so which count as the same.
+
+    By name; then an entry without stat information before one with; then
+    by size and flags. Two with the same name, size and flags are one entry.
+    """
+    info = entry.statinfo
+    if info is None:
+        return entry.name, 0, 0, 0
+    return entry.name, 1, info.size, info.flags
+
+
+def _unique(entries: Iterable[Any]) -> dict[tuple[str, int, int, int], Any]:
+    """The first of each set of entries XrdCl's merge counts as the same."""
+    found: dict[tuple[str, int, int, int], Any] = {}
+    for entry in entries:
+        found.setdefault(_key(entry), entry)
+    return found
+
+
+def _merged(listing: DirectoryList) -> DirectoryList:
+    """XrdCl's ``Merge``: the listing sorted, duplicates dropped."""
+    unique = _unique(listing.dirlist)
+    return _convert.gathered(listing.parent, [unique[key] for key in sorted(unique)])
+
+
+class _PartMerge:
+    """XrdCl's ``MergeChunked``: each part merged, less what earlier parts had."""
+
+    def __init__(self) -> None:
+        self._seen: set[tuple[str, int, int, int]] = set()
+
+    def __call__(self, listing: DirectoryList) -> DirectoryList:
+        unique = _unique(listing.dirlist)
+        fresh = sorted(key for key in unique if key not in self._seen)
+        self._seen.update(fresh)
+        return _convert.gathered(listing.parent, [unique[key] for key in fresh])
 
 
 def _unsupported() -> None:

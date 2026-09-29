@@ -19,8 +19,8 @@ import argparse
 import os
 import posixpath
 import sys
-from collections.abc import Sequence
-from typing import TextIO, TypedDict
+from collections.abc import Callable, Sequence
+from typing import Any, TextIO, TypedDict, cast
 
 from ..config import Config
 from ..copy import CopyResult, copy, copy_tree, third_party
@@ -98,6 +98,7 @@ def _parser() -> argparse.ArgumentParser:
         metavar="N",
         help="extra connections each file's data rides on (default 1, 0 for none)",
     )
+    _xrdcp_flags(parser)
     parser.add_argument(
         "-p",
         "--progress",
@@ -150,6 +151,50 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _xrdcp_flags(parser: argparse.ArgumentParser) -> None:
+    """The transfer controls ``xrdcp`` has, under ``xrdcp``'s names."""
+    parser.add_argument(
+        "-y",
+        "--sources",
+        type=int,
+        metavar="N",
+        help="read a root:// file from up to N of its replicas at once (1 to 32)",
+    )
+    parser.add_argument(
+        "-X",
+        "--xrate",
+        type=size_arg,
+        metavar="RATE",
+        help="cap the transfer at RATE bytes a second, e.g. 20M (at least 10k)",
+    )
+    parser.add_argument(
+        "--xrate-threshold",
+        type=size_arg,
+        metavar="RATE",
+        help="fail a transfer slower than RATE bytes a second (at least 10k)",
+    )
+    parser.add_argument(
+        "--cptimeout",
+        type=float,
+        metavar="SECONDS",
+        help="fail a transfer still running after SECONDS",
+    )
+    parser.add_argument(
+        "-Z",
+        "--dynamic-src",
+        action="store_true",
+        default=None,
+        help="the source may still be growing: read to its end, not to its size",
+    )
+    parser.add_argument(
+        "-F",
+        "--coerce",
+        action="store_true",
+        default=None,
+        help="ignore the server's file usage rules when opening DEST (kXR_force)",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Progress
 # ---------------------------------------------------------------------------
@@ -194,6 +239,12 @@ class _CopyOptions(TypedDict, total=False):
     dry_run: bool
     remove_source: bool
     resume: bool
+    sources: int
+    max_rate: float
+    min_rate: float
+    timeout: float
+    dynamic_source: bool
+    coerce: bool
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +298,7 @@ def _destination(source: XRootDURL, dest: XRootDURL, *, into: bool) -> XRootDURL
 
 def _misuse(args: argparse.Namespace) -> str | None:
     """The flag combinations that cannot mean anything, in words."""
-    for check in (_tree_misuse, _count_misuse, _transfer_misuse, _tpc_misuse):
+    for check in (_tree_misuse, _count_misuse, _transfer_misuse, _limit_misuse, _tpc_misuse):
         complaint = check(args)
         if complaint is not None:
             return complaint
@@ -290,6 +341,36 @@ def _transfer_misuse(args: argparse.Namespace) -> str | None:
     return None
 
 
+#: The smallest rate ``xrdcp`` takes for ``--xrate`` and ``--xrate-threshold``.
+_MIN_RATE = 10 * 1024
+
+
+#: What the ``xrdcp`` flags must not be, and what to say when they are.
+_LIMITS: tuple[tuple[Callable[[argparse.Namespace], bool], str], ...] = (
+    (
+        lambda a: a.sources is not None and not 1 <= a.sources <= 32,
+        "--sources is how many servers to read from at once, from 1 to 32",
+    ),
+    (
+        lambda a: any(r is not None and r < _MIN_RATE for r in (a.xrate, a.xrate_threshold)),
+        "--xrate and --xrate-threshold take a rate of at least 10k bytes a second",
+    ),
+    (
+        lambda a: a.cptimeout is not None and a.cptimeout <= 0,
+        "--cptimeout is how long a transfer may take, so more than nothing",
+    ),
+    (
+        lambda a: bool(a.resume) and (a.sources or 0) > 1,
+        "--continue carries one partial DEST on from one source; --sources reads several",
+    ),
+)
+
+
+def _limit_misuse(args: argparse.Namespace) -> str | None:
+    """Hold the ``xrdcp`` flags to ``xrdcp``'s ranges, and to what they can combine with."""
+    return next((complaint for broken, complaint in _LIMITS if broken(args)), None)
+
+
 #: The flags that shape how bytes pass through this process, which a
 #: third-party copy never sends through it.
 _STREAM_FLAGS = (
@@ -297,6 +378,11 @@ _STREAM_FLAGS = (
     ("in_flight", "--in-flight"),
     ("stripes", "--stripes"),
     ("streams", "--streams"),
+    ("sources", "--sources"),
+    ("xrate", "--xrate"),
+    ("xrate_threshold", "--xrate-threshold"),
+    ("cptimeout", "--cptimeout"),
+    ("dynamic_src", "--dynamic-src"),
 )
 
 
@@ -419,22 +505,32 @@ def _run(
     return results
 
 
+#: Flags passed on to :func:`~xrdclient.copy` when given: attribute, keyword.
+_PASSED = (
+    ("algorithm", "algorithm"),
+    ("chunk_size", "chunk_size"),
+    ("dry_run", "dry_run"),
+    ("remove_source", "remove_source"),
+    ("resume", "resume"),
+    ("sources", "sources"),
+    ("xrate", "max_rate"),
+    ("xrate_threshold", "min_rate"),
+    ("cptimeout", "timeout"),
+    ("dynamic_src", "dynamic_source"),
+    ("coerce", "coerce"),
+)
+
+
 def _copy_options(args: argparse.Namespace) -> _CopyOptions:
     """Keyword options shared by ordinary and recursive copies."""
-    options: _CopyOptions = {"overwrite": args.force or args.resume}
+    options: dict[str, Any] = {"overwrite": args.force or args.resume}
     if args.verify is not None:
-        options["verify"] = args.verify
-    if args.algorithm:
-        options["algorithm"] = args.algorithm
-    if args.chunk_size:
-        options["chunk_size"] = args.chunk_size
-    if args.dry_run:
-        options["dry_run"] = True
-    if args.remove_source:
-        options["remove_source"] = True
-    if args.resume:
-        options["resume"] = True
-    return options
+        options["verify"] = args.verify  # where ``False`` is an answer too
+    for attribute, keyword in _PASSED:
+        value = getattr(args, attribute)
+        if value:
+            options[keyword] = value
+    return cast("_CopyOptions", options)
 
 
 def _copy_one(
@@ -480,6 +576,7 @@ def _third_party(
         overwrite=args.force,
         verify=verify,
         algorithm=args.algorithm,
+        coerce=bool(args.coerce),
     )
 
 

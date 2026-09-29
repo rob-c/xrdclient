@@ -35,6 +35,7 @@ from ..proto import requests as r
 from ..proto import responses as rp
 from ..proto.frames import Request
 from ..session.bulk import BulkUnsupported
+from ..session.deadline import OperationExpiredError
 from ..session.router import Router
 from ..session.sync import Result, Session
 from ..types import (
@@ -133,6 +134,15 @@ class File:
         #: server. Zero on a healthy connection; useful in a log line when a
         #: long read survived a restart nobody noticed.
         self.recoveries = 0
+        #: Whether this handle may be re-opened after losing its server, in
+        #: place of :attr:`Config.recover_handles <xrdclient.Config.recover_handles>`
+        #: for this one file; ``None`` follows the configuration. Read at the
+        #: moment a connection is lost, so it can be changed while open.
+        self.recover_handles: bool | None = None
+        #: Whether the open follows redirects. ``False`` makes a redirect the
+        #: open's answer - :class:`~xrdclient.session.sync.RedirectRequired`,
+        #: naming where it points - instead of a hop towards the data server.
+        self.follow_redirects = True
         #: Sequential readahead on a read-only handle: the block fetched
         #: beyond the last read, where the next read is expected to start,
         #: and how far the next fetch looks ahead. See :meth:`_sequential`.
@@ -394,6 +404,7 @@ class File:
             optiont=optiont,
             fhtemplt=fhtemplt,
         )
+        self._router.follow_redirects = self.follow_redirects
         result = self._router.execute(request, path=self.url.path)
         # The open may have been redirected; every later operation on this
         # handle must stay on the server that issued it. A connection this
@@ -424,7 +435,10 @@ class File:
         nothing was lost with the connection. A handle opened for writing
         cannot — see :data:`_WRITING`.
         """
-        return bool(self.config.recover_handles) and not (self._flags & _WRITING)
+        wanted = self.recover_handles
+        if wanted is None:
+            wanted = self.config.recover_handles
+        return bool(wanted) and not (self._flags & _WRITING)
 
     def _execute(self, build: Callable[[bytes], Request], **kwargs: object) -> Result:
         """Run a handle-bearing request, re-opening once if the server is lost.
@@ -437,7 +451,7 @@ class File:
         try:
             return self._router.execute(build(self.handle), **kwargs)  # type: ignore[arg-type]
         except TransientError as exc:
-            if not self.recoverable:
+            if not self.recoverable or isinstance(exc, OperationExpiredError):
                 raise
             _log.debug("recovering %s after %s", self.url, exc)
             handle = self._reopen()
@@ -491,7 +505,7 @@ class File:
             if handle is not None:
                 self._close_handle(handle)
         except TransientError as exc:
-            if self._flags & _WRITING:
+            if self._flags & _WRITING or isinstance(exc, OperationExpiredError):
                 raise
             _log.debug("close of %s found the connection gone: %s", self.url, exc)
         finally:
@@ -742,7 +756,7 @@ class File:
         :class:`~xrdclient.errors.TransientError` the event path would have
         raised.
         """
-        if not self.recoverable:
+        if not self.recoverable or isinstance(error, OperationExpiredError):
             raise _transient(error)
         _log.debug("recovering %s after the bulk plane lost its connection: %s", self.url, error)
         self._reopen()

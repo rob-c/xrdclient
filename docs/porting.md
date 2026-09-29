@@ -227,10 +227,12 @@ server's `errno` and the `shellcode` a script would exit with. A `TypeError`
 or `ValueError` for bad arguments, and `ValueError` for I/O on a file that is
 not open, still raise, as they do in the bindings.
 
-**Timeouts are the caller's.** `timeout=` bounds how long the call waits; when
-it expires the call returns `errOperationExpired` (206) and the request is
-left to finish or fail on its own. It is not recalled - which XrdCl cannot do
-either.
+**Timeouts expire the request, as in XrdCl.** When `timeout=` runs out the
+call returns `errOperationExpired` (206): the request's stream is abandoned,
+a late answer is dropped, and nothing retries or follows a redirect for it
+afterwards. A request already on the wire may still take effect on the
+server - XrdCl cannot recall one either. The native API has the same thing as
+`with xrdclient.deadline(seconds):`.
 
 ## Porting a codebase, step by step
 
@@ -247,10 +249,8 @@ either.
 
 2. **Read the short list of behaviours that differ.** Every name the
    bindings export is here, the newer upstream API included (typed
-   exceptions, `TapeClient`); what differs is a handful of behaviours -
-   caller-side timeouts, the `CopyProcess` keywords that have no effect - and
-   [troubleshooting](compat-troubleshooting.md#what-behaves-differently) lists
-   them.
+   exceptions, `TapeClient`); what little differs is listed in
+   [troubleshooting](compat-troubleshooting.md#what-behaves-differently).
 
 3. **Run your tests with `install()`, before touching an import.** Add it to
    the test suite's `conftest.py`:

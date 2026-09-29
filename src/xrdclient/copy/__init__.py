@@ -12,6 +12,17 @@ binary stream before the pump ever sees it.
 from __future__ import annotations
 
 from .engine import CopyResult, SyncMode, copy, copy_tree
+from .limits import CopyTimeoutError, RateThresholdError
+from .replicas import NoMoreReplicasError
 from .tpc import third_party
 
-__all__ = ["copy", "copy_tree", "third_party", "CopyResult", "SyncMode"]
+__all__ = [
+    "copy",
+    "copy_tree",
+    "third_party",
+    "CopyResult",
+    "SyncMode",
+    "CopyTimeoutError",
+    "RateThresholdError",
+    "NoMoreReplicasError",
+]

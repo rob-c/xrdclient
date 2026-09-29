@@ -93,6 +93,7 @@ from .flags import (
 from .io import open_url as open
 from .path import XRootDPath
 from .path import XRootDPath as Path  # ``xrdclient.Path`` reads the way pathlib does
+from .session.deadline import OperationExpiredError, deadline
 from .types import (
     CheckpointInfo,
     ChecksumInfo,
@@ -156,6 +157,8 @@ __all__ = [
     "current",
     "override",
     "find_config_file",
+    # a time limit on whatever runs inside a block
+    "deadline",
     # copying
     "copy",
     "copy_tree",
@@ -221,6 +224,7 @@ __all__ = [
     "ProtocolError",
     "ConnectionError",
     "TimeoutError",
+    "OperationExpiredError",
     "TransientError",
     "AuthenticationError",
     "NoMechanismError",
