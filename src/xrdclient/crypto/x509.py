@@ -6,9 +6,11 @@ client genuinely needs is to look at the material it is about to offer — is
 this a proxy, whose is it, and has it expired — so that a stale proxy is a
 sentence rather than a 3010 from the far end an hour into a job.
 
-So this reads certificates; it does not verify signatures or build paths.
-Trust decisions belong to the endpoint, and pretending otherwise in a client
-would be the dangerous kind of convenience.
+So this reads certificates. It does not build paths for the login itself:
+trust in the *client* is the endpoint's decision. The pieces here that do
+check signatures (:func:`verify_signed`) serve X.509 delegation, where the
+client is about to hand a server a credential and so has to know which server
+it is talking to - see :mod:`xrdclient.crypto.trust`.
 """
 
 from __future__ import annotations
@@ -19,20 +21,31 @@ from dataclasses import dataclass, field
 from .._compat import SLOTS
 from .der import (
     TAG_BIT_STRING,
+    TAG_BOOLEAN,
     TAG_GENERALIZED_TIME,
     TAG_INTEGER,
+    TAG_OCTET_STRING,
+    TAG_OID,
     TAG_UTC_TIME,
     DERError,
     Element,
     oid_string,
     parse,
+    raw_children,
     read_integer,
 )
 from .rsa import RSAPublicKey, pem_blocks, public_key_from_bitstring
 
 __all__ = [
     "Certificate",
+    "Extension",
     "Name",
+    "certificate_fields",
+    "decode_name",
+    "extensions_of",
+    "parse_extension",
+    "signature_digest",
+    "verify_signed",
     "ProxyCredential",
     "default_proxy_path",
     "load_certificates",
@@ -325,3 +338,94 @@ def load_proxy(path: str) -> ProxyCredential:
     if not chain:
         raise DERError(f"no certificate in {path}")
     return ProxyCredential(chain=tuple(chain), key=load_private_key(data), path=path)
+
+
+# ---------------------------------------------------------------------------
+# The raw structure, for signing and verifying
+# ---------------------------------------------------------------------------
+
+#: ``sha*WithRSAEncryption`` - the signature algorithms a grid PKI uses.
+_SIGNATURE_DIGESTS = {
+    "1.2.840.113549.1.1.5": "sha1",
+    "1.2.840.113549.1.1.11": "sha256",
+    "1.2.840.113549.1.1.12": "sha384",
+    "1.2.840.113549.1.1.13": "sha512",
+}
+
+
+@dataclass(frozen=True, **SLOTS)
+class Extension:
+    """One certificate extension: what it is, and its bytes as written."""
+
+    oid: str
+    critical: bool
+    value: bytes
+    der: bytes = field(default=b"", repr=False)
+
+
+def decode_name(der: bytes) -> Name:
+    """A DER ``Name`` as a :class:`Name`."""
+    element, _ = parse(der)
+    return _decode_name(element)
+
+
+def certificate_fields(der: bytes) -> dict[str, bytes]:
+    """The parts of a certificate a signer copies, each exactly as written.
+
+    Keys: ``issuer``, ``subject``, ``spki`` and - when present -
+    ``extensions`` (the inner ``SEQUENCE OF Extension``).
+    """
+    tbs = raw_children(der)[0]
+    fields = raw_children(tbs)
+    index = 1 if fields and fields[0][0] == 0xA0 else 0
+    if len(fields) < index + 6:
+        raise DERError("certificate body is missing required fields")
+    out = {
+        "issuer": fields[index + 2],
+        "subject": fields[index + 4],
+        "spki": fields[index + 5],
+    }
+    for extra in fields[index + 6 :]:
+        if extra[0] == 0xA3:
+            out["extensions"] = raw_children(extra)[0]
+    return out
+
+
+def extensions_of(der: bytes) -> list[Extension]:
+    """Every extension of the certificate in ``der``, in order."""
+    block = certificate_fields(der).get("extensions")
+    return [parse_extension(raw) for raw in raw_children(block)] if block else []
+
+
+def parse_extension(raw: bytes) -> Extension:
+    """One DER ``Extension``: ``SEQUENCE { OID, BOOLEAN DEFAULT FALSE, OCTET STRING }``."""
+    parts = parse(raw)[0].children()
+    if len(parts) not in (2, 3) or parts[0].tag != TAG_OID or parts[-1].tag != TAG_OCTET_STRING:
+        raise DERError("malformed certificate extension")
+    critical = len(parts) == 3 and parts[1].tag == TAG_BOOLEAN and parts[1].value != b"\x00"
+    return Extension(oid_string(parts[0]), critical, parts[-1].value, raw)
+
+
+def signature_digest(algorithm: str) -> str:
+    """The hash behind a ``sha*WithRSAEncryption`` OID; refuses anything else."""
+    digest = _SIGNATURE_DIGESTS.get(algorithm)
+    if digest is None:
+        raise DERError(f"unsupported signature algorithm {algorithm}")
+    return digest
+
+
+def verify_signed(der: bytes, key: RSAPublicKey) -> bool:
+    """Whether ``key`` signed the certificate or certificate request in ``der``.
+
+    Both are ``SEQUENCE { body, AlgorithmIdentifier, BIT STRING }`` and both
+    are signed over the body exactly as written, so one function serves both.
+    """
+    try:
+        body, algorithm, signature = raw_children(der)[:3]
+        digest = signature_digest(oid_string(parse(algorithm)[0].children()[0]))
+        bits = parse(signature)[0]
+    except (DERError, ValueError, IndexError):
+        return False
+    if bits.tag != TAG_BIT_STRING or bits.value[:1] != b"\x00":
+        return False
+    return key.verify(body, bits.value[1:], digest=digest)

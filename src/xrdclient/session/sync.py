@@ -200,7 +200,15 @@ class Session:
 
     @property
     def closed(self) -> bool:
-        return self._m.state in (m.State.CLOSED, m.State.FAILED)
+        """Whether this session can carry nothing more.
+
+        Its socket counts as well as its state: a session whose socket has
+        been finalized under it - the cycle collector does that to a
+        connection it frees at the same time as the object that was about to
+        pool it - reads as closed, so the pool discards it instead of handing
+        a dead descriptor to the next caller (``EBADF``).
+        """
+        return self._m.state in (m.State.CLOSED, m.State.FAILED) or self._t.closed
 
     @property
     def data_paths(self) -> list[int]:

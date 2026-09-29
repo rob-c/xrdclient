@@ -1,8 +1,11 @@
-"""GSI: bucket framing, Diffie-Hellman, and one whole simulated handshake.
+"""GSI: bucket framing, Diffie-Hellman, and whole simulated handshakes.
 
-The interesting test is :func:`test_a_server_can_complete_the_handshake` —
-it plays the far end, so the session key, the proof of possession and the
-chain are all checked the way ``XrdSecgsi`` would check them.
+The interesting tests play the far end — :func:`test_a_server_can_complete_the_handshake`
+for the unsigned exchange, :func:`test_a_signed_exchange_ends_in_a_delegated_proxy`
+for the signed one and delegation — so the session key, the proof of
+possession, the chain and the delegated proxy are all checked the way
+``XrdSecgsi`` would check them. The real server has the last word in
+``test_gsi_delegation_interop.py``.
 """
 
 import dataclasses
@@ -22,20 +25,29 @@ from xrdclient.auth.gsi import (
     BUCKET_ISSUER_HASH,
     BUCKET_MAIN,
     BUCKET_MD_ALG,
+    BUCKET_MESSAGE,
     BUCKET_NONE,
     BUCKET_PUK,
     BUCKET_RTAG,
     BUCKET_SIGNED_RTAG,
     BUCKET_VERSION,
     BUCKET_X509,
+    BUCKET_X509_REQ,
     CLIENT_OPTS_DEFAULT,
+    REFUSAL,
     STEP_CLIENT_CERT,
     STEP_CLIENT_CERTREQ,
+    STEP_CLIENT_SIGPXY,
     STEP_SERVER_CERT,
     STEP_SERVER_PXYREQ,
+    VERSION_SIGNED_DH,
     VERSION_UNSIGNED_DH,
     Bucket,
+    Delegation,
     GSICredential,
+    Session,
+    answer_certificate,
+    answer_proxy_request,
     build_cert_response,
     build_certreq,
     decode_message,
@@ -44,10 +56,12 @@ from xrdclient.auth.gsi import (
     find_bucket,
     parse_dh_parameters,
     parse_peer_blob,
+    seal,
     session_key,
+    unseal,
 )
 from xrdclient.config import Config
-from xrdclient.crypto import cbc_decrypt, load_proxy
+from xrdclient.crypto import cbc_decrypt, load_certificates, load_proxy
 from xrdclient.errors import CredentialError
 
 OFFER = Offer("gsi", "v:10400,c:ssl,ca:1a2b3c4d.0")
@@ -282,10 +296,10 @@ def test_a_server_without_a_proof_request_gets_no_signature(proxy, key):
     assert find_bucket(plain, BUCKET_X509) == proxy.pem()
 
 
-def test_signed_dh_is_refused_by_name(proxy, key):
+def test_signed_dh_needs_the_servers_certificate(proxy, key):
     """``kXRS_cipher`` instead of ``kXRS_puk`` means the signed path."""
     challenge = server_challenge(bucket=BUCKET_CIPHER)
-    with pytest.raises(CredentialError, match="signed-DH"):
+    with pytest.raises(CredentialError, match="sent no RSA certificate"):
         build_cert_response(challenge, proxy.pem(), key)
 
 
@@ -316,8 +330,8 @@ def test_the_identity_is_the_human_behind_the_proxy(proxy):
     assert repr(credential) == "GSICredential(identity='/DC=org/DC=example/CN=Jane Doe')"
 
 
-def test_delegation_is_refused_by_name(proxy):
-    with pytest.raises(CredentialError, match="delegation"):
+def test_a_proxy_request_before_the_key_exchange_is_a_protocol_error(proxy):
+    with pytest.raises(CredentialError, match="before the key exchange"):
         GSICredential(proxy).step(encode_message(STEP_SERVER_PXYREQ, []))
 
 
@@ -385,3 +399,310 @@ def test_available_passes_over_a_proxy_whose_key_is_not_rsa(monkeypatch, tmp_pat
     monkeypatch.setenv("X509_USER_PROXY", str(path))
     monkeypatch.setattr(gsi, "load_proxy", lambda _: dataclasses.replace(proxy, key=object()))
     assert GSICredential.available(OFFER, Config(), username="j", host="h") is None
+
+
+# -- signed Diffie-Hellman and delegation ------------------------------------
+
+
+SERVER_NAME = (("2.5.4.10", "example"), ("2.5.4.3", "srv.example.org"))
+CA_NAME = (("2.5.4.10", "example"), ("2.5.4.3", "Example CA"))
+
+
+@pytest.fixture(scope="module")
+def pki(tmp_path_factory):
+    """A CA directory, and a server certificate it issued: key 2, signed by key 1."""
+    from _pki import make_certificate_with, name
+
+    ca_key, server_key = throwaway_key(1), throwaway_key(2)
+    directory = tmp_path_factory.mktemp("certificates")
+    ca = make_certificate_with(name(*CA_NAME), name(*CA_NAME), ca_key.public, ca_key, ())
+    (directory / "0a1b2c3d.0").write_bytes(pem("CERTIFICATE", ca))
+    server = make_certificate_with(
+        name(*SERVER_NAME), name(*CA_NAME), server_key.public, ca_key, ()
+    )
+    return {"ca_path": str(directory), "server_pem": pem("CERTIFICATE", server), "key": server_key}
+
+
+@pytest.fixture
+def delegating_proxy(tmp_path, key):
+    path = tmp_path / "x509up_dlg"
+    path.write_bytes(proxy_chain(key, key_usage=True))
+    return load_proxy(str(path))
+
+
+def signed_challenge(pki, private=(1 << 250) | 99, *, tag=b"abcdEFGH", certificate=None):
+    """``kXGS_cert`` from a server at 10400 or later: its DH blob, signed."""
+    blob = encode_public_blob(dh_parameters_pem(), pow(DH_GENERATOR, private, DH_PRIME))
+    inner = encode_message(STEP_SERVER_CERT, [Bucket(BUCKET_RTAG, tag)])
+    return encode_message(
+        STEP_SERVER_CERT,
+        [
+            Bucket(BUCKET_CIPHER, pki["key"].encrypt_private(blob)),
+            Bucket(BUCKET_X509, pki["server_pem"] if certificate is None else certificate),
+            Bucket(BUCKET_CIPHER_ALG, b"aes-128-cbc:bf-cbc"),
+            Bucket(BUCKET_MD_ALG, b"sha256:sha1"),
+            Bucket(BUCKET_MAIN, inner),
+        ],
+    )
+
+
+def server_reads_certificate(response, private, proxy):
+    """What ``ServerDoCert`` does with a signed ``kXGC_cert``: the session key and main."""
+    step, buckets = decode_message(response)
+    by_type = {bucket.type: bucket.data for bucket in buckets}
+    assert step == STEP_CLIENT_CERT
+    assert by_type[BUCKET_PUK] == proxy.certificate.public_key.pem()
+    assert by_type[BUCKET_CIPHER_ALG] == b"aes-128-cbc#16"
+    client_blob = proxy.certificate.public_key.decrypt_public(by_type[BUCKET_CIPHER])
+    secret = session_key(parse_peer_blob(client_blob), private, padded=True)
+    return secret, unseal(secret, by_type[BUCKET_MAIN], use_iv=True)
+
+
+def proxy_request_message(secret, request_der, *, tag=b"ijklMNOP", use_iv=True):
+    from _pki import pem as to_pem
+
+    inner = [Bucket(BUCKET_RTAG, tag)]
+    if request_der is not None:
+        inner.append(Bucket(BUCKET_X509_REQ, to_pem("CERTIFICATE REQUEST", request_der)))
+    sealed = seal(secret, encode_message(STEP_SERVER_PXYREQ, inner), use_iv=use_iv)
+    return encode_message(STEP_SERVER_PXYREQ, [Bucket(BUCKET_MAIN, sealed)])
+
+
+def server_reads_sigpxy(response, secret, proxy, tag=b"ijklMNOP", *, use_iv=True):
+    step, _buckets = decode_message(response)
+    assert step == STEP_CLIENT_SIGPXY
+    plain = unseal(secret, find_bucket(response, BUCKET_MAIN), use_iv=use_iv)
+    assert proxy.certificate.public_key.verify(tag, find_bucket(plain, BUCKET_SIGNED_RTAG))
+    return plain
+
+
+def the_request(proxy, cn="4242", **kwargs):
+    from _pki import make_request, name
+
+    subject = name(*[(_OIDS[k], v) for k, v in proxy.subject.rdns], ("2.5.4.3", cn))
+    return make_request(subject, throwaway_key(2), extensions=(_PCI,), **kwargs)
+
+
+_OIDS = {"DC": "0.9.2342.19200300.100.1.25", "CN": "2.5.4.3"}
+
+
+def _pci():
+    from _pki import PROXY_CERT_INFO, PROXY_CERT_INFO_OID, extension
+
+    return extension(PROXY_CERT_INFO_OID, PROXY_CERT_INFO, critical=True)
+
+
+_PCI = _pci()
+
+
+def test_a_signed_exchange_ends_in_a_delegated_proxy(pki, delegating_proxy, key):
+    """Both rounds, played from the server's side, as ``XrdSecgsi`` checks them."""
+    offer = Offer("gsi", "v:10600,c:ssl,ca:0a1b2c3d.0")
+    credential = GSICredential(
+        delegating_proxy,
+        cryptomod=offer.options()["c"],
+        server_version=10600,
+        delegation=Delegation(True, "srv.example.org", pki["ca_path"]),
+    )
+    first = credential.initial()
+    assert struct.unpack(">I", find_bucket(first, BUCKET_VERSION))[0] == VERSION_SIGNED_DH
+    assert struct.unpack(">I", find_bucket(first, BUCKET_CLNT_OPTS))[0] == 0x85
+
+    private = (1 << 250) | 12345
+    secret, inner = server_reads_certificate(
+        credential.step(signed_challenge(pki, private)), private, delegating_proxy
+    )
+    assert find_bucket(inner, BUCKET_X509) == delegating_proxy.pem()
+    assert delegating_proxy.certificate.public_key.verify(
+        b"abcdEFGH", find_bucket(inner, BUCKET_SIGNED_RTAG)
+    )
+
+    answer = credential.step(proxy_request_message(secret, the_request(delegating_proxy)))
+    plain = server_reads_sigpxy(answer, secret, delegating_proxy)
+    (issued,) = load_certificates(find_bucket(plain, BUCKET_X509))
+    assert issued.issuer == delegating_proxy.subject
+    assert issued.subject.rdns == (*delegating_proxy.subject.rdns, ("CN", "4242"))
+    assert issued.public_key == throwaway_key(2).public
+    assert find_bucket(plain, BUCKET_MESSAGE) is None
+
+
+def test_an_untrusted_server_is_answered_but_not_given_a_proxy(pki, delegating_proxy, caplog):
+    """The stock client's answer: log in, and tell the server no in words."""
+    credential = GSICredential(
+        delegating_proxy,
+        server_version=10400,
+        delegation=Delegation(True, "impostor.example.org", pki["ca_path"]),
+    )
+    credential.initial()
+    private = (1 << 250) | 7
+    secret, _inner = server_reads_certificate(
+        credential.step(signed_challenge(pki, private)), private, delegating_proxy
+    )
+    assert "not for impostor.example.org" in caplog.text
+    plain = server_reads_sigpxy(
+        credential.step(proxy_request_message(secret, the_request(delegating_proxy))),
+        secret,
+        delegating_proxy,
+    )
+    assert find_bucket(plain, BUCKET_X509) is None
+    assert find_bucket(plain, BUCKET_MESSAGE) == REFUSAL.encode()
+
+
+def test_without_the_option_nothing_is_offered_and_nothing_signed(pki, delegating_proxy):
+    credential = GSICredential(delegating_proxy, server_version=10400)
+    first = credential.initial()
+    assert struct.unpack(">I", find_bucket(first, BUCKET_CLNT_OPTS))[0] == CLIENT_OPTS_DEFAULT
+    private = (1 << 250) | 7
+    secret, _ = server_reads_certificate(
+        credential.step(signed_challenge(pki, private)), private, delegating_proxy
+    )
+    reply = credential.step(proxy_request_message(secret, the_request(delegating_proxy)))
+    plain = server_reads_sigpxy(reply, secret, delegating_proxy)
+    assert find_bucket(plain, BUCKET_MESSAGE) == REFUSAL.encode()
+
+
+def test_an_old_server_gets_the_unsigned_exchange_and_no_offer(proxy, caplog):
+    credential = GSICredential(
+        proxy, server_version=10300, delegation=Delegation(True, "srv", None)
+    )
+    first = credential.initial()
+    assert struct.unpack(">I", find_bucket(first, BUCKET_VERSION))[0] == VERSION_UNSIGNED_DH
+    assert struct.unpack(">I", find_bucket(first, BUCKET_CLNT_OPTS))[0] == CLIENT_OPTS_DEFAULT
+    assert "predates the signed exchange" in caplog.text
+    assert decode_message(credential.step(server_challenge()))[0] == STEP_CLIENT_CERT
+
+
+@pytest.mark.parametrize(
+    ("offered", "version", "sent", "padded"),
+    [
+        ("sslnopad", 10400, b"sslnopad", False),
+        ("sslnopad", 10300, b"ssl", False),
+        ("ssl|gcrypt", 10400, b"ssl", True),
+        ("", 10400, b"ssl", True),
+        ("|x", 10400, b"ssl", True),
+    ],
+)
+def test_the_crypto_module_says_whether_the_dh_secret_is_padded(
+    proxy, offered, version, sent, padded
+):
+    credential = GSICredential(proxy, cryptomod=offered, server_version=version)
+    assert credential.padded is padded
+    assert find_bucket(credential.initial(), BUCKET_CRYPTOMOD) == sent
+
+
+def test_a_padded_secret_keeps_its_leading_zeros():
+    theirs = (1 << 200) | 5
+    peer = parse_peer_blob(
+        encode_public_blob(dh_parameters_pem(), pow(DH_GENERATOR, theirs, DH_PRIME))
+    )
+    mine = next(
+        candidate
+        for candidate in range(3, 100000)
+        if pow(peer.public, candidate, DH_PRIME).bit_length() <= DH_PRIME.bit_length() - 8
+    )
+    padded = session_key(peer, mine, padded=True)
+    assert padded[0] == 0
+    assert padded != session_key(peer, mine)
+    assert padded[1:] == session_key(peer, mine)[:15]
+
+
+def test_a_nopad_server_gets_an_unpadded_secret(pki, proxy):
+    private = (1 << 250) | 3
+    message, session = answer_certificate(
+        signed_challenge(pki, private), proxy.pem(), proxy.key, padded=False
+    )
+    client = parse_peer_blob(
+        proxy.certificate.public_key.decrypt_public(find_bucket(message, BUCKET_CIPHER))
+    )
+    assert session.key == session_key(client, private)
+    assert session.use_iv and session.server_pem == pki["server_pem"]
+
+
+def test_signed_dh_parameters_must_verify_under_the_servers_key(pki, proxy):
+    stranger = pem("CERTIFICATE", _self_signed(throwaway_key(0)))
+    with pytest.raises(CredentialError, match="not signed by its certificate"):
+        answer_certificate(signed_challenge(pki, certificate=stranger), proxy.pem(), proxy.key)
+    with pytest.raises(CredentialError, match="sent no RSA certificate"):
+        answer_certificate(signed_challenge(pki, certificate=b"junk"), proxy.pem(), proxy.key)
+
+
+def _self_signed(signer):
+    from _pki import make_certificate_with, name
+
+    subject = name(("2.5.4.3", "someone"))
+    return make_certificate_with(subject, subject, signer.public, signer, ())
+
+
+def test_proxy_requests_that_cannot_be_signed_get_a_reason(pki, proxy):
+    """A proxy with no keyUsage, a request missing or garbled: words, not a failed login."""
+    session = Session(b"k" * 16, True)
+    cases = [
+        (the_request(proxy), b"problems signing the request: the signing proxy has no keyUsage"),
+        (None, b"bucket with proxy request missing"),
+    ]
+    for request, reason in cases:
+        plain = server_reads_sigpxy(
+            answer_proxy_request(
+                proxy_request_message(session.key, request), session, proxy, proxy.key,
+                allowed=True,
+            ),
+            session.key,
+            proxy,
+        )
+        assert find_bucket(plain, BUCKET_MESSAGE).startswith(reason)
+
+
+def test_an_unsigned_session_seals_without_an_iv(delegating_proxy):
+    session = Session(b"k" * 16, False)
+    message = proxy_request_message(session.key, the_request(delegating_proxy), use_iv=False)
+    reply = answer_proxy_request(
+        message, session, delegating_proxy, delegating_proxy.key, allowed=True, iv=b"\x00" * 16
+    )
+    plain = server_reads_sigpxy(reply, session.key, delegating_proxy, use_iv=False)
+    assert load_certificates(find_bucket(plain, BUCKET_X509))
+
+
+def test_a_proxy_request_that_does_not_decrypt_or_has_no_body_is_refused(delegating_proxy):
+    session = Session(b"k" * 16, True)
+    with pytest.raises(CredentialError, match="no main buffer"):
+        answer_proxy_request(
+            encode_message(STEP_SERVER_PXYREQ, []), session, delegating_proxy,
+            delegating_proxy.key, allowed=True,
+        )
+    garbled = encode_message(STEP_SERVER_PXYREQ, [Bucket(BUCKET_MAIN, b"\x00" * 40)])
+    with pytest.raises(CredentialError, match="cannot decrypt"):
+        answer_proxy_request(garbled, session, delegating_proxy, delegating_proxy.key, allowed=True)
+
+
+def test_sealing_puts_the_iv_first():
+    key = b"q" * 16
+    sealed = seal(key, b"hello", use_iv=True, iv=b"\x07" * 16)
+    assert sealed[:16] == b"\x07" * 16
+    assert unseal(key, sealed, use_iv=True) == b"hello"
+    assert len(seal(key, b"hello", use_iv=True)) == 32
+    assert unseal(key, seal(key, b"hello", use_iv=False), use_iv=False) == b"hello"
+
+
+def test_available_carries_the_version_and_the_delegation_choice(monkeypatch, tmp_path, key):
+    path = tmp_path / "x509up_u1000"
+    path.write_bytes(proxy_chain(key))
+    monkeypatch.setenv("X509_USER_PROXY", str(path))
+    config = Config(gsi_delegate=True, ca_path="/certs")
+    credential = GSICredential.available(
+        Offer("gsi", "v:10600,c:ssl"), config, username="j", host="srv"
+    )
+    assert credential.server_version == 10600 and credential.signed
+    assert credential.delegation == Delegation(True, "srv", "/certs")
+    garbled = GSICredential.available(Offer("gsi", "v:new"), Config(), username="j", host="h")
+    assert garbled.server_version == 0 and not garbled.delegation.wanted
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"), [(None, False), ("0", False), ("1", True), ("2", True), ("x", False)]
+)
+def test_the_stock_environment_variable_turns_delegation_on(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("XrdSecGSIDELEGPROXY", raising=False)
+    else:
+        monkeypatch.setenv("XrdSecGSIDELEGPROXY", value)
+    assert Config().gsi_delegate is expected

@@ -520,3 +520,37 @@ def test_a_connection_that_broke_while_idle_is_skipped():
     assert pool.release(pooled(session), url, config)
     session.broken = True
     assert pool.acquire(url, config) is None
+
+
+def test_a_session_whose_socket_was_finalized_is_never_handed_out(server, config):
+    """The cycle collector can close a socket under a session it also pools.
+
+    Freeing a filesystem in a reference cycle runs ``Router.__del__``, which
+    pools the session, and finalizes the socket in the same pass. The next
+    caller must dial afresh rather than send on a closed descriptor (EBADF).
+    """
+    session = Session.connect(server.url, config=config)
+    assert SESSIONS.release(session, server.url, config)
+    session._t._sock.close()  # what the collector's finalizer does to it
+    assert session.closed
+    assert SESSIONS.acquire(server.url, config) is None
+
+
+def test_a_write_after_a_socket_died_in_the_pool_goes_on_a_fresh_one(server, config):
+    """The EBADF xgfalclient hit: a request that is not retried must not
+    be sent on a pooled connection whose socket is already closed."""
+    with xrdclient.FileSystem(server.url, config) as fs:
+        fs.stat("/")
+        sock = fs._router._session._t._sock
+    sock.close()  # pooled by the close above, then finalized under the pool
+    with xrdclient.FileSystem(server.url, config) as fs:
+        fs.mkdir("/made-after-ebadf")  # not idempotent: a dead socket would fail it
+    assert "/made-after-ebadf" in server.dirs
+
+
+def test_a_delegating_login_is_never_pooled_for_one_that_did_not_ask(config):
+    """``gsi_delegate`` changes what the server holds, so it changes the key."""
+    from dataclasses import replace
+
+    url = parse("root://h//")
+    assert _key(url, replace(config, gsi_delegate=True)) != _key(url, config)

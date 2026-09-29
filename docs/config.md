@@ -151,6 +151,7 @@ believes in. `pool_size = 0` turns pooling off entirely.
 | `require_tls` | `False` | |
 | `trusted_redirect_domains` | `()` (credentials stay with their origin) | `XRD_TRUSTEDREDIRECTDOMAINS` |
 | `ztn_cleartext` | `False` | `XRD_ZTNCLEARTEXT` |
+| `gsi_delegate` | `False` | `XrdSecGSIDELEGPROXY` (a positive number turns it on) |
 | `prompt` | `None` (ask only at a terminal) | `XRD_PROMPT` |
 | `prompter` | `None` (ask on the terminal) | |
 
@@ -159,6 +160,11 @@ See [Authentication](auth.md) for what each mechanism looks for.
 `ztn_cleartext` opts back into offering a bearer token on a connection that
 is not TLS, which the client otherwise refuses to do - a token sent in the
 clear is a token anyone on the path can replay. Prefer `roots://`.
+
+`gsi_delegate` delegates the X.509 proxy to a GSI server that asks for one -
+what a third-party copy needs from its destination. The server's certificate
+is checked against `ca_path` and the host name first; see
+[Delegation](auth.md#delegation).
 
 ## Behaviour
 

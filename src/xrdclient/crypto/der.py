@@ -6,9 +6,11 @@ of universal types the certificates and keys actually use are decoded here;
 anything else comes back as a raw :class:`Element` for the caller to look at
 or ignore.
 
-This exists so that GSI needs no third-party parser. It is a *reader*: it
-never writes DER, and it is deliberately strict, because a lenient parser of
-attacker-supplied structures is a liability.
+This exists so that GSI needs no third-party parser. The reader is
+deliberately strict, because a lenient parser of attacker-supplied structures
+is a liability. The small writer at the end (:func:`encode`, :func:`sequence`
+and friends) exists for one job: X.509 delegation, where the client signs a
+proxy certificate for the server and so has to produce DER, not only read it.
 """
 
 from __future__ import annotations
@@ -24,6 +26,13 @@ __all__ = [
     "parse_all",
     "read_integer",
     "oid_string",
+    "raw_children",
+    "encode",
+    "encode_integer",
+    "encode_oid",
+    "encode_time",
+    "sequence",
+    "TAG_BOOLEAN",
     "TAG_INTEGER",
     "TAG_BIT_STRING",
     "TAG_OCTET_STRING",
@@ -38,6 +47,7 @@ __all__ = [
     "TAG_GENERALIZED_TIME",
 ]
 
+TAG_BOOLEAN = 0x01
 TAG_INTEGER = 0x02
 TAG_BIT_STRING = 0x03
 TAG_OCTET_STRING = 0x04
@@ -149,3 +159,76 @@ def oid_string(element: Element) -> str:
         elif index == len(data) - 1:
             raise DERError("OBJECT IDENTIFIER ends mid-arc")
     return ".".join(parts)
+
+
+def raw_children(data: bytes) -> list[bytes]:
+    """The children of the one constructed element in ``data``, byte for byte.
+
+    :meth:`Element.children` decodes; this keeps each child exactly as it was
+    written, which is what a signature covers and what a copied extension or
+    name must reproduce.
+    """
+    outer, _ = parse(data)
+    if not outer.constructed:
+        raise DERError(f"tag 0x{outer.tag:02x} is primitive and has no children")
+    out: list[bytes] = []
+    pos = 0
+    while pos < len(outer.value):
+        _element, end = parse(outer.value, pos)
+        out.append(outer.value[pos:end])
+        pos = end
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The writer: definite, minimal lengths, which is all DER allows
+# ---------------------------------------------------------------------------
+
+
+def _encode_length(count: int) -> bytes:
+    if count < 0x80:
+        return bytes([count])
+    body = count.to_bytes((count.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(body)]) + body
+
+
+def encode(tag: int, value: bytes) -> bytes:
+    """One tag-length-value triple."""
+    return bytes([tag]) + _encode_length(len(value)) + value
+
+
+def sequence(*parts: bytes) -> bytes:
+    """A SEQUENCE of already-encoded elements."""
+    return encode(TAG_SEQUENCE, b"".join(parts))
+
+
+def encode_integer(value: int) -> bytes:
+    """An INTEGER in the fewest two's-complement bytes."""
+    width = (value.bit_length() + 8) // 8
+    return encode(TAG_INTEGER, value.to_bytes(width, "big", signed=True))
+
+
+def encode_oid(dotted: str) -> bytes:
+    """An OBJECT IDENTIFIER from its dotted form."""
+    arcs = [int(part) for part in dotted.split(".")]
+    if len(arcs) < 2:
+        raise DERError(f"OBJECT IDENTIFIER {dotted!r} needs at least two arcs")
+    body = bytearray()
+    for arc in [40 * arcs[0] + arcs[1], *arcs[2:]]:
+        chunk = [arc & 0x7F]
+        arc >>= 7
+        while arc:
+            chunk.append(0x80 | (arc & 0x7F))
+            arc >>= 7
+        body += bytes(reversed(chunk))
+    return encode(TAG_OID, bytes(body))
+
+
+def encode_time(when: float) -> bytes:
+    """A certificate time: UTCTime through 2049, GeneralizedTime after (RFC 5280)."""
+    import time
+
+    moment = time.gmtime(int(when))
+    if moment.tm_year < 2050:
+        return encode(TAG_UTC_TIME, time.strftime("%y%m%d%H%M%SZ", moment).encode("ascii"))
+    return encode(TAG_GENERALIZED_TIME, time.strftime("%Y%m%d%H%M%SZ", moment).encode("ascii"))

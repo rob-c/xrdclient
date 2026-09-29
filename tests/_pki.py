@@ -145,12 +145,15 @@ def proxy_chain(
     ),
     proxy_cn: str = "1234567890",
     not_after: float | None = None,
+    key_usage: bool = False,
 ) -> bytes:
     """A three-certificate proxy file: proxy, key, user certificate, CA.
 
     The proxy shares ``key`` with nothing else; the user and CA certificates
     carry their own so the chain is structurally what a real one is. Returns
-    the combined PEM that ``$X509_USER_PROXY`` points at.
+    the combined PEM that ``$X509_USER_PROXY`` points at. ``key_usage``
+    gives the proxy the ``keyUsage`` extension a proxy must carry to sign a
+    delegated one, as every proxy a grid tool writes does.
     """
     ca_key = _cached_key(1)
     user_key = _cached_key(2)
@@ -167,7 +170,10 @@ def proxy_chain(
         user_key,
         serial=3,
         not_after=not_after,
-        extensions=((PROXY_CERT_INFO_OID, PROXY_CERT_INFO),),
+        extensions=(
+            *((("2.5.29.15", bytes.fromhex("030205a0")),) if key_usage else ()),
+            (PROXY_CERT_INFO_OID, PROXY_CERT_INFO),
+        ),
     )
     return (
         pem("CERTIFICATE", proxy)
@@ -241,3 +247,65 @@ def throwaway_key(slot: int = 0) -> RSAPrivateKey:
 def timestamp(text: str) -> float:
     """``"20260731120000"`` as a UNIX timestamp, in UTC."""
     return float(calendar.timegm(time.strptime(text, "%Y%m%d%H%M%S")))
+
+
+#: ``pkcs-9-at-extensionRequest``, where a PKCS#10 request carries extensions.
+EXTENSION_REQUEST_OID = "1.2.840.113549.1.9.14"
+
+
+def extension(key: str, body: bytes, *, critical: bool = False) -> bytes:
+    """One DER ``Extension``, the criticality flag written only when set."""
+    flag = tlv(0x01, b"\xff") if critical else b""
+    return sequence(oid(key), flag, tlv(0x04, body))
+
+
+def make_request(
+    subject: bytes,
+    key: RSAPrivateKey,
+    *,
+    extensions: tuple[bytes, ...] = (),
+    signer: RSAPrivateKey | None = None,
+    attributes: bytes | None = None,
+) -> bytes:
+    """A PKCS#10 certificate request, as DER - what a GSI server delegating asks for.
+
+    ``extensions`` are encoded :func:`extension` values, carried in an
+    ``extensionRequest`` attribute; ``signer`` defaults to ``key`` itself and
+    exists so a test can make a request whose signature does not match.
+    """
+    if attributes is None:
+        requested = setof(sequence(*extensions))
+        attributes = sequence(oid(EXTENSION_REQUEST_OID), requested) if extensions else b""
+    info = sequence(integer(0), subject, public_key_info(key.public), tlv(0xA0, attributes))
+    algorithm = sequence(oid(SHA256_WITH_RSA_OID), tlv(0x05, b""))
+    return sequence(info, algorithm, bitstring((signer or key).sign(info, digest="sha256")))
+
+
+def make_certificate_with(
+    subject: bytes,
+    issuer: bytes,
+    subject_key: RSAPublicKey,
+    signer: RSAPrivateKey,
+    extensions: tuple[bytes, ...],
+    *,
+    serial: int = 1,
+    not_before: float | None = None,
+    not_after: float | None = None,
+) -> bytes:
+    """Like :func:`make_certificate`, with extensions given already encoded."""
+    now = time.time()
+    algorithm = sequence(oid(SHA256_WITH_RSA_OID), tlv(0x05, b""))
+    tbs = sequence(
+        tlv(0xA0, integer(2)),
+        integer(serial),
+        algorithm,
+        issuer,
+        sequence(
+            utctime(now - 3600 if not_before is None else not_before),
+            utctime(now + 43200 if not_after is None else not_after),
+        ),
+        subject,
+        public_key_info(subject_key),
+        *([tlv(0xA3, sequence(*extensions))] if extensions else []),
+    )
+    return sequence(tbs, algorithm, bitstring(signer.sign(tbs, digest="sha256")))

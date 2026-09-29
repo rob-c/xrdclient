@@ -22,12 +22,17 @@ from dataclasses import dataclass
 from .._compat import SLOTS
 from .der import (
     TAG_BIT_STRING,
+    TAG_NULL,
     TAG_OCTET_STRING,
     DERError,
     Element,
+    encode,
+    encode_integer,
+    encode_oid,
     oid_string,
     parse,
     read_integer,
+    sequence,
 )
 
 __all__ = [
@@ -111,6 +116,54 @@ class RSAPublicKey:
         expected = _pkcs1_v15_pad(message, self.size, digest)
         return recovered.to_bytes(self.size, "big") == expected
 
+    def recover(self, block: bytes) -> bytes:
+        """What the private key signed into ``block``: the inverse of :meth:`RSAPrivateKey.sign`.
+
+        OpenSSL's ``RSA_public_decrypt`` with PKCS#1 v1.5 padding - the
+        "decrypt with the public key" GSI uses to check the peer signed its
+        Diffie-Hellman parameters. Raises :class:`ValueError` if the block is
+        not a type-1 padded message under this key.
+        """
+        if len(block) != self.size:
+            raise ValueError(f"RSA block of {len(block)} bytes, key is {self.size}")
+        plain = pow(int.from_bytes(block, "big"), self.e, self.n).to_bytes(self.size, "big")
+        end = plain.find(b"\x00", 2)
+        if plain[:2] != b"\x00\x01" or end < 10 or plain[2:end].strip(b"\xff"):
+            raise ValueError("the RSA block is not PKCS#1 v1.5 signature padding")
+        return plain[end + 1 :]
+
+    def decrypt_public(self, data: bytes) -> bytes:
+        """:meth:`recover` over each key-sized block of ``data``, concatenated.
+
+        ``XrdCryptosslRSA::DecryptPublic``: a message longer than one block
+        was signed a block at a time, and comes back the same way.
+        """
+        if not data or len(data) % self.size:
+            raise ValueError(f"{len(data)} bytes is not a whole number of {self.size}-byte blocks")
+        return b"".join(
+            self.recover(data[at : at + self.size]) for at in range(0, len(data), self.size)
+        )
+
+    def der(self) -> bytes:
+        """The ``SubjectPublicKeyInfo`` DER - what a certificate or request carries."""
+        inner = sequence(encode_integer(self.n), encode_integer(self.e))
+        return sequence(
+            sequence(encode_oid(RSA_OID), encode(TAG_NULL, b"")),
+            encode(TAG_BIT_STRING, b"\x00" + inner),
+        )
+
+    def pem(self) -> bytes:
+        """``-----BEGIN PUBLIC KEY-----``, byte for byte as ``PEM_write_bio_PUBKEY`` writes it.
+
+        The GSI server compares the key a signed-DH client announces with the
+        one in its certificate *as text*, so the layout matters, not only the key.
+        """
+        import base64
+        import textwrap
+
+        body = "\n".join(textwrap.wrap(base64.b64encode(self.der()).decode("ascii"), 64))
+        return f"-----BEGIN PUBLIC KEY-----\n{body}\n-----END PUBLIC KEY-----\n".encode("ascii")
+
     def __repr__(self) -> str:
         return f"RSAPublicKey(bits={self.n.bit_length()}, e={self.e})"
 
@@ -162,6 +215,17 @@ class RSAPrivateKey:
         """
         block = _pkcs1_v15_pad(message, self.size, digest)
         return self._power(int.from_bytes(block, "big")).to_bytes(self.size, "big")
+
+    def encrypt_private(self, data: bytes) -> bytes:
+        """``XrdCryptosslRSA::EncryptPrivate``: :meth:`sign` a block at a time.
+
+        Each block holds at most ``size - 11`` bytes of ``data``, the most
+        PKCS#1 v1.5 padding leaves room for; the signatures are concatenated.
+        """
+        if not data:
+            raise ValueError("nothing to encrypt")
+        room = self.size - 11
+        return b"".join(self.sign(data[at : at + room]) for at in range(0, len(data), room))
 
     def _power(self, value: int) -> int:
         """``value ** d mod n``, by CRT when the primes are known."""

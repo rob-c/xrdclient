@@ -329,8 +329,13 @@ and from then on reads and writes travel there while requests keep the
 control link to themselves. The second connection inherits the session's
 identity rather than logging in again.
 
-Not yet: GSI's signed-DH path and X.509 delegation, both refused by name
-rather than mis-answered, and HTTP/2.
+GSI speaks the signed Diffie-Hellman exchange to servers that offer it and
+can delegate the X.509 proxy - `Config(gsi_delegate=True)` or
+`XrdSecGSIDELEGPROXY=1`, off by default as in the stock client - signing the
+server's proxy request only once its certificate checks out against the CA
+directory and the host name. See [Authentication](docs/auth.md).
+
+Not yet: HTTP/2.
 
 Full documentation is in [`docs/`](docs/) (`mkdocs serve` to read it), with
 [`SECURITY.md`](SECURITY.md) for the threat model,

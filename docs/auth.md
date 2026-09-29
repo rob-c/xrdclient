@@ -33,10 +33,53 @@ print(proxy.identity, proxy.remaining() / 3600, "hours left")
 The whole path is pure Python - DER, X.509, RSA, AES - so there is no
 `openssl` to have the wrong version of.
 
-!!! note "Not implemented"
-    GSI's signed Diffie-Hellman variant and X.509 delegation are refused by
-    name rather than mis-answered. Encryption-required endpoints that insist
-    on them will say so.
+Which Diffie-Hellman exchange is used is the server's call, as it is for the
+stock client: a server at GSI version 10400 or later (every current one) gets
+the *signed* exchange - each side signs its DH value with its private key, the
+server's is checked against the key in its certificate, and every encrypted
+buffer carries a fresh IV. Older servers get the original unsigned exchange.
+
+### Delegation
+
+A server that is to act for you - a third-party copy pulling from another
+site, a gateway staging to tape - needs a proxy of its own. Delegation gives it
+one without your private key leaving your machine: the server makes a key pair
+and sends a certificate request, and the client signs it into a proxy one
+link below yours.
+
+```python
+Config(gsi_delegate=True)          # or: export XrdSecGSIDELEGPROXY=1
+```
+
+It is off by default, as in the stock client, and the same environment
+variable turns it on. When it is on:
+
+- the client tells the server it will sign (`kOptsDlgPxy | kOptsSigReq`), so a
+  server configured with `-exppxy` asks, whatever its `-dlgpxy` says;
+- it signs nothing until the server's certificate chains to a CA in
+  `ca_path` (`$X509_CERT_DIR`, else `/etc/grid-security/certificates`) and
+  names the host dialled - by `CN`, `<service>/<host>` or `subjectAltName`.
+  A server that fails either is still logged into, and told "Not allowed to
+  sign proxy requests", exactly the stock client's answer;
+- delegation needs the signed exchange; a server older than GSI 10400 is
+  logged into without one, with a warning.
+
+The delegated proxy follows XrdCrypto's profile: subject `<your proxy>/CN=<serial>`,
+valid until your proxy expires and no longer, your proxy's extensions copied
+with a critical RFC 3820 `ProxyCertInfo` (`inheritAll`), `sha256WithRSAEncryption`.
+Two deliberate differences: the request's own signature is checked before
+anything is signed, and your proxy's key identifiers are not copied onto a
+certificate for a different key - so the proxy the server ends up with passes
+`openssl verify -allow_proxy_certs`, which one delegated by the stock client
+does not. A path-length constraint is carried down one step, and a proxy
+already at zero refuses rather than sign something no verifier accepts.
+
+`XrdSecGSIDELEGPROXY=2` - the stock client's "send my private key instead" -
+is treated as `1`: the key is never sent.
+
+`xrdcp` is the odd one out among the stock tools: it sets
+`XrdSecGSIDELEGPROXY` itself, on only for `--tpc delegate`, so an exported
+value has no effect on it. The Python bindings and this client both honour it.
 
 ## `ztn` - bearer tokens (WLCG, SciTokens, macaroons)
 

@@ -94,8 +94,7 @@ Third-party copy works in both dialects from one call: `xrdclient.third_party` s
 the `XrdOucTPC` rendezvous to a `root://` pair and the WLCG `COPY` dialect to
 an `http(s)`/`dav(s)` one, so the bytes move server to server either way.
 
-Not yet: GSI's signed-DH path and X.509 delegation, both refused by name
-rather than mis-answered, and HTTP/2.
+Not yet: HTTP/2.
 
 ## Licence
 

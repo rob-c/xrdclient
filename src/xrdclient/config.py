@@ -374,6 +374,15 @@ class Config:
     #: a token on the wire is a token for whoever reads the wire. Turn it on
     #: (or set ``$XRD_ZTNCLEARTEXT``) only on a network you trust end to end.
     ztn_cleartext: bool = field(default_factory=lambda: bool(_env_flag("XRD_ZTNCLEARTEXT")))
+    #: Delegate the X.509 proxy to a GSI server that asks for one: the server
+    #: sends a proxy request and the client signs it, so the server holds a
+    #: proxy of its own (for third-party copy) and the client's key stays put.
+    #: Off, as in the stock client; ``$XrdSecGSIDELEGPROXY`` set to a positive
+    #: number turns it on, as it does there. Only done once the server's
+    #: certificate chains to a CA in :attr:`ca_path` and names the host.
+    gsi_delegate: bool = field(
+        default_factory=lambda: _env_int("XrdSecGSIDELEGPROXY", 0) > 0
+    )
     #: Ask for missing credentials rather than failing. ``None`` - the default,
     #: overridable with ``$XRD_PROMPT`` - means "only if somebody is there",
     #: which is a terminal on both stdin and stderr. See :mod:`xrdclient.auth.prompt`.

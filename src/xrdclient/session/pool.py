@@ -56,6 +56,9 @@ _IDENTITY_FIELDS = (
     "verify_tls",
     "require_tls",
     "ztn_cleartext",
+    # A session that delegated a proxy at login is a different grant from
+    # one that did not; neither may stand in for the other.
+    "gsi_delegate",
 )
 
 #: Where and as whom: scheme, host, port, the URL's own user, and the digest.

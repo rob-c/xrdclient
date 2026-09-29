@@ -1,30 +1,40 @@
-"""``gsi`` — X.509 proxy authentication, in pure Python.
+"""``gsi`` — X.509 proxy authentication and delegation, in pure Python.
 
 The wire format is XrdSut's bucket buffer: the NUL-terminated name ``"gsi"``,
 a big-endian step code, then type-length-value buckets terminated by a zero
-type. The handshake this implements is the two-round unsigned-Diffie-Hellman
-path, which is what a stock client negotiates when it advertises a version
-below ``XrdSecgsiVersDHsigned``:
+type. The handshake is two rounds, three with delegation:
 
 1. **kXGC_certreq** — the client names its crypto module, its version, the CA
-   hash the server asked for, and a random tag, with a nested message holding
-   the tag the *server* must sign.
-2. **kXGS_cert** — the server answers with its Diffie-Hellman public blob and
-   a random tag of its own.
+   hash the server asked for, its options (whether it will delegate) and a
+   random tag, with a nested message holding the tag the *server* must sign.
+2. **kXGS_cert** — the server answers with its certificate, its
+   Diffie-Hellman public blob and a random tag of its own.
 3. **kXGC_cert** — the client agrees an AES-128 session key over that group,
    signs the server's tag with the proxy's private key (proof of possession),
    and returns its own public value plus the proxy chain, encrypted under the
    session key.
+4. **kXGS_pxyreq** / **kXGC_sigpxy** — only when the client offered to
+   delegate: the server sends a certificate request for a key pair it made,
+   and the client signs it into a proxy one link below its own
+   (:mod:`xrdclient.crypto.delegation`). The client's private key never leaves
+   the client.
+
+Which Diffie-Hellman the exchange uses is the server's version's to decide,
+as it is for the stock client. From ``XrdSecgsiVersDHsigned`` (10400) each
+side *signs* its DH blob with its private key - the server's is checked
+against the key in its certificate - the shared secret keeps its leading
+zeros, and every encrypted buffer starts with a fresh IV. Older servers get
+the original unsigned exchange. Delegation needs the signed one: a server
+refuses to take a proxy over an exchange it cannot attribute, and so does
+this client, which in addition checks the server's certificate against the
+CA directory and the host name (:mod:`xrdclient.crypto.trust`) before it signs
+anything for it.
 
 Everything it needs is here or in :mod:`xrdclient.crypto`: DH is
 ``pow(g, x, p)`` on Python integers, AES-CBC and RSA are
 :mod:`xrdclient.crypto.aes` and :mod:`xrdclient.crypto.rsa`, and the proxy is read by
 :mod:`xrdclient.crypto.x509`. There is no ``cryptography`` dependency and no
 extra to install.
-
-**Not implemented:** the signed-DH path (the server must offer ``kXRS_puk``,
-not ``kXRS_cipher``) and X.509 delegation (``kXGS_pxyreq``). Both are
-refused by name rather than silently mis-answered.
 
 Translated from go-hep ``xrootd/xrdproto/auth/gsi`` and ``XrdSecgsi``.
 """
@@ -39,10 +49,12 @@ from dataclasses import dataclass
 from .._compat import SLOTS
 from .._log import get_logger
 from ..config import Config
-from ..crypto.aes import cbc_encrypt
+from ..crypto.aes import cbc_decrypt, cbc_encrypt
+from ..crypto.delegation import DelegationError, load_proxy_request, sign_proxy_request
 from ..crypto.der import DERError, parse, read_integer
-from ..crypto.rsa import RSAPrivateKey, pem_blocks
-from ..crypto.x509 import ProxyCredential, default_proxy_path, load_proxy
+from ..crypto.rsa import RSAPrivateKey, RSAPublicKey, pem_blocks
+from ..crypto.trust import TrustError, verify_server
+from ..crypto.x509 import ProxyCredential, default_proxy_path, load_certificates, load_proxy
 from ..errors import CredentialError
 from .base import Credential, Offer
 from .prompt import Ask, humanise
@@ -55,15 +67,22 @@ __all__ = [
     "find_bucket",
     "build_certreq",
     "build_cert_response",
+    "answer_certificate",
+    "answer_proxy_request",
+    "Session",
+    "seal",
+    "unseal",
     "parse_dh_parameters",
     "parse_peer_blob",
     "encode_public_blob",
     "session_key",
     "PeerPublic",
+    "Delegation",
     "STEP_CLIENT_CERTREQ",
     "STEP_CLIENT_CERT",
     "STEP_SERVER_CERT",
     "STEP_SERVER_PXYREQ",
+    "STEP_CLIENT_SIGPXY",
     "BUCKET_CRYPTOMOD",
     "BUCKET_MAIN",
     "BUCKET_PUK",
@@ -73,6 +92,8 @@ __all__ = [
     "BUCKET_VERSION",
     "BUCKET_CLNT_OPTS",
     "BUCKET_X509",
+    "BUCKET_X509_REQ",
+    "BUCKET_MESSAGE",
     "BUCKET_ISSUER_HASH",
     "BUCKET_CIPHER_ALG",
     "BUCKET_MD_ALG",
@@ -97,6 +118,7 @@ BUCKET_CIPHER = 3005
 BUCKET_RTAG = 3006
 BUCKET_SIGNED_RTAG = 3007
 BUCKET_USER = 3008
+BUCKET_MESSAGE = 3011
 BUCKET_VERSION = 3014
 BUCKET_CLNT_OPTS = 3019
 BUCKET_X509 = 3022
@@ -105,11 +127,24 @@ BUCKET_X509_REQ = 3024
 BUCKET_CIPHER_ALG = 3025
 BUCKET_MD_ALG = 3026
 
-#: Advertised so the server chooses the unsigned-DH path. Anything at or above
-#: ``XrdSecgsiVersDHsigned`` (10400) selects signed DH, which is not written.
+#: Advertised to a server older than signed DH: the original exchange.
 VERSION_UNSIGNED_DH = 10300
-#: A stock client's default options, with proxy delegation off.
+#: ``XrdSecgsiVersDHsigned``: advertised to - and by - a server that signs its
+#: DH blob, which selects the signed exchange on both ends. The client claims
+#: no later version, so a newer server expects the random tag signed raw, as
+#: this client signs it.
+VERSION_SIGNED_DH = 10400
+#: A stock client's default options (``kOptsCreatePxy``), with delegation off.
 CLIENT_OPTS_DEFAULT = 0x80
+#: ``kOptsDlgPxy | kOptsSigReq``: "ask me for a delegated proxy, I will sign
+#: the request" - what ``XrdSecGSIDELEGPROXY=1`` adds.
+CLIENT_OPTS_DELEGATE = 0x01 | 0x04
+#: ``gNoPadTag``: a crypto module name ending in it cannot pad a DH secret.
+NOPAD = "nopad"
+#: ``EVP_MAX_IV_LENGTH``: the IV the signed exchange puts before each buffer.
+IV_LEN = 16
+#: What the stock client tells a server whose proxy request it will not sign.
+REFUSAL = "Not allowed to sign proxy requests"
 #: AES-128: the session key is the leading 16 bytes of the DH shared secret.
 SESSION_KEY_LEN = 16
 RTAG_LEN = 8
@@ -235,15 +270,20 @@ def encode_public_blob(params_pem: bytes, public: int) -> bytes:
     return params_pem + _BPUB + hexed + b"---EPUB---"
 
 
-def session_key(peer: PeerPublic, private: int, length: int = SESSION_KEY_LEN) -> bytes:
+def session_key(
+    peer: PeerPublic, private: int, length: int = SESSION_KEY_LEN, *, padded: bool = False
+) -> bytes:
     """The leading ``length`` bytes of the DH shared secret.
 
     XrdSecgsi's unsigned path takes the secret's *minimal* big-endian form —
     leading zeros stripped, as OpenSSL's ``DH_compute_key`` returns it — and
-    uses its first bytes directly, with no KDF.
+    uses its first bytes directly, with no KDF. The signed path, when both
+    ends can, keeps the secret at the full width of the prime
+    (``EVP_PKEY_CTX_set_dh_pad``), leading zeros and all.
     """
     secret = pow(peer.public, private, peer.p)
-    raw = secret.to_bytes((secret.bit_length() + 7) // 8, "big")
+    width = peer.p.bit_length() if padded else secret.bit_length()
+    raw = secret.to_bytes((width + 7) // 8, "big")
     if len(raw) < length:
         raise CredentialError(f"DH shared secret is {len(raw)} bytes, need {length}")
     return raw[:length]
@@ -276,6 +316,126 @@ def build_certreq(
     )
 
 
+@dataclass(frozen=True, **SLOTS)
+class Session:
+    """What the certificate round leaves for a delegation round after it."""
+
+    key: bytes
+    use_iv: bool
+    server_pem: bytes = b""
+
+
+def seal(key: bytes, plain: bytes, *, use_iv: bool, iv: bytes | None = None) -> bytes:
+    """AES-CBC under the session key; the signed exchange prefixes a fresh IV."""
+    if not use_iv:
+        return cbc_encrypt(key, plain)
+    vector = iv if iv is not None else os.urandom(IV_LEN)
+    return vector + cbc_encrypt(key, plain, vector)
+
+
+def unseal(key: bytes, data: bytes, *, use_iv: bool) -> bytes:
+    """The inverse of :func:`seal`."""
+    try:
+        if not use_iv:
+            return cbc_decrypt(key, data)
+        return cbc_decrypt(key, data[IV_LEN:], data[:IV_LEN])
+    except ValueError as exc:
+        raise CredentialError(f"cannot decrypt the server's GSI message: {exc}") from exc
+
+
+def _server_key(server_pem: bytes | None) -> RSAPublicKey:
+    certificates = load_certificates(server_pem or b"")
+    key = certificates[0].public_key if certificates else None
+    if key is None:
+        raise CredentialError("the server signed its DH parameters but sent no RSA certificate")
+    return key
+
+
+def _unsign(blob: bytes, server_pem: bytes | None) -> bytes:
+    """The server's DH blob, recovered with the key in its certificate."""
+    try:
+        return _server_key(server_pem).decrypt_public(blob)
+    except ValueError as exc:
+        raise CredentialError(
+            "the server's DH parameters are not signed by its certificate's key"
+        ) from exc
+
+
+def _peer_blob(challenge: bytes) -> tuple[bytes, bool]:
+    """The server's DH blob, and whether it came signed."""
+    signed = find_bucket(challenge, BUCKET_CIPHER)
+    if signed is not None:
+        return _unsign(signed, find_bucket(challenge, BUCKET_X509)), True
+    blob = find_bucket(challenge, BUCKET_PUK)
+    if blob is None:
+        raise CredentialError("the server's GSI challenge carries no DH public key")
+    return blob, False
+
+
+def _signed_tag(message: bytes | None, key: RSAPrivateKey) -> list[Bucket]:
+    """Proof of possession: raw PKCS#1 v1.5 over the tag the server sent, if it sent one."""
+    tag = find_bucket(message, BUCKET_RTAG) if message is not None else None
+    return [Bucket(BUCKET_SIGNED_RTAG, key.sign(tag))] if tag else []
+
+
+def _outer_cert(
+    peer: PeerPublic, public: int, key: RSAPrivateKey, signed: bool, main: bytes
+) -> list[Bucket]:
+    blob = encode_public_blob(peer.params_pem, public)
+    if signed:
+        agreement = [
+            Bucket(BUCKET_CIPHER, key.encrypt_private(blob)),
+            Bucket(BUCKET_PUK, key.public.pem()),
+            Bucket(BUCKET_CIPHER_ALG, b"aes-128-cbc#%d" % IV_LEN),
+        ]
+    else:
+        agreement = [Bucket(BUCKET_PUK, blob), Bucket(BUCKET_CIPHER_ALG, b"aes-128-cbc")]
+    return [
+        Bucket(BUCKET_CRYPTOMOD, b"ssl"),
+        *agreement,
+        Bucket(BUCKET_MD_ALG, b"sha256"),
+        Bucket(BUCKET_MAIN, main),
+    ]
+
+
+def answer_certificate(
+    challenge: bytes,
+    chain_pem: bytes,
+    key: RSAPrivateKey,
+    *,
+    private: int | None = None,
+    rtag: bytes | None = None,
+    iv: bytes | None = None,
+    padded: bool = True,
+) -> tuple[bytes, Session]:
+    """Answer ``kXGS_cert`` with ``kXGC_cert``, in whichever DH the server chose.
+
+    Returns the message and the :class:`Session` a delegation round needs.
+    ``private``, ``rtag`` and ``iv`` are injectable so the encoding can be
+    pinned by a test; leave them unset in production and they are drawn from
+    :func:`os.urandom`. ``padded=False`` is for a server whose crypto module
+    says ``nopad``.
+    """
+    blob, signed = _peer_blob(challenge)
+    peer = parse_peer_blob(blob)
+    if private is None:
+        # A private exponent in [2, p-2]; the group is the server's choice.
+        private = 2 + int.from_bytes(os.urandom((peer.p.bit_length() + 7) // 8), "big") % (
+            peer.p - 3
+        )
+    secret = session_key(peer, private, padded=signed and padded)
+
+    inner = [
+        Bucket(BUCKET_X509, chain_pem),
+        *_signed_tag(find_bucket(challenge, BUCKET_MAIN), key),
+        Bucket(BUCKET_RTAG, rtag if rtag is not None else os.urandom(RTAG_LEN)),
+    ]
+    main = seal(secret, encode_message(STEP_CLIENT_CERT, inner), use_iv=signed, iv=iv)
+    outer = _outer_cert(peer, pow(peer.g, private, peer.p), key, signed, main)
+    server_pem = find_bucket(challenge, BUCKET_X509) or b""
+    return encode_message(STEP_CLIENT_CERT, outer), Session(secret, signed, server_pem)
+
+
 def build_cert_response(
     challenge: bytes,
     chain_pem: bytes,
@@ -284,46 +444,50 @@ def build_cert_response(
     private: int | None = None,
     rtag: bytes | None = None,
 ) -> bytes:
-    """Answer ``kXGS_cert`` with ``kXGC_cert``.
+    """Answer ``kXGS_cert`` with ``kXGC_cert``: :func:`answer_certificate`'s message alone."""
+    return answer_certificate(challenge, chain_pem, key, private=private, rtag=rtag)[0]
 
-    ``private`` and ``rtag`` are injectable so the encoding can be pinned by
-    a test; leave them unset in production and they are drawn from
-    :func:`os.urandom`.
+
+def _delegated(plain: bytes, proxy: ProxyCredential, key: RSAPrivateKey) -> Bucket:
+    """The signed proxy for the server's request, or the reason there is none."""
+    request = find_bucket(plain, BUCKET_X509_REQ)
+    if request is None:
+        return Bucket(BUCKET_MESSAGE, b"bucket with proxy request missing")
+    try:
+        issued = sign_proxy_request(load_proxy_request(request), proxy.certificate, key)
+    except DelegationError as exc:
+        _log.warning("not delegating the X.509 proxy: %s", exc)
+        return Bucket(BUCKET_MESSAGE, f"problems signing the request: {exc}".encode())
+    _log.debug("delegated a proxy for %s until %s", issued.subject, issued.not_after)
+    return Bucket(BUCKET_X509, issued.pem())
+
+
+def answer_proxy_request(
+    challenge: bytes,
+    session: Session,
+    proxy: ProxyCredential,
+    key: RSAPrivateKey,
+    *,
+    allowed: bool,
+    iv: bytes | None = None,
+) -> bytes:
+    """Answer ``kXGS_pxyreq`` with ``kXGC_sigpxy``.
+
+    With ``allowed`` the request is signed into a proxy below ``proxy``;
+    without, the server is told so in words - the stock client's answer, which
+    lets the login finish with nothing delegated.
     """
-    blob = find_bucket(challenge, BUCKET_PUK)
-    if blob is None:
-        if find_bucket(challenge, BUCKET_CIPHER) is not None:
-            raise CredentialError(
-                "the server chose GSI signed-DH; this client implements unsigned-DH only"
-            )
-        raise CredentialError("the server's GSI challenge carries no DH public key")
-    peer = parse_peer_blob(blob)
-
-    if private is None:
-        # A private exponent in [2, p-2]; the group is the server's choice.
-        private = 2 + int.from_bytes(os.urandom((peer.p.bit_length() + 7) // 8), "big") % (
-            peer.p - 3
-        )
-    secret = session_key(peer, private)
-
-    inner = [Bucket(BUCKET_X509, chain_pem)]
     main = find_bucket(challenge, BUCKET_MAIN)
-    server_tag = find_bucket(main, BUCKET_RTAG) if main is not None else None
-    if server_tag:
-        # Proof of possession: raw PKCS#1 v1.5 over the server's tag.
-        inner.append(Bucket(BUCKET_SIGNED_RTAG, key.sign(server_tag)))
-    inner.append(Bucket(BUCKET_RTAG, rtag if rtag is not None else os.urandom(RTAG_LEN)))
-
-    encrypted = cbc_encrypt(secret, encode_message(STEP_CLIENT_CERT, inner))
+    if main is None:
+        raise CredentialError("the server's proxy request has no main buffer")
+    plain = unseal(session.key, main, use_iv=session.use_iv)
+    answer = _delegated(plain, proxy, key) if allowed else Bucket(BUCKET_MESSAGE, REFUSAL.encode())
+    inner = [answer, *_signed_tag(plain, key)]
+    sealed = seal(
+        session.key, encode_message(STEP_CLIENT_SIGPXY, inner), use_iv=session.use_iv, iv=iv
+    )
     return encode_message(
-        STEP_CLIENT_CERT,
-        [
-            Bucket(BUCKET_CRYPTOMOD, b"ssl"),
-            Bucket(BUCKET_PUK, encode_public_blob(peer.params_pem, pow(peer.g, private, peer.p))),
-            Bucket(BUCKET_CIPHER_ALG, b"aes-128-cbc"),
-            Bucket(BUCKET_MD_ALG, b"sha256"),
-            Bucket(BUCKET_MAIN, encrypted),
-        ],
+        STEP_CLIENT_SIGPXY, [Bucket(BUCKET_CRYPTOMOD, b"ssl"), Bucket(BUCKET_MAIN, sealed)]
     )
 
 
@@ -332,22 +496,70 @@ def build_cert_response(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, **SLOTS)
+class Delegation:
+    """Whether, and to whom, the proxy may be delegated."""
+
+    wanted: bool = False
+    host: str = ""
+    ca_path: str | None = None
+
+
+def _server_version(options: dict[str, str]) -> int:
+    """The ``v:`` of the offer; ``0`` - the oldest behaviour - when absent or garbled."""
+    try:
+        return int(options.get("v", "0"))
+    except ValueError:
+        return 0
+
+
 class GSICredential(Credential):
     """``gsi`` — an X.509 proxy from ``$X509_USER_PROXY``."""
 
-    __slots__ = ("proxy", "cryptomod", "issuer_hash", "_rtag")
+    __slots__ = (
+        "proxy",
+        "cryptomod",
+        "issuer_hash",
+        "server_version",
+        "padded",
+        "delegation",
+        "_rtag",
+        "_session",
+        "_may_delegate",
+    )
     name = "gsi"
 
-    def __init__(self, proxy: ProxyCredential, *, cryptomod: str = "ssl", issuer_hash: str = ""):
+    def __init__(
+        self,
+        proxy: ProxyCredential,
+        *,
+        cryptomod: str = "ssl",
+        issuer_hash: str = "",
+        server_version: int = 0,
+        delegation: Delegation | None = None,
+    ):
         self.proxy = proxy
-        self.cryptomod = cryptomod or "ssl"
+        # The first module the server lists; "nopad" on it says the server
+        # cannot pad a DH secret, which the signed exchange must then match.
+        module = (cryptomod or "ssl").split("|")[0] or "ssl"
+        self.padded = not module.endswith(NOPAD)
+        self.cryptomod = module[: -len(NOPAD)] if not self.padded else module
         self.issuer_hash = issuer_hash
+        self.server_version = server_version
+        self.delegation = delegation or Delegation()
         self._rtag = b""
+        self._session: Session | None = None
+        self._may_delegate = False
 
     @property
     def identity(self) -> str:
         """Who this proxy says you are, with the proxy CNs stripped."""
         return self.proxy.identity
+
+    @property
+    def signed(self) -> bool:
+        """Whether the server's version makes this the signed-DH exchange."""
+        return self.server_version >= VERSION_SIGNED_DH
 
     def initial(self) -> bytes:
         if self.proxy.expired:
@@ -356,24 +568,55 @@ class GSICredential(Credential):
                 f"{-self.proxy.remaining() / 3600:.1f} hours ago; renew it"
             )
         self._rtag = os.urandom(RTAG_LEN)
+        self._session, self._may_delegate = None, False
         return build_certreq(
-            cryptomod=self.cryptomod,
+            cryptomod=self.cryptomod + ("" if self.padded or not self.signed else NOPAD),
+            version=VERSION_SIGNED_DH if self.signed else VERSION_UNSIGNED_DH,
             issuer_hash=self.issuer_hash,
+            options=CLIENT_OPTS_DEFAULT | (CLIENT_OPTS_DELEGATE if self._offers() else 0),
             rtag=self._rtag,
         )
+
+    def _offers(self) -> bool:
+        """Whether to offer the server a delegated proxy."""
+        if self.delegation.wanted and not self.signed:
+            _log.warning(
+                "not delegating the X.509 proxy: the server runs GSI %d, "
+                "which predates the signed exchange delegation needs",
+                self.server_version,
+            )
+        return self.delegation.wanted and self.signed
+
+    def _key(self) -> RSAPrivateKey:
+        key = self.proxy.key
+        if not isinstance(key, RSAPrivateKey):
+            raise CredentialError("the proxy's private key is not RSA")
+        return key
 
     def step(self, challenge: bytes) -> bytes | None:
         step, _buckets = decode_message(challenge)
         if step == STEP_SERVER_CERT:
-            key = self.proxy.key
-            if not isinstance(key, RSAPrivateKey):
-                raise CredentialError("the proxy's private key is not RSA")
-            return build_cert_response(challenge, self.proxy.pem(), key)
+            message, self._session = answer_certificate(
+                challenge, self.proxy.pem(), self._key(), padded=self.padded
+            )
+            self._may_delegate = self._offers() and self._trusted(self._session)
+            return message
         if step == STEP_SERVER_PXYREQ:
-            raise CredentialError(
-                "the server asked for X.509 delegation, which this client does not do"
+            if self._session is None:
+                raise CredentialError("the server asked for a proxy before the key exchange")
+            return answer_proxy_request(
+                challenge, self._session, self.proxy, self._key(), allowed=self._may_delegate
             )
         raise CredentialError(f"unexpected GSI step {step} from the server")
+
+    def _trusted(self, session: Session) -> bool:
+        """Whether the server proved to be the host it was dialled as."""
+        try:
+            verify_server(session.server_pem, self.delegation.host, self.delegation.ca_path)
+        except TrustError as exc:
+            _log.warning("not delegating the X.509 proxy to %s: %s", self.delegation.host, exc)
+            return False
+        return True
 
     @classmethod
     def available(
@@ -393,7 +636,13 @@ class GSICredential(Credential):
             _log.debug("X.509 proxy %s expired", path)
             return None
         options = offer.options()
-        return cls(proxy, cryptomod=options.get("c", "ssl"), issuer_hash=options.get("ca", ""))
+        return cls(
+            proxy,
+            cryptomod=options.get("c", "ssl"),
+            issuer_hash=options.get("ca", ""),
+            server_version=_server_version(options),
+            delegation=Delegation(config.gsi_delegate, host, config.ca_path),
+        )
 
     @classmethod
     def missing(cls, offer: Offer, config: Config, *, username: str, host: str) -> Ask | None:
