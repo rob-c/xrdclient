@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import io
 import struct
+import time
 from dataclasses import replace
 
 import pytest
@@ -26,7 +27,7 @@ from xrdclient.client import file as file_module
 from xrdclient.client.file import File
 from xrdclient.config import Config
 from xrdclient.crypto.sigver import Signer
-from xrdclient.errors import ProtocolError, TransientError, XRootDError
+from xrdclient.errors import ProtocolError, TransientError, WaitLimitError, XRootDError
 from xrdclient.flags import OpenFlags
 from xrdclient.io import _write_window, open_url
 from xrdclient.io.raw import XRootDRawIO
@@ -530,3 +531,174 @@ def test_reading_a_whole_file_object_is_byte_exact(big, small):
     with open_url(f"{big.url}//data/p.bin", "rb", config=small) as fh:
         assert b"".join(iter(lambda: fh.read(777), b"")) == PAYLOAD
     assert isinstance(fh, io.BufferedReader)
+
+
+# ---------------------------------------------------------------------------
+# Answers that are not just bytes
+# ---------------------------------------------------------------------------
+
+
+def _deferred(handler, nth: int = 1):
+    """``handler``, except that its ``nth`` call is answered later, via kXR_asynresp.
+
+    A kXR_waitresp goes out first; the real answer follows wrapped in a
+    stream-0 kXR_attn, which is how a server keeps its promise.
+    """
+
+    def later(conn, sid, params, body):
+        yield S.frame(sid, c.kXR_waitresp, struct.pack(">i", 1))
+        for reply in handler(conn, sid, params, body):
+            yield S.frame(0, c.kXR_attn, struct.pack(">i", c.kXR_asynresp) + bytes(4) + reply)
+
+    return _nth(handler, nth, later)
+
+
+def test_a_deferred_read_is_answered_on_its_own_stream(big, small):
+    """The id of a read answered later is never lent to another before the answer is in."""
+    big.handlers[c.kXR_read] = _deferred(S._h_read)
+    with _reader(big, replace(small, readahead=0)) as handle:
+        assert handle.read(100, 0) == PAYLOAD[:100]
+        assert handle.read(100, 5000) == PAYLOAD[5000:5100]
+        assert handle.read(100, 9000) == PAYLOAD[9000:9100]
+        assert not handle.session.broken
+
+
+def test_a_deferred_read_in_a_window_is_answered_in_its_place(big, small):
+    big.handlers[c.kXR_read] = _deferred(S._h_read, nth=2)
+    with _reader(big, small) as handle:
+        assert handle.read(len(PAYLOAD), 0) == PAYLOAD
+        assert handle.read(100, 20000) == PAYLOAD[20000:20100]
+
+
+def test_a_deferred_write_is_acknowledged_on_its_own_stream(server, small):
+    """A write acked late must not be the answer a later read takes for end of file."""
+    server.handlers[c.kXR_write] = _deferred(S._h_write)
+    with _writer(server, small) as handle:
+        assert handle.write(PAYLOAD[:100], 0) == 100
+        assert handle.read(100, 0) == PAYLOAD[:100]
+        assert handle.write(PAYLOAD, 0) == len(PAYLOAD)
+        assert handle.read(100, 4000) == PAYLOAD[4000:4100]
+    assert server.contents("/data/w.bin") == PAYLOAD
+
+
+def test_a_deferred_reply_still_owed_is_drained_before_the_wire_is_reused(big, small):
+    """A refusal ends the read; the promised answer is taken off the wire first."""
+
+    def refuse(conn, sid, params, body):
+        yield S.error(sid, 3011, "no such range")
+
+    calls = {"n": 0}
+
+    def handler(conn, sid, params, body):
+        calls["n"] += 1
+        answer = {1: _deferred(S._h_read), 2: refuse}.get(calls["n"], S._h_read)
+        yield from answer(conn, sid, params, body)
+
+    big.handlers[c.kXR_read] = handler
+    with _reader(big, replace(small, readahead=0)) as handle:
+        view = memoryview(bytearray(2 * 4096))
+        with pytest.raises(XRootDError, match="no such range"):
+            with handle.session.bulk(handle.handle, chunk=4096, depth=2) as reader:
+                reader.into(view, 0)
+        assert not handle.session.broken
+        assert handle.read(100, 300) == PAYLOAD[300:400]
+
+
+def test_a_deferred_reply_waits_no_longer_than_the_stall_clock_allows(big, small):
+    big.handlers[c.kXR_read] = _deferred(S._h_read)
+    with _reader(big, replace(small, readahead=0, stall_deadline=0)) as handle:
+        assert handle.read(100, 0) == PAYLOAD[:100]
+
+
+def test_a_request_given_up_on_leaves_the_connection_usable(big, small):
+    """kXR_wait past the retry limit frees its id; the plane is not refused after."""
+    with _reader(big, replace(small, redirect_limit=2, readahead=0)) as handle:
+        big.waits[c.kXR_stat] = 10
+        with pytest.raises(WaitLimitError):
+            handle.stat(refresh=True)
+        big.waits[c.kXR_stat] = 0
+        assert handle.session.machine.idle()
+        assert handle.read(100, 0) == PAYLOAD[:100]
+        assert handle.read(100, 100) == PAYLOAD[100:200]
+        assert big.seen.count(c.kXR_read) == 2
+
+
+def test_a_deferred_answer_given_up_on_is_dropped_when_it_comes(big, small):
+    """Over the wait budget, the id stays held and the plane steps aside until it lands."""
+
+    def later(conn, sid, params, body):
+        yield S.frame(sid, c.kXR_waitresp, struct.pack(">i", 5))
+        # A deferred answer comes later, not in the same breath: the client
+        # gives up at once (5 s is over its 1 s budget), so this pause is
+        # what lets the test see the id still held before the answer lands.
+        time.sleep(0.5)
+        for reply in S._h_stat(conn, sid, params, body):
+            yield S.frame(0, c.kXR_attn, struct.pack(">i", c.kXR_asynresp) + bytes(4) + reply)
+
+    with _reader(big, replace(small, wait_budget=1, readahead=0, recover_handles=False)) as handle:
+        big.handlers[c.kXR_stat] = _nth(S._h_stat, 1, later)
+        with pytest.raises(WaitLimitError, match="budget"):
+            handle.stat(refresh=True)
+        assert not handle.session.machine.idle()
+        # The late answer is on its way; a read meanwhile is carried by the
+        # event path, which drops it, and the plane is lent again after.
+        assert handle.read(100, 0) == PAYLOAD[:100]
+        assert handle.session.machine.idle()
+        assert handle.read(100, 200) == PAYLOAD[200:300]
+        assert not handle.session.broken
+
+
+def _notice(text: bytes = b"server says hello\x00") -> bytes:
+    return S.frame(0, c.kXR_attn, struct.pack(">i", c.kXR_asyncms) + text)
+
+
+@pytest.mark.parametrize("text", [b"server says hello\x00", b"hi"])
+def test_a_server_notice_in_the_middle_of_a_read_is_kept_not_fatal(big, small, text):
+    def noisy(conn, sid, params, body):
+        yield _notice(text)
+        yield from S._h_read(conn, sid, params, body)
+
+    big.handlers[c.kXR_read] = _nth(S._h_read, 1, noisy)
+    with _reader(big, replace(small, readahead=0)) as handle:
+        assert handle.read(len(PAYLOAD), 0) == PAYLOAD
+        assert not handle.session.broken
+        assert [n.action for n in handle.session.notices()] == [c.kXR_asyncms]
+
+
+def test_a_server_notice_while_draining_is_kept_not_fatal(server, small):
+    def refuse(conn, sid, params, body):
+        yield S.error(sid, 3007, "disk on fire")
+        yield _notice()
+
+    server.handlers[c.kXR_write] = _nth(S._h_write, 1, refuse)
+    with _writer(server, small) as handle:
+        with pytest.raises(XRootDError, match="disk on fire"):
+            handle.write(PAYLOAD, 0)
+        assert not handle.session.broken
+        assert len(handle.session.notices()) == 1
+
+
+def _stray(conn, sid, params, body):
+    yield S.frame(sid ^ 0x100, c.kXR_ok, b"x")
+
+
+def test_a_read_that_loses_step_is_read_again_on_a_fresh_connection(big, small):
+    big.handlers[c.kXR_read] = _nth(S._h_read, 1, _stray)
+    with _reader(big, replace(small, readahead=0, recover_handles=True)) as handle:
+        assert handle.read(100, 0) == PAYLOAD[:100]
+        assert handle.recoveries == 1
+
+
+def test_a_read_that_loses_step_fails_where_it_cannot_recover(big, small):
+    big.handlers[c.kXR_read] = _nth(S._h_read, 1, _stray)
+    with _reader(big, replace(small, readahead=0, recover_handles=False)) as handle:
+        with pytest.raises(ProtocolError, match="not one of"):
+            handle.read(100, 0)
+
+
+def test_a_protocol_error_on_a_sound_connection_is_not_recovered(big, small):
+    with _reader(big, replace(small, recover_handles=True)) as handle:
+        with handle.session.bulk(handle.handle, chunk=4096, depth=1):
+            with pytest.raises(ProtocolError, match="already lent"):
+                handle.readv([(0, 4)])
+        assert handle.recoveries == 0

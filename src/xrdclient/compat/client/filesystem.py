@@ -14,12 +14,12 @@ from collections.abc import Callable, Iterable, Sequence
 from typing import Any, Optional, TypeVar
 
 from ...client.filesystem import FileSystem as NativeFileSystem
-from ...copy.engine import copy as _copy_file
 from ...errors import ServerError
 from ...proto import requests as r
 from . import _args, _convert, env
 from ._dispatch import call, no_answer, now
 from ._status import OK, UnsupportedURLError, errErrorResponse, errInvalidArgs, failure, status
+from .copyprocess import CopyProcess
 from .flags import AccessMode, DirListFlags, MkDirFlags
 from .responses import DirectoryList, HostList, XRootDStatus
 from .url import URL
@@ -298,10 +298,14 @@ class FileSystem:
     # -- whole files ---------------------------------------------------------
 
     def copy(self, source: str, target: str, force: bool = False) -> tuple[XRootDStatus, None]:
-        """Copy ``source`` to ``target``, both full URLs; ``force`` overwrites."""
-        return call(  # type: ignore[no-any-return]
-            lambda: _copy_file(source, target, overwrite=force, verify=False, config=env.config())
-        )
+        """Copy ``source`` to ``target``, both full URLs; ``force`` overwrites.
+
+        One :class:`CopyProcess` job, as the bindings run it, so the two
+        report a failure alike.
+        """
+        process = CopyProcess()
+        process.add_job(source, target, force=force)
+        return process.run()[0], None
 
     def cat(self, path: str) -> XRootDStatus:
         """Write ``path``'s contents to standard output; returns the status alone."""

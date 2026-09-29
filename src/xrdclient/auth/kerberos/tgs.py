@@ -26,7 +26,7 @@ from collections.abc import Callable, Sequence
 
 from ..._log import get_logger
 from ...crypto.der import DERError
-from ...crypto.rfc3961 import IntegrityError, UnsupportedEnctypeError, get_enctype
+from ...crypto.rfc3961 import Enctype, IntegrityError, UnsupportedEnctypeError, get_enctype
 from ...errors import CredentialError
 from .asn1 import (
     APP_KRB_ERROR,
@@ -107,6 +107,20 @@ def _split_time(now: float) -> tuple[int, int]:
     return int(seconds), int(micro)
 
 
+def _session(ticket: Ticket, what: str) -> Enctype:
+    """The enctype of ``ticket``'s session key, if this client can use that key at all."""
+    try:
+        enctype = get_enctype(ticket.enctype)
+    except UnsupportedEnctypeError as exc:
+        raise CredentialError(f"{what} cannot be used: {exc}") from exc
+    if len(ticket.key) != enctype.key_size:
+        raise CredentialError(
+            f"{what} cannot be used: its {enctype.name} session key is "
+            f"{len(ticket.key)} bytes, not {enctype.key_size}"
+        )
+    return enctype
+
+
 def request_ticket(
     tgt: Ticket,
     server: Principal,
@@ -131,16 +145,13 @@ def request_ticket(
             f"{server} is in realm {server.realm} but your ticket-granting ticket is for "
             f"{realm}; cross-realm authentication is not supported by this client"
         )
-    try:
-        session = get_enctype(tgt.enctype)
-    except UnsupportedEnctypeError as exc:
-        raise CredentialError(f"your ticket-granting ticket cannot be used: {exc}") from exc
+    session = _session(tgt, "your ticket-granting ticket")
     # 31 bits, as MIT draws it: some KDCs have read the UInt32 as signed.
     nonce = secrets.randbits(31) if nonce is None else nonce
     body = encode_req_body(
         options=options, realm=realm, server=server, till=tgt.end_time, nonce=nonce, etypes=etypes
     )
-    ctime, cusec = _split_time(clock())
+    ctime, cusec = _split_time(clock() + tgt.kdc_offset)
     checksum = (session.checksum_type, session.checksum(tgt.key, USAGE_TGS_REQ_CKSUM, body))
     authenticator = encode_authenticator(tgt.client, ctime, cusec, checksum=checksum)
     sealed = EncryptedData(tgt.enctype, session.encrypt(tgt.key, USAGE_TGS_REQ_AUTH, authenticator))
@@ -174,7 +185,9 @@ def _open_reply(reply: bytes, tgt: Ticket, server: Principal, nonce: int) -> Tic
         raise IntegrityError(f"asked for {server}, got a ticket for {part.server}")
     if not rep.client.same_name(tgt.client):
         raise IntegrityError(f"the ticket is for {rep.client}, not {tgt.client}")
-    get_enctype(part.key.enctype)  # a session key this client cannot use is no use
+    # A session key this client cannot use is no use.
+    if len(part.key.value) != get_enctype(part.key.enctype).key_size:
+        raise IntegrityError(f"the session key for {server} is {len(part.key.value)} bytes")
     return Ticket(
         client=tgt.client,
         server=part.server,
@@ -186,6 +199,7 @@ def _open_reply(reply: bytes, tgt: Ticket, server: Principal, nonce: int) -> Tic
         flags=part.flags,
         der=rep.ticket,
         key=part.key.value,
+        kdc_offset=tgt.kdc_offset,
     )
 
 
@@ -196,8 +210,8 @@ def build_ap_req(
     clock: Callable[[], float] = time.time,
 ) -> bytes:
     """The AP-REQ XRootD's ``krb5`` plugin expects, for ``ticket``'s service."""
-    enctype = get_enctype(ticket.enctype)
-    ctime, cusec = _split_time(clock())
+    enctype = _session(ticket, f"the ticket for {ticket.server}")
+    ctime, cusec = _split_time(clock() + ticket.kdc_offset)
     authenticator = encode_authenticator(ticket.client, ctime, cusec)
     sealed = EncryptedData(
         ticket.enctype, enctype.encrypt(ticket.key, USAGE_AP_REQ_AUTH, authenticator)
@@ -213,8 +227,8 @@ def build_krb_cred(
     ``session`` is the service ticket the AP-REQ just used: the server's
     ``krb5_rd_cred`` opens the message with that ticket's session key.
     """
-    enctype = get_enctype(session.enctype)
-    ctime, cusec = _split_time(clock())
+    enctype = _session(session, f"the ticket for {session.server}")
+    ctime, cusec = _split_time(clock() + session.kdc_offset)
     part = encode_enc_krb_cred_part([encode_cred_info(forwarded)], ctime, cusec)
     sealed = EncryptedData(session.enctype, enctype.encrypt(session.key, USAGE_KRB_CRED, part))
     return encode_krb_cred([forwarded.der], sealed)

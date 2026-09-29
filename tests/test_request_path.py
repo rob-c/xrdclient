@@ -76,6 +76,49 @@ def test_a_subclass_with_its_own_params_is_not_given_its_parents_layout():
     assert encode(Tagged("/a"), 9)[4:20] == b"T" * 16
 
 
+def test_a_mixin_params_ahead_of_the_parent_is_not_given_its_layout():
+    """The MRO decides whose ``params`` a class has, not the class's own dict."""
+
+    class Mixin:
+        def params(self, w: Writer) -> None:
+            w.zeros(15).u8(7)
+
+    class Mixed(Mixin, r.Read):
+        __slots__ = ()
+
+    request = Mixed(b"abcd", 0, 1)
+    assert bytes(request.header_params()) == _written(request) == bytes(15) + b"\x07"
+    assert encode(request, 9)[4:20] == bytes(15) + b"\x07"
+
+
+def test_a_mixin_without_params_keeps_the_layout():
+    class Mixin:
+        pass
+
+    class Mixed(Mixin, r.Read):
+        __slots__ = ()
+
+    assert Mixed.header_params is r.Read.header_params
+
+
+@pytest.mark.parametrize("fhandle", [memoryview(b"abcd"), bytearray(b"abcd"), "abcd"])
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda h: r.Stat("", 0, h),
+        lambda h: r.Close(h),
+        lambda h: r.Read(h, 5, 6),
+        lambda h: r.PgRead(h, 5, 6),
+        lambda h: r.Write(h, 5, b"d"),
+    ],
+)
+def test_a_handle_the_writer_took_is_packed_the_same(build, fhandle):
+    """``Writer.padded`` took any bytes-like or text handle; so must ``4s``."""
+    request = build(fhandle)
+    assert bytes(request.header_params()) == _written(request)
+    assert len(encode(request, 1)) >= 24
+
+
 def test_a_subclass_that_only_inherits_keeps_the_layout():
     class Quiet(r.Stat):
         __slots__ = ()
@@ -207,7 +250,8 @@ def test_a_config_whose_id_was_reused_is_not_mistaken_for_the_old_one(monkeypatc
     config = Config(username="alice")
     url = parse("root://h.example//a")
     stranger = Config(username="mallory")
-    monkeypatch.setitem(pool._DIGESTS, (id(config), ""), (stranger, "not-alice"))
+    remembered = pool._Known(stranger, pool._context(config), (), (), "not-alice")
+    monkeypatch.setitem(pool._DIGESTS, (id(config), ""), remembered)
     assert pool._identity(url, config) != "not-alice"
 
 

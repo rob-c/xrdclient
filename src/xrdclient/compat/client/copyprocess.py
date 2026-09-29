@@ -12,7 +12,14 @@ What the keywords do here:
 - ``force``, ``posc``, ``mkdir``, ``cont``, ``retry``, ``rtrplc``,
   ``thirdparty`` (``"none"``, ``"first"``, ``"only"``), ``checksummode``,
   ``checksumtype``, ``checksumpreset``, ``rmBadCksum``, ``chunksize``,
-  ``parallelchunks`` and ``tpctimeout`` do what they do in XrdCl.
+  ``parallelchunks`` and ``tpctimeout`` do what they do in XrdCl
+  (``XrdClCopyProcess.cc``, ``XrdClClassicCopyJob.cc``). In particular a
+  retry under the ``"force"`` policy overwrites what the failed attempt left,
+  and one under ``"continue"`` carries on from it; ``checksummode`` takes the
+  source's checksum for ``"end2end"`` and ``"source"`` (or the preset, for any
+  mode), the target's for ``"end2end"`` and ``"target"``, and compares them
+  only when it has both - so any other mode, ``"end"`` included, checks
+  nothing; and ``target`` names the file itself, a trailing ``/`` or all.
 - ``sourcelimit``, ``coerce``, ``dynamicsource``, ``inittimeout``,
   ``cptimeout``, ``xrate`` and ``xrateThreshold`` are accepted and have no
   effect: this client reads from one source, applies no rate limit, and bounds
@@ -22,6 +29,7 @@ What the keywords do here:
 from __future__ import annotations
 
 import dataclasses
+import errno
 import os
 import posixpath
 from concurrent.futures import ThreadPoolExecutor
@@ -29,6 +37,7 @@ from typing import Any
 
 from ... import errors
 from ...client.filesystem import FileSystem
+from ...copy.engine import _digest_of
 from ...copy.engine import copy as _copy_file
 from ...copy.tpc import third_party as _third_party
 from ...url import parse
@@ -37,9 +46,11 @@ from ._status import (
     OK,
     errCheckSumError,
     errInvalidArgs,
+    errLocalError,
     errOperationInterrupted,
     failure,
     from_exception,
+    status,
 )
 from .responses import XRootDStatus
 from .url import URL
@@ -110,7 +121,7 @@ class CopyProcess:
         cont: bool = False,
         rtrplc: str | None = None,
     ) -> None:
-        """Queue a copy of ``source`` to ``target`` (a file, or a directory ending ``/``)."""
+        """Queue a copy of ``source`` to the file ``target``."""
         del sourcelimit, coerce, dynamicsource, inittimeout, cptimeout, xrateThreshold, xrate
         self.__jobs.append(
             _Job(
@@ -173,44 +184,110 @@ def _run(item: tuple[int, _Job], total: int, handler: Any) -> dict[str, Any]:
         # local path, say - which XrdCl reports as a status like any other.
         results = {"status": failure(errInvalidArgs, str(exc))}
     except Exception as exc:
-        results = {"status": from_exception(exc)}
+        results = {"status": _job_failure(exc)}
     _tell(handler, "end", job_id, results)
     return results
 
 
+def _job_failure(exc: Exception) -> XRootDStatus:
+    """``exc`` as XrdCl reports it: a local file's error is ``errLocalError``.
+
+    XrdCl opens a local end through its own file handler, which answers with
+    code 402 and the errno translated to the protocol's number
+    (``XProtocol::mapError``): an existing target is ``kXR_ItExists``.
+    """
+    if not isinstance(exc, OSError) or isinstance(exc, errors.XRootDError):
+        return from_exception(exc)
+    eno = exc.errno or 0
+    detail = (exc.strerror or str(exc)).lower()
+    return status(errLocalError, errno=_LOCAL_ERRNOS.get(eno, eno), message=detail)
+
+
+#: ``XProtocol::mapError`` for the errors a local copy end meets.
+_LOCAL_ERRNOS = {
+    errno.ENOENT: errors.kXR_NotFound,
+    errno.EPERM: errors.kXR_NotAuthorized,
+    errno.EACCES: errors.kXR_NotAuthorized,
+    errno.EIO: errors.kXR_IOError,
+    errno.ENOSPC: errors.kXR_NoSpace,
+    errno.ENAMETOOLONG: errors.kXR_ArgTooLong,
+    errno.EISDIR: errors.kXR_isDirectory,
+    errno.EEXIST: errors.kXR_ItExists,
+    errno.EROFS: errors.kXR_fsReadOnly,
+    errno.EDQUOT: errors.kXR_overQuota,
+}
+
+
 def _attempts(job: _Job, job_id: int, handler: Any) -> dict[str, Any]:
-    """Copy, retrying a transient failure ``job.retry`` times."""
-    resume = job.cont
+    """Copy, retrying a transient failure ``job.retry`` times.
+
+    As in XrdCl, a retry under the ``"continue"`` policy resumes what the
+    failed attempt left at the target, and under any other - ``"force"`` is
+    the default - overwrites it.
+    """
     for attempt in range(job.retry + 1):
         try:
-            return _once(job, job_id, handler, resume=resume)
+            return _once(job, job_id, handler)
         except errors.TransientError:
             if attempt == job.retry:
                 raise
             resume = job.rtrplc == "continue"
+            job = dataclasses.replace(job, force=not resume, cont=resume)
     raise AssertionError("unreachable")  # pragma: no cover
 
 
-def _once(job: _Job, job_id: int, handler: Any, *, resume: bool) -> dict[str, Any]:
+def _once(job: _Job, job_id: int, handler: Any) -> dict[str, Any]:
     target = _destination(job)
-    if job.mkdir:
-        _make_parent(target)
+    _make_parent(target, remote=job.mkdir)
     try:
-        result = _transfer(job, job_id, target, handler, resume=resume)
+        result = _transfer(job, job_id, target, handler)
     except errors.ChecksumMismatchError as exc:
         if job.rmBadCksum:
             _remove(target)
         return {"status": from_exception(exc)}
     outcome: dict[str, Any] = {"size": result.size, "status": OK}
-    if result.checksum is not None:
-        found = f"{result.checksum.algorithm}:{result.checksum.value}"
-        outcome.update(sourceCheckSum=found, targetCheckSum=found)
-        if job.checksumpreset and job.checksumpreset.lower() != result.checksum.value.lower():
-            outcome["status"] = failure(errCheckSumError, f"expected {job.checksumpreset}")
+    try:
+        _verify(job, target, outcome)
+    except (errors.XRootDError, OSError) as exc:
+        outcome["status"] = _job_failure(exc)
     return outcome
 
 
-def _transfer(job: _Job, job_id: int, target: str, handler: Any, *, resume: bool) -> Any:
+def _verify(job: _Job, target: str, outcome: dict[str, Any]) -> None:
+    """The checksums ``checksummode`` asks for, compared if there are two.
+
+    ``XrdClClassicCopyJob.cc``, ``Run``: the source's for ``"end2end"`` and
+    ``"source"`` - or the preset, whatever the mode - and the target's for
+    ``"end2end"`` and ``"target"``; a side that cannot say fails the job.
+    """
+    algorithm = job.checksumtype or env.config().preferred_checksum
+    if job.checksumpreset:
+        outcome["sourceCheckSum"] = _labelled(algorithm, job.checksumpreset)
+    elif job.checksummode in ("end2end", "source"):
+        outcome["sourceCheckSum"] = _checksum(job.source, algorithm)
+    if job.checksummode in ("end2end", "target"):
+        outcome["targetCheckSum"] = _checksum(target, algorithm)
+    theirs, ours = outcome.get("sourceCheckSum"), outcome.get("targetCheckSum")
+    if theirs is None or ours is None or theirs.lower() == ours.lower():
+        return
+    if job.rmBadCksum:
+        _remove(target)
+    outcome["status"] = failure(errCheckSumError)
+
+
+def _checksum(url: str, algorithm: str) -> str:
+    """``algorithm:value`` for ``url``: its server's answer, or ours if it is local."""
+    return _labelled(algorithm, _digest_of(parse(url), env.config(), algorithm))
+
+
+def _labelled(algorithm: str, value: str) -> str:
+    """XrdCl's form: ``Utils::NormalizeChecksum`` drops an adler32 or crc32's leading zeros."""
+    if algorithm in ("adler32", "crc32"):
+        value = value.lstrip("0")
+    return f"{algorithm}:{value}"
+
+
+def _transfer(job: _Job, job_id: int, target: str, handler: Any) -> Any:
     """The bytes themselves: server to server, through here, or one then the other."""
     config = env.config()
     if job.parallelchunks:
@@ -228,7 +305,6 @@ def _transfer(job: _Job, job_id: int, target: str, handler: Any, *, resume: bool
         except (errors.UnsupportedError, ValueError):
             if job.thirdparty == "only":
                 raise
-    verify = job.checksummode != "none"
 
     def progress(done: int, size: int | None) -> None:
         if _tell(handler, "should_cancel", job_id):
@@ -239,34 +315,34 @@ def _transfer(job: _Job, job_id: int, target: str, handler: Any, *, resume: bool
         job.source,
         target,
         chunk_size=job.chunksize or None,
-        verify=verify,
-        algorithm=job.checksumtype or None,
+        # Checksums are XrdCl's to take, after the copy: see ``_verify``.
+        verify=False,
         # Continuing a partial target means writing over what is there.
-        overwrite=job.force or resume,
+        overwrite=job.force or job.cont,
         progress=progress,
         config=config,
-        resume=resume,
+        resume=job.cont,
     )
 
 
 def _destination(job: _Job) -> str:
-    """Where the file goes: into ``target`` when that names a directory."""
-    if not job.target.endswith("/") and not _is_local_dir(job.target):
-        return job.target
-    name = posixpath.basename(parse(job.source).path.rstrip("/"))
-    return job.target.rstrip("/") + "/" + name
+    """Where the file goes: ``target`` itself, as XrdCl takes it.
+
+    A local target loses a trailing ``/`` - ``/tmp/d/`` is the file ``d``, as
+    XrdCl's local file handler has it; a remote one goes to the server as given.
+    """
+    url = parse(job.target)
+    return url.path.rstrip("/") or "/" if url.is_local else job.target
 
 
-def _is_local_dir(target: str) -> bool:
+def _make_parent(target: str, *, remote: bool) -> None:
+    """The target's directory: always for a local one, as XrdCl makes it, else if asked."""
     url = parse(target)
-    return url.is_local and os.path.isdir(url.path)
-
-
-def _make_parent(target: str) -> None:
-    url = parse(target)
-    parent = posixpath.dirname(url.path.rstrip("/")) or "/"
+    parent = posixpath.dirname(url.path) or "/"
     if url.is_local:
         os.makedirs(parent, exist_ok=True)
+        return
+    if not remote:
         return
     with FileSystem(url.with_path("/"), env.config()) as fs:
         fs.makedirs(parent, exist_ok=True)

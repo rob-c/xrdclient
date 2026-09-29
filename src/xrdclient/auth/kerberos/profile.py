@@ -41,6 +41,9 @@ Sections = dict[str, Block]
 #: MIT's rule for which files ``includedir`` reads.
 _INCLUDEDIR_NAME = re.compile(r"^(?:[A-Za-z0-9_-]+|.*\.conf)$")
 
+#: A directive: its word at the very start of the line, then white space.
+_DIRECTIVE = re.compile(r"(include|includedir|module)\s(.*)", re.DOTALL)
+
 _TRUE = ("y", "yes", "true", "t", "1", "on")
 
 #: Enctype names ``krb5.conf`` may use, to their numbers. Names this client
@@ -75,22 +78,30 @@ class _Parser:
             line = raw.strip()
             if not line or line[0] in "#;":
                 continue
-            if not self.stack and self._directive(line, origin):
+            if self._directive(raw, origin):
                 continue
             self._line(line)
 
-    def _directive(self, line: str, origin: str) -> bool:
-        """``include``, ``includedir`` and ``module``, which live outside any block."""
-        word, _, rest = line.partition(" ")
-        rest = rest.strip()
+    def _directive(self, raw: str, origin: str) -> bool:
+        """``include``, ``includedir`` and ``module``, which MIT reads first on a line.
+
+        As in MIT's ``prof_parse.c``: a directive starts the line, its word
+        is followed by any white space, and ``include`` and ``includedir``
+        count anywhere in the file - after a ``[section]``, even inside a
+        block - while ``module`` only counts before the first section.
+        """
+        found = _DIRECTIVE.match(raw)
+        if found is None:
+            return False
+        word, rest = found[1], found[2].strip()
         if word == "include":
             self.read(rest)
         elif word == "includedir":
             self._read_dir(rest)
-        elif word == "module":
-            _log.debug("%s: ignoring profile module %s", origin, rest)
+        elif self.stack:
+            return False  # ``module`` inside a section is just a line
         else:
-            return False
+            _log.debug("%s: ignoring profile module %s", origin, rest)
         return True
 
     def _line(self, line: str) -> None:

@@ -37,6 +37,18 @@ _READ_PARAMS = struct.Struct(">4sqi")
 _WRITE_PARAMS = struct.Struct(">4sqB3x")
 
 
+def _handle(fhandle: bytes | bytearray | memoryview | str) -> bytes:
+    """A file handle as ``struct``'s ``4s`` takes it.
+
+    Whatever :meth:`Writer.padded` accepts - a ``bytearray``, a
+    ``memoryview``, text - and not only ``bytes``, so that the fast path
+    refuses nothing the general one would have sent.
+    """
+    if type(fhandle) is bytes:
+        return fhandle
+    return fhandle.encode("utf-8") if isinstance(fhandle, str) else bytes(fhandle)
+
+
 def _encode_path(path: str) -> bytes:
     return path.encode("utf-8")
 
@@ -170,7 +182,7 @@ class Stat(Request):
         w.u8(self.options).zeros(11).padded(self.fhandle, 4)
 
     def header_params(self) -> bytes:
-        return _STAT_PARAMS.pack(self.options, self.fhandle)
+        return _STAT_PARAMS.pack(self.options, _handle(self.fhandle))
 
     def payload(self) -> bytes:
         return _encode_path(self.path)
@@ -560,7 +572,7 @@ class Close(Request):
         w.padded(self.fhandle, 4).zeros(12)
 
     def header_params(self) -> bytes:
-        return _HANDLE_PARAMS.pack(self.fhandle)
+        return _HANDLE_PARAMS.pack(_handle(self.fhandle))
 
 
 class Read(Request):
@@ -580,7 +592,7 @@ class Read(Request):
         w.padded(self.fhandle, 4).i64(self.offset).i32(self.length)
 
     def header_params(self) -> bytes:
-        return _READ_PARAMS.pack(self.fhandle, self.offset, self.length)
+        return _READ_PARAMS.pack(_handle(self.fhandle), self.offset, self.length)
 
     def payload(self) -> bytes:
         # ``read_args``: the path to answer on, then seven reserved bytes.
@@ -613,7 +625,7 @@ class Write(Request):
         w.padded(self.fhandle, 4).i64(self.offset).u8(self.pathid).zeros(3)
 
     def header_params(self) -> bytes:
-        return _WRITE_PARAMS.pack(self.fhandle, self.offset, self.pathid)
+        return _WRITE_PARAMS.pack(_handle(self.fhandle), self.offset, self.pathid)
 
     def payload(self) -> bytes:
         return b"" if self.pathid else self.data
@@ -639,7 +651,7 @@ class Sync(Request):
         w.padded(self.fhandle, 4).zeros(12)
 
     def header_params(self) -> bytes:
-        return _HANDLE_PARAMS.pack(self.fhandle)
+        return _HANDLE_PARAMS.pack(_handle(self.fhandle))
 
 
 class ReadV(Request):
@@ -734,7 +746,7 @@ class Clone(Request):
         w.padded(self.fhandle, 4).zeros(12)
 
     def header_params(self) -> bytes:
-        return _HANDLE_PARAMS.pack(self.fhandle)
+        return _HANDLE_PARAMS.pack(_handle(self.fhandle))
 
     def payload(self) -> bytes:
         w = Writer()
@@ -766,7 +778,7 @@ class PgRead(Request):
         w.padded(self.fhandle, 4).i64(self.offset).i32(self.length)
 
     def header_params(self) -> bytes:
-        return _READ_PARAMS.pack(self.fhandle, self.offset, self.length)
+        return _READ_PARAMS.pack(_handle(self.fhandle), self.offset, self.length)
 
     def payload(self) -> bytes:
         if not self.reqflags and not self.pathid:

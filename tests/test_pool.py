@@ -8,13 +8,18 @@ two.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
+import pytest
+
 import xrdclient
+from xrdclient.auth import credential_files
 from xrdclient.config import Config
 from xrdclient.proto import constants as c
 from xrdclient.session import SESSIONS, Session, SessionPool
+from xrdclient.session import pool as pool_module
 from xrdclient.session.pool import _identity, _key
 from xrdclient.url import parse
 
@@ -97,6 +102,46 @@ def test_a_file_opened_through_a_filesystem_borrows(server, config):
         assert fs.stat("/data/a.root").st_size == 11
     assert logins(server) == 1
     assert len(SESSIONS) == 1
+
+
+@pytest.mark.parametrize("pool_size", [8, 0])
+def test_a_filesystem_closed_first_leaves_its_files_connection_alone(server, config, pool_size):
+    """Neither pooled nor closed under a file still reading from it."""
+    config = config.evolve(pool_size=pool_size)
+    fs = xrdclient.FileSystem(server.url, config)
+    handle = xrdclient.File(f"{server.url}/data/a.root", config, router=fs._router.lend())
+    handle.open()
+    fs.close()
+    assert len(SESSIONS) == 0
+    assert not handle.session.closed
+    assert handle.read() == b"hello world"
+    handle.close()
+    assert len(SESSIONS) == (1 if pool_size else 0)
+    assert logins(server) == 1
+
+
+def test_the_last_file_to_close_is_the_one_that_pools(server, config):
+    with xrdclient.FileSystem(server.url, config) as fs:
+        first = xrdclient.File(f"{server.url}/data/a.root", config, router=fs._router.lend())
+        second = xrdclient.File(f"{server.url}/data/a.root", config, router=fs._router.lend())
+        first.open()
+        second.open()
+    first.close()
+    assert len(SESSIONS) == 0
+    assert second.read() == b"hello world"
+    second.close()
+    assert len(SESSIONS) == 1
+
+
+def test_a_shared_connection_one_holder_discarded_is_closed_not_pooled(server, config):
+    fs = xrdclient.FileSystem(server.url, config)
+    handle = xrdclient.File(f"{server.url}/data/a.root", config, router=fs._router.lend())
+    handle.open()
+    session = handle.session
+    fs._router.discard()
+    assert not session.closed
+    handle.close()
+    assert session.closed and len(SESSIONS) == 0
 
 
 def test_an_open_that_fails_still_returns_its_connection(server, config):
@@ -351,8 +396,98 @@ def test_every_credential_field_changes_the_identity():
         ("auth_order", ("unix",)),
         ("verify_tls", False),
         ("require_tls", True),
+        ("ztn_cleartext", True),
     ):
         assert _identity(url, base.evolve(**{field: value})) != _identity(url, base), field
+
+
+# ----------------------------------------------------------------------
+# The credentials a login finds for itself
+
+
+def test_a_different_bearer_token_in_the_environment_is_a_different_login(monkeypatch):
+    url = parse("root://example.org/")
+    monkeypatch.setenv("BEARER_TOKEN", "alice")
+    alice = _key(url, Config())
+    monkeypatch.setenv("BEARER_TOKEN", "bob")
+    assert _key(url, Config()) != alice
+
+
+def test_the_same_config_notices_the_environment_change_under_it(monkeypatch):
+    url, config = parse("root://example.org/"), Config()
+    monkeypatch.setenv("KRB5CCNAME", "FILE:/tmp/one")
+    before = _identity(url, config)
+    monkeypatch.setenv("KRB5CCNAME", "FILE:/tmp/two")
+    assert _identity(url, config) != before
+
+
+def test_a_token_file_rewritten_in_place_is_a_different_login(tmp_path, monkeypatch):
+    monkeypatch.delenv("BEARER_TOKEN", raising=False)
+    token = tmp_path / "bt"
+    token.write_text("alice")
+    url, config = parse("root://example.org/"), Config(token_file=str(token))
+    before = _identity(url, config)
+    token.write_text("bob-the-longer")
+    assert _identity(url, config) != before
+    # Unchanged since, it is remembered rather than re-hashed.
+    again = _identity(url, config)
+    monkeypatch.setattr(pool_module, "_digest", lambda *_: pytest.fail("hashed again"))
+    assert _identity(url, config) == again
+
+
+def test_a_proxy_that_appears_is_a_different_login(tmp_path):
+    proxy = tmp_path / "x509up"
+    url, config = parse("root://example.org/"), Config(proxy=str(proxy), auth_order=("unix",))
+    before = _identity(url, config)
+    proxy.write_text("chain")
+    assert _identity(url, config) != before
+
+
+def test_an_auth_order_changed_under_a_config_is_noticed():
+    order = ["ztn", "unix"]
+    url, config = parse("root://example.org/"), Config(auth_order=order)
+    before = _identity(url, config)
+    order[:] = ["unix"]
+    after = _identity(url, config)
+    assert after != before
+    assert after == _identity(url, Config(auth_order=("unix",)))
+
+
+def test_the_files_each_mechanism_reads_are_the_ones_watched(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("KRB5CCNAME", f"DIR:{tmp_path}")
+    everything = Config(token_file="/t", keytab="/k", proxy="/p")
+    files = credential_files(everything)
+    assert files[0] == "/t" and str(tmp_path / f"bt_u{os.getuid()}") in files
+    assert {"/p", "/k", str(tmp_path / "primary"), str(tmp_path / "tkt")} <= set(files)
+    # An explicit token makes the token files beside the point.
+    assert "/t" not in credential_files(everything.evolve(token="x"))
+    assert credential_files(Config(auth_order=("unix",), proxy=None)) == ()
+    monkeypatch.setenv("KRB5CCNAME", f"DIR::{tmp_path}/tkt2")
+    assert credential_files(Config(auth_order=("krb5",))) == (f"{tmp_path}/tkt2",)
+    monkeypatch.setenv("KRB5CCNAME", "KCM:")
+    assert credential_files(Config(auth_order=("krb5",))) == ()
+
+
+def test_a_session_goes_back_under_the_identity_it_logged_in_with(monkeypatch):
+    pool, url, config = SessionPool(), parse("root://example.org/"), Config(auth_order=("ztn",))
+    stub = FakeSession()
+    monkeypatch.setattr(Session, "connect", staticmethod(lambda *a, **k: stub))
+    monkeypatch.setenv("BEARER_TOKEN", "alice")
+    session = pool.connect(url, config)
+    monkeypatch.setenv("BEARER_TOKEN", "bob")
+    assert pool.release(session, url, config)
+    assert pool.acquire(url, config) is None
+    monkeypatch.setenv("BEARER_TOKEN", "alice")
+    assert pool.acquire(url, config) is stub
+
+
+def test_a_session_dialled_with_pooling_off_is_not_remembered(monkeypatch):
+    pool, url = SessionPool(), parse("root://example.org/")
+    stub = FakeSession()
+    monkeypatch.setattr(Session, "connect", staticmethod(lambda *a, **k: stub))
+    assert pool.connect(url, Config(pool_size=0)) is stub
+    assert len(pool._born) == 0
 
 
 def test_where_the_question_is_asked_is_not_who_is_answering():

@@ -102,10 +102,10 @@ do; a file redirected to a data server gets a connection of its own.
 
 | Method | Returns | Notes |
 | --- | --- | --- |
-| `add_job(source, target, ...)` | `None` | see the keywords below. A `target` ending in `/`, or naming an existing local directory, receives the source's file name. |
+| `add_job(source, target, ...)` | `None` | see the keywords below. `target` is the file to write, as in XrdCl: a local `/tmp/d/` is the file `/tmp/d`, a directory is refused (`402`, `kXR_isDirectory` or `kXR_ItExists`), and a local target's parent directories are made whether or not `mkdir` is set. Naming the file after the source is `xrdcp`'s doing, not `CopyProcess`'s. |
 | `parallel(n)` | `None` | run up to `n` jobs at once, on threads |
 | `prepare()` | `status` | checks every URL and `thirdparty` value; `errInvalidArgs` (9) on the first bad one |
-| `run(handler=None)` | `(status, [dict])` | one dict per job: `status` always, `size` on success, `sourceCheckSum` and `targetCheckSum` (`"adler32:8eaaaa54"`) when a checksum was taken. The overall status is the first failed job's, or success. |
+| `run(handler=None)` | `(status, [dict])` | one dict per job: `status` always, `size` once the bytes are across (even if a checksum then fails the job), `sourceCheckSum` and `targetCheckSum` (`"adler32:8eaaaa54"`, leading zeros dropped as XrdCl drops them) for each checksum taken. A local end's failure is `errLocalError` (402) with the protocol's number in `errno` - `3018` for a target that exists, `3011` for a missing local source. The overall status is the first failed job's, or success. |
 
 ### `add_job` keywords
 
@@ -117,9 +117,9 @@ do; a file redirected to a data server gets a connection of its own.
 | `coerce` | `False` | accepted, no effect |
 | `mkdir` | `False` | honoured: create the target's parent directories |
 | `thirdparty` | `"none"` | honoured: `"none"`, `"first"` (try server-to-server, fall back to streaming through this process), `"only"` |
-| `checksummode` | `"none"` | honoured: anything but `"none"` (`"end2end"`, `"source"`, `"target"`) verifies the copy with a checksum |
+| `checksummode` | `"none"` | honoured, as XrdCl reads it: `"end2end"` and `"source"` ask the source for its checksum, `"end2end"` and `"target"` the target (a local one is digested here), and the two are compared only when both exist. Any other value - `"end"` included - takes no checksum. An end that cannot checksum fails the job with its error |
 | `checksumtype` | `""` | honoured: the algorithm, e.g. `"adler32"`; empty takes the default |
-| `checksumpreset` | `""` | honoured: the expected value; a mismatch fails the job with `errCheckSumError` (305) |
+| `checksumpreset` | `""` | honoured: stands in for the source's checksum in any mode, so it is compared when the target's is taken (`"end2end"`, `"target"`); a mismatch fails the job with `errCheckSumError` (305) |
 | `dynamicsource` | `False` | accepted, no effect |
 | `chunksize` | the bindings: 8 MiB | honoured; when not given, `Config.chunk_size` (4 MiB unless `XRD_CPCHUNKSIZE` or `EnvPutInt("CPChunkSize")` says otherwise) |
 | `parallelchunks` | the bindings: 4 | honoured, as the number of chunks in flight (`Config.in_flight`) |
@@ -131,7 +131,7 @@ do; a file redirected to a data server gets a connection of its own.
 | `xrate` | `0` | accepted, no effect - no rate limit is applied |
 | `retry` | `0` (`CpRetry`) | honoured: retry a transient failure this many times |
 | `cont` | `False` | honoured: resume a partial target |
-| `rtrplc` | `"force"` (`CpRetryPolicy`) | honoured: `"continue"` resumes on retry, anything else starts again |
+| `rtrplc` | `"force"` (`CpRetryPolicy`) | honoured: a retry under `"continue"` resumes the partial target; under anything else it overwrites it, as XrdCl sets `force` for the retry |
 
 ### Progress handler
 
@@ -184,7 +184,7 @@ compares them, and `repr` prints `<name: value, ...>` as the bindings do.
 | --- | --- | --- |
 | `status` | `int` | `0` OK, `1` error, `3` fatal |
 | `code` | `int` | XrdCl's error code - see [status codes](#status-codes) |
-| `errno` | `int` | the server's `kXR_*` number when `code` is 400, else `0` (or the OS `errno` for a local failure) |
+| `errno` | `int` | the server's `kXR_*` number when `code` is 400, the `kXR_*` number for the OS error when it is 402, else `0` (or the OS `errno` for a local failure) |
 | `message` | `str` | XrdCl's rendering: `"[ERROR] Server responded with an error: [3011] ...\n"`, `"[SUCCESS] "` |
 | `shellcode` | `int` | the exit status XrdCl's tools would use: `0` for success, else `code // 100 + 50` |
 | `error` | `bool` | `status` is error or fatal |
@@ -383,7 +383,7 @@ fatal. `shellcode` is `code // 100 + 50`, as in XrdCl.
 | 2 | `errUnknown` | a failure with no better description | 1 | 50 |
 | 3 | `errInvalidOp` | `open` on a file that is already open | 1 | 50 |
 | 9 | `errInvalidArgs` | a bad URL in `CopyProcess.prepare`, a bad argument to a callback call, `sendinfo` over 1024 characters | 1 | 50 |
-| 12 | `errOSError` | a local file operation failed; `errno` is the OS's | 1 | 50 |
+| 12 | `errOSError` | a local file operation outside a copy failed; `errno` is the OS's | 1 | 50 |
 | 13 | `errNotSupported` | `fcntl`, `openusingtemplate`, any call on a `FileSystem` whose URL did not parse | 1 | 50 |
 | 14 | `errDataError` | a page read failed its CRC32C check | 1 | 50 |
 | 15 | `errNotImplemented` | `dirlist` with `ZIP`; `sendinfo` to a server that is not `root://` | 1 | 50 |
@@ -395,6 +395,7 @@ fatal. `shellcode` is `code // 100 + 50`, as in XrdCl.
 | 305 | `errCheckSumError` | a copy's checksums did not match, or `checksumpreset` was not met | 1 | 53 |
 | 306 | `errRedirectLimit` | more redirects than `RedirectLimit` | 1 | 53 |
 | 400 | `errErrorResponse` | the server refused the request; `errno` is its `kXR_*` number | 1 | 54 |
+| 402 | `errLocalError` | a copy's local end failed; `errno` is the protocol's number for the OS error (`XProtocol::mapError`) | 1 | 54 |
 
 XrdCl's `errInvalidAddr` (101), `errSocketTimeout` (103), `errTlsError`
 (110) and `errLoginFailed` (203) are not produced. An unreachable server is

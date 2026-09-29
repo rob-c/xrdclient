@@ -19,6 +19,7 @@ implementation, and what makes the protocol testable without a socket.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -275,7 +276,12 @@ class SessionMachine:
         self._out_path: dict[int, bytearray] = {}
         self._events: list[Event] = []
         self._pending: dict[int, _Pending] = {}
-        self._free: list[int] = []
+        #: Ids free for reuse, oldest first: an id goes back to the end of the
+        #: line, so the one just given up is the last to be handed out again.
+        self._free: deque[int] = deque()
+        #: Ids whose request was given up on while an answer may still come;
+        #: held out of the pool until it does, and whatever arrives is dropped.
+        self._retired: set[int] = set()
         #: Ids handed to the bulk reader, which frames its own requests; held
         #: out of the pool until it gives them back.
         self._leased: set[int] = set()
@@ -354,6 +360,17 @@ class SessionMachine:
         if self._pending.pop(streamid, None) is not None and streamid >= _FIRST_SID:
             self._free.append(streamid)
 
+    def abandon(self, streamid: int) -> None:
+        """Give up on a stream whose answer may still be on its way.
+
+        Unlike :meth:`release`, the id is not reused until that answer has
+        arrived: a late reply matched to a newer request on the same id is
+        the wrong data returned as if it were right. Whatever does arrive is
+        dropped, and a final reply puts the id back in the pool.
+        """
+        if self._pending.pop(streamid, None) is not None:
+            self._retired.add(streamid)
+
     def close(self, *, graceful: bool = True) -> None:
         """Queue ``kXR_endsess`` and mark the machine closed."""
         if self.state is State.READY and graceful and self.session_id:
@@ -381,7 +398,7 @@ class SessionMachine:
         out of the event path, which is only safe while this machine is not
         waiting for an answer of its own.
         """
-        return self.state is State.READY and not self._pending
+        return self.state is State.READY and not self._pending and not self._retired
 
     def lease_sids(self, count: int) -> list[int]:
         """Reserve ``count`` stream ids for a caller that frames its own requests.
@@ -431,12 +448,12 @@ class SessionMachine:
 
     def _acquire_sid(self) -> int:
         if self._free:
-            return self._free.pop()
+            return self._free.popleft()
         sid = self._next_sid
         self._next_sid += 1
         if self._next_sid > 0xFFFF:
             self._next_sid = _FIRST_SID
-        if sid in self._pending or sid in self._leased:
+        if sid in self._pending or sid in self._leased or sid in self._retired:
             raise ProtocolError("stream id space exhausted")
         return sid
 
@@ -601,6 +618,9 @@ class SessionMachine:
 
         pending = self._pending.get(sid)
         if pending is None:
+            if sid in self._retired:
+                self._retired_reply(sid, status, body, framer)
+                return
             _log.debug("response on unknown stream %d (%s)", sid, c.status_name(status))
             return
         if status == c.kXR_ok:
@@ -612,6 +632,21 @@ class SessionMachine:
             self._response_unexpected(sid, status, pending)
             return
         handler(self, sid, body, pending, framer)
+
+    def _retired_reply(self, sid: int, status: int, body: bytes, framer: _Framer) -> None:
+        """Drop a late reply to an abandoned stream; free the id once it is final."""
+        _log.debug("late %s on abandoned stream %d dropped", c.status_name(status), sid)
+        if status == c.kXR_status:
+            state = rp.parse_status(body)
+            # Its raw data follows the frame, and must be skipped with it.
+            framer.need_trailer = state.dlen
+            framer.trailer_for = sid if state.dlen else None
+            final = state.is_final
+        else:
+            final = status not in (c.kXR_oksofar, c.kXR_waitresp)
+        if final:
+            self._retired.discard(sid)
+            self._free.append(sid)
 
     def _unwrap_attn(self, body: bytes) -> tuple[int, int, bytes] | None:
         """Unpack a ``kXR_asynresp``, or record the notice and return None."""

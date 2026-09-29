@@ -24,19 +24,22 @@ none of it. With nobody there, the same explanation goes into the
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 
 from .._log import get_logger
 from ..config import Config
-from ..errors import NoMechanismError
+from ..crypto.x509 import default_proxy_path
+from ..errors import CredentialError, NoMechanismError
 from . import prompt
 from .base import Credential, Offer, parse_security_trailer
 from .gsi import GSICredential
+from .kerberos.ccache import ccache_name, resolve_ccache
 from .krb5 import KerberosCredential
 from .prompt import Ask, Prompter, ask_on_terminal, forget
 from .simple import HostCredential, UnixCredential
-from .sss import SSSCredential
-from .ztn import TokenCredential, discover_token
+from .sss import SSSCredential, default_keytab_path
+from .ztn import TokenCredential, _token_paths, discover_token
 
 __all__ = [
     "Ask",
@@ -58,6 +61,8 @@ __all__ = [
     "GSICredential",
     "KerberosCredential",
     "discover_token",
+    "AMBIENT_ENV",
+    "credential_files",
 ]
 
 _log = get_logger(__name__)
@@ -85,6 +90,54 @@ for _cls in (
     KerberosCredential,
 ):
     register(_cls)
+
+
+#: The environment variables a mechanism consults when it logs in, rather
+#: than when its :class:`~xrdclient.config.Config` is made: which token, which
+#: proxy, keytab or Kerberos cache is used is decided by these at that moment.
+AMBIENT_ENV = (
+    "BEARER_TOKEN",
+    "XDG_RUNTIME_DIR",
+    "X509_USER_PROXY",
+    "XrdSecSSSKT",
+    "XrdSecsssKT",
+    "KRB5CCNAME",
+    "KRB5_CONFIG",
+)
+
+
+def credential_files(config: Config) -> tuple[str, ...]:
+    """The files the mechanisms in ``auth_order`` would read a credential from.
+
+    What a login would find there is part of who it logs in as: a token file
+    rewritten in place, or a renewed proxy, is a different credential under
+    the same name. An explicit ``token`` makes the token files irrelevant,
+    and a ``proxy`` is read for TLS client authentication whatever the order.
+    """
+    order = set(config.auth_order)
+    files: list[str] = []
+    if "ztn" in order and not config.token:
+        files += _token_paths(config)
+    if "gsi" in order or config.proxy:
+        files.append(default_proxy_path(config))
+    if "sss" in order:
+        files.append(default_keytab_path(config))
+    if "krb5" in order:
+        files += _ccache_files()
+    return tuple(files)
+
+
+def _ccache_files() -> list[str]:
+    """The default Kerberos cache, and a ``DIR:`` collection's pointer to it."""
+    name = ccache_name()
+    try:
+        path = resolve_ccache(name)
+    except CredentialError:
+        return []  # not a file: nothing here this client could log in with
+    kind, _, rest = name.partition(":")
+    if kind == "DIR" and not rest.startswith(":"):
+        return [os.path.join(rest, "primary"), path]
+    return [path]
 
 
 def select(

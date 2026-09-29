@@ -12,6 +12,8 @@ this package checking itself.
 
 from __future__ import annotations
 
+import struct
+
 import pytest
 
 from _krb5_mit import CAPTURED, SERVICE_PASSWORD
@@ -292,3 +294,58 @@ def test_our_krb_cred_is_xrdcps_krb_cred_but_for_the_confounder(tmp_path, enctyp
 
 def test_key_repr_never_shows_the_key():
     assert "value" not in repr(Key(18, b"\x01" * 32))
+
+
+# -- a cache that records the KDC's clock as ahead of or behind this one ------
+
+
+def _skewed(tmp_path, enctype: int, name: str, seconds: int, micros: int):
+    """MIT's cache with its DeltaTime header tag (all zeros as captured) set."""
+    raw = bytearray(data(enctype, name))
+    assert raw[:8] == bytes.fromhex("0504000c00010008")  # version 4, one tag: DeltaTime
+    raw[8:16] = struct.pack(">ii", seconds, micros)
+    path = tmp_path / name
+    path.write_bytes(bytes(raw))
+    return read_ccache(str(path))[1]
+
+
+def test_the_ap_req_authenticator_uses_the_kdcs_clock_as_kinit_measured_it(tmp_path, enctype):
+    """A host 299.75 s fast still sends xrdcp's authenticator, as MIT's kdc_timesync does."""
+    service = next(
+        t for t in _skewed(tmp_path, enctype, "service_ccache", -300, 250_000)
+        if t.server.same_name(SERVICE)
+    )
+    assert service.kdc_offset == -299.75
+    theirs = body_of(data(enctype, "xrdcp_ap_req"), asn1.APP_AP_REQ)
+    sealed = read_encrypted_data(theirs.get(4))
+    cipher = get_enctype(sealed.etype)
+    their_auth = cipher.decrypt(service.key, tgs.USAGE_AP_REQ_AUTH, sealed.cipher)
+    fields = body_of(their_auth, asn1.APP_AUTHENTICATOR)
+    when = fields.time(5) + fields.integer(4) / 1_000_000
+
+    ours = body_of(tgs.build_ap_req(service, clock=lambda: when + 299.75), asn1.APP_AP_REQ)
+    mine = read_encrypted_data(ours.get(4))
+    assert cipher.decrypt(service.key, tgs.USAGE_AP_REQ_AUTH, mine.cipher) == their_auth
+
+
+def test_the_tgs_authenticator_uses_the_kdcs_clock_and_the_ticket_keeps_it(tmp_path, enctype):
+    (tgt,) = _skewed(tmp_path, enctype, "tgt_ccache", 3600, 0)
+    sent: list[bytes] = []
+
+    def send(profile, realm, request):
+        sent.append(request)
+        return data(enctype, "kdc_tgs_rep")
+
+    clock = float(CAPTURED[str(enctype)]["our_clock"])
+    ticket = tgs.request_ticket(
+        tgt, SERVICE, Profile(), etypes=[enctype], clock=lambda: clock - 3600, send=send,
+        nonce=12345678,
+    )
+    assert ticket.kdc_offset == 3600
+    request = body_of(sent[0], asn1.APP_TGS_REQ)
+    padata = [Fields(pa, "PA-DATA") for pa in parse_all(request.get(3).value)]
+    ap_req = body_of(next(pa.octets(2) for pa in padata if pa.integer(1) == 1), asn1.APP_AP_REQ)
+    sealed = read_encrypted_data(ap_req.get(4))
+    plain = get_enctype(sealed.etype).decrypt(tgt.key, tgs.USAGE_TGS_REQ_AUTH, sealed.cipher)
+    authenticator = body_of(plain, asn1.APP_AUTHENTICATOR)
+    assert (authenticator.time(5), authenticator.integer(4)) == tgs._split_time(clock)

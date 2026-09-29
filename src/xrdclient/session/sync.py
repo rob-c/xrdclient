@@ -14,6 +14,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import NoReturn
 
 from .._compat import SLOTS
 from .._log import get_logger
@@ -29,7 +30,7 @@ from ..proto.frames import Request
 from ..transport.base import Transport
 from ..transport.sync import SocketTransport
 from ..url import XRootDURL, parse
-from .bulk import BulkReader
+from .bulk import WAITRESP_GRACE, BulkReader, BulkUnsupported
 
 __all__ = ["Session", "Result", "RedirectRequired"]
 
@@ -41,7 +42,7 @@ _RECV = 1 << 18
 _DEAD = frozenset({m.State.CLOSED, m.State.FAILED})
 
 #: Grace added to a kXR_waitresp delay before the deferred reply is overdue.
-_WAITRESP_GRACE = 30.0
+_WAITRESP_GRACE = WAITRESP_GRACE
 
 
 class RedirectRequired(XRootDError):
@@ -242,6 +243,10 @@ class Session:
         out, self._notices = self._notices, []
         return out
 
+    def note(self, info: rp.AttnInfo) -> None:
+        """Keep a notice the bulk reader took off the wire, for :meth:`notices`."""
+        self._notices.append(info)
+
     # ------------------------------------------------------------------
     # Data paths
     # ------------------------------------------------------------------
@@ -406,6 +411,18 @@ class Session:
         return time.monotonic() + max(limit, seconds + _WAITRESP_GRACE if seconds else 0.0)
 
     def _await(self, sid: int, on_chunk: Callable[[bytes], None] | None, pathid: int = 0) -> Result:
+        try:
+            return self._answer(sid, on_chunk, pathid)
+        finally:
+            # Given up on with its answer maybe still to come - a stall, a
+            # deferred reply over the wait budget, a consumer that raised: the
+            # id stays out of circulation until that answer is off the wire,
+            # so it can never be taken for a later request's. A completed,
+            # failed or redirected stream is released already, and this is
+            # a no-op for it.
+            self._m.abandon(sid)
+
+    def _answer(self, sid: int, on_chunk: Callable[[bytes], None] | None, pathid: int) -> Result:
         # Absolute, over the whole logical operation: see Config.stall_deadline.
         state = _AwaitState(0, 0.0, 0, self._armed())
         while True:
@@ -441,19 +458,23 @@ class Session:
         # Parking is not stalling, but repeated delays share one budget.
         state.parked += event.seconds
         if state.parked > self.config.wait_budget:
-            raise WaitLimitError(
+            self._give_up(
+                sid,
+                event,
                 f"{type(event.request).__name__} was parked for {state.parked:.0f}s, "
                 f"over the {self.config.wait_budget:.0f}s budget for one operation",
-                attempts=state.waits,
+                state.waits,
             )
         if not event.resend:
             state.deadline = self._armed(event.seconds)
             return
         state.waits += 1
         if state.waits > self.config.redirect_limit:
-            raise WaitLimitError(
+            self._give_up(
+                sid,
+                event,
                 f"server kept asking to wait for {type(event.request).__name__}",
-                attempts=state.waits,
+                state.waits,
             )
         _log.debug("server asked to wait %.1fs: %s", event.seconds, event.message)
         time.sleep(event.seconds)
@@ -461,6 +482,18 @@ class Session:
         self._flush()
         state.streamed = 0  # the body starts over on the resend
         state.deadline = self._armed()
+
+    def _give_up(self, sid: int, event: m.Waiting, message: str, attempts: int) -> NoReturn:
+        """Stop waiting on ``sid``, freeing it when nothing more will come.
+
+        ``kXR_wait`` is the server's last word on a request until it is sent
+        again, so its id can be reused at once. A ``kXR_waitresp`` promises an
+        answer later; :meth:`_await` keeps that id out of circulation until
+        the answer is off the wire.
+        """
+        if event.resend:
+            self._m.release(sid)
+        raise WaitLimitError(message, attempts=attempts)
 
     # ------------------------------------------------------------------
     # I/O pump
@@ -604,7 +637,10 @@ class Session:
                     "one reader owns the wire at a time"
                 )
             if not self._m.idle():
-                raise ProtocolError(
+                # Something is still owed an answer on this wire - a request
+                # given up on whose reply has not arrived yet - so the event
+                # path, which knows to drop it, carries this one.
+                raise BulkUnsupported(
                     "a bulk read needs the connection to itself, and this one "
                     "still has requests outstanding"
                 )

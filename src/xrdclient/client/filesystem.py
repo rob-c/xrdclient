@@ -751,13 +751,17 @@ class FileSystem:
         from .file import File
 
         flags = OpenFlags.NEW | OpenFlags.UPDATE | OpenFlags.MAKEPATH
-        fh = File(self._url_for(path), self.config, router=self._router.lend())
+        lent = self._router.lend()
+        fh = File(self._url_for(path), self.config, router=lent)
         try:
             fh.open(flags=flags, mode=Access.OWNER_READ | Access.OWNER_WRITE)
-        except ExistsError:
-            if not exist_ok:
-                raise
-            return
+        except BaseException as exc:
+            # The lent router shares this filesystem's connection until it
+            # lets go, and a failed open leaves it to the caller to let go.
+            lent.close()
+            if exist_ok and isinstance(exc, ExistsError):
+                return
+            raise
         fh.close()
 
     # ------------------------------------------------------------------
@@ -1099,17 +1103,24 @@ class FileSystem:
         """
         from ..io import open_url
 
-        return open_url(
-            self._url_for(path),
-            mode,
-            buffering=buffering,
-            encoding=encoding,
-            errors=errors,
-            newline=newline,
-            config=self.config,
-            router=self._router.lend(),
-            posc=posc,
-        )
+        lent = self._router.lend()
+        try:
+            return open_url(
+                self._url_for(path),
+                mode,
+                buffering=buffering,
+                encoding=encoding,
+                errors=errors,
+                newline=newline,
+                config=self.config,
+                router=lent,
+                posc=posc,
+            )
+        except BaseException:
+            # A failed open leaves the lent router, and its share of this
+            # filesystem's connection, to be let go of here.
+            lent.close()
+            raise
 
     def read_bytes(self, path: str) -> bytes:
         """Whole-file read, like :meth:`pathlib.Path.read_bytes`."""

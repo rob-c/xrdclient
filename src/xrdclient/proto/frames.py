@@ -49,10 +49,12 @@ class Request:
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
-        # A class that redefines ``params`` but not ``header_params`` must not
-        # inherit a parent's precomputed layout: its own ``params`` is the
-        # truth, so it gets the general path back.
-        if "params" in cls.__dict__ and "header_params" not in cls.__dict__:
+        # A precomputed layout is only the truth for the ``params`` it was
+        # written beside. A class whose ``params`` resolves elsewhere - its
+        # own, or a mixin's ahead of the parent in the MRO - must not inherit
+        # the parent's layout, so it gets the general path back.
+        owner = next(k for k in cls.__mro__ if "header_params" in k.__dict__)
+        if owner is not Request and cls.params is not getattr(owner, "params", None):
             cls.header_params = Request.header_params  # type: ignore[method-assign]
 
     def params(self, w: Writer) -> None:

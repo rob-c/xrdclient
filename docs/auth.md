@@ -82,7 +82,11 @@ TGS exchange, over UDP with a TCP fallback, to the `kdc` listed for the realm
 in `$KRB5_CONFIG` or `/etc/krb5.conf`) and keeps it in memory for the rest of
 the process; the cache file is never written. A server started with
 `-exptkn` (its offer ends `,fwd`) also gets a forwarded TGT, which needs a
-forwardable one: `kinit -f`.
+forwardable one: `kinit -f`. As with MIT's default `kdc_timesync`, the
+authenticators carry the local time corrected by the KDC clock offset `kinit`
+recorded in the cache, so a host whose clock has drifted still logs in.
+`include` and `includedir` are followed wherever they start a line of
+`krb5.conf`, as MIT follows them.
 
 Supported: the AES enctypes - `aes256-cts-hmac-sha1-96`,
 `aes128-cts-hmac-sha1-96`, `aes256-cts-hmac-sha384-192` and

@@ -599,3 +599,32 @@ def test_any_other_challenge_is_refused():
     credential = KerberosCredential("xrootd/srv", _session())
     with pytest.raises(CredentialError, match="unexpected krb5 challenge"):
         credential.step(b"something else")
+
+
+def test_a_session_key_of_the_wrong_length_is_a_credential_error(monkeypatch, tmp_path):
+    """A damaged cache must say so as a CredentialError, not escape as a ValueError."""
+    ahead = time.time() + 3600
+    body = struct.pack(">HH", CCACHE_VERSION_4, 0) + _principal(("jane",))
+    body += _credential(("jane",), ("krbtgt", REALM), end_time=ahead, key=b"short")
+    path = tmp_path / "short"
+    path.write_bytes(body)
+    monkeypatch.setenv("KRB5CCNAME", f"FILE:{path}")
+    with pytest.raises(CredentialError, match="session key is 5 bytes, not 32"):
+        KerberosCredential.available(OFFER, Config(), username="jane", host="srv")
+    ticket = read_ccache(str(path))[1][0]
+    with pytest.raises(CredentialError, match="session key is 5 bytes"):
+        KerberosCredential("x", ticket).initial()
+
+
+def test_the_kdc_clock_offset_in_a_version_4_header_is_kept(tmp_path):
+    """Tag 1 (DeltaTime) is seconds and microseconds, signed; other tags are skipped."""
+    header = struct.pack(">HH4s", 2, 4, b"????") + struct.pack(">HHii", 1, 8, -300, 250_000)
+    body = struct.pack(">HH", CCACHE_VERSION_4, len(header)) + header + _principal(("jane",))
+    body += _credential(("jane",), ("krbtgt", REALM), end_time=time.time() + 60)
+    path = tmp_path / "skewed"
+    path.write_bytes(body)
+    assert read_ccache(str(path))[1][0].kdc_offset == -299.75
+    odd = struct.pack(">HHi", 1, 4, 7)  # not the 8 bytes DeltaTime has: ignored
+    body = struct.pack(">HH", CCACHE_VERSION_4, len(odd)) + odd + _principal(("jane",))
+    path.write_bytes(body + _credential(("jane",), ("krbtgt", REALM), end_time=time.time() + 60))
+    assert read_ccache(str(path))[1][0].kdc_offset == 0.0

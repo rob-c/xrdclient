@@ -26,7 +26,10 @@ import hashlib
 import os
 import threading
 import time
+import weakref
+from dataclasses import dataclass
 
+from .._compat import SLOTS
 from .._log import get_logger
 from ..config import Config
 from ..url import XRootDURL
@@ -52,18 +55,55 @@ _IDENTITY_FIELDS = (
     "auth_order",
     "verify_tls",
     "require_tls",
+    "ztn_cleartext",
 )
 
 #: Where and as whom: scheme, host, port, the URL's own user, and the digest.
 Key = tuple[str, str, int, str]
 
+#: What a credential file looked like: its path and, if it is there, enough
+#: of its ``stat`` to tell that it was replaced or rewritten.
+FileState = tuple[str, "tuple[int, int, int, int] | None"]
+
+
+@dataclass(frozen=True, **SLOTS)
+class _Known:
+    """A digest worked out, and what it was worked out from.
+
+    The config is held, not just its ``id``: a config that was collected
+    could otherwise hand its id, and so its digest, to a stranger.
+    """
+
+    config: Config
+    #: The config's ``auth_order`` as it was - a list can be changed under a
+    #: frozen config - and the ambient environment the mechanisms read.
+    context: tuple[object, ...]
+    files: tuple[str, ...]
+    states: tuple[FileState, ...]
+    digest: str
+
 
 #: Digests already worked out, by the config and URL user they were worked out
-#: for. The config is held, not just its ``id``: a config that was collected
-#: could otherwise hand its id, and so its digest, to a stranger. Bounded,
-#: because a caller that builds a config per request must not grow it forever.
-_DIGESTS: dict[tuple[int, str], tuple[Config, str]] = {}
+#: for. Bounded, because a caller that builds a config per request must not
+#: grow it forever.
+_DIGESTS: dict[tuple[int, str], _Known] = {}
 _DIGESTS_MAX = 64
+
+
+def _context(config: Config) -> tuple[object, ...]:
+    # Imported here, not at the top: the mechanisms (and the crypto behind
+    # them) are loaded by the first login, not by ``import xrdclient``.
+    from ..auth import AMBIENT_ENV
+
+    return (tuple(config.auth_order), *(os.environ.get(name) for name in AMBIENT_ENV))
+
+
+def _state(path: str) -> FileState:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return (path, None)
+    return (path, (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns))
 
 
 def _identity(url: XRootDURL, config: Config) -> str:
@@ -74,26 +114,46 @@ def _identity(url: XRootDURL, config: Config) -> str:
     one of these fields is a bearer token. Comparing digests answers the only
     question the pool has ("same credentials?") and answers nothing else.
 
-    Every acquire and release asks, with the same frozen config nearly every
-    time, so the answer is remembered per config rather than re-hashed.
+    Who that is is not only the config: ``$BEARER_TOKEN``, ``$KRB5CCNAME``
+    and the token, proxy, keytab and ticket files are read at login, so they
+    go in too - a file by its ``stat``, which changes when it is rewritten.
+    Every acquire and release asks, with the same config nearly every time,
+    so the digest is remembered per config and only re-hashed when the
+    environment or one of those files has changed since; the check costs a
+    few ``stat`` calls, not a read.
     """
     key = (id(config), url.username)
+    context = _context(config)
     known = _DIGESTS.get(key)
-    if known is not None and known[0] is config:
-        return known[1]
-    digest = _digest(url, config)
+    if known is not None and known.config is config and known.context == context:
+        states = tuple(_state(path) for path in known.files)
+        if states == known.states:
+            return known.digest
+    from ..auth import credential_files
+
+    files = credential_files(config)
+    states = tuple(_state(path) for path in files)
+    digest = _digest(url, config, context, states)
     if len(_DIGESTS) >= _DIGESTS_MAX:
         _DIGESTS.clear()
-    _DIGESTS[key] = (config, digest)
+    _DIGESTS[key] = _Known(config, context, files, states, digest)
     return digest
 
 
-def _digest(url: XRootDURL, config: Config) -> str:
+def _digest(
+    url: XRootDURL,
+    config: Config,
+    context: tuple[object, ...] = (),
+    states: tuple[FileState, ...] = (),
+) -> str:
     digest = hashlib.sha256()
     digest.update(repr(url.username or config.username).encode())
     for name in _IDENTITY_FIELDS:
+        value = getattr(config, name)
         digest.update(b"\x00")
-        digest.update(repr(getattr(config, name)).encode())
+        digest.update(repr(tuple(value) if name == "auth_order" else value).encode())
+    digest.update(b"\x00")
+    digest.update(repr((context, states)).encode())
     return digest.hexdigest()
 
 
@@ -149,7 +209,27 @@ class SessionPool:
 
     def __init__(self) -> None:
         self._idle: dict[Key, list[tuple[float, Session]]] = {}
+        #: Who each connection dialled through :meth:`connect` logged in as,
+        #: worked out as it logged in. Released later, it goes back under
+        #: that identity, not under whatever the environment says by then: a
+        #: session is not re-authenticated because ``$BEARER_TOKEN`` moved on.
+        self._born: weakref.WeakKeyDictionary[Session, str] = weakref.WeakKeyDictionary()
         self._lock = threading.Lock()
+
+    def connect(self, url: XRootDURL, config: Config) -> Session:
+        """Dial a new session, remembering whose credentials it logged in with."""
+        if config.pool_size <= 0:
+            return Session.connect(url, config=config)
+        identity = _identity(url, config)
+        session = Session.connect(url, config=config)
+        with self._lock:
+            self._born[session] = identity
+        return session
+
+    def _key_for(self, session: Session, url: XRootDURL, config: Config) -> Key:
+        with self._lock:
+            identity = self._born.get(session)
+        return (*_where(url, config), identity or _identity(url, config))
 
     def acquire(self, url: XRootDURL, config: Config) -> Session | None:
         """A live session for ``url``, or ``None`` if the caller must dial.
@@ -196,7 +276,7 @@ class SessionPool:
         if _cannot_pool(session, config):
             return False
         cutoff = time.monotonic() - config.pool_idle_ttl
-        key = _key(url, config)
+        key = self._key_for(session, url, config)
         with self._lock:
             bucket = self._idle.setdefault(key, [])
             expired = _prune(bucket, cutoff)
@@ -218,6 +298,7 @@ class SessionPool:
         # The lock may have been held by a thread that does not exist on this
         # side of the fork, so it is replaced rather than taken.
         self._idle = {}
+        self._born = weakref.WeakKeyDictionary()
         self._lock = threading.Lock()
 
     def clear(self) -> None:

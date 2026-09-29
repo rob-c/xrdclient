@@ -829,3 +829,61 @@ def test_an_error_body_that_is_not_an_error_still_becomes_one():
     exc = m._server_error(rp.ErrorInfo(0, "nothing went wrong"), "/d/f.root")
     assert isinstance(exc, ServerError)
     assert "nothing went wrong" in str(exc)
+
+
+# --------------------------------------------------------------------------
+# Abandoned streams
+# --------------------------------------------------------------------------
+
+
+def test_a_freed_stream_id_goes_to_the_back_of_the_line():
+    """The id just given up on is the last to be handed out again."""
+    machine = ready()
+    first, second = machine.submit(r.Ping()), machine.submit(r.Ping())
+    machine.receive_data(ok(first) + ok(second))
+    drain(machine)
+    assert machine.submit(r.Ping()) == first
+
+
+def test_an_abandoned_stream_is_not_reused_until_its_answer_arrives():
+    machine = ready()
+    sid = machine.submit(r.Read(b"HDL0", 0, 4))
+    machine.abandon(sid)
+    assert not machine.idle() and machine.in_flight == 0
+    machine._free.clear()
+    machine._next_sid = sid
+    with pytest.raises(ProtocolError, match="exhausted"):
+        machine.submit(r.Ping())
+    # Instalments and a promise of later keep it held; the final reply frees it.
+    machine.receive_data(frame(sid, c.kXR_oksofar, b"ab"))
+    machine.receive_data(frame(sid, c.kXR_waitresp, struct.pack(">i", 1)))
+    assert not machine.idle()
+    machine.receive_data(ok(sid, b"cd"))
+    assert drain(machine) == []
+    assert machine.idle()
+    assert machine.submit(r.Ping()) == sid
+
+
+def test_abandoning_a_stream_that_is_finished_does_nothing():
+    machine = ready()
+    machine.abandon(SID)
+    assert machine.idle()
+
+
+@pytest.mark.parametrize(
+    ("resptype", "data", "freed"),
+    [
+        (c.kXR_PartialResult, b"late", False),
+        (c.kXR_FinalResult, b"late", True),
+        (c.kXR_FinalResult, b"", True),
+    ],
+)
+def test_a_late_status_reply_to_an_abandoned_stream_is_skipped_whole(resptype, data, freed):
+    """Its raw trailer is part of it: left on the wire it would be read as a header."""
+    machine = ready()
+    sid = machine.submit(r.PgRead(b"HDL0", 0, 4))
+    machine.abandon(sid)
+    after = machine.submit(r.Ping())
+    machine.receive_data(status_frame(sid, c.kXR_pgread, resptype, data) + ok(after, b"pong"))
+    assert only(machine, m.Completed).data == b"pong"
+    assert machine.idle() is freed

@@ -96,6 +96,17 @@ def _retarget(request: Request, original: PathFields, token: str) -> None:
             setattr(request, name, _with_token(value, token))
 
 
+def _as_url(host: str) -> str:
+    """A negative-port host field as a URL, reading a bare ``host[:port]`` as XRootD.
+
+    XrdCl's ``URL::FromString`` takes a string with no scheme to be a
+    ``root://`` one, so a server that names only ``host:port`` - or a host
+    with no port, which then gets the default - is followed rather than
+    refused.
+    """
+    return host if "://" in host else f"root://{host}"
+
+
 def _redirect_url(base: XRootDURL, host: str) -> XRootDURL:
     """Where a ``kXR_redirect`` with a negative port points.
 
@@ -105,12 +116,44 @@ def _redirect_url(base: XRootDURL, host: str) -> XRootDURL:
     follow on the same request, so it is refused by name rather than dialled
     as if it were XRootD.
     """
-    if "://" not in host:
-        raise ProtocolError(f"kXR_redirect with a negative port must name a URL, not {host!r}")
-    target = parse(host)
+    target = parse(_as_url(host))
     if target.scheme not in ROOT_SCHEMES:
         raise ProtocolError(f"redirected to a {target.scheme} URL, which is not XRootD: {host}")
+    if not target.host:
+        raise ProtocolError(f"kXR_redirect with a negative port names no host: {host!r}")
     return base.evolve(scheme=target.scheme, host=target.host, port=target.port)
+
+
+def _redirect_path(target: RedirectInfo) -> str:
+    """The path a redirect tells the request to use instead, or ``""``.
+
+    Only a negative port's URL can carry one - ``root://ds//real/name``, as
+    ``XrdOfs`` sends for a file whose storage is elsewhere - and XrdCl puts
+    it in place of the request's own (``RewriteCGIAndPath`` with the new
+    URL's path). A URL that stops at its host, or at the slash after it,
+    names no path, and the request keeps its own.
+    """
+    if target.port >= 0:
+        return ""
+    url = _as_url(target.host)
+    _, _, path = url.partition("://")[2].partition("/")
+    return parse(url).path if path else ""
+
+
+def _repath(original: PathFields, path: str) -> None:
+    """Put ``path`` in place of the request's path, keeping the caller's CGI.
+
+    The field that names where the request acts - a rename's destination,
+    as XrdCl rewrites it, and a request's only path otherwise. A request by
+    handle has no path to replace, and one naming a list of paths cannot
+    have them all become one, so both are left as they are.
+    """
+    for name in reversed(original):
+        value = original[name]
+        if isinstance(value, str) and value:
+            _, sep, query = value.partition("?")
+            original[name] = f"{path}{sep}{query}"
+            return
 
 
 @dataclass(**SLOTS)
@@ -129,6 +172,44 @@ class _Route:
     session: Session | None = None
     hops: int = 0
     attempts: int = 0
+
+
+class _Loan:
+    """A connection more than one router is using at once.
+
+    What a :class:`~xrdclient.client.FileSystem` and the files it opened
+    share when an open was not redirected. Whichever of them lets go last
+    puts it back in the pool - or closes it, if any of them saw it fail - so
+    the filesystem closing first neither pools a connection a file is still
+    reading from, nor closes it under the file.
+    """
+
+    __slots__ = ("session", "url", "config", "holders", "spoiled", "_lock")
+
+    def __init__(self, session: Session, url: XRootDURL, config: Config) -> None:
+        self.session = session
+        #: Where, and as whom, the connection goes back to the pool.
+        self.url = url
+        self.config = config
+        self.holders = 1
+        #: Whether a holder let go of it because it failed or misbehaved.
+        self.spoiled = False
+        self._lock = threading.Lock()
+
+    def join(self) -> _Loan:
+        with self._lock:
+            self.holders += 1
+        return self
+
+    def leave(self, *, spoiled: bool = False) -> None:
+        with self._lock:
+            self.holders -= 1
+            self.spoiled = self.spoiled or spoiled
+            last = self.holders == 0
+        if not last:
+            return
+        if self.spoiled or not SESSIONS.release(self.session, self.url, self.config):
+            self.session.close()
 
 
 class Router:
@@ -154,14 +235,15 @@ class Router:
         #: that got it (a filesystem, which asks its manager every time).
         self.sticky = sticky
         self._session: Session | None = None
-        #: Whether this router may hand its connection back to the pool. False
-        #: on a pinned router that borrowed the connection it shares: the
-        #: router it came from is still using it.
-        self._owns = True
+        #: Set while the connection is shared with other routers - a lender
+        #: and the files it lent to - and ``None`` while this router is its
+        #: only user, free to pool or close it alone.
+        self._loan: _Loan | None = None
         #: The router a :meth:`lend` borrows its first connection from.
         self._lender: Router | None = None
-        #: Whether this router was lent for one open, so that pinning it may
-        #: take over a connection it made for itself; see :meth:`pin`.
+        #: Whether this router was lent for one open, so that pinning it hands
+        #: its hold on the connection over rather than sharing it; see
+        #: :meth:`pin`.
         self._lent = False
         self._lock = threading.RLock()
 
@@ -193,18 +275,45 @@ class Router:
         if self._session is not None:
             # A session whose peer went away is closed as far as the
             # protocol goes, but its socket is still a descriptor.
-            self._session.close()
+            self._let_go(self._session, self._loan, self.url, spoiled=True)
+            self._session, self._loan = None, None
         lender, self._lender = self._lender, None
         if lender is not None:
             # Borrowed, not dialled: the open this router was lent for starts
             # on the connection its lender already has.
-            self._session, self._owns = lender.session, False
+            self._loan = lender._share()
+            self._session = self._loan.session
             return
-        self._owns = True
         self._session = self._dial(self.url)
 
+    def _hold(self, session: Session) -> _Loan:
+        """This router's share of ``session``, its current connection.
+
+        Called with the lock held. A connection this router had to itself
+        becomes a shared one, with this router as its first holder.
+        """
+        if self._loan is None:
+            self._loan = _Loan(session, self.url, self.config)
+        return self._loan
+
+    def _share(self) -> _Loan:
+        """A new holder's share of this router's connection, connecting first."""
+        with self._lock:
+            return self._hold(self.session).join()
+
+    def _let_go(
+        self, session: Session, loan: _Loan | None, url: XRootDURL, *, spoiled: bool = False
+    ) -> None:
+        """Finish with ``session``: leave its loan, else close or pool it."""
+        if loan is not None:
+            loan.leave(spoiled=spoiled)
+        elif spoiled:
+            session.close()
+        else:
+            self._offer(session, url)
+
     def _dial(self, url: XRootDURL) -> Session:
-        return SESSIONS.acquire(url, self.config) or Session.connect(url, config=self.config)
+        return SESSIONS.acquire(url, self.config) or SESSIONS.connect(url, self.config)
 
     def _offer(self, session: Session, url: XRootDURL) -> None:
         """Pool a connection this router is finished with, or close it."""
@@ -281,6 +390,11 @@ class Router:
             route.target = None if home else destination
         if route.original is None:
             route.original = _path_fields(request)
+        path = _redirect_path(redirect.target)
+        if path:
+            # Into the snapshot, not only the request: every later hop, and a
+            # retry at the manager, builds on the path this one moved it to.
+            _repath(route.original, path)
         _retarget(request, route.original, redirect.target.token)
         _log.debug("redirected to %s:%s", destination.host, destination.port)
 
@@ -311,14 +425,15 @@ class Router:
                 return False
             if same_server(destination, self.url, self.config):
                 return True
-            leaving, owns, origin = self._session, self._owns, self.url
-            self._session, self._owns, self.url = None, True, destination
+            leaving, loan, origin = self._session, self._loan, self.url
+            self._session, self._loan, self.url = None, None, destination
         # The connection being left behind is not broken - it is simply not
         # the server holding the file - so it goes back to the pool, keyed by
         # the endpoint it is still connected to. The next open asks the same
         # manager the same question, and finds it already answered once.
-        if leaving is not None and owns:
-            self._offer(leaving, origin)
+        # Never ``None``: the request that brought the redirect went out on it.
+        assert leaving is not None
+        self._let_go(leaving, loan, origin)
         return True
 
     def _recover(self, request: Request, route: _Route, error: XrdConnectionError) -> None:
@@ -364,16 +479,15 @@ class Router:
 
         Only if it is still ``failed``: another thread may have replaced it
         already, and closing its fresh connection would turn one failure into
-        two. A borrowed connection is let go of without being closed - it is
-        its lender's to close.
+        two. A shared connection is not closed under the routers still using
+        it: it is marked, and the last of them closes it instead of pooling it.
         """
         with self._lock:
-            session = self._session
+            session, loan = self._session, self._loan
             if session is None or (failed is not None and session is not failed):
                 return
-            owns, self._session, self._owns = self._owns, None, True
-        if owns:
-            session.close()
+            self._session, self._loan = None, None
+        self._let_go(session, loan, self.url, spoiled=True)
 
     def discard(self) -> None:
         """Close this connection for good, keeping it out of the pool.
@@ -405,32 +519,38 @@ class Router:
         leaves the recovery to :class:`~xrdclient.client.file.File`, which is the
         only layer that knows how to get the handle back.
 
-        ``transfer`` hands the connection over rather than sharing it: the
-        caller is done with this router and the pinned one becomes the single
-        owner, free to return the connection to the pool when it closes.
-        Without it the pinned router is a borrower, and closing one of those
-        lets go of the connection without touching it - the router it came
-        from still has work for it. A :meth:`lend`-ed router always hands over
-        a connection it made for itself: nobody else holds it.
+        ``transfer`` hands this router's hold on the connection over rather
+        than sharing it: the caller is done with this router, and the pinned
+        one takes its place - the single owner, if this router was. Without
+        it the two share the connection, and whichever lets go last returns
+        it to the pool. A :meth:`lend`-ed router always hands over: it was
+        made for the one open, and its caller keeps only the pinned router.
         """
         pinned = Router(self.url, self.config, reconnect=False)
         with self._lock:
-            give = transfer or (self._lent and self._owns)
-            pinned._session = self._session
-            if give:
-                self._session = None
-            pinned._owns = give or pinned._session is None
+            session = self._session
+            if session is None:
+                return pinned
+            if transfer or self._lent:
+                pinned._loan = self._loan
+                self._session, self._loan = None, None
+            else:
+                pinned._loan = self._hold(session).join()
+            pinned._session = session
         return pinned
 
     def close(self) -> None:
-        """Finish with this connection, offering it to the pool if it is ours."""
+        """Finish with this connection, offering it to the pool if it is ours.
+
+        One shared with other routers stays open until the last of them has
+        finished with it: a filesystem closed before a file it opened must not
+        pool, or close, the connection that file is still using.
+        """
         with self._lock:
-            session, self._session = self._session, None
-            owns, self._owns = self._owns, True
-        if session is None or not owns:
-            return
-        if not SESSIONS.release(session, self.url, self.config):
-            session.close()
+            session, loan = self._session, self._loan
+            self._session, self._loan = None, None
+        if session is not None:
+            self._let_go(session, loan, self.url)
 
     def __del__(self) -> None:
         """Give the connection back even when nobody said ``close``.

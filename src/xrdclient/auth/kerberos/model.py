@@ -80,6 +80,10 @@ class Ticket:
     client, encrypted for the service. ``key`` is the session key the KDC
     shared with the client for it; it never leaves memory, is never logged,
     and is left out of ``repr``. ``enctype`` is the session key's.
+    ``kdc_offset`` is how many seconds the KDC's clock is ahead of this
+    host's, as ``kinit`` measured it and wrote it into the cache; MIT adds it
+    to the local time in every authenticator (``kdc_timesync``), and so does
+    this client, so that a host whose clock is off still logs in.
     """
 
     client: Principal
@@ -92,6 +96,7 @@ class Ticket:
     flags: int
     der: bytes = b""
     key: bytes = field(default=b"", repr=False, compare=False)
+    kdc_offset: float = field(default=0.0, compare=False)
 
     @property
     def expired(self) -> bool:

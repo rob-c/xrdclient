@@ -371,7 +371,8 @@ def test_filesystem_copy(fs, root, tmp_path, srv):
     status, response = fs.copy(root + "/d/l.txt", str(target))
     assert status.ok and response is None
     assert target.read_bytes() == TEXT
-    assert fs.copy(root + "/d/l.txt", str(target))[0].code == 12  # exists, no force
+    exists = fs.copy(root + "/d/l.txt", str(target))[0]  # no force
+    assert (exists.code, exists.errno) == (402, 3018)  # errLocalError, kXR_ItExists
     assert fs.copy(root + "/d/l.txt", str(target), force=True)[0].ok
 
 
@@ -611,6 +612,73 @@ def test_open_with_a_callback(root):
     f.close()
 
 
+def test_a_file_whose_open_failed_through_a_callback_is_finished_too(root):
+    """As with the bindings: the callback's failure is what later opens and closes answer."""
+    f = client.File()
+    handler = client.utils.AsyncResponseHandler()
+    assert f.open(root + "/nope", callback=handler).ok
+    failed = handler.wait()[0]
+    assert failed.errno == 3011 and not f.is_open()
+    assert f.open(root + "/d/l.txt")[0] == failed
+    assert f.close()[0] == failed
+
+
+def _slow_opens(monkeypatch):
+    """Native opens that wait for ``gate``; returns it, and the files they closed."""
+    from xrdclient.compat.client import file as compat_file
+
+    gate, done, closed = threading.Event(), threading.Event(), []
+    real_open, real_close = compat_file.NativeFile.open, compat_file.NativeFile.close
+
+    def slow_open(self, *args):
+        gate.wait(30)
+        try:
+            return real_open(self, *args)
+        finally:
+            done.set()
+
+    def close(self):
+        closed.append(self)
+        return real_close(self)
+
+    monkeypatch.setattr(compat_file.NativeFile, "open", slow_open)
+    monkeypatch.setattr(compat_file.NativeFile, "close", close)
+    return gate, done, closed
+
+
+def test_an_open_that_times_out_stays_failed_when_it_later_succeeds(root, monkeypatch):
+    """The late handle is closed, not installed: no reads through it, and no leak."""
+    gate, done, closed = _slow_opens(monkeypatch)
+    f = client.File()
+    expired, _ = f.open(root + "/d/l.txt", timeout=1)
+    assert expired.code == 206
+    gate.set()
+    assert done.wait(30)
+    for _ in range(300):  # the worker closes the late handle just after opening it
+        if closed:
+            break
+        time.sleep(0.01)
+    assert len(closed) == 1 and not f.is_open()
+    assert f.open(root + "/d/l.txt")[0] == expired == f.close()[0]
+    with pytest.raises(ValueError, match="closed"):
+        f.read()
+
+
+def test_an_open_that_lands_as_its_caller_gives_up_is_given_back(root, monkeypatch):
+    """The open finished just before the timeout was acted on: it is undone, not kept."""
+    from xrdclient.compat.client import _status
+    from xrdclient.compat.client import file as compat_file
+
+    def late(operation, convert, *, timeout, callback, hosts):
+        operation()  # the open succeeds and installs its handle...
+        return _status.failure(_status.errOperationExpired), None  # ...as time runs out
+
+    monkeypatch.setattr(compat_file, "call", late)
+    f = client.File()
+    assert f.open(root + "/d/l.txt", timeout=1)[0].code == 206
+    assert not f.is_open() and f.native is None
+
+
 def test_a_callback_on_an_unopened_file_has_no_hosts():
     from xrdclient.compat.client.file import File
 
@@ -707,12 +775,16 @@ def test_a_copy_process_in_parallel_with_checksums(root, tmp_path):
     assert all(r["sourceCheckSum"].startswith("adler32:") for r in results)
 
 
-def test_a_copy_into_a_directory_keeps_the_name(root, tmp_path):
+def test_a_target_directory_is_not_filled_with_the_sources_name(root, tmp_path, srv):
+    """``CopyProcess`` copies to the path it is given - naming the file is ``xrdcp``'s job."""
     process = client.CopyProcess()
-    process.add_job(root + "/d/l.txt", str(tmp_path) + "/")
-    process.add_job(root + "/d/sub/g", str(tmp_path))
-    assert process.run()[0].ok
-    assert (tmp_path / "l.txt").read_bytes() == TEXT and (tmp_path / "g").exists()
+    process.add_job(root + "/d/l.txt", str(tmp_path))
+    process.add_job(str(tmp_path / "up"), root + "/d/sub/")
+    (tmp_path / "up").write_bytes(b"u")
+    _, results = process.run()
+    assert (results[0]["status"].code, results[0]["status"].errno) == (402, 3018)
+    assert not (tmp_path / "l.txt").exists()
+    assert results[1]["status"].code == 400 and "/d/sub/up" not in srv.files
 
 
 def test_a_copy_process_makes_the_parent_when_asked(root, tmp_path, srv):
@@ -783,6 +855,148 @@ def test_a_transient_failure_is_retried(root, tmp_path, monkeypatch):
     calls.clear()
     process.add_job(root + "/d/l.txt", str(tmp_path / "s"), retry=1)
     assert process.run()[0].code == 108
+
+
+def test_a_force_retry_overwrites_what_the_failure_left(root, tmp_path, monkeypatch):
+    """XrdCl's default CpRetryPolicy: retry with force, so a partial target is no obstacle."""
+    from xrdclient import errors
+    from xrdclient.compat.client import copyprocess
+
+    real, calls = copyprocess._copy_file, []
+
+    def flaky(source, target, **kwargs):
+        calls.append((kwargs["overwrite"], kwargs["resume"]))
+        if len(calls) == 1:
+            with open(target, "wb") as partial:
+                partial.write(b"part")  # what an interrupted download leaves
+            raise errors.TransientError("connection reset mid-transfer")
+        return real(source, target, **kwargs)
+
+    monkeypatch.setattr(copyprocess, "_copy_file", flaky)
+    process = client.CopyProcess()
+    process.add_job(root + "/d/l.txt", str(tmp_path / "x"), retry=2)
+    status, _ = process.run()
+    assert status.ok, status.message
+    assert calls == [(False, False), (True, False)]
+    assert (tmp_path / "x").read_bytes() == TEXT
+
+
+def test_a_target_that_exists_is_a_local_error_as_in_xrdcl(root, tmp_path):
+    (tmp_path / "there").write_bytes(b"x")
+    (tmp_path / "dir").mkdir()
+    process = client.CopyProcess()
+    process.add_job(root + "/d/l.txt", str(tmp_path / "there"))
+    process.add_job(root + "/d/l.txt", str(tmp_path / "dir"), force=True)
+    process.add_job(str(tmp_path / "missing"), str(tmp_path / "t"))
+    _, results = process.run()
+    codes = [(r["status"].code, r["status"].errno) for r in results]
+    assert codes == [(402, 3018), (402, 3016), (402, 3011)]
+    assert results[0]["status"].message == "[ERROR] Local error: file exists\n"
+
+
+def test_a_local_error_without_an_errno_the_protocol_names(root, tmp_path, monkeypatch):
+    import errno as errnos
+
+    from xrdclient.compat.client import copyprocess
+
+    def refuse(*args, **kwargs):
+        raise OSError(errnos.EBUSY, "Resource busy")
+
+    monkeypatch.setattr(copyprocess, "_copy_file", refuse)
+    process = client.CopyProcess()
+    process.add_job(root + "/d/l.txt", str(tmp_path / "busy"))
+    status = process.run()[0]
+    assert (status.code, status.errno) == (402, errnos.EBUSY)
+
+
+def test_a_missing_source_leaves_no_target(root, tmp_path):
+    process = client.CopyProcess()
+    process.add_job(root + "/nope", str(tmp_path / "b.bin"))
+    process.add_job(root + "/nope", str(tmp_path / "kept"), force=True)
+    (tmp_path / "kept").write_bytes(b"precious")
+    _, results = process.run()
+    assert [r["status"].errno for r in results] == [3011, 3011]
+    assert not (tmp_path / "b.bin").exists()
+    assert (tmp_path / "kept").read_bytes() == b"precious"
+
+
+def _no_checksums(srv):
+    """The server a stock xrootd is without a checksum plugin: kXR_Qcksum is refused."""
+    from xrdclient.proto import constants as c
+    from xrdclient.testing import error
+    from xrdclient.testing import server as fake
+
+    def query(conn, sid, params, body):
+        if int.from_bytes(params[:2], "big") == c.kXR_Qcksum:
+            yield error(sid, 3013, "query chksum is not supported")
+            return
+        yield from fake._h_query(conn, sid, params, body)
+
+    srv.handlers[c.kXR_query] = query
+
+
+@pytest.mark.parametrize(
+    ("mode", "preset", "keys", "code"),
+    [
+        ("end", "", set(), 0),  # not a mode XrdCl knows: nothing is checked
+        ("end", "0000abcd", {"sourceCheckSum"}, 0),  # a preset alone compares with nothing
+        ("target", "", {"targetCheckSum"}, 0),  # the local target, digested here
+        ("target", "0000abcd", {"sourceCheckSum", "targetCheckSum"}, 305),
+        ("source", "", set(), 400),  # the server cannot say
+        ("end2end", "", set(), 400),
+    ],
+)
+def test_checksum_modes_ask_what_xrdcl_asks(root, srv, tmp_path, mode, preset, keys, code):
+    _no_checksums(srv)
+    process = client.CopyProcess()
+    process.add_job(
+        root + "/d/l.txt",
+        str(tmp_path / "c"),
+        checksummode=mode,
+        checksumtype="adler32",
+        checksumpreset=preset,
+    )
+    _, (result,) = process.run()
+    assert result["status"].code == code
+    assert set(result) == {"status", "size"} | keys and result["size"] == len(TEXT)
+    if preset:
+        assert result["sourceCheckSum"] == "adler32:abcd"  # leading zeros dropped, as XrdCl
+    if code == 400:
+        assert result["status"].errno == 3013
+
+
+def test_a_checksum_other_than_adler32_or_crc32_keeps_its_leading_zeros(root, tmp_path):
+    process = client.CopyProcess()
+    process.add_job(
+        root + "/d/l.txt",
+        str(tmp_path / "md5"),
+        checksummode="end",
+        checksumtype="md5",
+        checksumpreset="00ff",
+    )
+    assert process.run()[1][0]["sourceCheckSum"] == "md5:00ff"
+
+
+def test_a_bad_checksum_found_after_the_copy_can_remove_the_target(root, tmp_path):
+    process = client.CopyProcess()
+    process.add_job(
+        root + "/d/l.txt",
+        str(tmp_path / "bad"),
+        checksummode="end2end",
+        checksumpreset="1",
+        rmBadCksum=True,
+    )
+    assert process.run()[0].message == "[ERROR] CheckSum error"
+    assert not (tmp_path / "bad").exists()
+
+
+@pytest.mark.parametrize("mkdir", [True, False])
+def test_a_local_target_ending_in_a_slash_is_the_file_itself(root, tmp_path, mkdir):
+    """XrdCl writes ``sub/dir/`` as the file ``dir``, and makes a local target's parents."""
+    process = client.CopyProcess()
+    process.add_job(root + "/d/l.txt", str(tmp_path / "sub" / "dir") + "/", mkdir=mkdir)
+    assert process.run()[0].ok
+    assert (tmp_path / "sub" / "dir").read_bytes() == TEXT
 
 
 def test_a_handler_can_cancel_a_job(root, tmp_path):
@@ -1272,6 +1486,40 @@ def test_a_copy_process_reports_as_the_bindings_do(official, two_sandboxes, tmp_
         process.add_job(f"{url}/{sandbox}/{side}/nope", str(tmp_path / f"{side}-2.txt"))
         assert process.prepare().ok
         outcomes.append(_norm(process.run()))
+    assert outcomes[0] == outcomes[1]
+
+
+@pytest.mark.interop
+@pytest.mark.parity
+def test_copy_process_edge_cases_end_as_with_the_bindings(official, two_sandboxes, tmp_path):
+    """Existing targets, missing sources, checksum modes and a target ending in ``/``."""
+    url, sandbox = two_sandboxes
+    outcomes = []
+    for side, module in (("theirs", official), ("ours", client)):
+        local = tmp_path / side
+        local.mkdir()
+        (local / "kept").write_bytes(b"precious")
+        source = f"{url}/{sandbox}/{side}/l.txt"
+        process = module.CopyProcess()
+        process.add_job(source, str(local / "a"))
+        process.add_job(source, str(local / "a"))  # exists, no force
+        process.add_job(f"{url}/{sandbox}/{side}/nope", str(local / "b"))
+        process.add_job(f"{url}/{sandbox}/{side}/nope", str(local / "kept"), force=True)
+        process.add_job(source, str(local / "sub" / "dir") + "/", mkdir=True)
+        process.add_job(source, str(local / "no" / "parent"))
+        for n, mode in enumerate(("end", "source", "target", "end2end", "none")):
+            process.add_job(source, str(local / f"m{n}"), checksummode=mode, checksumtype="adler32")
+        process.add_job(
+            source, str(local / "p"), checksummode="target", checksumtype="adler32",
+            checksumpreset="0badcafe",
+        )
+        assert process.prepare().ok
+        status, results = process.run()
+        files = sorted(
+            (str(path.relative_to(local)), path.read_bytes())
+            for path in local.rglob("*") if path.is_file()
+        )
+        outcomes.append((_norm((status, results)), files))
     assert outcomes[0] == outcomes[1]
 
 

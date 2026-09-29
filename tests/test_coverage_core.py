@@ -35,7 +35,7 @@ from xrdclient.proto import constants as c
 from xrdclient.proto import requests as r
 from xrdclient.proto.machine import SessionMachine, State
 from xrdclient.session import bulk as session_bulk
-from xrdclient.session.bulk import BulkReader
+from xrdclient.session.bulk import BulkReader, BulkUnsupported
 from xrdclient.session.router import Router
 from xrdclient.session.sync import Session
 from xrdclient.testing import FakeServer, error
@@ -277,10 +277,13 @@ def test_a_receive_whose_deadline_has_passed_is_a_timeout(server, config):
 
 
 def test_a_bulk_reader_is_refused_while_a_request_is_outstanding(server, config):
-    """A reader would take the outstanding request's reply off the wire."""
+    """A reader would take the outstanding request's reply off the wire.
+
+    Refused as unsupported, so the caller carries on down the event path.
+    """
     with Session.connect(server.url, config=config) as session:
         session.machine.submit(r.Ping())
-        with pytest.raises(ProtocolError, match="still has requests outstanding"):
+        with pytest.raises(BulkUnsupported, match="still has requests outstanding"):
             with session.bulk(b"HDL0", chunk=1024, depth=1):
                 pass  # pragma: no cover - the entry is what raises
 

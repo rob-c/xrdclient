@@ -41,6 +41,7 @@ from ..errors import ProtocolError, XRootDError, raise_for_status
 from ..errors import TimeoutError as XrdTimeoutError
 from ..proto import constants as c
 from ..proto import requests as r
+from ..proto import responses as rp
 from ..proto.frames import Request, ResponseHeader, decode_header
 
 __all__ = ["BulkReader", "BulkUnsupported"]
@@ -52,6 +53,12 @@ _HEADER = 8
 
 #: Most a drain holds of a reply it is throwing away, at a time.
 _SINK = 64 << 10
+
+#: How long past the delay a ``kXR_waitresp`` names its answer may still take.
+WAITRESP_GRACE = 30.0
+
+#: What wraps a ``kXR_asynresp`` answer: action, reserved, then its own header.
+_ASYNC = 16
 
 #: Where ``dlen`` starts in a request header: streamid, requestid, 16 bytes of
 #: parameters.
@@ -452,17 +459,60 @@ class BulkReader:
     def _next_reply(self, header: memoryview) -> ResponseHeader:
         """The next reply header, which must answer a request still owed.
 
+        What is not an answer is dealt with on the way, as the event path
+        would: a server notice is kept for :meth:`Session.notices`, and a
+        ``kXR_waitresp`` leaves its stream owed - the answer it promises comes
+        later, as a ``kXR_asynresp``, and is unwrapped here into the reply it
+        carries. Until that answer is in, the stream id cannot be reused, or
+        it would be taken for the reply to whatever was sent on it next.
+
         The wire is torn from here until the frame's body is off it too.
+        """
+        while True:
+            reply = self._frame_header(header)
+            if reply is None:
+                continue
+            if reply.streamid not in self._owed:
+                raise ProtocolError(
+                    f"bulk transfer: reply on stream {reply.streamid}, "
+                    f"which is not one of the {len(self._owed)} in flight"
+                )
+            if reply.status != c.kXR_waitresp:
+                return reply
+            self._deferred(self._body(reply.dlen))
+
+    def _frame_header(self, header: memoryview) -> ResponseHeader | None:
+        """The next frame's header, unwrapped if it is a ``kXR_asynresp``.
+
+        ``None`` when the frame was a notice, which is off the wire already.
         """
         self._torn = True
         self._exact(header, _HEADER)
         reply = decode_header(bytes(header))
-        if reply.streamid not in self._owed:
-            raise ProtocolError(
-                f"bulk transfer: reply on stream {reply.streamid}, "
-                f"which is not one of the {len(self._owed)} in flight"
-            )
-        return reply
+        if reply.status != c.kXR_attn:
+            return reply
+        size = reply.dlen
+        head = b""
+        if size >= _ASYNC:
+            self._exact(header, _HEADER)
+            head = bytes(header)
+            if int.from_bytes(head[:4], "big") == c.kXR_asynresp:
+                self._exact(header, _HEADER)
+                inner = decode_header(bytes(header))
+                # What is on the wire is what is left of this frame, whatever
+                # the inner header claims - which is how the event path reads it.
+                return ResponseHeader(inner.streamid, inner.status, size - _ASYNC)
+        notice = rp.parse_attn(head + self._body(size - len(head)))
+        _log.debug("server notice during a bulk transfer: %r", notice)
+        self._session.note(notice)  # type: ignore[attr-defined]
+        return None
+
+    def _deferred(self, body: bytearray) -> None:
+        """Give a ``kXR_waitresp``'s answer the time the server asked for."""
+        budget = self._session.config.wait_budget  # type: ignore[attr-defined]
+        seconds = min(rp.parse_waitresp(bytes(body)).seconds, budget)
+        if self._expires is not None:
+            self._expires = max(self._expires, time.monotonic() + seconds + WAITRESP_GRACE)
 
     def _body(self, size: int) -> bytearray:
         """The rest of a frame whose header is already off the wire."""
@@ -487,19 +537,13 @@ class BulkReader:
 
         Bounded by the same stall clock as the read itself. Only replies to
         this reader's own reads can be on the wire, since it holds the
-        connection to itself; anything else means the stream is out of step.
+        connection to itself, and notices; anything else means the stream is
+        out of step. A deferred answer is waited for like any other.
         """
         header = memoryview(bytearray(_HEADER))
         sink = memoryview(bytearray(min(self._chunk, _SINK)))
         while self._owed:
-            self._torn = True
-            self._exact(header, _HEADER)
-            reply = decode_header(bytes(header))
-            if reply.streamid not in self._owed:
-                raise ProtocolError(
-                    f"bulk read: reply on stream {reply.streamid} while draining, "
-                    "which is not one still owed"
-                )
+            reply = self._next_reply(header)
             left = reply.dlen
             while left:
                 step = min(left, len(sink))
@@ -532,7 +576,7 @@ def _refuse(status: int, body: bytearray) -> NoReturn:
         text = bytes(body[4:]).split(b"\x00", 1)[0].decode("utf-8", "replace")
         raise_for_status(code, text)
         raise ProtocolError(f"bulk request failed with error code {code}: {text}")
-    # kXR_wait, kXR_waitresp, kXR_redirect: a conversation, not bytes.
+    # kXR_wait, kXR_redirect: a conversation, not bytes.
     raise BulkUnsupported(
         f"server answered a bulk request with {c.status_name(status)}; "
         "the transfer falls back to the standard path"

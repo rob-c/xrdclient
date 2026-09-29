@@ -15,6 +15,7 @@ back as one.
 from __future__ import annotations
 
 import contextlib
+import threading
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from functools import partial
 from typing import Any, Optional, TypeVar
@@ -93,6 +94,8 @@ class File:
             wanted |= OpenFlags.MAKEPATH
         mode = _args.u16(mode, "mode")
 
+        attempt = _Attempt()
+
         def opened() -> None:
             try:
                 if mode:
@@ -102,12 +105,27 @@ class File:
             except BaseException:
                 native.close()
                 raise
-            self.native, self.__cursor = native, 0
+            if not attempt.deliver(partial(self.__install, native)):
+                _close_quietly(native)  # its caller gave up on it: nobody else will
 
-        outcome = self.__run(opened, timeout=timeout, callback=callback)
+        outcome = self.__run(opened, timeout=timeout, callback=_marking(self.__fail, callback))
         if callback is None and not outcome[0].ok:
-            self.__failed = outcome[0]
+            # An open that failed stays failed - and one that timed out may
+            # still succeed later, so it must not install the handle then, and
+            # must give it back if it did so in the moment before this.
+            attempt.abandon()
+            if self.native is native:
+                self.native = None
+                _close_quietly(native)
+            self.__fail(outcome[0])
         return outcome
+
+    def __install(self, native: NativeFile) -> None:
+        self.native, self.__cursor = native, 0
+
+    def __fail(self, why: XRootDStatus) -> None:
+        """Finish with this file, as XrdCl does after a failed open."""
+        self.__failed = why
 
     def openusingtemplate(
         self,
@@ -154,8 +172,7 @@ class File:
         # quietly, since whatever it was connected to may already be gone.
         native = getattr(self, "native", None)
         if native is not None:
-            with contextlib.suppress(Exception):
-                native.close()
+            _close_quietly(native)
 
     # -- reading -------------------------------------------------------------
 
@@ -379,6 +396,44 @@ class File:
     def __repr__(self) -> str:
         where = str(self.native.url) if self.native is not None else "not open"
         return f"<XRootD.client.File {where}>"
+
+
+class _Attempt:
+    """One open, whose handle goes to the caller unless the caller gave up first."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._abandoned = False
+
+    def deliver(self, install: Callable[[], None]) -> bool:
+        """Install the opened handle, or say the caller is no longer waiting for it."""
+        with self._lock:
+            if not self._abandoned:
+                install()
+            return not self._abandoned
+
+    def abandon(self) -> None:
+        with self._lock:
+            self._abandoned = True
+
+
+def _close_quietly(native: NativeFile) -> None:
+    with contextlib.suppress(Exception):
+        native.close()
+
+
+def _marking(mark: Callable[[XRootDStatus], None], callback: Callback) -> Callback:
+    """``callback``, first passing a failure to ``mark``: an open that failed is dead."""
+    if not callable(callback):
+        return callback  # ``None``, or something ``call`` will refuse
+    user = callback
+
+    def delivered(status: XRootDStatus, response: Any, hosts: HostList) -> object:
+        if not status.ok:
+            mark(status)
+        return user(status, response, hosts)
+
+    return delivered
 
 
 def _same(value: T) -> T:

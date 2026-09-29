@@ -370,23 +370,46 @@ def _bulk_to_file(
     *,
     overwrite: bool,
 ) -> int:
-    """Download to a local path with every connection writing its own span."""
+    """Download to a local path with every connection writing its own span.
+
+    The target is opened before the source is, so a copy that fails before
+    a byte arrives - no such source, say - leaves the destination as it was
+    found: a file it created is removed again, and one that was there is not
+    truncated, since the download sizes the file itself once the source has
+    answered. A failure after that keeps what was written, for a resume.
+    """
     from ..client import bulk
 
-    flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if overwrite else os.O_EXCL)
-    fd = os.open(target.path, flags, 0o644)
+    fd, created = _create(target.path, overwrite=overwrite)
+    arrived = False
+
+    def reported(done: int, total: int | None) -> None:
+        nonlocal arrived
+        arrived = True
+        if progress is not None:
+            progress(done, total)
+
     try:
-        return bulk.download(source, fd, config=config, progress=progress).size
-    except BulkUnsupported:
-        # Nothing was transferred, and the caller is about to try again the
-        # ordinary way: leave the destination as it was found, so an
-        # exclusive create is still exclusive on the second attempt.
-        if not overwrite:
+        return bulk.download(source, fd, config=config, progress=reported).size
+    except BaseException as exc:
+        # ``BulkUnsupported`` sends the caller the ordinary way next, which
+        # must find an exclusive create still exclusive.
+        if created and (not arrived or isinstance(exc, BulkUnsupported)):
             with suppress(OSError):
                 os.remove(target.path)
         raise
     finally:
         os.close(fd)
+
+
+def _create(path: str, *, overwrite: bool) -> tuple[int, bool]:
+    """A descriptor for writing ``path``, and whether this call created the file."""
+    try:
+        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644), True
+    except FileExistsError:
+        if not overwrite:
+            raise
+    return os.open(path, os.O_WRONLY | os.O_CREAT), False
 
 
 def _descriptor_of(writer: IO[bytes]) -> int | None:

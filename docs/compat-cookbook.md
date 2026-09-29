@@ -366,8 +366,8 @@ class Progress(client.utils.CopyProgressHandler):
 process = client.CopyProcess()
 process.add_job(f"{SERVER}/{BASE}/lines.txt", "/tmp/cookbook/lines.txt",
                 force=True, mkdir=True, checksummode="end2end")
-process.add_job(f"{SERVER}/{BASE}/written.dat", "/tmp/cookbook/",
-                force=True, mkdir=True)      # a directory: keeps the name
+process.add_job(f"{SERVER}/{BASE}/written.dat", "/tmp/cookbook/written.dat",
+                force=True)                  # the file itself: its directory is made
 process.parallel(2)
 
 status = process.prepare()
@@ -551,7 +551,11 @@ I/O on a `File` that is not open is `ValueError`. The
 the common `errno` values.
 
 A failed `open` leaves the `File` object finished with: every later `open`
-and `close` on it returns the same failure. Make a new `File` to retry.
+and `close` on it returns the same failure - whether the failure came back
+directly, to a `callback`, or as `errOperationExpired` from a `timeout`. An
+open that times out is not recalled from the server, but if it succeeds after
+all, its handle is closed rather than attached to the `File`. Make a new
+`File` to retry.
 
 ## Using it from threads
 

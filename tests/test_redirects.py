@@ -23,7 +23,7 @@ from xrdclient.proto import constants as c
 from xrdclient.proto import requests as r
 from xrdclient.proto import responses as rp
 from xrdclient.session.pool import SESSIONS
-from xrdclient.session.router import Router, _path_fields, _retarget
+from xrdclient.session.router import Router, _path_fields, _redirect_path, _repath, _retarget
 from xrdclient.session.sync import RedirectRequired, Session
 from xrdclient.testing import FakeServer
 
@@ -110,9 +110,15 @@ def test_a_lent_router_hands_its_own_connection_on_to_the_pinned_one(config):
         lent.execute(r.Open("/f", c.kXR_open_read), path="/f")
         pinned = lent.pin()
         assert pinned.endpoint == f"{ds.address[0]}:{ds.address[1]}"
-        assert pinned._owns and not lent.connected
+        assert pinned._loan is None and not lent.connected
         pinned.close()
         home.close()
+
+
+def test_pinning_a_router_that_never_connected_pins_nothing(config, server):
+    pinned = Router(server.url, config).pin()
+    assert not pinned.connected and pinned._loan is None
+    pinned.close()
 
 
 def test_a_lent_router_that_stayed_home_only_borrows(config, server):
@@ -120,7 +126,7 @@ def test_a_lent_router_that_stayed_home_only_borrows(config, server):
     lent = home.lend()
     lent.execute(r.Ping())
     pinned = lent.pin()
-    assert pinned._session is home._session and not pinned._owns
+    assert pinned._session is home._session and pinned._loan is home._loan is not None
     pinned.close()
     lent.close()
     assert home.connected
@@ -326,11 +332,87 @@ def test_a_negative_port_to_another_protocol_is_refused():
         Router._destination(here, target)
 
 
-def test_a_negative_port_with_a_bare_host_is_refused():
-    target = rp.RedirectInfo("ds.example.org", -1094)
+def test_a_negative_port_with_a_bare_host_is_read_as_xrootd():
+    """XrdCl's ``URL::FromString`` takes a scheme-less string to be ``root://``."""
+    here = xrdclient.url.parse("roots://mgr.example.org:2094//")
+    moved = Router._destination(here, rp.RedirectInfo("ds.example.org", -1094))
+    assert (moved.scheme, moved.host, moved.port) == ("root", "ds.example.org", 1094)
+    moved = Router._destination(here, rp.RedirectInfo("ds.example.org:3094", -1))
+    assert (moved.scheme, moved.host, moved.port) == ("root", "ds.example.org", 3094)
+
+
+def test_a_negative_port_that_names_no_host_is_refused():
     here = xrdclient.url.parse("root://mgr.example.org//")
-    with pytest.raises(ProtocolError, match="URL"):
-        Router._destination(here, target)
+    with pytest.raises(ProtocolError, match="no host"):
+        Router._destination(here, rp.RedirectInfo("/elsewhere", -1))
+
+
+def test_a_negative_port_with_a_bare_host_is_followed(config):
+    with (
+        FakeServer(files={"/f": b"hi"}) as target,
+        FakeServer() as front,
+        Router(front.url, config) as router,
+    ):
+        front.redirects[c.kXR_stat] = (f"{target.address[0]}:{target.address[1]}", -1, "")
+        request = r.Stat("/f")
+        router.execute(request, path="/f")
+        assert request.path == "/f"
+        assert c.kXR_stat in target.seen
+
+
+def test_a_negative_port_url_with_a_path_replaces_the_request_path(config):
+    """XrdCl rewrites the request from the new URL's path (``RewriteCGIAndPath``)."""
+    with (
+        FakeServer(files={"/g": b"hi"}) as target,
+        FakeServer() as front,
+        Router(front.url, config) as router,
+    ):
+        where = f"root://{target.address[0]}:{target.address[1]}//g"
+        front.redirects[c.kXR_stat] = (where, -1, "k=1")
+        request = r.Stat("/f?mine=1")
+        router.execute(request, path="/f")
+        assert request.path == "/g?mine=1&k=1"
+        assert (c.kXR_stat, "/g?mine=1&k=1") in target.arguments
+
+
+def test_a_negative_port_path_moves_a_rename_destination(config):
+    """For ``kXR_mv`` XrdCl rewrites the path after the space: the destination."""
+    with (
+        FakeServer(files={"/a": b"A"}) as target,
+        FakeServer() as front,
+        Router(front.url, config) as router,
+    ):
+        where = f"root://{target.address[0]}:{target.address[1]}//c"
+        front.redirects[c.kXR_mv] = (where, -1, "")
+        request = r.Mv("/a", "/b")
+        router.execute(request, path="/a")
+        assert (request.src, request.dst) == ("/a", "/c")
+
+
+@pytest.mark.parametrize(
+    ("host", "port", "path"),
+    [
+        ("root://ds//g/h", -1, "/g/h"),
+        ("root://ds:3094//g", -1, "/g"),
+        ("ds:3094//g", -1, "/g"),
+        ("root://ds/", -1, ""),
+        ("root://ds", -1, ""),
+        ("ds", -1, ""),
+        ("ds", 1094, ""),
+        ("ds", 0, ""),
+    ],
+)
+def test_only_a_url_naming_a_path_moves_the_request(host, port, path):
+    assert _redirect_path(rp.RedirectInfo(host, port)) == path
+
+
+def test_a_redirect_path_leaves_requests_without_one_alone():
+    by_handle = {"path": ""}
+    _repath(by_handle, "/g")
+    assert by_handle == {"path": ""}
+    many: dict[str, str | list[str]] = {"paths": ["/a", "/b"]}
+    _repath(many, "/g")
+    assert many == {"paths": ["/a", "/b"]}
 
 
 def test_a_positive_port_keeps_the_scheme():

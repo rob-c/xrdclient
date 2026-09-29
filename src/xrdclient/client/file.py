@@ -678,6 +678,21 @@ class File:
         _log.debug("recovering %s after the bulk plane lost its connection: %s", self.url, error)
         self._reopen()
 
+    def _recover_from_step(self, error: ProtocolError) -> None:
+        """Re-open after the bulk plane found its wire out of step, or re-raise.
+
+        A plane that could not tell whose
+        reply it was reading has marked the connection broken, which a
+        handle that can be re-opened survives, as it does a lost connection:
+        the read is run again, on the event path, over a fresh one. Anything
+        else - a connection still sound, a handle that cannot be re-opened -
+        is the caller's to see.
+        """
+        if not (self.session.broken and self.recoverable):
+            raise error
+        _log.debug("recovering %s after the bulk plane lost step with the server", self.url)
+        self._reopen()
+
     def _plane_read(self, size: int, offset: int) -> bytes | None:
         """``size`` bytes at ``offset`` off the bulk data plane, or ``None``.
 
@@ -716,6 +731,8 @@ class File:
             _log.debug("bulk read declined for %s (%s); using the event path", self.url, exc)
         except XrdConnectionError as exc:
             self._recover_from_plane(exc)
+        except ProtocolError as exc:
+            self._recover_from_step(exc)
         return None
 
     def readv(self, ranges: Iterable[ReadRange | tuple[int, int]]) -> list[bytes]:
@@ -774,6 +791,8 @@ class File:
             _log.debug("bulk readv declined for %s (%s); using the event path", self.url, exc)
         except XrdConnectionError as exc:
             self._recover_from_plane(exc)
+        except ProtocolError as exc:
+            self._recover_from_step(exc)
         return None
 
     def pgread(self, size: int, offset: int, *, verify: bool = True) -> PageResult:

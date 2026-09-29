@@ -984,3 +984,43 @@ def test_an_unverified_third_party_copy_asks_nothing_more(server):
         result = xrdclient.third_party(server.url / "data/a.root", dst.url / "b.root")
     assert not result.verified
     assert c.kXR_query not in dst.seen
+
+
+# ---------------------------------------------------------------------------
+# A download that fails before a byte arrives
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("overwrite", [True, False])
+def test_a_download_of_a_missing_source_leaves_no_target(server, tmp_path, overwrite):
+    """XrdCl opens the source first; the bulk path creates the target first, then undoes it."""
+    target = tmp_path / "never.root"
+    with pytest.raises(FileNotFoundError):
+        xrdclient.copy(server.url / "data/nope", target, overwrite=overwrite)
+    assert not target.exists()
+
+
+def test_a_download_of_a_missing_source_leaves_an_existing_target_as_it_was(server, tmp_path):
+    target = tmp_path / "kept.root"
+    target.write_bytes(b"precious and longer than the source")
+    with pytest.raises(FileNotFoundError):
+        xrdclient.copy(server.url / "data/nope", target, progress=lambda done, total: None)
+    assert target.read_bytes() == b"precious and longer than the source"
+    xrdclient.copy(server.url / "data/a.root", target)  # a shorter source: cut to fit
+    assert target.read_bytes() == b"hello world"
+
+
+def test_a_download_that_fails_part_way_keeps_what_it_wrote(server, tmp_path, monkeypatch):
+    """What arrived stays, for a resume; only a copy that never started is undone."""
+    from xrdclient.client import bulk
+
+    def partial(source, fd, *, progress, **kwargs):
+        os.write(fd, b"hello")
+        progress(5, 11)
+        raise xrdclient.errors.TransientError("dropped")
+
+    monkeypatch.setattr(bulk, "download", partial)
+    target = tmp_path / "part.root"
+    with pytest.raises(xrdclient.errors.TransientError):
+        xrdclient.copy(server.url / "data/a.root", target)
+    assert target.read_bytes() == b"hello"

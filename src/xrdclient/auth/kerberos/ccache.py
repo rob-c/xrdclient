@@ -42,6 +42,9 @@ CCACHE_VERSION_3 = 0x0503
 #: MIT keeps cache metadata as pseudo-credentials in this realm; they are not tickets.
 _CONFIG_REALM = "X-CACHECONF:"
 
+#: The version 4 header tag that carries the KDC's clock offset.
+_TAG_DELTATIME = 1
+
 _UNREACHABLE = ("KCM", "KEYRING", "API", "MEMORY", "MSLSA")
 
 
@@ -91,7 +94,23 @@ def _skip_list(reader: _Reader) -> None:
         reader.blob()
 
 
-def _read_entry(reader: _Reader, version: int) -> Ticket:
+def _kdc_offset(header: bytes) -> float:
+    """A version 4 header's DeltaTime tag: the KDC's clock minus ours, else 0.
+
+    The header is a run of ``(u16 tag, u16 length, value)``; tag 1 holds the
+    offset as signed seconds and microseconds, which ``kinit`` records when
+    ``kdc_timesync`` is on - MIT's default.
+    """
+    tags = _Reader(header)
+    while not tags.exhausted:
+        tag, value = tags.u16(), tags.take(tags.u16())
+        if tag == _TAG_DELTATIME and len(value) == 8:
+            seconds, micros = struct.unpack(">ii", value)
+            return float(seconds + micros / 1_000_000)
+    return 0.0
+
+
+def _read_entry(reader: _Reader, version: int, kdc_offset: float) -> Ticket:
     client = _read_principal(reader)
     server = _read_principal(reader)
     enctype = reader.u16()
@@ -116,6 +135,7 @@ def _read_entry(reader: _Reader, version: int) -> Ticket:
         flags=flags,
         der=der,
         key=key,
+        kdc_offset=kdc_offset,
     )
 
 
@@ -131,14 +151,13 @@ def read_ccache(path: str) -> tuple[Principal, list[Ticket]]:
     version = reader.u16()
     if version not in (CCACHE_VERSION_3, CCACHE_VERSION_4):
         raise ValueError(f"unsupported credential cache version 0x{version:04x} in {path}")
-    if version == CCACHE_VERSION_4:
-        reader.take(reader.u16())  # header tags: only a KDC clock offset, unused here
+    kdc_offset = _kdc_offset(reader.take(reader.u16())) if version == CCACHE_VERSION_4 else 0.0
     default = _read_principal(reader)
 
     out: list[Ticket] = []
     while not reader.exhausted:
         try:
-            ticket = _read_entry(reader, version)
+            ticket = _read_entry(reader, version, kdc_offset)
         except (ValueError, struct.error) as exc:
             _log.debug("credential cache %s ends early: %s", path, exc)
             break

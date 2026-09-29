@@ -269,6 +269,7 @@ def test_the_as_rep_tag_on_the_encrypted_part_is_accepted_too():
         ({"ticket_server": Principal(("xrootd", "other"), REALM, 1)}, "asked for xrootd/srv"),
         ({"client": Principal(("mallory",), REALM, 1)}, "the ticket is for mallory"),
         ({"key": Key(23, bytes(16))}, "enctype 23 is not supported"),
+        ({"key": Key(18, bytes(5))}, "session key for xrootd/srv.* is 5 bytes"),
         ({"tag": 0x62}, "expected EncTGSRepPart"),
         ({"raw": b"\x6d\x03\x30\x01\x00"}, "unusable"),
     ],
@@ -429,6 +430,36 @@ def test_include_and_includedir_are_followed(tmp_path):
     assert profile.values("libdefaults", "default_realm") == ["A.ORG"]
     assert profile.libdefault("rdns") == "false"
     assert profile.libdefault("udp_preference_limit") == "1"
+
+
+def test_include_counts_after_a_section_and_after_a_tab(tmp_path):
+    """MIT reads ``include``/``includedir`` at the start of any line, with any blank after."""
+    confd = tmp_path / "inc"
+    confd.mkdir()
+    (confd / "realm.conf").write_text("[realms]\n EX.ORG = {\n  kdc = 127.0.0.1:1\n }\n")
+    (tmp_path / "one").write_text("[libdefaults]\n rdns = false\n")
+    (tmp_path / "two").write_text("[libdefaults]\n dns_lookup_kdc = false\n")
+    main = tmp_path / "krb5.conf"
+    main.write_text(
+        "[libdefaults]\n default_realm = EX.ORG\n"
+        f"includedir\t{confd}\n"
+        f"include   {tmp_path / 'one'}  \n"
+        # The file carries on in its own section after an include.
+        " udp_preference_limit = 1\n"
+        "[realms]\n OTHER = {\n"
+        f"include {tmp_path / 'two'}\n"  # even inside a block
+        "  kdc = other\n }\n"
+        # Not at the start of the line, or a longer word: an ordinary relation.
+        f" include {tmp_path / 'missing'}\n"
+        "[x]\n includes = 1\nmodule = m\n"  # ``module`` counts only before a section
+    )
+    profile = Profile.load(str(main))
+    assert profile.kdcs("EX.ORG") == ["127.0.0.1:1"]
+    assert profile.libdefault("rdns") == "false"
+    assert profile.libdefault("dns_lookup_kdc") == "false"
+    assert profile.libdefault("udp_preference_limit") == "1"
+    assert profile.kdcs("OTHER") == ["other"]
+    assert profile.values("x", "includes") == ["1"] and profile.values("x", "module") == ["m"]
 
 
 def test_krb5_config_is_a_colon_separated_list_and_etc_is_the_default(tmp_path, monkeypatch):

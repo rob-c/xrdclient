@@ -45,6 +45,7 @@ errInvalidResponse = 303
 errCheckSumError = 305
 errRedirectLimit = 306
 errErrorResponse = 400
+errLocalError = 402
 
 #: XrdCl's words for each code, which lead every status message.
 _DESCRIPTIONS = {
@@ -65,9 +66,10 @@ _DESCRIPTIONS = {
     errOperationExpired: "Operation expired",
     errOperationInterrupted: "Operation interrupted",
     errInvalidResponse: "Invalid response",
-    errCheckSumError: "Checksum error",
+    errCheckSumError: "CheckSum error",
     errRedirectLimit: "Redirect limit has been reached",
     errErrorResponse: "Server responded with an error",
+    errLocalError: "Local error",
 }
 
 
