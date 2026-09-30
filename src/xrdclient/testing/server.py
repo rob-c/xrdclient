@@ -58,9 +58,16 @@ __all__ = ["FakeServer", "frame", "error", "pgwrite_cse", "from_directory", "mai
 #: never a name, and decoding one as text invents an argument nobody sent.
 _DATA_REQUESTS = frozenset(
     {
-        c.kXR_write, c.kXR_writev, c.kXR_clone, c.kXR_pgwrite,
-        c.kXR_read, c.kXR_readv, c.kXR_pgread,
-        c.kXR_auth, c.kXR_login, c.kXR_sigver,
+        c.kXR_write,
+        c.kXR_writev,
+        c.kXR_clone,
+        c.kXR_pgwrite,
+        c.kXR_read,
+        c.kXR_readv,
+        c.kXR_pgread,
+        c.kXR_auth,
+        c.kXR_login,
+        c.kXR_sigver,
     }
 )
 
@@ -431,49 +438,60 @@ class _Connection:
         with self.s._live_lock:
             self.s._live.add(self.sock)
         try:
-            if len(self.rfile.read(20) or b"") < 20:
-                return
-            self._send(_frame(0, c.kXR_ok, struct.pack(">ii", 0, c.ROOTD_PQ)))
-            while True:
-                header = self.rfile.read(c.REQUEST_HDRLEN)
-                if not header or len(header) < c.REQUEST_HDRLEN:
-                    return
-                sid, opcode, params, dlen = _REQ.unpack(header)
-                # dlen counts the data even when the data is on a bound path,
-                # so where to read it from is decided by the request, not by
-                # which socket the header arrived on.
-                source = self.paths.get(_data_path(opcode, params), self)
-                body = source.rfile.read(dlen) if dlen else b""
-                self.s.seen.append(opcode)
-                self.route = _reply_path(opcode, params, body)
-                for chunk in self._dispatch(sid, opcode, params, body):
-                    self._send(chunk)
-                if self.bound_to is not None and not self.s.serves_arrivals:
-                    # A bound connection is the other end's to read and write:
-                    # its own thread must never take a byte off it again.
-                    with self.s._live_lock:
-                        self.s._parked.add(self.unpark)
-                    self.unpark.wait()
-                    return
-                if opcode == c.kXR_endsess:
-                    return
+            self._serve()
         except (OSError, ValueError):
             pass
         finally:
+            self._teardown()
+
+    def _serve(self) -> None:
+        """Handshake, then answer requests until the link is done with."""
+        if len(self.rfile.read(20) or b"") < 20:
+            return
+        self._send(_frame(0, c.kXR_ok, struct.pack(">ii", 0, c.ROOTD_PQ)))
+        while True:
+            header = self.rfile.read(c.REQUEST_HDRLEN)
+            if not header or len(header) < c.REQUEST_HDRLEN:
+                return
+            if not self._serve_request(header):
+                return
+
+    def _serve_request(self, header: bytes) -> bool:
+        """Answer one request; false once this thread must stop reading."""
+        sid, opcode, params, dlen = _REQ.unpack(header)
+        # dlen counts the data even when the data is on a bound path,
+        # so where to read it from is decided by the request, not by
+        # which socket the header arrived on.
+        source = self.paths.get(_data_path(opcode, params), self)
+        body = source.rfile.read(dlen) if dlen else b""
+        self.s.seen.append(opcode)
+        self.route = _reply_path(opcode, params, body)
+        for chunk in self._dispatch(sid, opcode, params, body):
+            self._send(chunk)
+        if self.bound_to is not None and not self.s.serves_arrivals:
+            # A bound connection is the other end's to read and write:
+            # its own thread must never take a byte off it again.
             with self.s._live_lock:
-                self.s._live.discard(self.sock)
-                self.s._parked.discard(self.unpark)
-                if self.sessid:
-                    self.s._sessions.pop(self.sessid, None)
-            if self.bound_to is not None:
-                self.bound_to.paths.pop(
-                    next((k for k, v in self.bound_to.paths.items() if v is self), 0), None
-                )
-            try:
-                self.rfile.close()
-                self.sock.close()  # type: ignore[attr-defined]
-            except OSError:
-                pass
+                self.s._parked.add(self.unpark)
+            self.unpark.wait()
+            return False
+        return bool(opcode != c.kXR_endsess)
+
+    def _teardown(self) -> None:
+        with self.s._live_lock:
+            self.s._live.discard(self.sock)
+            self.s._parked.discard(self.unpark)
+            if self.sessid:
+                self.s._sessions.pop(self.sessid, None)
+        if self.bound_to is not None:
+            self.bound_to.paths.pop(
+                next((k for k, v in self.bound_to.paths.items() if v is self), 0), None
+            )
+        try:
+            self.rfile.close()
+            self.sock.close()  # type: ignore[attr-defined]
+        except OSError:
+            pass
 
     def _send(self, data: bytes) -> None:
         target = self.paths.get(self.route, self)
@@ -683,9 +701,7 @@ def _h_dirlist(conn: _Connection, sid: int, params: bytes, body: bytes) -> Itera
             # A directory has nothing to digest, and the server says so in the
             # token rather than leaving it out.
             value = (
-                _checksum(algorithm, bytes(conn.s.files[full]))
-                if full in conn.s.files
-                else "none"
+                _checksum(algorithm, bytes(conn.s.files[full])) if full in conn.s.files else "none"
             )
             line += f" [ {algorithm}:{value} ]".encode()
         out += name.encode() + b"\n" + line + b"\n"
@@ -1095,55 +1111,90 @@ def _config_value(conn: _Connection, name: str) -> str:
     return ""
 
 
+def _q_cksum(conn: _Connection, sid: int, args: str) -> Iterator[bytes]:
+    path = _clean(args)
+    algorithm = "adler32"
+    for pair in args.partition("?")[2].split("&"):
+        if pair.startswith("cks.type="):
+            algorithm = pair.split("=", 1)[1]
+    value = _checksum(algorithm, bytes(conn._file(path)))
+    yield _frame(sid, c.kXR_ok, f"{algorithm} {value}".encode() + b"\x00")
+
+
+def _q_config(conn: _Connection, sid: int, args: str) -> Iterator[bytes]:
+    names = args.split("\n")
+    values = [_config_value(conn, n) for n in names]
+    yield _frame(sid, c.kXR_ok, "\n".join(values).encode() + b"\x00")
+
+
+def _q_ckscan(conn: _Connection, sid: int, args: str) -> Iterator[bytes]:
+    conn.s.cancelled_checksums.append(_clean(args))
+    yield _frame(sid, c.kXR_ok)
+
+
+def _q_stats(conn: _Connection, sid: int, args: str) -> Iterator[bytes]:
+    yield _frame(sid, c.kXR_ok, f'<statistics sel="{args}"/>'.encode() + b"\x00")
+
+
+def _q_space(conn: _Connection, sid: int, args: str) -> Iterator[bytes]:
+    yield _frame(sid, c.kXR_ok, conn.s.space.encode() + b"\x00")
+
+
+def _q_prep(conn: _Connection, sid: int, args: str) -> Iterator[bytes]:
+    handle, *wanted = args.split("\n")
+    if handle not in conn.s.prepared:
+        yield _error(sid, 3000, f"prepare request {handle} is not one of ours")
+        return
+    asked = conn.s.prepared[handle]
+    yield _frame(
+        sid,
+        c.kXR_ok,
+        json.dumps(
+            {
+                "request_id": handle,
+                "responses": [
+                    {
+                        "path": _clean(path),
+                        "path_exists": _clean(path) in conn.s.files,
+                        "on_tape": _clean(path) in conn.s.nearline,
+                        "online": _clean(path) in conn.s.files
+                        and _clean(path) not in conn.s.nearline,
+                        "requested": _clean(path) in asked,
+                        "has_reqid": _clean(path) in asked,
+                        "req_time": "",
+                        "error_text": "" if _clean(path) in conn.s.files else "no such file",
+                    }
+                    for path in wanted
+                ],
+            }
+        ).encode()
+        + b"\x00",
+    )
+
+
+def _q_visa(conn: _Connection, sid: int, args: str) -> Iterator[bytes]:
+    yield _frame(sid, c.kXR_ok, b"visa\x00")
+
+
+_QUERIES: dict[int, Callable[[_Connection, int, str], Iterator[bytes]]] = {
+    c.kXR_Qcksum: _q_cksum,
+    c.kXR_Qconfig: _q_config,
+    c.kXR_Qckscan: _q_ckscan,
+    c.kXR_QStats: _q_stats,
+    c.kXR_Qspace: _q_space,
+    c.kXR_QPrep: _q_prep,
+    c.kXR_Qvisa: _q_visa,
+}
+
+
 def _h_query(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
     infotype = struct.unpack(">H", params[:2])[0]
     args = body.split(b"\x00", 1)[0].decode("utf-8", "replace")
-    if infotype == c.kXR_Qcksum:
-        path = _clean(args)
-        algorithm = "adler32"
-        for pair in args.partition("?")[2].split("&"):
-            if pair.startswith("cks.type="):
-                algorithm = pair.split("=", 1)[1]
-        value = _checksum(algorithm, bytes(conn._file(path)))
-        yield _frame(sid, c.kXR_ok, f"{algorithm} {value}".encode() + b"\x00")
-    elif infotype == c.kXR_Qconfig:
-        names = args.split("\n")
-        values = [_config_value(conn, n) for n in names]
-        yield _frame(sid, c.kXR_ok, "\n".join(values).encode() + b"\x00")
-    elif infotype == c.kXR_Qckscan:
-        conn.s.cancelled_checksums.append(_clean(args))
-        yield _frame(sid, c.kXR_ok)
-    elif infotype == c.kXR_QStats:
-        yield _frame(sid, c.kXR_ok, f'<statistics sel="{args}"/>'.encode() + b"\x00")
-    elif infotype == c.kXR_Qspace:
-        yield _frame(sid, c.kXR_ok, conn.s.space.encode() + b"\x00")
-    elif infotype == c.kXR_QPrep:
-        handle, *wanted = args.split("\n")
-        if handle not in conn.s.prepared:
-            yield _error(sid, 3000, f"prepare request {handle} is not one of ours")
-            return
-        asked = conn.s.prepared[handle]
-        yield _frame(sid, c.kXR_ok, json.dumps({
-            "request_id": handle,
-            "responses": [
-                {
-                    "path": _clean(path),
-                    "path_exists": _clean(path) in conn.s.files,
-                    "on_tape": _clean(path) in conn.s.nearline,
-                    "online": _clean(path) in conn.s.files
-                    and _clean(path) not in conn.s.nearline,
-                    "requested": _clean(path) in asked,
-                    "has_reqid": _clean(path) in asked,
-                    "req_time": "",
-                    "error_text": "" if _clean(path) in conn.s.files else "no such file",
-                }
-                for path in wanted
-            ],
-        }).encode() + b"\x00")
-    elif infotype == c.kXR_Qvisa:
-        yield _frame(sid, c.kXR_ok, b"visa\x00")
-    else:
+    query = _QUERIES.get(infotype)
+    if query is None:
         yield _error(sid, 3013, f"query {infotype} is not supported")
+        return
+    yield from query(conn, sid, args)
 
 
 def _h_query_fctl(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
@@ -1194,59 +1245,99 @@ def _h_prepare(conn: _Connection, sid: int, params: bytes, body: bytes) -> Itera
 def _h_fattr(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
     subcode, numattr, options = params[4], params[5], params[6]
     reader = Reader(body, "kXR_fattr")
+    path = _fattr_path(conn, params, reader)
+    if subcode == c.kXR_fattrList and options & c.kXR_fattrRecurse and path in conn.s.dirs:
+        yield _frame(sid, c.kXR_ok, _fattr_walk(conn, path))
+        return
+    store = conn.s.xattrs.setdefault(path, {})
+    if subcode == c.kXR_fattrList:
+        yield _frame(sid, c.kXR_ok, _fattr_list(store, bool(options & c.kXR_fattrAData)))
+        return
+    yield _frame(sid, c.kXR_ok, _fattr_edit(store, reader, subcode, numattr, options))
+
+
+def _fattr_path(conn: _Connection, params: bytes, reader: Reader) -> str:
+    """The path the request names, by body or by open handle; must exist."""
     path = reader.cstring()
     if not path:
         path = conn.handles.get(params[:4], "")
     path = _clean(path)
     if path not in conn.s.files and path not in conn.s.dirs:
         raise _NotFound(path)
-    if subcode == c.kXR_fattrList and options & c.kXR_fattrRecurse and path in conn.s.dirs:
-        # The recursive reply is a flat run of ``relpath:name`` entries with no
-        # header, and only regular files carry them - directories in the way
-        # are walked through rather than reported.
-        prefix = path.rstrip("/") + "/"
-        entries = bytearray()
-        for name in sorted(conn.s.files):
-            if not name.startswith(prefix):
-                continue
-            for attribute in sorted(conn.s.xattrs.get(name, {})):
-                entries += f"{name[len(prefix) :]}:{attribute}".encode() + b"\x00"
-        yield _frame(sid, c.kXR_ok, bytes(entries))
-        return
+    return path
 
-    store = conn.s.xattrs.setdefault(path, {})
 
-    if subcode == c.kXR_fattrList:
-        # A list reply is bare ``name\0 [len value]`` records: no count
-        # header and no per-attribute code, unlike the other subcodes.
-        values = bool(options & c.kXR_fattrAData)
-        reply = Writer()
-        for name in sorted(store):
-            reply.text(name, nul=True)
-            if values:
-                reply.i32(len(store[name])).raw(store[name])
-        yield _frame(sid, c.kXR_ok, reply.bytes())
-        return
-
+def _fattr_edit(
+    store: dict[str, bytes], reader: Reader, subcode: int, numattr: int, options: int
+) -> bytes:
+    """Apply a set, get or delete to each named attribute; the coded reply."""
     items: list[tuple[str, int, bytes | None]] = []
+    edit = _FATTR_EDITS.get(subcode)
     for _ in range(max(numattr, 1)):
         if reader.remaining < 3:
             break
         reader.u16()
         name = reader.cstring()
-        if subcode == c.kXR_fattrSet:
-            value = reader.bytes(reader.i32())
-            if options & c.kXR_fattrIsNew and name in store:
-                items.append((name, kXR_ItExists, None))
-                continue
-            store[name] = bytes(value)
-            items.append((name, 0, None))
-        elif subcode == c.kXR_fattrGet:
-            current = store.get(name)
-            items.append((name, 0 if current is not None else kXR_AttrNotFound, current or b""))
-        elif subcode == c.kXR_fattrDel:
-            items.append((name, 0 if store.pop(name, None) is not None else kXR_AttrNotFound, None))
-    yield _frame(sid, c.kXR_ok, _fattr_reply(items))
+        if edit is not None:
+            items.append(edit(store, name, reader, options))
+    return _fattr_reply(items)
+
+
+def _fattr_walk(conn: _Connection, path: str) -> bytes:
+    """The recursive reply: a flat run of ``relpath:name`` entries with no
+    header, and only regular files carry them - directories in the way are
+    walked through rather than reported."""
+    prefix = path.rstrip("/") + "/"
+    entries = bytearray()
+    for name in sorted(conn.s.files):
+        if not name.startswith(prefix):
+            continue
+        for attribute in sorted(conn.s.xattrs.get(name, {})):
+            entries += f"{name[len(prefix) :]}:{attribute}".encode() + b"\x00"
+    return bytes(entries)
+
+
+def _fattr_list(store: dict[str, bytes], values: bool) -> bytes:
+    """A list reply is bare ``name\\0 [len value]`` records: no count header
+    and no per-attribute code, unlike the other subcodes."""
+    reply = Writer()
+    for name in sorted(store):
+        reply.text(name, nul=True)
+        if values:
+            reply.i32(len(store[name])).raw(store[name])
+    return reply.bytes()
+
+
+def _fattr_set(
+    store: dict[str, bytes], name: str, reader: Reader, options: int
+) -> tuple[str, int, bytes | None]:
+    value = reader.bytes(reader.i32())
+    if options & c.kXR_fattrIsNew and name in store:
+        return (name, kXR_ItExists, None)
+    store[name] = bytes(value)
+    return (name, 0, None)
+
+
+def _fattr_get(
+    store: dict[str, bytes], name: str, reader: Reader, options: int
+) -> tuple[str, int, bytes | None]:
+    current = store.get(name)
+    return (name, 0 if current is not None else kXR_AttrNotFound, current or b"")
+
+
+def _fattr_del(
+    store: dict[str, bytes], name: str, reader: Reader, options: int
+) -> tuple[str, int, bytes | None]:
+    return (name, 0 if store.pop(name, None) is not None else kXR_AttrNotFound, None)
+
+
+_FATTR_EDITS: dict[
+    int, Callable[[dict[str, bytes], str, Reader, int], tuple[str, int, bytes | None]]
+] = {
+    c.kXR_fattrSet: _fattr_set,
+    c.kXR_fattrGet: _fattr_get,
+    c.kXR_fattrDel: _fattr_del,
+}
 
 
 _HANDLERS = {
@@ -1371,13 +1462,15 @@ def main(argv: Sequence[str] | None = None, *, wait: Callable[[], None] = _block
     parser.add_argument("--pattern", default="*", help="which files to take, as a glob")
     args = parser.parse_args(argv)
 
-    server = from_directory(args.directory, host=args.host, port=args.port,
-                            pattern=args.pattern).start()
+    server = from_directory(
+        args.directory, host=args.host, port=args.port, pattern=args.pattern
+    ).start()
     host, port = server.address
     # Flushed as they go: this is a program whose next act is to block, and an
     # unflushed buffer would leave the terminal with nothing to connect to.
-    print(f"serving {len(server.files) // 2} files on root://{host}:{port}/ with no login",
-          flush=True)
+    print(
+        f"serving {len(server.files) // 2} files on root://{host}:{port}/ with no login", flush=True
+    )
     for path in sorted(server.files):
         print(f"  root://{host}:{port}/{path}  {len(server.files[path]):,} bytes", flush=True)
     try:

@@ -532,14 +532,22 @@ def _xattr(args: argparse.Namespace, endpoints: Endpoints) -> int:
         filesystem.removexattr(path, args.remove)
         return OK
     if args.recursive:
-        tree = filesystem.listxattr_tree(path)
-        if args.json:
-            print(dumps(tree))
-            return OK
-        for name, names in tree.items():
-            for attribute in names:
-                print(f"{name}: {attribute}")
+        return _xattr_tree(args, filesystem, path)
+    return _xattr_show(args, filesystem, path)
+
+
+def _xattr_tree(args: argparse.Namespace, filesystem: Any, path: str) -> int:
+    tree = filesystem.listxattr_tree(path)
+    if args.json:
+        print(dumps(tree))
         return OK
+    for name, names in tree.items():
+        for attribute in names:
+            print(f"{name}: {attribute}")
+    return OK
+
+
+def _xattr_show(args: argparse.Namespace, filesystem: Any, path: str) -> int:
     attributes = filesystem.xattrs(path)
     if args.json:
         print(dumps(attributes))

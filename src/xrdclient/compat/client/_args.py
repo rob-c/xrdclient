@@ -20,7 +20,7 @@ __all__ = ["chunks", "u16", "u32", "u64"]
 def _unsigned(value: Any, bits: int, name: str) -> int:
     # ``bool`` is an ``int`` to Python and not to the C parser; neither is a
     # float, however whole.
-    if isinstance(value, bool) or not isinstance(value, int):
+    if not isinstance(value, int) or isinstance(value, bool):
         raise TypeError(f"{name} must be an integer, not {type(value).__name__}")
     if not 0 <= value < 1 << bits:
         raise OverflowError(f"{name}={value} does not fit in an unsigned {bits}-bit integer")
@@ -33,21 +33,21 @@ def _unsigned(value: Any, bits: int, name: str) -> int:
 
 def u64(value: Any, name: str = "offset") -> int:
     """An offset, or a size a file can have."""
-    if value.__class__ is int and 0 <= value < _U64:
+    if type(value) is int and 0 <= value < _U64:
         return value
     return _unsigned(value, 64, name)
 
 
 def u32(value: Any, name: str = "size") -> int:
     """The size of one request, or of one chunk of one."""
-    if value.__class__ is int and 0 <= value < _U32:
+    if type(value) is int and 0 <= value < _U32:
         return value
     return _unsigned(value, 32, name)
 
 
 def u16(value: Any, name: str = "timeout") -> int:
     """A timeout in seconds, a flags word, or a mode."""
-    if value.__class__ is int and 0 <= value < _U16:
+    if type(value) is int and 0 <= value < _U16:
         return value
     return _unsigned(value, 16, name)
 

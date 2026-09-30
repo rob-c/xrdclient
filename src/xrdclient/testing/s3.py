@@ -220,22 +220,10 @@ class _Handler(BaseHTTPRequestHandler):
         :mod:`xrdclient.s3.sigv4`: a check that calls the code under test would
         agree with it however wrong it was.
         """
-        header = self.headers.get("Authorization", "")
-        algorithm, _, rest = header.partition(" ")
-        fields = dict(
-            item.strip().split("=", 1) for item in rest.split(",") if "=" in item
-        )
-        if algorithm != "AWS4-HMAC-SHA256" or not fields.keys() >= {
-            "Credential",
-            "SignedHeaders",
-            "Signature",
-        }:
+        fields = self._authorization()
+        if fields is None:
             return False
-        key, _, scope = fields["Credential"].partition("/")
-        stamp = self.headers.get("x-amz-date", "")
-        if key != self.fake.access_key or scope.split("/")[::3] != [stamp[:8], "aws4_request"]:
-            return False
-
+        scope = fields["Credential"].partition("/")[2]
         names = fields["SignedHeaders"].split(";")
         hashed = self.headers.get("x-amz-content-sha256", "")
         if hashed != "UNSIGNED-PAYLOAD" and hashed != hashlib.sha256(body).hexdigest():
@@ -253,8 +241,8 @@ class _Handler(BaseHTTPRequestHandler):
         )
         to_sign = "\n".join(
             [
-                algorithm,
-                stamp,
+                "AWS4-HMAC-SHA256",
+                self.headers.get("x-amz-date", ""),
                 scope,
                 hashlib.sha256(canonical.encode()).hexdigest(),
             ]
@@ -264,6 +252,27 @@ class _Handler(BaseHTTPRequestHandler):
             derived = hmac.new(derived, step.encode(), hashlib.sha256).digest()
         expected = hmac.new(derived, to_sign.encode(), hashlib.sha256).hexdigest()
         return hmac.compare_digest(expected, fields["Signature"])
+
+    def _authorization(self) -> dict[str, str] | None:
+        """The fields of the ``Authorization`` header, or ``None`` if it is not ours.
+
+        "Ours" means SigV4, carrying every field a check needs, for our access
+        key, with a credential scope that matches the request's date.
+        """
+        header = self.headers.get("Authorization", "")
+        algorithm, _, rest = header.partition(" ")
+        fields = dict(item.strip().split("=", 1) for item in rest.split(",") if "=" in item)
+        if algorithm != "AWS4-HMAC-SHA256" or not fields.keys() >= {
+            "Credential",
+            "SignedHeaders",
+            "Signature",
+        }:
+            return None
+        key, _, scope = fields["Credential"].partition("/")
+        stamp = self.headers.get("x-amz-date", "")
+        if key != self.fake.access_key or scope.split("/")[::3] != [stamp[:8], "aws4_request"]:
+            return None
+        return fields
 
     def _header(self, name: str) -> str:
         """One signed header's value, whitespace-folded as the rules say."""
@@ -358,8 +367,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.fake.objects[key] = data
         self._send(
             200,
-            f"<CopyObjectResult><ETag>&quot;{_md5(data)}&quot;</ETag>"
-            "</CopyObjectResult>".encode(),
+            f"<CopyObjectResult><ETag>&quot;{_md5(data)}&quot;</ETag></CopyObjectResult>".encode(),
             Content_Type="application/xml",
         )
 

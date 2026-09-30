@@ -280,7 +280,7 @@ def report(results: list[Result]) -> None:
             print("\n".join(r.diff))
 
 
-def main(argv: list[str] | None = None) -> int:
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--compat-only", action="store_true", help="skip the official runs")
     parser.add_argument("-k", dest="only", action="append", help="only examples matching this")
@@ -288,20 +288,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--python", default=sys.executable, help="interpreter to run them with")
     parser.add_argument("--timeout", type=float, default=300.0, help="per run, in seconds")
     parser.add_argument("-v", "--verbose", action="store_true", help="print each run's output")
-    args = parser.parse_args(argv)
+    return parser.parse_args(argv)
 
-    xrootd = shutil.which("xrootd")
-    if xrootd is None:
-        print("run_all: no xrootd binary on PATH", file=sys.stderr)
-        return 2
-    scripts = [s for s in examples() if not args.only or any(k in s.name for k in args.only)]
-    official = not args.compat_only and have_official(args.python)
-    if not args.compat_only and not official:
-        print("run_all: the official XRootD bindings are not importable; skipping those runs")
 
+def _selected(only: list[str] | None) -> list[Path]:
+    """The examples a ``-k`` matches, or all of them when none was given."""
+    return [s for s in examples() if not only or any(k in s.name for k in only)]
+
+
+def _run_examples(
+    xrootd: str, scripts: list[Path], args: argparse.Namespace, official: bool
+) -> list[Result]:
+    """Every example, ``-j`` at a time, against one server."""
     with server(xrootd) as (url, local), tempfile.TemporaryDirectory() as scratch:
         with ThreadPoolExecutor(max(args.jobs, 1)) as pool:
-            results = list(
+            return list(
                 pool.map(
                     lambda s: compare(
                         s, args.python, url, local, official, args.timeout, Path(scratch)
@@ -309,7 +310,11 @@ def main(argv: list[str] | None = None) -> int:
                     scripts,
                 )
             )
-    if args.verbose:
+
+
+def _summarise(results: list[Result], official: bool, verbose: bool) -> int:
+    """Print what went wrong and the table; the exit status."""
+    if verbose:
         for r in results:
             print(f"\n== {r.name}\n{r.compat.stdout.rstrip()}")
     report(results)
@@ -322,6 +327,22 @@ def main(argv: list[str] | None = None) -> int:
     ran = "official and compat" if official else "compat only"
     print(f"\nall {len(results)} examples passed ({ran})")
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+
+    xrootd = shutil.which("xrootd")
+    if xrootd is None:
+        print("run_all: no xrootd binary on PATH", file=sys.stderr)
+        return 2
+    scripts = _selected(args.only)
+    official = not args.compat_only and have_official(args.python)
+    if not args.compat_only and not official:
+        print("run_all: the official XRootD bindings are not importable; skipping those runs")
+
+    results = _run_examples(xrootd, scripts, args, official)
+    return _summarise(results, official, args.verbose)
 
 
 if __name__ == "__main__":

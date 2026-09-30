@@ -422,7 +422,17 @@ def test_requests_that_must_not_be_signed_are_refused(keys):
             sign_proxy_request(load_proxy_request(raw), who, key)
 
 
-@pytest.mark.skipif(shutil.which("openssl") is None, reason="no openssl to cross-check with")
+def _openssl_verifies_proxies() -> bool:
+    if shutil.which("openssl") is None:
+        return False
+    # macOS ships LibreSSL as ``openssl``, whose ``verify`` has no -allow_proxy_certs.
+    done = subprocess.run(
+        ["openssl", "verify", "-help"], capture_output=True, text=True, check=False
+    )
+    return "-allow_proxy_certs" in done.stdout + done.stderr
+
+
+@pytest.mark.skipif(not _openssl_verifies_proxies(), reason="no openssl -allow_proxy_certs here")
 def test_openssl_accepts_the_delegated_chain(keys, tmp_path):
     """The whole chain - CA, user, proxy, delegated proxy - by OpenSSL's rules."""
     proxy_key, ca_key, user_key = keys

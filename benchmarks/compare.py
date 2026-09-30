@@ -197,121 +197,151 @@ def _ok(pair: tuple[object, object]) -> object:
     return response
 
 
+def _repeat(fn: Callable[[], object], count: int) -> int:
+    """Call ``fn`` ``count`` times: a latency case, which moves no bytes."""
+    for _ in range(count):
+        fn()
+    return 0
+
+
+def _repeat_ok(fn: Callable[[], object], count: int) -> int:
+    """``_repeat`` for the bindings, whose calls answer ``(status, response)``."""
+    for _ in range(count):
+        _ok(fn())  # type: ignore[arg-type]
+    return 0
+
+
+def _case(name: str, kind: str, ops: int = 1, **fns: Callable[[], int]) -> Case:
+    """A case; the ``official`` contender is dropped when the bindings are absent."""
+    if official is None:
+        fns.pop("official", None)
+    return Case(name, kind, fns, ops)
+
+
 def cases(url: str, size: int) -> list[Case]:
     """Every case, bound to the server at ``url``."""
-    big, small, many = f"{url}//bench/big.bin", f"{url}//bench/small.bin", "/bench/many"
+    return [*_latency_cases(url), *_read_cases(url, size), *_write_cases(url, size)]
+
+
+def _latency_cases(url: str) -> list[Case]:
+    """One operation at a time, ``ops`` of them per timed run."""
+    small, many = f"{url}//bench/small.bin", "/bench/many"
     fs = xrdclient.FileSystem(url, CONFIG)
     cfs = compat.FileSystem(url)
     ofs = official.FileSystem(url) if official else None
-    out: list[Case] = []
+    n, m = 200, 50
+    return [
+        _case(
+            "ping",
+            "latency",
+            n,
+            xrdclient=lambda: _repeat(fs.ping, n),
+            compat=lambda: _repeat_ok(cfs.ping, n),
+            official=lambda: _repeat_ok(ofs.ping, n),
+        ),
+        _case(
+            "stat",
+            "latency",
+            n,
+            xrdclient=lambda: _repeat(lambda: fs.stat("/bench/small.bin"), n),
+            compat=lambda: _repeat_ok(lambda: cfs.stat("/bench/small.bin"), n),
+            official=lambda: _repeat_ok(lambda: ofs.stat("/bench/small.bin"), n),
+        ),
+        _case(
+            "open+close",
+            "latency",
+            m,
+            xrdclient=lambda: _repeat(lambda: _open_close_native(small), m),
+            compat=lambda: _repeat(lambda: _open_close_bindings(compat, small), m),
+            official=lambda: _repeat(lambda: _open_close_bindings(official, small), m),
+        ),
+        _case(
+            "4KiB read on open file",
+            "latency",
+            n,
+            xrdclient=lambda: _reads_native(small, 4096, n),
+            compat=lambda: _reads_bindings(compat, small, 4096, n),
+            official=lambda: _reads_bindings(official, small, 4096, n),
+        ),
+        _case(
+            "dirlist 1000 + stat",
+            "latency",
+            5,
+            xrdclient=lambda: _repeat(lambda: fs.scandir(many), 5),
+            compat=lambda: _repeat_ok(lambda: cfs.dirlist(many, 1), 5),
+            official=lambda: _repeat_ok(lambda: ofs.dirlist(many, 1), 5),
+        ),
+    ]
 
-    def add(name: str, kind: str, ops: int = 1, **fns: Callable[[], int] | None) -> None:
-        out.append(Case(name, kind, {k: v for k, v in fns.items() if v is not None}, ops))
 
-    n = 200
-    add(
-        "ping",
-        "latency",
-        n,
-        xrdclient=lambda: [fs.ping() for _ in range(n)] and 0,
-        compat=lambda: [_ok(cfs.ping()) for _ in range(n)] and 0,
-        official=(lambda: [_ok(ofs.ping()) for _ in range(n)] and 0) if ofs else None,
-    )
-    add(
-        "stat",
-        "latency",
-        n,
-        xrdclient=lambda: [fs.stat("/bench/small.bin") for _ in range(n)] and 0,
-        compat=lambda: [_ok(cfs.stat("/bench/small.bin")) for _ in range(n)] and 0,
-        official=(lambda: [_ok(ofs.stat("/bench/small.bin")) for _ in range(n)] and 0)
-        if ofs
-        else None,
-    )
-    m = 50
-    add(
-        "open+close",
-        "latency",
-        m,
-        xrdclient=lambda: [_open_close_native(small) for _ in range(m)] and 0,
-        compat=lambda: [_open_close_bindings(compat, small) for _ in range(m)] and 0,
-        official=(lambda: [_open_close_bindings(official, small) for _ in range(m)] and 0)
-        if official
-        else None,
-    )
-    add(
-        "4KiB read on open file",
-        "latency",
-        n,
-        xrdclient=lambda: _reads_native(small, 4096, n),
-        compat=lambda: _reads_bindings(compat, small, 4096, n),
-        official=(lambda: _reads_bindings(official, small, 4096, n)) if official else None,
-    )
-    add(
-        "dirlist 1000 + stat",
-        "latency",
-        5,
-        xrdclient=lambda: [fs.scandir(many) for _ in range(5)] and 0,
-        compat=lambda: [_ok(cfs.dirlist(many, 1)) for _ in range(5)] and 0,
-        official=(lambda: [_ok(ofs.dirlist(many, 1)) for _ in range(5)] and 0) if ofs else None,
-    )
-    add(
-        "read whole file",
-        "throughput",
-        xrdclient=lambda: _read_all_native(big),
-        compat=lambda: _read_all_bindings(compat, big),
-        official=(lambda: _read_all_bindings(official, big)) if official else None,
-    )
+def _read_cases(url: str, size: int) -> list[Case]:
+    """Moving the big file's bytes to the client, MiB/s."""
+    big = f"{url}//bench/big.bin"
+    out = [
+        _case(
+            "read whole file",
+            "throughput",
+            xrdclient=lambda: _read_all_native(big),
+            compat=lambda: _read_all_bindings(compat, big),
+            official=lambda: _read_all_bindings(official, big),
+        )
+    ]
     for chunk in (64 << 10, 1 * MiB):
         count = min(size // chunk, 512)
-        add(
-            f"{count} x {chunk >> 10}KiB reads",
-            "throughput",
-            xrdclient=lambda c=chunk, k=count: _reads_native(big, c, k),
-            compat=lambda c=chunk, k=count: _reads_bindings(compat, big, c, k),
-            official=(lambda c=chunk, k=count: _reads_bindings(official, big, c, k))
-            if official
-            else None,
+        out.append(
+            _case(
+                f"{count} x {chunk >> 10}KiB reads",
+                "throughput",
+                xrdclient=lambda c=chunk, k=count: _reads_native(big, c, k),
+                compat=lambda c=chunk, k=count: _reads_bindings(compat, big, c, k),
+                official=lambda c=chunk, k=count: _reads_bindings(official, big, c, k),
+            )
         )
     ranges = [(i * (size // 1024), 4096) for i in range(1024)]
-    add(
-        "readv 1024 x 4KiB",
-        "throughput",
-        xrdclient=lambda: _readv_native(big, ranges),
-        compat=lambda: _readv_bindings(compat, big, ranges),
-        official=(lambda: _readv_bindings(official, big, ranges)) if official else None,
-    )
-    payload = os.urandom(size)
-    add(
-        "write whole file",
-        "throughput",
-        xrdclient=lambda: _write_native(f"{url}//bench/w-native.bin", payload),
-        compat=lambda: _write_bindings(compat, f"{url}//bench/w-compat.bin", payload),
-        official=(lambda: _write_bindings(official, f"{url}//bench/w-official.bin", payload))
-        if official
-        else None,
-    )
-    add(
-        "write 1MiB chunks",
-        "throughput",
-        xrdclient=lambda: _write_stream_native(f"{url}//bench/s-native.bin", payload),
-        compat=lambda: _write_chunks_bindings(compat, f"{url}//bench/s-compat.bin", payload),
-        official=(lambda: _write_chunks_bindings(official, f"{url}//bench/s-official.bin", payload))
-        if official
-        else None,
-    )
-    scratch = Path(tempfile.mkdtemp(prefix="xrdcmp-local"))
-    add(
-        "copy download",
-        "throughput",
-        xrdclient=lambda: (
-            xrdclient.copy(big, str(scratch / "n.bin"), config=CONFIG, verify=False).size
-        ),
-        compat=lambda: _copy_bindings(compat, big, str(scratch / "c.bin"), size),
-        official=(lambda: _copy_bindings(official, big, str(scratch / "o.bin"), size))
-        if official
-        else None,
+    out.append(
+        _case(
+            "readv 1024 x 4KiB",
+            "throughput",
+            xrdclient=lambda: _readv_native(big, ranges),
+            compat=lambda: _readv_bindings(compat, big, ranges),
+            official=lambda: _readv_bindings(official, big, ranges),
+        )
     )
     return out
+
+
+def _write_cases(url: str, size: int) -> list[Case]:
+    """Moving bytes to the server, and a whole-file copy back, MiB/s."""
+    big = f"{url}//bench/big.bin"
+    payload = os.urandom(size)
+    scratch = Path(tempfile.mkdtemp(prefix="xrdcmp-local"))
+    return [
+        _case(
+            "write whole file",
+            "throughput",
+            xrdclient=lambda: _write_native(f"{url}//bench/w-native.bin", payload),
+            compat=lambda: _write_bindings(compat, f"{url}//bench/w-compat.bin", payload),
+            official=lambda: _write_bindings(official, f"{url}//bench/w-official.bin", payload),
+        ),
+        _case(
+            "write 1MiB chunks",
+            "throughput",
+            xrdclient=lambda: _write_stream_native(f"{url}//bench/s-native.bin", payload),
+            compat=lambda: _write_chunks_bindings(compat, f"{url}//bench/s-compat.bin", payload),
+            official=lambda: _write_chunks_bindings(
+                official, f"{url}//bench/s-official.bin", payload
+            ),
+        ),
+        _case(
+            "copy download",
+            "throughput",
+            xrdclient=lambda: (
+                xrdclient.copy(big, str(scratch / "n.bin"), config=CONFIG, verify=False).size
+            ),
+            compat=lambda: _copy_bindings(compat, big, str(scratch / "c.bin"), size),
+            official=lambda: _copy_bindings(official, big, str(scratch / "o.bin"), size),
+        ),
+    ]
 
 
 def _open_close_native(url: str) -> None:
@@ -467,7 +497,7 @@ def measure(case: Case, rounds: int, moved: dict[str, int]) -> Outcome:
     return Outcome(case, samples)
 
 
-def main(argv: list[str] | None = None) -> int:
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawTextHelpFormatter
     )
@@ -478,46 +508,67 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--only", default="", help="comma-separated case names to run")
     parser.add_argument("--gate", action="store_true", help="exit 1 unless every case is won")
     parser.add_argument("--json", type=Path, help="write the raw samples here")
-    args = parser.parse_args(argv)
+    return parser.parse_args(argv)
+
+
+@contextlib.contextmanager
+def _target(size: int, rtt: float) -> Iterator[str]:
+    """A server's URL - behind a relay adding ``rtt`` ms of round trip when that is not zero."""
+    with server(size) as (url, _data):
+        relay = Relay(int(url.rsplit(":", 1)[1]), rtt) if rtt else None
+        yield f"root://127.0.0.1:{relay.port}" if relay else url
+        if relay:
+            relay.close()
+
+
+def _selected(every: list[Case], only: str) -> list[Case]:
+    """The cases ``--only`` names, or all of them when it is empty."""
+    wanted = {n.strip() for n in only.split(",") if n.strip()}
+    return [case for case in every if not wanted or case.name in wanted]
+
+
+def _verdicts(case: Case, outcome: Outcome, alpha: float) -> tuple[list[str], list[str]]:
+    """Each of ours against the official bindings: the verdict texts, and what was not won."""
+    verdicts, lost = [], []
+    for who in ("xrdclient", "compat"):
+        won, p = outcome.wins(who, alpha)
+        ratio = outcome.median("official") / outcome.median(who)
+        verdicts.append(f"{who} {ratio:.2f}x{'' if won else ' LOST'} (p={p:.3f})")
+        if not won:
+            lost.append(f"{case.name}: {who}")
+    return verdicts, lost
+
+
+def _run_case(case: Case, rounds: int, alpha: float, lost: list[str]) -> dict[str, object]:
+    """Measure one case and print its row; what was not won goes on ``lost``."""
+    moved: dict[str, int] = {}
+    outcome = measure(case, rounds, moved)
+    cells = "".join(f"{outcome.rate(w, moved[w]):>16}" for w in ("xrdclient", "compat", "official"))
+    verdicts, not_won = _verdicts(case, outcome, alpha)
+    lost.extend(not_won)
+    print(f"  {case.name:<24}{cells}   {'; '.join(verdicts)}")
+    return {
+        "case": case.name,
+        "kind": case.kind,
+        "ops": case.ops,
+        "moved": moved,
+        "samples": outcome.samples,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
     if official is None:
         sys.exit("the official XRootD bindings are not installed: nothing to compare with")
 
     size = args.size * MiB
     lost: list[str] = []
     report: list[dict[str, object]] = []
-    with server(size) as (url, _data):
-        relay = Relay(int(url.rsplit(":", 1)[1]), args.rtt) if args.rtt else None
-        target = f"root://127.0.0.1:{relay.port}" if relay else url
+    with _target(size, args.rtt) as target:
         print(f"{target}  big file {args.size} MiB  rtt {args.rtt} ms  rounds {args.rounds}\n")
         print(f"  {'case':<24}{'xrdclient':>16}{'compat':>16}{'official':>16}   verdict")
-        wanted = {n.strip() for n in args.only.split(",") if n.strip()}
-        for case in cases(target, size):
-            if wanted and case.name not in wanted:
-                continue
-            moved: dict[str, int] = {}
-            outcome = measure(case, args.rounds, moved)
-            cells = "".join(
-                f"{outcome.rate(w, moved[w]):>16}" for w in ("xrdclient", "compat", "official")
-            )
-            verdicts = []
-            for who in ("xrdclient", "compat"):
-                won, p = outcome.wins(who, args.alpha)
-                ratio = outcome.median("official") / outcome.median(who)
-                verdicts.append(f"{who} {ratio:.2f}x{'' if won else ' LOST'} (p={p:.3f})")
-                if not won:
-                    lost.append(f"{case.name}: {who}")
-            print(f"  {case.name:<24}{cells}   {'; '.join(verdicts)}")
-            report.append(
-                {
-                    "case": case.name,
-                    "kind": case.kind,
-                    "ops": case.ops,
-                    "moved": moved,
-                    "samples": outcome.samples,
-                }
-            )
-        if relay:
-            relay.close()
+        for case in _selected(cases(target, size), args.only):
+            report.append(_run_case(case, args.rounds, args.alpha, lost))
     if args.json:
         args.json.write_text(json.dumps({"rtt_ms": args.rtt, "cases": report}, indent=1))
     if lost:

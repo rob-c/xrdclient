@@ -265,7 +265,9 @@ class XRootDFileSystem(AbstractFileSystem):
                 for entry in entries
             ]
             listing.sort(key=lambda item: str(item["name"]))
-        return listing if detail else [str(item["name"]) for item in listing]
+        if not detail:
+            return [str(item["name"]) for item in listing]
+        return listing
 
     def _file_listed(
         self, path: str, filesystem: FileSystem, target: str, failure: OSError

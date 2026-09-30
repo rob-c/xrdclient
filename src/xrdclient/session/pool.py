@@ -196,6 +196,26 @@ def _keep(bucket: list[tuple[float, Session]], session: Session, maximum: int) -
     return True
 
 
+def _take(
+    bucket: list[tuple[float, Session]], cutoff: float
+) -> tuple[Session | None, list[Session]]:
+    """Pop from the newest end until a live, fresh session turns up.
+
+    Called with the pool's lock held. Dead sessions are simply dropped;
+    those idle past ``cutoff`` are handed back for closing outside the lock.
+    """
+    stale: list[Session] = []
+    while bucket:
+        when, session = bucket.pop()
+        if session.closed or session.broken:
+            continue
+        if when < cutoff:
+            stale.append(session)
+            continue
+        return session, stale
+    return None, stale
+
+
 def _close_entries(entries: list[tuple[float, Session]]) -> None:
     for _, session in entries:
         session.close()
@@ -245,19 +265,9 @@ class SessionPool:
             return None
         cutoff = time.monotonic() - config.pool_idle_ttl
         key = _key(url, config)
-        found: Session | None = None
-        stale: list[Session] = []
         with self._lock:
             bucket = self._idle.get(key, [])
-            while bucket:
-                when, session = bucket.pop()
-                if session.closed or session.broken:
-                    continue
-                if when < cutoff:
-                    stale.append(session)
-                    continue
-                found = session
-                break
+            found, stale = _take(bucket, cutoff)
             if not bucket:
                 self._idle.pop(key, None)
         # Outside the lock: closing writes a kXR_endsess and can block, and no
