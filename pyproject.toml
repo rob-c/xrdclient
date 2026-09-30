@@ -24,6 +24,11 @@ classifiers = [
 ]
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/rob-c/xrdclient"
+Repository = "https://github.com/rob-c/xrdclient"
+Issues = "https://github.com/rob-c/xrdclient/issues"
+
 [project.optional-dependencies]
 dev = [
   "complexipy>=6,<7",
