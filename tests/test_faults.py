@@ -473,3 +473,116 @@ def _wedged_transfer(proxy: FaultProxy) -> int:
         _wait_for_quiet(proxy)
         done.set()
         return _drain(client)
+
+
+# ---------------------------------------------------------------------------
+# A link that keeps flaking in and out
+# ---------------------------------------------------------------------------
+#
+# flaky() cuts the connection at a random point in a random fraction of the
+# chunks, so a transfer is disconnected at an unpredictable stage, the client
+# reconnects, and the next connection may be cut too. This is the "20% packet
+# loss, connections dropping mid-transfer" case: what a resilient client must
+# ride out by reconnecting and continuing, not restarting from nothing or,
+# worse, handing back a short or corrupt file as if it were whole.
+
+
+@pytest.fixture
+def flaky_cfg() -> Config:
+    """A big reconnect budget and no backoff, so a hammering test stays quick.
+
+    The timeouts are generous on purpose: these tests do real socket work
+    through a proxy, and run alongside the rest of the suite under ``-n`` load,
+    where a tight timeout would fail on CPU starvation rather than on anything
+    the client did. Resilience here is about surviving dropped connections, not
+    about how fast a starved loopback answers.
+    """
+    return Config(
+        username="tester",
+        auth_order=("host",),
+        request_timeout=30.0,
+        connect_timeout=30.0,
+        connect_retries=200,
+        retry_backoff=0.0,
+        recover_handles=True,
+    )
+
+
+def test_flaky_arms_and_heals(broken):
+    assert "flaky" not in broken.armed
+    broken.flaky(0.2, seed=1)
+    assert "flaky" in broken.armed
+    broken.heal()
+    assert "flaky" not in broken.armed
+
+
+def test_a_flaky_link_still_delivers_every_byte_of_a_download(broken, flaky_cfg, tmp_path):
+    """The bytes that arrive are the file's, however many times the link drops."""
+    broken.chop(4096).flaky(0.15, seed=11)
+    out = tmp_path / "dl.root"
+    import xrdclient
+
+    xrdclient.copy(broken.url.with_path("/data/big.root"), out, config=flaky_cfg, verify=False)
+    assert out.read_bytes() == PAYLOAD
+    assert broken.connections > 1  # it really did reconnect
+
+
+def test_a_flaky_link_never_yields_a_short_or_corrupt_read(broken, flaky_cfg):
+    """read_bytes either returns the whole file or raises - never a partial."""
+    broken.chop(4096).flaky(0.15, seed=5)
+    import xrdclient
+
+    assert xrdclient.read_bytes(broken.url.with_path("/data/big.root"), config=flaky_cfg) == PAYLOAD
+
+
+def test_a_flaky_link_survives_an_upload(broken, flaky_cfg, tmp_path):
+    """A write cannot be replayed blind, so the copy restarts or resumes it."""
+    import xrdclient
+
+    source = tmp_path / "src.bin"
+    source.write_bytes(PAYLOAD)
+    fs = FileSystem(broken.url, flaky_cfg)
+    fs.makedirs("/up", exist_ok=True)  # the directory exists before the link turns flaky
+    broken.chop(4096).flaky(0.12, seed=9)
+    xrdclient.copy(source, broken.url.with_path("/up/f.bin"), config=flaky_cfg, verify=False)
+    broken.heal()
+    with FileSystem(broken.url, flaky_cfg) as clean:
+        assert clean.read_bytes("/up/f.bin") == PAYLOAD
+
+
+def test_metadata_queries_ride_out_a_flaky_link(broken, flaky_cfg):
+    broken.chop(32).flaky(0.2, seed=3)
+    with FileSystem(broken.url, flaky_cfg) as fs:
+        for _ in range(8):
+            assert fs.stat("/data/big.root").st_size == len(PAYLOAD)
+
+
+def test_a_link_too_broken_to_finish_fails_cleanly(broken):
+    """Below the reconnect budget it recovers; past it, a clear error, no partial."""
+    import xrdclient
+
+    broken.chop(512).flaky(0.9, seed=2)
+    stingy = Config(
+        username="tester", auth_order=("host",), request_timeout=1.0, connect_timeout=1.0,
+        connect_retries=3, retry_backoff=0.0, recover_handles=True,
+    )
+    with pytest.raises((XrdConnectionError, TransientError)):
+        xrdclient.read_bytes(broken.url.with_path("/data/big.root"), config=stingy)
+
+
+def test_a_handle_op_gives_up_after_the_reconnect_budget(broken):
+    """An open file's stat, re-opened up to connect_retries times, then stops.
+
+    The handle is opened on a healthy link; then every connection is cut, so
+    each re-open fails and the budget runs out - a clear error, not an endless
+    loop of reconnects."""
+    stingy = Config(
+        username="tester", auth_order=("host",), request_timeout=1.0, connect_timeout=1.0,
+        connect_retries=2, retry_backoff=0.0, recover_handles=True,
+    )
+    with File(broken.url.with_path("/data/big.root"), stingy) as handle:
+        assert handle.stat(refresh=True).st_size == len(PAYLOAD)  # healthy link
+        broken.drop_after(0)  # from now on every connection is cut at once
+        broken.cut()
+        with pytest.raises((XrdConnectionError, TransientError)):
+            handle.stat(refresh=True)

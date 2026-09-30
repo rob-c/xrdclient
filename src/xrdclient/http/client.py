@@ -28,6 +28,7 @@ from ..errors import (
     ConnectionError as XRDConnectionError,
 )
 from ..errors import (
+    ProtocolError,
     RedirectLimitError,
     TransientError,
     kXR_ArgInvalid,
@@ -46,6 +47,7 @@ from ..errors import (
 )
 from ..transport.base import tls_context
 from ..url import XRootDURL, parse, quote_path
+from .expect import InterimAnswer, await_continue, wants_expect
 
 __all__ = [
     "HTTPClient",
@@ -299,6 +301,7 @@ class HTTPClient:
         extra: dict[str, str] | None = None,
         *,
         credentials: bool = True,
+        relay: bool | None = None,
     ) -> dict[str, str]:
         """Standing headers for ``url``, with ``extra`` layered on top.
 
@@ -306,13 +309,18 @@ class HTTPClient:
         meant for: the configured token and every credential header in
         ``extra`` are left out. A token in ``url``'s own query is still
         presented, because whoever wrote that URL chose to hand it over.
+        ``relay`` overrides that for the ``TransferHeader*`` family alone -
+        see :func:`relays_transfer_headers`.
         """
         headers = {"User-Agent": "xrd/1.0 (pure python)", "Accept": "*/*"}
         token = bearer_token(self.config, url) if credentials else _url_token(url)
         if token:
             headers["Authorization"] = f"Bearer {token}"
         if extra:
-            headers.update(extra if credentials else _without_credentials(extra))
+            keep = credentials if relay is None else relay
+            headers.update(
+                extra if credentials else _without_credentials(extra, keep_transfer=keep)
+            )
         return headers
 
     def sign(
@@ -348,10 +356,10 @@ class HTTPClient:
         # leaves it they stay behind for the rest of the chain, even if a
         # later hop comes back: the server that sent it there is not one
         # the caller vouched for.
-        trusted = True
+        trusted = relay = True
         for _ in range(self.config.redirect_limit + 1):
             response = self._once(
-                method, target, body, headers, credentials=trusted, timeout=timeout
+                method, target, body, headers, credentials=trusted, relay=relay, timeout=timeout
             )
             if response.status == 401 and not asked:
                 # One shot at asking, and only ever the first time: a second
@@ -366,17 +374,36 @@ class HTTPClient:
                     response.close()
                     continue
             if response.status in _REDIRECTS and response.getheader("Location"):
-                location = response.getheader("Location", "")
-                response.read()
-                response.close()
-                target = _redirect(target, location)
-                trusted = trusted and self._carries_credentials(url, target)
+                hop = self._next_hop(response, url, target, trusted, relay)
+                target, trusted, relay = hop
                 if response.status == 303:
                     method, body = "GET", None
                 _log.debug("%s redirected to %s", method, target)
                 continue
             return _checked(response, target, expect, errors)
         raise RedirectLimitError(f"more than {self.config.redirect_limit} redirects for {url}")
+
+    def _next_hop(
+        self,
+        response: http.client.HTTPResponse,
+        origin: XRootDURL,
+        current: XRootDURL,
+        trusted: bool,
+        relay: bool,
+    ) -> tuple[XRootDURL, bool, bool]:
+        """Where a redirect goes, and what may still be sent there.
+
+        Both rights only ever narrow along a chain: once a hop leaves the
+        origin, the caller's credentials stay behind for good, and a copy's
+        ``TransferHeader*`` headers once they leave its site.
+        """
+        location = response.getheader("Location", "")
+        response.read()
+        response.close()
+        target = _redirect(current, location)
+        trusted = trusted and self._carries_credentials(origin, target)
+        relay = relay and (trusted or relays_transfer_headers(origin, target))
+        return target, trusted, relay
 
     def request(
         self,
@@ -433,6 +460,85 @@ class HTTPClient:
                 return True
         return False
 
+    def _send_expecting(
+        self,
+        conn: http.client.HTTPConnection,
+        method: str,
+        target: str,
+        body: bytes,
+        headers: dict[str, str],
+    ) -> http.client.HTTPResponse:
+        """Send the headers, wait for ``100 Continue``, then the body.
+
+        A server that answers first - EOS's ``307`` to a disk server - gets
+        its answer returned without a byte of the body having been sent, so
+        :meth:`open` follows the redirect instead of dying mid-upload.
+        """
+        announced = {**headers, "Expect": "100-continue"}
+        if not any(name.lower() == "content-length" for name in announced):
+            announced["Content-Length"] = str(len(body))
+        conn.request(method, target, body=None, headers=announced)
+        try:
+            await_continue(conn, method)
+        except InterimAnswer as early:
+            self._release(conn)
+            return early.response
+        conn.send(body)
+        return conn.getresponse()
+
+    def _release(self, conn: http.client.HTTPConnection) -> None:
+        """Take a connection with a half-sent request out of the pool.
+
+        It is not closed here: the early response is still being read from
+        its socket, and closing that response closes the socket with it.
+        """
+        for key in [k for k, pooled in self._pool.items() if pooled is conn]:
+            del self._pool[key]
+
+    def begin_upload(
+        self, method: str, url: XRootDURL, headers: dict[str, str]
+    ) -> tuple[http.client.HTTPConnection, XRootDURL]:
+        """Open a chunked upload of unknown length, following early redirects.
+
+        The headers go out with ``Expect: 100-continue``, so a server that
+        redirects the upload does it before any of the body is committed to
+        the wrong host. Returns the connection to stream the chunks into and
+        the URL they are going to.
+        """
+        target, trusted = url, True
+        for _ in range(self.config.redirect_limit + 1):
+            conn = self.ready(target)
+            standing = self.headers_for(target, headers, credentials=trusted)
+            sent = self.sign(method, target, standing, None)
+            conn.putrequest(method, request_target(target))
+            for name, value in sent.items():
+                conn.putheader(name, value)
+            conn.putheader("Transfer-Encoding", "chunked")
+            conn.putheader("Expect", "100-continue")
+            conn.endheaders()
+            try:
+                await_continue(conn, method)
+            except InterimAnswer as early:
+                self._release(conn)
+                response = early.response
+                location = response.getheader("Location")
+                try:
+                    response.read(MAX_BODY)
+                finally:
+                    response.close()
+                if response.status in _REDIRECTS and location:
+                    target = _redirect(target, location)
+                    trusted = trusted and self._carries_credentials(url, target)
+                    _log.debug("%s redirected to %s", method, target)
+                    continue
+                check_status(response.status, response.reason, target, (), None)
+                raise ProtocolError(
+                    f"{target.host} answered {method} with {response.status} "
+                    f"{response.reason} before the body was sent"
+                ) from None
+            return conn, target
+        raise RedirectLimitError(f"more than {self.config.redirect_limit} redirects for {url}")
+
     def _carries_credentials(self, origin: XRootDURL, target: XRootDURL) -> bool:
         trusted = carries_credentials(origin, target, self._trusted())
         if not trusted:
@@ -447,6 +553,7 @@ class HTTPClient:
         headers: dict[str, str] | None,
         *,
         credentials: bool = True,
+        relay: bool | None = None,
         timeout: float | None = None,
     ) -> http.client.HTTPResponse:
         """One request, retried once if a pooled connection had gone stale.
@@ -458,7 +565,7 @@ class HTTPClient:
         target = request_target(url)
         # A signer signs for the host it is given, so its signature is no
         # use anywhere else and is added whoever that host is.
-        standing = self.headers_for(url, headers, credentials=credentials)
+        standing = self.headers_for(url, headers, credentials=credentials, relay=relay)
         sent = self.sign(method, url, standing, body)
         # A conditional request is not safe to repeat: the first attempt may
         # have been applied, which makes the second one fail its condition.
@@ -466,8 +573,11 @@ class HTTPClient:
         for attempt in (0, 1):
             try:
                 conn = self.ready(url, timeout)
-                conn.request(method, target, body=body, headers=sent)
-                response = conn.getresponse()
+                if body is not None and wants_expect(method, len(body)):
+                    response = self._send_expecting(conn, method, target, body, sent)
+                else:
+                    conn.request(method, target, body=body, headers=sent)
+                    response = conn.getresponse()
                 self._serving[response] = conn
                 return response
             except (http.client.HTTPException, OSError) as exc:
@@ -567,6 +677,28 @@ def carries_credentials(
     return any(_in_domain(target.host, domain) for domain in trusted)
 
 
+def relays_transfer_headers(origin: XRootDURL, target: XRootDURL) -> bool:
+    """Whether a redirect may carry a ``COPY``'s ``TransferHeader*`` headers.
+
+    Those are not this client's credential for the host it is talking to:
+    they are what the node that runs a third-party copy must present to the
+    *far* endpoint - in practice a macaroon minted for this one transfer,
+    scoped to one file and a few activities, for minutes. EOS's head node
+    hands every ``COPY`` to a disk server of its own over plain ``http``
+    (``st-*.cern.ch:8443``, authorised by a capability it signs), and a copy
+    whose headers stayed behind fails there with ``401``. So they follow a
+    redirect within the site that sent it - the origin's parent domain,
+    which the origin proved it speaks for over TLS - even down to ``http``,
+    and never anywhere else. The caller's own ``Authorization`` keeps the
+    stricter rule of :func:`carries_credentials`. davix and gfal2 send
+    everything everywhere.
+    """
+    labels = origin.host.lower().split(".")
+    if len(labels) < 3 or labels[-1].isdigit():  # a bare domain, or an address
+        return origin.host.lower() == target.host.lower()
+    return _in_domain(target.host.lower(), ".".join(labels[1:]))
+
+
 def _in_domain(host: str, domain: str) -> bool:
     domain = domain.lower().strip(".")
     return domain == "*" or host == domain or host.endswith("." + domain)
@@ -581,13 +713,19 @@ def _url_token(url: XRootDURL) -> str | None:
     return None
 
 
-def _without_credentials(headers: dict[str, str]) -> dict[str, str]:
-    """``headers`` less any that would authenticate the request."""
+def _without_credentials(
+    headers: dict[str, str], *, keep_transfer: bool = False
+) -> dict[str, str]:
+    """``headers`` less any that would authenticate the request.
+
+    ``keep_transfer`` keeps the ``TransferHeader*`` family, which a
+    same-site redirect of a ``COPY`` must carry to the node that runs it.
+    """
     return {
         name: value
         for name, value in headers.items()
         if name.lower() not in _CREDENTIAL_HEADERS
-        and not name.lower().startswith(_CREDENTIAL_PREFIX)
+        and (keep_transfer or not name.lower().startswith(_CREDENTIAL_PREFIX))
     }
 
 

@@ -311,6 +311,19 @@ def test_a_waitresp_parks_the_request_instead_of_repeating_it(server, fs):
     assert server.seen.count(c.kXR_stat) == 1
 
 
+def test_a_waitresp_promising_more_than_the_budget_is_still_waited_for(server, fs):
+    """Its seconds are a ceiling, not a forecast: EOS parks a TPC's sync for an
+    hour and answers when the copy is done. Refusing the promise up front
+    abandoned copies that would have finished in seconds."""
+
+    def handler(conn, sid, params, body):
+        yield frame(sid, c.kXR_waitresp, struct.pack(">i", 3600))
+        yield frame(sid, c.kXR_ok, conn._stat_line("/data/a.root"))
+
+    server.handlers[c.kXR_stat] = handler
+    assert fs.stat("/data/a.root").size == len(b"hello world")
+
+
 def test_an_absurd_wait_is_capped_rather_than_obeyed():
     """A server asking for an hour must not hang the caller for an hour."""
     config = Config(username="t", auth_order=("host",), wait_cap=0.25)

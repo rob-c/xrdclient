@@ -382,8 +382,7 @@ def _use_third_party(srv, tmp_path):
         return xrdclient.third_party(
             srv.url.with_path("/store/f.root"),
             destination.url.with_path("/pushed.root"),
-            config=CONFIG,
-        )
+            config=CONFIG, verify=False)
 
 
 def _use_file(srv, tmp_path):

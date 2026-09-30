@@ -532,13 +532,27 @@ class Set(Request):
 # --------------------------------------------------------------------------
 
 
-class Open(Request):
-    """``kXR_open``."""
+#: The ``kXR_open`` option bits that change something: create, replace,
+#: truncate, or open for writing. An open carrying none of them only reads.
+_OPEN_WRITES = c.kXR_delete | c.kXR_new | c.kXR_open_updt | c.kXR_open_wrto | c.kXR_open_apnd
 
-    __slots__ = ("path", "options", "mode", "optiont", "fhtemplt")
+
+class Open(Request):
+    """``kXR_open``.
+
+    A read-only open may be replayed; one that writes may not. Re-opening a
+    file for reading has no effect the first open did not already have, so a
+    connection that dropped during or right after it can simply be dialled
+    again - which is what lets a read survive a flaky link. An open that
+    creates, truncates or writes can leave the namespace changed even when
+    its answer never arrived, so it is never retried blind; the copy engine
+    restarts those deliberately instead. :attr:`idempotent` is therefore set
+    per instance, from the flags, rather than fixed for the type.
+    """
+
+    __slots__ = ("path", "options", "mode", "optiont", "fhtemplt", "idempotent")
     opcode = c.kXR_open
     signed = True
-    idempotent = False
 
     def __init__(
         self,
@@ -551,6 +565,7 @@ class Open(Request):
     ) -> None:
         self.path = path
         self.options = options
+        self.idempotent = not options & _OPEN_WRITES
         self.mode = mode
         #: ``kXR_dup`` / ``kXR_samefs``: what to do with the file ``fhtemplt``
         #: names, a handle open on the same connection.

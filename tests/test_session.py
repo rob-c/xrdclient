@@ -17,7 +17,7 @@ from xrdclient.proto import machine
 from xrdclient.proto import requests as r
 from xrdclient.session.router import Router, _path_fields, _retarget
 from xrdclient.session.sync import RedirectRequired, Result, Session
-from xrdclient.testing import FakeServer
+from xrdclient.testing import FakeServer, error
 
 # ---------------------------------------------------------------------------
 # Session
@@ -299,3 +299,43 @@ def test_an_event_this_version_does_not_know_is_passed_over(server, config):
     with Session.connect(server.url, config=config) as session:
         scripted(session, [Curious()], [machine.Completed(7, r.Ping(), b"done")])
         assert bytes(session._await(7, None)) == b"done"
+
+
+# -- why a refused request went out as nobody -------------------------------
+
+
+def _refuse_everything(conn, sid, params, payload):
+    yield error(sid, 3010, "unauthorized identity used")
+
+
+def test_a_refusal_after_falling_back_to_unix_says_why_the_proxy_was_not_used(
+    monkeypatch, tmp_path
+):
+    """EOS's "unauthorized identity used", with the reason it was that identity."""
+    missing = tmp_path / "x509up_u1000"
+    monkeypatch.setenv("X509_USER_PROXY", str(missing))
+    with FakeServer(sec="&P=gsi&P=unix") as srv:
+        srv.handlers[c.kXR_stat] = _refuse_everything
+        config = Config(username="jane", prompt=False)
+        with Session.connect(srv.url, config=config) as session:
+            assert session.mechanism == "unix"
+            with pytest.raises(PermissionError) as caught:
+                session.execute(r.Stat("/eos/x"), path="/eos/x")
+    refused = caught.value
+    assert refused.message == "unauthorized identity used"  # the server's words, untouched
+    assert f"logged in as unix: gsi was not used - there is no file at {missing}" in str(refused)
+
+
+def test_other_errors_and_identified_logins_get_no_explanation(monkeypatch, tmp_path):
+    monkeypatch.setenv("X509_USER_PROXY", str(tmp_path / "absent"))
+    with FakeServer(sec="&P=gsi&P=unix") as srv:
+        with Session.connect(srv.url, config=Config(prompt=False)) as session:
+            with pytest.raises(FileNotFoundError) as caught:
+                session.execute(r.Stat("/nope"), path="/nope")
+    assert caught.value.hint == ""
+    with FakeServer(sec="&P=host") as srv:
+        srv.handlers[c.kXR_stat] = _refuse_everything
+        with Session.connect(srv.url, config=Config(auth_order=("host",))) as session:
+            with pytest.raises(PermissionError) as caught:
+                session.execute(r.Stat("/x"), path="/x")
+    assert caught.value.hint == ""  # nothing identifying was offered, so nothing was skipped

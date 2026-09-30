@@ -15,16 +15,25 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractContextManager, ExitStack, nullcontext, suppress
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from typing import IO, Any, Literal, cast
 
-from .._compat import SLOTS
+from .._compat import SLOTS, TIMEOUTS
 from .._log import get_logger
 from ..config import Config
 from ..crypto import new as new_checksum
-from ..errors import ChecksumMismatchError, UnsupportedError, XRootDError, kXR_Unsupported
+from ..errors import (
+    ChecksumMismatchError,
+    UnsupportedError,
+    WaitLimitError,
+    XRootDError,
+    kXR_Unsupported,
+)
+from ..errors import ConnectionError as XRDConnectionError
+from ..errors import TimeoutError as XRDTimeoutError
+from ..session import deadline as dl
 from ..session.bulk import BulkUnsupported
 from ..types import ChecksumInfo
 from ..url import XRootDURL, parse
@@ -249,14 +258,16 @@ def _spread(
 def _divisible(source: XRootDURL, target: XRootDURL) -> bool:
     """Can this pair be moved as spans at all?
 
-    The target is written at an offset, which rules out an HTTP ``PUT`` and
-    any scheme the writer would refuse anyway; the source is read at one, and
-    is asked how long it is first, which a scheme nothing here speaks would
-    turn into a connection attempt to nowhere.
+    The target is a local file: each worker opens it again to write its own
+    span, which a remote one does not allow. dCache and XRootD's Ceph
+    backend (RAL's Echo) treat a file as written once it is closed, and
+    refuse every later open for update - "File already exists" - so a
+    ``root://`` target is written by one stream, as ``xrdcp`` writes it (EOS
+    would take the spans, but did not go any faster for them). The source is
+    read at an offset and asked how long it is first, which a scheme nothing
+    here speaks would turn into a connection attempt to nowhere.
     """
-    return (target.is_local or target.is_root) and (
-        source.is_local or source.is_root or source.is_http
-    )
+    return target.is_local and (source.is_local or source.is_root or source.is_http)
 
 
 def _spans(size: int, workers: int) -> list[tuple[int, int]]:
@@ -352,6 +363,64 @@ def _probe(url: XRootDURL, config: Config) -> tuple[int, int] | None:
         except OSError:
             return None
     return stat.st_size, stat.st_mtime
+
+
+#: Failures that say an end could not be reached: there is nothing to clean up
+#: on it, and asking would only wait out the same timeout again.
+_UNREACHABLE = (*TIMEOUTS, XRDConnectionError, XRDTimeoutError, UnsupportedError)
+
+
+@contextmanager
+def _cleaned_on_failure(job: _Job, *, resume: bool) -> Iterator[None]:
+    """Run a transfer; if it fails, remove an empty target it left behind.
+
+    Not for a resume, whose whole point is the partial target.
+    """
+    existed = job.dst_url is not None and job.dst_url.is_local and os.path.exists(job.dst_url.path)
+    try:
+        yield
+    except BaseException as exc:
+        if not resume and _may_clean(job.dst_url, existed, exc):
+            _discard_empty_target(job)
+        raise
+
+
+def _may_clean(target: XRootDURL | None, existed: bool, error: BaseException) -> bool:
+    """Whether a failed copy's target is one this copy may tidy up.
+
+    Not an open stream, not an end that could not be reached (asking would
+    only wait out the same timeout again), not a scheme this client does not
+    speak, and not a local file that was there before the copy began.
+    """
+    if target is None or isinstance(error, _UNREACHABLE):
+        return False
+    if target.is_local:
+        return not existed
+    return target.is_root or target.is_http or target.is_s3
+
+
+def _discard_empty_target(job: _Job) -> None:
+    """Remove the target of a failed copy if it is empty and was never data.
+
+    An empty file at the destination of a failed copy - a local one opened
+    before the source answered 404, or the name EOS creates before
+    redirecting an upload - looks like a finished copy of an empty file to
+    whatever runs next. It is removed when the source was not empty (or not
+    there at all). A target with bytes in it is left alone: that is either
+    somebody's data or a partial transfer that ``resume=True`` can continue.
+    Best effort, so the error the caller sees stays the copy's own.
+    """
+    target = job.dst_url
+    assert target is not None  # checked by _may_clean
+    with suppress(Exception):
+        there = _probe(target, job.config)
+        if there is None or there[0] != 0:
+            return
+        source = _probe(job.src_url, job.config) if job.src_url is not None else None
+        if source is not None and source[0] == 0:
+            return  # an empty source: an empty target may be the right answer
+        _remove(target, job.config)
+        _log.debug("removed the empty %s a failed copy left behind", target)
 
 
 def _remove(url: XRootDURL, config: Config) -> None:
@@ -789,6 +858,87 @@ def _checked(check: _Verify, config: Config) -> ChecksumInfo | None:
     return _compare(check.checkable, config, check.algorithm, ours, strict=check.strict)
 
 
+def _transfer(
+    job: _Job,
+    algorithm: str,
+    verify: bool | None,
+    resume: bool,
+    sources: int,
+    progress: Progress | None,
+    pace: Pace,
+) -> tuple[int, _Plan, _Verify]:
+    """Move the file, reconnecting and continuing when the link drops under it.
+
+    The bulk download plane recovers its own workers; this is the same promise
+    for the paths that do not - a single stream, and every upload - so a
+    transfer survives a connection that flakes in and out rather than failing
+    at the first reset. Each retry re-plans: a target that can be written at an
+    offset (a local file, or ``root://``) continues from what already landed,
+    and one that cannot (an HTTP ``PUT``, which replaces the whole resource) is
+    started again from the beginning, which is safe because a half-done upload
+    persists nothing. A timeout or a busy-server wait is not a dropped link and
+    is left to stand; so is a mid-transfer failure the copy cannot safely redo
+    (an exclusive create, whose retry could clobber another writer's file).
+    """
+    attempts = 0
+    resume_now = resume
+    while True:
+        plan = _plan(job, resume=resume_now, sources=sources)
+        check = _verification(job, plan.ends, algorithm, verify)
+        pace.check()
+        report = pace.watch(progress, start=plan.offset) if pace.limited else progress
+        pace.begin()
+        try:
+            return _move(job, plan, report, check.digest), plan, check
+        except _Stop as stop:
+            raise stop.error from None
+        except XRDConnectionError as exc:
+            attempts += 1
+            resume_now = _retry_transfer(job, exc, attempts, resume=resume)
+            _log.debug("retrying the transfer to %s after %s", job.names()[1], exc)
+
+
+def _retry_transfer(job: _Job, exc: XRDConnectionError, attempts: int, *, resume: bool) -> bool:
+    """Whether to try the move again, and with resume; or re-raise ``exc``.
+
+    Returns ``True`` to continue from what landed, ``False`` to restart from
+    the beginning. Raises when the failure is not a dropped link, the budget
+    is spent, the deadline has passed, or the copy cannot be safely redone.
+    """
+    cfg = job.config
+    if isinstance(exc, (XRDTimeoutError, WaitLimitError)):
+        raise exc  # a stall or a busy server, not a link that dropped
+    if attempts > cfg.connect_retries or not _can_retry(job, resume=resume):
+        raise exc
+    remaining = dl.remaining()
+    if remaining is not None and remaining <= 0:
+        raise exc
+    backoff = cfg.retry_backoff
+    if backoff > 0:
+        pause = min(backoff * 2 ** (attempts - 1), cfg.wait_cap)
+        time.sleep(pause if remaining is None else max(min(pause, remaining), 0.0))
+    return _writes_at_offset(job.dst_url)
+
+
+def _can_retry(job: _Job, *, resume: bool) -> bool:
+    """Whether a dropped transfer to this target may be redone at all.
+
+    It needs a target named by URL, not an open stream this process cannot
+    rewind. An overwrite may be restarted or continued freely; an exclusive
+    create may not, since a restart could not tell its own half-written file
+    from somebody else's and would clobber it - unless the caller already
+    asked to resume, having taken that on themselves.
+    """
+    if job.dst_url is None:
+        return False
+    return job.overwrite or resume
+
+
+def _writes_at_offset(target: XRootDURL | None) -> bool:
+    """Whether ``target`` can be continued from an offset rather than restarted."""
+    return target is not None and (target.is_local or target.is_root)
+
+
 def _move(job: _Job, plan: _Plan, progress: Progress | None, digest: Any) -> int:
     """Move the bytes the way ``plan`` says; how many this call moved."""
     if plan.bulking:
@@ -936,7 +1086,7 @@ def copy(
     which costs a read of whichever end is local. An HTTP target cannot be
     resumed at all, because a ``PUT`` replaces the whole resource.
 
-    A file long enough to give every worker a whole chunk is moved by
+    A download long enough to give every worker a whole chunk is moved by
     ``config.parallel_chunks`` connections at once, each carrying one span of
     it. That too is a transfer nobody read in order, so it verifies the same
     way; ``parallel_chunks=1`` keeps the single stream and its cheaper
@@ -976,18 +1126,11 @@ def copy(
     )
     if dry_run:
         return _dry_run(job)
-    try:
-        plan = _plan(job, resume=resume, sources=sources)
-        check = _verification(job, plan.ends, algorithm or cfg.preferred_checksum, verify)
-        pace.check()
-        report = pace.watch(progress, start=plan.offset) if pace.limited else progress
-        started = time.monotonic()
-        pace.begin()
-        size = _move(job, plan, report, check.digest)
-        elapsed = time.monotonic() - started
-        pace.check()
-    except _Stop as stop:
-        raise stop.error from None
+    algo = algorithm or cfg.preferred_checksum
+    started = time.monotonic()
+    with _cleaned_on_failure(job, resume=resume):
+        size, plan, check = _transfer(job, algo, verify, resume, sources, progress, pace)
+    elapsed = time.monotonic() - started
     checksum = _checked(check, cfg)
     if remove_source and job.src_url is not None:
         _remove(job.src_url, cfg)  # only now: a failed verification kept the original

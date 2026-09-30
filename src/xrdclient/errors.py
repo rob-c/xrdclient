@@ -178,6 +178,10 @@ class ServerError(XRootDError):
     """
 
     code: int = 0
+    #: This client's own explanation, when it has one the server could not
+    #: give - why a login fell back to ``unix``, say. Shown by ``str()`` but
+    #: kept out of :attr:`message`, which stays the server's words exactly.
+    hint: str = ""
 
     def __init__(self, code: int, message: str, *, path: str | None = None) -> None:
         self.code = code
@@ -185,10 +189,17 @@ class ServerError(XRootDError):
         self.path = path
         XRootDError.__init__(self, self._describe())
 
+    def explain(self, hint: str) -> None:
+        """Attach :attr:`hint`, so that ``str()`` carries it."""
+        self.hint = hint
+        if not isinstance(self, OSError):
+            self.args = (self._describe(),)
+
     def _describe(self) -> str:
         name = _CODE_NAMES.get(self.code, f"kXR_unknown({self.code})")
         where = f" [{self.path}]" if self.path else ""
-        return f"{name}: {self.message}{where}"
+        note = f" ({self.hint})" if self.hint else ""
+        return f"{name}: {self.message}{where}{note}"
 
     def __reduce__(self) -> tuple:  # type: ignore[type-arg]
         # ``OSError.__reduce__`` would round-trip through ``(errno, strerror)``

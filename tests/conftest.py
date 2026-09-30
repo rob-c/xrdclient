@@ -70,6 +70,19 @@ def _no_dotfile(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_ambient_proxy(tmp_path_factory, monkeypatch):
+    """Keep the developer's own grid proxy out of every TLS handshake.
+
+    With nothing configured, :func:`~xrdclient.transport.base.tls_context`
+    presents ``/tmp/x509up_u<uid>`` as gfal2 and XrdCl do, so on a grid login
+    node the suite would otherwise run with a real certificate in hand. A
+    test about that discovery points it somewhere of its own.
+    """
+    absent = str(tmp_path_factory.mktemp("noproxy") / "x509up_absent")
+    monkeypatch.setattr("xrdclient.transport.base.default_proxy_path", lambda: absent)
+
+
+@pytest.fixture(autouse=True)
 def _a_short_data_stream_probe(monkeypatch):
     """Do not spend the suite's time learning what the fake server is.
 

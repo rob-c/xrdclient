@@ -478,7 +478,7 @@ def test_copying_is_awaitable(server, tmp_path):
         assert [r.size for r in results] == [len(BODY)]
         with FakeServer() as destination:
             pushed = await xrdclient.aio.third_party(
-                server.url / "data/a.root", destination.url / "pulled.root"
+                server.url / "data/a.root", destination.url / "pulled.root", verify=False
             )
             assert pushed.size == len(BODY)
 

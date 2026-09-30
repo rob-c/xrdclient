@@ -119,7 +119,7 @@ rehearsed (`dry_run=True`) or moved (`remove_source=True`). Every transfer keeps
 `config.in_flight` chunks read ahead of the write it is waiting on, so the two
 ends overlap instead of taking turns. An interrupted
 transfer is continued rather than restarted with `resume=True`, or `xrd-cp -c`,
-and a file long enough to be worth it is moved by `config.parallel_chunks`
+and a download long enough to be worth it is moved by `config.parallel_chunks`
 connections at once, one span of the file each. A tree of small files copies
 `workers=` of them in parallel, `xrd-cp -r --parallel N`.
 

@@ -98,6 +98,16 @@ class FakeDAVServer:
         self.require_token: str | None = None
         #: ``path -> location`` sent as a 307 before the real answer.
         self.redirects: dict[str, str] = {}
+        #: Answer a redirect as soon as the headers are in and hang up
+        #: without reading the body, as EOS's head node does with a ``PUT``.
+        #: A client that did not ask ``Expect: 100-continue`` first is left
+        #: writing into a closed connection.
+        self.early_redirects = False
+        #: Honour ``Expect: 100-continue``. ``False`` is a server that ignores
+        #: the expectation, which HTTP allows: it just reads the body.
+        self.expect_continue = True
+        #: The headers of every request served, in order.
+        self.headers: list[dict[str, str]] = []
         #: Refuse ``PROPFIND``, the way a plain HTTP server would.
         self.no_dav = False
         #: Answer a ranged ``GET`` with the whole body, as some caches do.
@@ -279,10 +289,19 @@ class _Handler(BaseHTTPRequestHandler):
         if body and self.command != "HEAD":
             self.wfile.write(body)
 
+    def handle_expect_100(self) -> bool:
+        """Say ``100 Continue`` - unless a knob says this server would not."""
+        if self.fake.early_redirects and self.fake.redirects.get(self.target):
+            return True  # :meth:`_gate` answers before the body is read
+        if not self.fake.expect_continue:
+            return True
+        return super().handle_expect_100()
+
     def _gate(self) -> bool:
         """Record the request; answer it here if a knob says to."""
         self.fake.seen.append((self.command, self.target))
         self.fake.targets.append(self.path)
+        self.fake.headers.append(dict(self.headers.items()))
         handler = self.fake.handlers.get(self.command)
         if handler is not None:
             canned = handler(self.command, self.target, dict(self.headers.items()))
@@ -296,6 +315,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(401, b"no token")
             return False
         location = self.fake.redirects.pop(self.target, None)
+        if location and self.fake.early_redirects:
+            self.close_connection = True
+            self._send(307, b"", Location=location, Connection="close")
+            return False
         if location:
             self._body()
             self._send(307, b"", Location=location)

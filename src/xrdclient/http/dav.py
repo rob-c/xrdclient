@@ -485,10 +485,28 @@ class HTTPFileSystem(FileSystem):
     ) -> None:
         """``MKCOL``. ``mode`` has no HTTP equivalent and is ignored."""
         target = self._url(path, collection=True)
-        if parents:
-            for parent in _ancestors(target.path):
-                self._mkcol(self.url.with_path(parent + "/"), exist_ok=True)
-        self._mkcol(target, exist_ok=exist_ok)
+        if not parents:
+            self._mkcol(target, exist_ok=exist_ok)
+            return
+        # gfal2's mkdir_rec, not a walk down from the root: try the target,
+        # and only climb while the server says the parent is missing. A grid
+        # storage element refuses MKCOL on the top of its namespace (EOS's
+        # ``/eos/``, dCache's ``/pnfs/``) with 403 even though it exists, so
+        # starting at the root cannot work there; this never goes near it.
+        missing: list[XRootDURL] = []
+        current = target
+        while True:
+            try:
+                self._mkcol(current, exist_ok=exist_ok if current is target else True)
+                break
+            except FileNotFoundError:
+                parent = posixpath.dirname(current.path.rstrip("/"))
+                if parent in ("", "/"):
+                    raise
+                missing.append(current)
+                current = self.url.with_path(parent + "/")
+        for child in reversed(missing):
+            self._mkcol(child, exist_ok=exist_ok if child is target else True)
 
     def _mkcol(self, target: XRootDURL, *, exist_ok: bool) -> None:
         # RFC 4918: MKCOL answers 405 when the collection is already there,
@@ -500,6 +518,11 @@ class HTTPFileSystem(FileSystem):
                 "MKCOL", target, expect=(201,), errors={405: kXR_ItExists}
             )
         except FileExistsError:
+            if not exist_ok or not self.isdir(target.path):
+                raise
+        except PermissionError:
+            # EOS and dCache answer MKCOL on a collection that is there but
+            # not the caller's to write with 403, not 405: still "exists".
             if not exist_ok or not self.isdir(target.path):
                 raise
 
@@ -737,8 +760,3 @@ class HTTPFileSystem(FileSystem):
     def xattrs(self, path: str) -> dict[str, bytes]:
         raise self._unsupported("extended attributes")
 
-
-def _ancestors(path: str) -> list[str]:
-    """Every parent of ``path``, shallowest first, excluding the root."""
-    parts = [p for p in path.strip("/").split("/") if p]
-    return ["/" + "/".join(parts[: i + 1]) for i in range(len(parts) - 1)]

@@ -137,9 +137,12 @@ From the command line that is `xrd-cp --stripes 8`. Its neighbour
 move at once, but how many `kXR_bind` sub-streams each one rides; see
 [`data_streams`](config.md) for what that binds and when it falls back.
 
-It happens by itself, and only where it can pay. The target must be one that
-takes a write at an offset, so a local path or `root://` but never an HTTP
-`PUT`; the source must answer how long it is; and the file must be long enough
+It happens by itself, and only where it can pay. The target must be a local
+file, because each worker opens it again to write its own span: dCache and
+XRootD's Ceph backend treat a remote file as written once it is closed and
+refuse the second open ("File already exists"), so an upload to `root://` is
+one stream, as `xrdcp` writes it - and never an HTTP `PUT`. The source must
+answer how long it is; and the file must be long enough
 to give every worker a whole `chunk_size`, or the spans cost more in
 connections than they save in round trips. Anything that fails those falls
 back to the single stream, which is also what `parallel_chunks=1` asks for.

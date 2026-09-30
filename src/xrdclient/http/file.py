@@ -12,21 +12,25 @@ from __future__ import annotations
 
 import http.client
 import io
+import time
 from typing import IO, TYPE_CHECKING, Any, BinaryIO, Literal, TextIO, overload
 
 from .._log import get_logger
 from ..config import Config
+from ..errors import ConnectionError as XRDConnectionError
 from ..errors import (
     ExistsError,
     ProtocolError,
     TransientError,
     UnsupportedError,
+    WaitLimitError,
     kXR_ItExists,
     kXR_Unsupported,
 )
+from ..errors import TimeoutError as XRDTimeoutError
 from ..io.raw import OpenBinaryMode, OpenTextMode
 from ..url import XRootDURL, parse
-from .client import HTTPClient, check_status, request_target
+from .client import HTTPClient, check_status
 
 if TYPE_CHECKING:
     from _typeshed import ReadableBuffer, WriteableBuffer
@@ -174,6 +178,25 @@ class HTTPRawIO(io.RawIOBase):
         # compliant server answers it with 416 rather than an empty body.
         if self._eof_at is not None and self._pos >= self._eof_at:
             return 0
+        # A GET that drops mid-body is resumed with a fresh ranged GET from
+        # ``_pos``, the last byte handed back - so a flaky link costs a
+        # reconnect, not the read. Only bytes already committed are ever
+        # counted, so a resume never double-reads or skips.
+        attempts = 0
+        while True:
+            try:
+                return self._read_live(buffer)
+            except (XRDTimeoutError, WaitLimitError):
+                raise  # a stall or a busy server, not a link that dropped
+            except XRDConnectionError as exc:
+                attempts += 1
+                if attempts > self.config.connect_retries:
+                    raise
+                _log.debug("resuming %s at %d after %s", self.url.path, self._pos, exc)
+                self._backoff(attempts)
+
+    def _read_live(self, buffer: WriteableBuffer) -> int:
+        """One read from the open stream; a drop mid-body raises TransientError."""
         stream = self._stream()
         if stream is None:
             return 0
@@ -194,6 +217,11 @@ class HTTPRawIO(io.RawIOBase):
             self._size = self._eof_at = self._pos
         self._pos += count
         return count
+
+    def _backoff(self, attempts: int) -> None:
+        backoff = self.config.retry_backoff
+        if backoff > 0:
+            time.sleep(min(backoff * 2 ** (attempts - 1), self.config.wait_cap))
 
     def readall(self) -> bytes:
         # Counted as it arrives rather than asked for up front: a HEAD here
@@ -286,17 +314,11 @@ class HTTPRawIO(io.RawIOBase):
 
     def _begin_upload(self) -> None:
         """Start a chunked ``PUT`` and flush whatever is already buffered."""
-        conn = self.client.ready(self.url)
-        # ``None`` for the body: it is about to be streamed, so a signer that
-        # would hash it has nothing to hash yet.
-        headers = self.client.sign(
-            "PUT", self.url, self.client.headers_for(self.url, self._conditional()), None
-        )
-        conn.putrequest("PUT", request_target(self.url))
-        for name, value in headers.items():
-            conn.putheader(name, value)
-        conn.putheader("Transfer-Encoding", "chunked")
-        conn.endheaders()
+        # The body is about to be streamed, so a signer that would hash it
+        # has nothing to hash yet. The headers go first and alone: a server
+        # that redirects the upload (EOS, to the disk server that will hold
+        # the file) says so before any of it is sent to the wrong host.
+        conn, self.url = self.client.begin_upload("PUT", self.url, self._conditional())
         self._upload = conn
         pending, self._buffer = bytes(self._buffer), bytearray()
         if pending:

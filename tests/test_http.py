@@ -272,8 +272,10 @@ def test_a_body_cut_short_of_its_promise_is_an_error_not_a_download(dav):
 
 
 def test_a_streaming_read_cut_short_names_the_bytes_it_kept(dav):
+    """With retries off, a dropped read surfaces, and its error says how far it got."""
     dav.truncate_at = 5
-    with open_http(dav.url / "d/a.root", "rb") as fh:
+    config = Config(connect_retries=0)
+    with open_http(dav.url / "d/a.root", "rb", config=config) as fh:
         assert fh.read(5) == b"hello"
         with pytest.raises(TransientError, match="short of the declared Content-Length") as caught:
             fh.read()
@@ -281,14 +283,17 @@ def test_a_streaming_read_cut_short_names_the_bytes_it_kept(dav):
 
 
 def test_a_cut_stream_recovers_with_a_ranged_get(dav):
+    """A GET dropped mid-body is resumed from where it got to, on its own.
+
+    The server cuts every response to five bytes, so the read only finishes
+    by reconnecting with ``Range`` and picking up each time - which is what a
+    flaky link needs and what a bare read now does without being told to."""
     dav.truncate_at = 5
-    with open_http(dav.url / "d/a.root", "rb") as fh:
-        assert fh.read(5) == b"hello"
-        with pytest.raises(TransientError):
-            fh.read()
-        dav.truncate_at = None
-        assert fh.read() == b" world"
-    assert ("GET", "/d/a.root") in dav.seen
+    config = Config(connect_retries=20, retry_backoff=0.0)
+    with open_http(dav.url / "d/a.root", "rb", config=config) as fh:
+        assert fh.read() == b"hello world"
+    ranged = [h.get("Range") for m, h in zip(dav.seen, dav.headers) if m[0] == "GET"]
+    assert any(r for r in ranged)  # it resumed with at least one ranged GET
 
 
 def test_text_mode_iterates_lines(dav):
@@ -430,6 +435,60 @@ def test_mkdir_is_mkcol_with_pathlib_semantics(fs, dav):
     assert "/d/deep/er/still" in dav.dirs
     with pytest.raises(FileNotFoundError):
         fs.mkdir("/d/absent/child")
+
+
+def _grid_namespace(dav):
+    """A storage element's top levels: there, but refusing MKCOL with 403.
+
+    EOS answers MKCOL on ``/eos/`` like this, and dCache on ``/pnfs/``; a
+    ``makedirs`` that started from the root could never get past them.
+    """
+    dav.add_dir("/eos/lhcb/user")
+
+    def refuse_the_top(method, path, headers):
+        refused = ("/eos", "/eos/lhcb", "/eos/ro")
+        return (403, b"FORBIDDEN", {}) if path.rstrip("/") in refused else None
+
+    dav.handlers["MKCOL"] = refuse_the_top
+
+
+def test_makedirs_climbs_only_as_far_as_the_missing_parents(fs, dav):
+    _grid_namespace(dav)
+    fs.makedirs("/eos/lhcb/user/r/me/run1")
+    assert {"/eos/lhcb/user/r", "/eos/lhcb/user/r/me", "/eos/lhcb/user/r/me/run1"} <= dav.dirs
+    mkcols = [path for method, path in dav.seen if method == "MKCOL"]
+    assert "/eos" not in mkcols and "/eos/lhcb" not in mkcols
+    # target, then up while 409, then back down: the gfal2 order
+    assert mkcols == [
+        "/eos/lhcb/user/r/me/run1",
+        "/eos/lhcb/user/r/me",
+        "/eos/lhcb/user/r",
+        "/eos/lhcb/user/r/me",
+        "/eos/lhcb/user/r/me/run1",
+    ]
+
+
+def test_makedirs_of_a_directory_that_is_there_is_one_request(fs, dav):
+    _grid_namespace(dav)
+    fs.makedirs("/eos/lhcb/user", exist_ok=True)
+    assert [s for s in dav.seen if s[0] == "MKCOL"] == [("MKCOL", "/eos/lhcb/user")]
+
+
+def test_exist_ok_forgives_a_403_on_a_collection_that_is_there(fs, dav):
+    """EOS says 403, not 405, for a collection the caller cannot write in."""
+    _grid_namespace(dav)
+    fs.mkdir("/eos/lhcb", exist_ok=True)
+    fs.makedirs("/eos/lhcb", exist_ok=True)
+    with pytest.raises(PermissionError):
+        fs.mkdir("/eos/lhcb")
+    with pytest.raises(PermissionError):
+        fs.mkdir("/eos/ro", exist_ok=True)  # refused, and not there
+
+
+def test_makedirs_with_no_root_to_stop_at_says_what_is_missing(fs, dav):
+    dav.handlers["MKCOL"] = lambda method, path, headers: (409, b"no parent", {})
+    with pytest.raises(FileNotFoundError):
+        fs.makedirs("/x/y")
 
 
 def test_exist_ok_does_not_forgive_a_resource_on_the_name(fs):
@@ -670,11 +729,129 @@ def elsewhere():
 
 def test_a_pull_moves_the_bytes_without_them_passing_through_us(dav, elsewhere):
     """The whole point: one COPY from us, and the data goes server to server."""
-    result = xrdclient.third_party(dav.url / "d/a.root", elsewhere.url / "d/copy.root")
+    result = xrdclient.third_party(
+        dav.url / "d/a.root", elsewhere.url / "d/copy.root", verify=False
+    )
     assert elsewhere.contents("/d/copy.root") == BODY
     assert elsewhere.seen == [("COPY", "/d/copy.root")]
     assert ("GET", "/d/a.root") in dav.seen
     assert result.size == len(BODY)
+
+
+def test_a_pull_is_verified_against_both_servers_by_default(dav, elsewhere):
+    xrdclient.third_party(dav.url / "d/a.root", elsewhere.url / "d/v.root")
+    assert elsewhere.contents("/d/v.root") == BODY
+    assert ("HEAD", "/d/v.root") in elsewhere.seen  # its digest, asked for afterwards
+
+
+def test_the_far_end_gets_a_minted_token_when_nothing_else_authorises_it(
+    dav, elsewhere, monkeypatch
+):
+    """gfal2's ``RETRIEVE_BEARER_TOKEN``: a proxy cannot be shown to the other server."""
+    from xrdclient.http import tpc
+
+    asked = []
+
+    def mint(far, config, client, *, write, timeout):
+        asked.append((far.path, write))
+        return "minted-for-this-copy"
+
+    monkeypatch.setattr(tpc, "_minted", mint)
+    xrdclient.third_party(dav.url / "d/a.root", elsewhere.url / "d/m.root", verify=False)
+    assert asked == [("/d/a.root", False)]  # a pull reads the far end
+    headers = elsewhere.copies[-1]
+    assert headers["TransferHeaderAuthorization"] == "Bearer minted-for-this-copy"
+    assert headers["Credential"] == "none"
+
+
+def test_a_refused_copy_leaves_no_empty_destination(dav, elsewhere):
+    """EOS names the destination, then refuses the COPY with 401."""
+
+    def name_then_refuse(method, path, headers):
+        elsewhere.add_file(path, b"")
+        return (401, b"Unauthorized", {})
+
+    elsewhere.handlers["COPY"] = name_then_refuse
+    with pytest.raises(PermissionError):
+        xrdclient.third_party(dav.url / "d/a.root", elsewhere.url / "d/refused.root")
+    assert "/d/refused.root" not in elsewhere.files
+
+
+def test_a_minted_token_is_scoped_to_what_the_copy_does(monkeypatch):
+    from xrdclient.http import dav as dav_module
+    from xrdclient.http import tpc
+
+    requests = []
+
+    def macaroon(url, *, caveats, validity, config, client):
+        requests.append((str(url), caveats, validity))
+        return "m"
+
+    monkeypatch.setattr(dav_module, "macaroon", macaroon)
+    far = xrdclient.url.parse("https://se.example.org/store/f.root")
+    config = xrdclient.Config(request_timeout=600)
+    assert tpc._minted(far, config, None, write=False, timeout=None) == "m"
+    assert tpc._minted(far, config, None, write=True, timeout=300) == "m"
+    assert requests[0][1:] == (["activity:LIST,DOWNLOAD"], "PT30M")
+    assert requests[1][1:] == (["activity:LIST,DOWNLOAD,MANAGE,UPLOAD,DELETE"], "PT20M")
+    # Nothing to mint: plain http, a token already in hand, or a far end that cannot.
+    assert tpc._minted(xrdclient.url.parse("http://se/f"), config, None, write=False,
+                       timeout=None) is None
+    assert tpc._minted(far, xrdclient.Config(token="t"), None, write=False, timeout=None) is None
+
+    def refuse(*args, **kwargs):
+        raise PermissionError("no macaroons here")
+
+    monkeypatch.setattr(dav_module, "macaroon", refuse)
+    assert tpc._minted(far, config, None, write=False, timeout=None) is None
+
+
+@pytest.mark.parametrize(
+    ("origin", "target", "relayed"),
+    [
+        # EOS's head node to its own disk server, over its internal plain http
+        ("https://eoslhcb.cern.ch/eos/f", "http://st-096-hh151a57.cern.ch:8443/eos/f", True),
+        ("https://webdav.echo.stfc.ac.uk:1094/f", "https://gw3.echo.stfc.ac.uk/f", True),
+        # anywhere else: never
+        ("https://eoslhcb.cern.ch/eos/f", "https://evil.example.org/f", False),
+        ("https://eoslhcb.cern.ch/eos/f", "https://cern.ch.evil.org/f", False),
+        # a bare domain or an address has no site to share
+        ("https://cern.ch/f", "https://st.cern.ch/f", False),
+        ("https://10.0.0.1/f", "https://10.0.0.2/f", False),
+        ("https://10.0.0.1/f", "https://10.0.0.1/g", True),
+    ],
+)
+def test_transfer_headers_follow_a_redirect_only_within_the_site(origin, target, relayed):
+    from xrdclient.http.client import carries_credentials, relays_transfer_headers
+
+    parse = xrdclient.url.parse
+    assert relays_transfer_headers(parse(origin), parse(target)) is relayed
+    if target.startswith("http://"):
+        # the caller's own Authorization still never follows a downgrade
+        assert not carries_credentials(parse(origin), parse(target), ("cern.ch",))
+
+
+def test_a_copy_redirected_within_the_site_keeps_its_transfer_headers(dav, elsewhere):
+    """Not the caller's Authorization: that one stays behind as before."""
+    import xrdclient.http.client as client_module
+
+    seen = []
+    elsewhere.handlers["COPY"] = lambda method, path, headers: seen.append(headers) or None
+    dav.redirects["/d/r.root"] = str(elsewhere.url / "d/r.root")
+    original = client_module.relays_transfer_headers
+    client_module.relays_transfer_headers = lambda origin, target: True
+    try:
+        xrdclient.http.third_party(
+            elsewhere.url / "d/a.root", dav.url / "d/r.root",
+            remote_token="for-the-far-side", verify=False,
+            config=xrdclient.Config(token="mine"),
+        )
+    except OSError:
+        pass  # the fake cannot finish a copy it was redirected into; the headers are the point
+    finally:
+        client_module.relays_transfer_headers = original
+    assert seen and seen[0].get("TransferHeaderAuthorization") == "Bearer for-the-far-side"
+    assert "Authorization" not in seen[0]
 
 
 def test_the_copy_asks_for_it_the_way_the_wlcg_dialect_says(dav, elsewhere):

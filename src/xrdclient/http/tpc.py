@@ -92,6 +92,7 @@ def third_party(
     transfer_headers: Mapping[str, str] | None = None,
     progress: Callable[[int, int | None], None] | None = None,
     timeout: float | None = None,
+    mint_token: bool = True,
 ) -> CopyResult:
     """Ask one HTTP endpoint to transfer ``source`` to ``target`` directly.
 
@@ -106,6 +107,16 @@ def third_party(
     then the ambient token - so a pair of pre-signed URLs just works:
 
         >>> third_party(f"{src}?authz={read_token}", f"{dst}?authz={write_token}")
+
+    With none of those, and an ``https`` far end, a macaroon is minted there
+    with this client's own credential - its X.509 proxy, typically - scoped
+    to the one file and to what the transfer needs of it (``LIST,DOWNLOAD``
+    to read, ``LIST,DOWNLOAD,MANAGE,UPLOAD,DELETE`` to write) for twice the
+    ``timeout`` plus ten minutes. That is gfal2's ``RETRIEVE_BEARER_TOKEN``,
+    and it is how a grid user with only a proxy gets EOS and dCache to copy
+    between each other: neither can present the user's certificate to the
+    other. ``mint_token=False`` skips it; a far end that cannot mint (no
+    macaroon support) is logged and the copy goes ahead without.
 
     ``delegate=False`` sends ``Credential: none``, which is what tells a
     server not to go looking for a delegated X.509 credential it was never
@@ -122,18 +133,55 @@ def third_party(
     su, du = parse(source), parse(target)
     _require_http(su, du)
     near, far = (du, su) if mode == "pull" else (su, du)
+    owned = client or HTTPClient(cfg)
+    if remote_token is None and mint_token and not delegate:
+        remote_token = _minted(far, cfg, owned, write=mode == "push", timeout=timeout)
     headers = _copy_headers(
         far, cfg, mode, overwrite, remote_token, delegate, verify, streams, transfer_headers
     )
-    owned = client or HTTPClient(cfg)
     started = time.monotonic()
     _log.debug("COPY %s %s -> %s", mode, su, du)
     try:
         size = _run_copy(owned, near, headers, progress, timeout)
+    except OSError:
+        from ..copy.tpc import discard_if_empty
+
+        discard_if_empty(du, cfg)
+        raise
     finally:
         if client is None:
             owned.close()
     return CopyResult(source=str(su), target=str(du), size=size, seconds=time.monotonic() - started)
+
+
+#: What the far end is asked to allow, as gfal2 asks: reading needs a listing
+#: and a download; writing also needs the name made, filled and - for a
+#: failed copy's cleanup - removed.
+READ_ACTIVITIES = ("LIST", "DOWNLOAD")
+WRITE_ACTIVITIES = ("LIST", "DOWNLOAD", "MANAGE", "UPLOAD", "DELETE")
+
+
+def _minted(
+    far: XRootDURL, config: Config, client: HTTPClient, *, write: bool, timeout: float | None
+) -> str | None:
+    """A macaroon for ``far``, when nothing else will authorise it; else ``None``."""
+    if not far.use_tls or _remote_token(far, None, config):
+        return None
+    from .dav import macaroon
+
+    minutes = 2 * int(timeout or config.request_timeout or 0) // 60 + 10
+    activities = WRITE_ACTIVITIES if write else READ_ACTIVITIES
+    try:
+        return macaroon(
+            far,
+            caveats=[f"activity:{','.join(activities)}"],
+            validity=f"PT{minutes}M",
+            config=config,
+            client=client,
+        )
+    except (OSError, ProtocolError) as exc:
+        _log.debug("no macaroon from %s, copying without one: %s", far.host, exc)
+        return None
 
 
 def _require_http(source: XRootDURL, target: XRootDURL) -> None:

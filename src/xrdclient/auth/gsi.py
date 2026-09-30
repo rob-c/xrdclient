@@ -4,15 +4,20 @@ The wire format is XrdSut's bucket buffer: the NUL-terminated name ``"gsi"``,
 a big-endian step code, then type-length-value buckets terminated by a zero
 type. The handshake is two rounds, three with delegation:
 
-1. **kXGC_certreq** — the client names its crypto module, its version, the CA
-   hash the server asked for, its options (whether it will delegate) and a
-   random tag, with a nested message holding the tag the *server* must sign.
+1. **kXGC_certreq** — the client names its crypto module, its version, the
+   hashes of the CA that issued *its own* certificate (``new.0|old.0``, the
+   names that CA has in a certificate directory - the server loads it by them
+   to verify the chain it will be sent), its options (whether it will
+   delegate) and a random tag, with a nested message holding the tag the
+   *server* must sign.
 2. **kXGS_cert** — the server answers with its certificate, its
-   Diffie-Hellman public blob and a random tag of its own.
+   Diffie-Hellman public blob, a random tag of its own, and the message
+   digests it supports.
 3. **kXGC_cert** — the client agrees an AES-128 session key over that group,
-   signs the server's tag with the proxy's private key (proof of possession),
-   and returns its own public value plus the proxy chain, encrypted under the
-   session key.
+   picks a digest from the server's list (``sha256`` where offered, else
+   ``sha1`` - dCache's doors offer ``sha1:md5`` alone), signs the server's
+   tag with the proxy's private key (proof of possession), and returns its
+   own public value plus the proxy chain, encrypted under the session key.
 4. **kXGS_pxyreq** / **kXGC_sigpxy** — only when the client offered to
    delegate: the server sends a certificate request for a key pair it made,
    and the client signs it into a proxy one link below its own
@@ -54,7 +59,13 @@ from ..crypto.delegation import DelegationError, load_proxy_request, sign_proxy_
 from ..crypto.der import DERError, parse, read_integer
 from ..crypto.rsa import RSAPrivateKey, RSAPublicKey, pem_blocks
 from ..crypto.trust import TrustError, verify_server
-from ..crypto.x509 import ProxyCredential, default_proxy_path, load_certificates, load_proxy
+from ..crypto.x509 import (
+    ProxyCredential,
+    default_proxy_path,
+    issuer_hashes,
+    load_certificates,
+    load_proxy,
+)
 from ..errors import CredentialError
 from .base import Credential, Offer
 from .prompt import Ask, humanise
@@ -378,8 +389,56 @@ def _signed_tag(message: bytes | None, key: RSAPrivateKey) -> list[Bucket]:
     return [Bucket(BUCKET_SIGNED_RTAG, key.sign(tag))] if tag else []
 
 
+#: The message digests this client can sign with, most preferred first.
+CLIENT_DIGESTS = ("sha256", "sha1")
+
+
+def choose_digest(offered: bytes | None) -> bytes:
+    """The digest to answer ``kXGS_cert`` with: ours, the first the server lists.
+
+    The server says what it accepts in the challenge's ``kXRS_md_alg`` bucket
+    (``sha256`` from a current xrootd, ``sha1:md5`` from dCache and older
+    xrootd) and refuses a reply naming anything else. A server that sends no
+    list predates the choice and gets ``sha256``, which is what this client
+    always said before it read the list.
+    """
+    if not offered:
+        return CLIENT_DIGESTS[0].encode()
+    names = [name.strip().lower() for name in offered.decode("ascii", "replace").split(":")]
+    for digest in CLIENT_DIGESTS:
+        if digest in names:
+            return digest.encode()
+    raise CredentialError(
+        f"the server's GSI accepts only the digests {':'.join(names)}, "
+        f"and this client signs with {':'.join(CLIENT_DIGESTS)}"
+    )
+
+
+def client_ca_hashes(proxy: ProxyCredential) -> str:
+    """``new.0|old.0``: the CA-directory names of the authority behind ``proxy``.
+
+    That authority signed the end-entity certificate - the first link in the
+    chain that is neither a proxy nor an anchor. Empty when the chain has
+    no such link, or it cannot be read far enough to hash.
+    """
+    for certificate in proxy.chain:
+        if certificate.is_proxy or certificate.is_anchor:
+            continue
+        try:
+            new, old = issuer_hashes(certificate)
+        except (DERError, ValueError, IndexError):
+            return ""
+        return f"{new}.0|{old}.0"
+    return ""
+
+
 def _outer_cert(
-    peer: PeerPublic, public: int, key: RSAPrivateKey, signed: bool, main: bytes
+    peer: PeerPublic,
+    public: int,
+    key: RSAPrivateKey,
+    signed: bool,
+    main: bytes,
+    digest: bytes = b"sha256",
 ) -> list[Bucket]:
     blob = encode_public_blob(peer.params_pem, public)
     if signed:
@@ -393,7 +452,7 @@ def _outer_cert(
     return [
         Bucket(BUCKET_CRYPTOMOD, b"ssl"),
         *agreement,
-        Bucket(BUCKET_MD_ALG, b"sha256"),
+        Bucket(BUCKET_MD_ALG, digest),
         Bucket(BUCKET_MAIN, main),
     ]
 
@@ -418,6 +477,7 @@ def answer_certificate(
     """
     blob, signed = _peer_blob(challenge)
     peer = parse_peer_blob(blob)
+    digest = choose_digest(find_bucket(challenge, BUCKET_MD_ALG))
     if private is None:
         # A private exponent in [2, p-2]; the group is the server's choice.
         private = 2 + int.from_bytes(os.urandom((peer.p.bit_length() + 7) // 8), "big") % (
@@ -431,7 +491,7 @@ def answer_certificate(
         Bucket(BUCKET_RTAG, rtag if rtag is not None else os.urandom(RTAG_LEN)),
     ]
     main = seal(secret, encode_message(STEP_CLIENT_CERT, inner), use_iv=signed, iv=iv)
-    outer = _outer_cert(peer, pow(peer.g, private, peer.p), key, signed, main)
+    outer = _outer_cert(peer, pow(peer.g, private, peer.p), key, signed, main, digest)
     server_pem = find_bucket(challenge, BUCKET_X509) or b""
     return encode_message(STEP_CLIENT_CERT, outer), Session(secret, signed, server_pem)
 
@@ -639,7 +699,12 @@ class GSICredential(Credential):
         return cls(
             proxy,
             cryptomod=options.get("c", "ssl"),
-            issuer_hash=options.get("ca", ""),
+            # Our CA, not the server's: the server's own ``ca:`` names the
+            # authority behind *its* certificate, and echoing it back makes a
+            # server whose CA differs from ours build our chain on the wrong
+            # anchor ("chain is inconsistent"). Its list is the fallback only
+            # for a chain too odd to hash, which is what was sent before.
+            issuer_hash=client_ca_hashes(proxy) or options.get("ca", ""),
             server_version=_server_version(options),
             delegation=Delegation(config.gsi_delegate, host, config.ca_path),
         )

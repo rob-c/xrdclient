@@ -568,7 +568,7 @@ def test_workers_skip_what_sync_says_is_already_there(tree, server):
 # ---------------------------------------------------------------------------
 
 
-def test_a_long_file_is_moved_by_several_connections_at_once(src, server, monkeypatch):
+def test_a_long_file_is_moved_by_several_connections_at_once(server, tmp_path, monkeypatch):
     """``parallel_chunks`` is sessions, because one session serialises itself."""
     threads = set()
     positioned = engine._resumer
@@ -583,9 +583,33 @@ def test_a_long_file_is_moved_by_several_connections_at_once(src, server, monkey
         return positioned(*args, **kwargs)
 
     monkeypatch.setattr(engine, "_resumer", spy)
-    result = xrdclient.copy(src, server.url / "wide.bin", chunk_size=1024)
-    assert server.contents("/wide.bin") == PAYLOAD
+    server.add_file("/wide.bin", PAYLOAD)
+    target = tmp_path / "wide.bin"
+    config = xrdclient.Config(bulk=False)  # the spans, not the bulk data plane
+    result = xrdclient.copy(server.url / "wide.bin", target, chunk_size=1024, config=config)
+    assert target.read_bytes() == PAYLOAD
     assert (result.size, len(threads)) == (len(PAYLOAD), 4)
+
+
+def test_an_upload_opens_its_remote_target_once(src, server):
+    """dCache and Echo refuse a second open of a closed file for update.
+
+    Spreading an upload over connections - create, close, reopen per span -
+    failed there with "File already exists" on a name nobody had used.
+    """
+    from xrdclient.testing.server import _HANDLERS
+
+    opened = []
+
+    def count(conn, sid, params, payload):
+        opened.append(payload.split(b"?")[0].rstrip(b"\x00"))
+        yield from _HANDLERS[c.kXR_open](conn, sid, params, payload)
+
+    server.handlers[c.kXR_open] = count
+    xrdclient.copy(src, server.url / "once.bin", chunk_size=1024)
+    assert server.contents("/once.bin") == PAYLOAD
+    assert opened.count(b"/once.bin") == 1
+    assert engine._spread(parse(src), server.url / "x.bin", xrdclient.Config(), 1024) is None
 
 
 def test_a_parallel_download_reassembles_in_order(server, tmp_path):
@@ -595,8 +619,12 @@ def test_a_parallel_download_reassembles_in_order(server, tmp_path):
     assert result.size == len(PAYLOAD)
 
 
-def test_a_parallel_transfer_verifies_by_comparing_the_two_files(src, server):
-    result = xrdclient.copy(src, server.url / "checked.bin", chunk_size=1024)
+def test_a_parallel_transfer_verifies_by_comparing_the_two_files(server, tmp_path):
+    server.add_file("/checked.bin", PAYLOAD)
+    result = xrdclient.copy(
+        server.url / "checked.bin", tmp_path / "checked.bin", chunk_size=1024,
+        config=xrdclient.Config(bulk=False),
+    )
     assert result.verified
     assert result.checksum.value == xrdclient.crypto.checksum_bytes("adler32", PAYLOAD)
 
@@ -653,13 +681,18 @@ def test_a_parallel_transfer_still_refuses_to_clobber(src, server):
             xrdclient.copy(src, dst.url / "taken.bin", chunk_size=1024, overwrite=False)
 
 
-def test_a_source_shorter_than_it_claimed_stops_at_its_end(src, server, monkeypatch):
+def test_a_source_shorter_than_it_claimed_stops_at_its_end(server, tmp_path, monkeypatch):
     """A span past the end of the file writes nothing rather than looping -
     and the shortfall is an error, not a finished copy of half a file."""
+    server.add_file("/short.bin", PAYLOAD)
     monkeypatch.setattr(engine, "_probe", lambda url, config: (len(PAYLOAD) * 2, 0))
+    target = tmp_path / "short.bin"
     with pytest.raises(xrdclient.errors.XRootDError, match="incomplete"):
-        xrdclient.copy(src, server.url / "short.bin", chunk_size=1024, verify=False)
-    assert server.contents("/short.bin") == PAYLOAD
+        xrdclient.copy(
+            server.url / "short.bin", target, chunk_size=1024, verify=False,
+            config=xrdclient.Config(bulk=False),
+        )
+    assert target.read_bytes() == PAYLOAD
 
 
 def test_a_resumed_transfer_is_not_also_a_divided_one(server, tmp_path):
@@ -680,7 +713,9 @@ def test_a_resumed_transfer_is_not_also_a_divided_one(server, tmp_path):
 def test_third_party_emits_the_stock_rendezvous(server):
     """The dialect is the contract: stock XRootD accepts only this order."""
     with FakeServer() as dst:
-        result = xrdclient.third_party(server.url / "data/a.root", dst.url / "pulled.root")
+        result = xrdclient.third_party(
+            server.url / "data/a.root", dst.url / "pulled.root", verify=False,
+        )
 
     assert result.size == 11
     _assert_rendezvous_paths(server, dst)
@@ -709,7 +744,9 @@ def _assert_rendezvous_order(dst):
 
 def test_third_party_can_carry_a_token_mode(server):
     with FakeServer() as dst:
-        xrdclient.third_party(server.url / "data/a.root", dst.url / "t.root", token_mode="delegate")
+        xrdclient.third_party(
+            server.url / "data/a.root", dst.url / "t.root", token_mode="delegate", verify=False,
+        )
     assert all(p.endswith("&tpc.token_mode=delegate") for p in dst.opened if "tpc.key" in p)
 
 
@@ -723,13 +760,13 @@ def test_a_scheme_the_library_does_not_speak_is_reported_as_unsupported(server, 
 
 def test_third_party_refuses_a_non_root_endpoint(server, tmp_path):
     with pytest.raises(ValueError, match="root://"):
-        xrdclient.third_party(server.url / "data/a.root", os.fspath(tmp_path / "x"))
+        xrdclient.third_party(server.url / "data/a.root", os.fspath(tmp_path / "x"), verify=False)
 
 
 def test_third_party_dispatches_an_http_pair_to_the_copy_dialect():
     """Two ``davs://`` endpoints get WLCG ``COPY``, not the XRootD rendezvous."""
     with FakeDAVServer(files={"/d/a.root": b"hello"}) as src, FakeDAVServer(dirs=["/d"]) as dst:
-        result = xrdclient.third_party(src.url / "d/a.root", dst.url / "d/b.root")
+        result = xrdclient.third_party(src.url / "d/a.root", dst.url / "d/b.root", verify=False)
     assert dst.contents("/d/b.root") == b"hello"
     assert result.size == 5
 
@@ -738,22 +775,23 @@ def test_third_party_refuses_to_mix_the_two_dialects(server):
     """Each dialect is one server asking another in a language it speaks."""
     with FakeDAVServer(dirs=["/d"]) as dst:
         with pytest.raises(ValueError, match="root:// and http://"):
-            xrdclient.third_party(server.url / "data/a.root", dst.url / "d/b.root")
+            xrdclient.third_party(server.url / "data/a.root", dst.url / "d/b.root", verify=False)
 
 
 def test_the_root_only_options_are_refused_rather_than_ignored():
     """``tpc.token_mode`` has no HTTP spelling, so silently dropping it would lie."""
     with FakeDAVServer(files={"/d/a.root": b"x"}) as src, FakeDAVServer(dirs=["/d"]) as dst:
         with pytest.raises(ValueError, match="Credential header"):
-            xrdclient.third_party(src.url / "d/a.root", dst.url / "d/b.root", token_mode="delegate")
+            xrdclient.third_party(
+                src.url / "d/a.root", dst.url / "d/b.root", token_mode="delegate", verify=False,
+            )
 
 
 def test_third_party_can_demand_an_exclusive_destination(server):
     with FakeServer(files={"/taken.root": b"x"}) as dst:
         with pytest.raises(FileExistsError):
             xrdclient.third_party(
-                server.url / "data/a.root", dst.url / "taken.root", overwrite=False
-            )
+                server.url / "data/a.root", dst.url / "taken.root", overwrite=False, verify=False)
 
 
 def test_a_third_party_copy_takes_the_timeout_it_was_given(server, monkeypatch):
@@ -768,7 +806,9 @@ def test_a_third_party_copy_takes_the_timeout_it_was_given(server, monkeypatch):
 
     monkeypatch.setattr(engine_tpc, "Router", Recording)
     with FakeServer(dirs=["/"]) as dst:
-        xrdclient.third_party(server.url / "data/a.root", dst.url / "b.root", timeout=12.5)
+        xrdclient.third_party(
+            server.url / "data/a.root", dst.url / "b.root", timeout=12.5, verify=False,
+        )
     assert seen and set(seen) == {12.5}
 
 
@@ -778,7 +818,7 @@ def test_a_third_party_copy_survives_a_source_that_will_not_close(server):
         server.handlers[c.kXR_close] = lambda conn, sid, params, body: iter(
             [error(sid, 3012, "close refused")]
         )
-        result = xrdclient.third_party(server.url / "data/a.root", dst.url / "b.root")
+        result = xrdclient.third_party(server.url / "data/a.root", dst.url / "b.root", verify=False)
         assert c.kXR_close in server.seen  # it was tried, and it failed
     assert result.size == 11
 
@@ -810,8 +850,7 @@ def test_persist_on_close_can_be_declined(server):
     """Without ``posc`` the open carries no ``kXR_posc``; the rendezvous is the same."""
     with FakeServer() as dst:
         result = xrdclient.third_party(
-            server.url / "data/a.root", dst.url / "plain.root", posc=False
-        )
+            server.url / "data/a.root", dst.url / "plain.root", posc=False, verify=False)
     assert result.size == 11
     assert "/plain.root" in dst.files
 
@@ -961,8 +1000,7 @@ def test_third_party_names_the_data_servers_it_landed_on_not_the_redirectors(ser
         dst_rdr.redirects[c.kXR_open] = ("127.0.0.1", dst.address[1], "")
         result = xrdclient.third_party(
             f"root://localhost:{src_rdr.address[1]}//data/a.root",
-            f"root://localhost:{dst_rdr.address[1]}//pulled.root",
-        )
+            f"root://localhost:{dst_rdr.address[1]}//pulled.root", verify=False)
         (dst_open,) = [p for p in dst.opened if "tpc.key" in p]
         (src_open,) = [p for p in server.opened if "tpc.key" in p]
     assert result.size == 11
@@ -981,9 +1019,32 @@ def test_a_verified_third_party_copy_asks_both_ends_afterwards():
 
 def test_an_unverified_third_party_copy_asks_nothing_more(server):
     with FakeServer(dirs=["/"]) as dst:
-        result = xrdclient.third_party(server.url / "data/a.root", dst.url / "b.root")
+        result = xrdclient.third_party(server.url / "data/a.root", dst.url / "b.root", verify=False)
     assert not result.verified
     assert c.kXR_query not in dst.seen
+
+
+def test_a_third_party_copy_is_verified_by_default_and_a_bad_one_removed(server):
+    """A destination may call a pull finished that never happened.
+
+    RAL's Echo did, pulling from EOS: success from ``kXR_sync`` and
+    ``kXR_close``, and a full-size file of no data. This fake's destination
+    never pulls either, which makes it that server.
+    """
+    with FakeServer(dirs=["/"]) as dst:
+        with pytest.raises(ChecksumMismatchError):
+            xrdclient.third_party(server.url / "data/a.root", dst.url / "b.root")
+        assert "/b.root" not in dst.files
+
+
+def test_the_keyed_source_open_carries_the_redirects_capability():
+    """EOS's disk servers refuse a TPC source open without the head node's ``cap.*``."""
+    from xrdclient.copy import tpc
+
+    placed = "/eos/f.root?tpc.stage=placement&cap.sym=AQE&cap.msg=zz&mgm.id=7"
+    assert tpc._redirect_cgi(placed) == "cap.sym=AQE&cap.msg=zz&mgm.id=7"
+    assert tpc._redirect_cgi("/plain/f.root?tpc.stage=placement") == ""
+    assert tpc._redirect_cgi("/plain/f.root") == ""
 
 
 # ---------------------------------------------------------------------------
@@ -1021,6 +1082,77 @@ def test_a_download_that_fails_part_way_keeps_what_it_wrote(server, tmp_path, mo
 
     monkeypatch.setattr(bulk, "download", partial)
     target = tmp_path / "part.root"
+    # connect_retries=0 isolates one attempt; that a flaky link is retried and
+    # recovered is test_resilience's business, not this one's.
+    config = xrdclient.Config(connect_retries=0)
     with pytest.raises(xrdclient.errors.TransientError):
-        xrdclient.copy(server.url / "data/a.root", target)
+        xrdclient.copy(server.url / "data/a.root", target, config=config)
     assert target.read_bytes() == b"hello"
+
+
+# -- what a failed copy leaves behind ------------------------------------------
+#
+# An empty file where a failed copy was going looks like a finished copy of an
+# empty file to whatever runs next, so it is removed; anything with bytes in it
+# is kept, being either somebody's data or a partial that ``resume`` continues.
+
+
+@pytest.fixture
+def dav():
+    with FakeDAVServer(files={"/d/data.bin": b"payload" * 100}, dirs=["/d"]) as server:
+        yield server
+
+
+def test_a_download_whose_source_is_missing_leaves_no_file(dav, tmp_path):
+    target = tmp_path / "out.bin"
+    with pytest.raises(FileNotFoundError):
+        xrdclient.copy(str(dav.url / "d/missing.bin"), str(target))
+    assert not target.exists()
+
+
+def test_a_download_onto_a_file_that_was_there_keeps_it(dav, tmp_path):
+    """Not ours to remove, even emptied: it existed before the copy did."""
+    target = tmp_path / "out.bin"
+    target.write_bytes(b"")
+    with pytest.raises(FileNotFoundError):
+        xrdclient.copy(str(dav.url / "d/missing.bin"), str(target))
+    assert target.exists()
+
+
+def test_an_upload_the_server_fails_after_creating_the_name_is_cleaned_up(dav, src):
+    """EOS creates the name first; a failed upload used to leave it at 0 bytes."""
+
+    def create_then_fail(method, path, headers):
+        dav.add_file(path, b"")
+        return (500, b"disk server went away", {})
+
+    dav.handlers["PUT"] = create_then_fail
+    with pytest.raises(OSError):
+        xrdclient.copy(str(src), str(dav.url / "d/up.bin"))
+    assert "/d/up.bin" not in dav.files
+
+
+def test_a_partial_target_is_kept_for_resume(dav, src):
+    def write_some_then_fail(method, path, headers):
+        dav.add_file(path, b"half")
+        return (500, b"interrupted", {})
+
+    dav.handlers["PUT"] = write_some_then_fail
+    with pytest.raises(OSError):
+        xrdclient.copy(str(src), str(dav.url / "d/up.bin"))
+    assert dav.contents("/d/up.bin") == b"half"
+
+
+def test_copying_an_empty_source_that_then_fails_keeps_the_empty_target(dav, tmp_path):
+    """An empty target is the right answer for an empty source."""
+    empty = tmp_path / "empty.bin"
+    empty.write_bytes(b"")
+
+    def create_then_fail(method, path, headers):
+        dav.add_file(path, b"")
+        return (500, b"late failure", {})
+
+    dav.handlers["PUT"] = create_then_fail
+    with pytest.raises(OSError):
+        xrdclient.copy(str(empty), str(dav.url / "d/e.bin"))
+    assert dav.contents("/d/e.bin") == b""

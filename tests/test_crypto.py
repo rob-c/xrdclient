@@ -459,3 +459,65 @@ def test_a_fresh_signer_starts_its_sequence_at_zero():
     assert signer.seqno == 0
     signer.sign(encode(r.Write(b"H", 0, b"a"), 5))
     assert signer.seqno == 1
+
+
+# -- CA-directory names ---------------------------------------------------------
+#
+# Each vector was checked against ``openssl x509 -subject_hash
+# -subject_hash_old``; GSI names the client's CA by them, and a server looks
+# the CA up in its certificate directory under exactly these file names.
+
+
+@pytest.mark.parametrize(
+    ("der_hex", "new", "old"),
+    [
+        # DC=org, CN=example ca - UTF8String, already canonical
+        (
+            "302a31133011060a0992268993f22c6401190c036f72673113301106035504030c0a"
+            "6578616d706c65206361",
+            "33027a7e",
+            "b67780a4",
+        ),
+        # DC=ORG (IA5String), CN="  Example \t  CA  " (PrintableString): the same
+        # name once canonical - lower case, trimmed, inner space runs folded -
+        # so the same new hash, while the old one hashes the DER as written
+        (
+            "303131133011060a0992268993f22c64011916034f5247311a301806035504031311"
+            "20204578616d706c652009202043412020",
+            "33027a7e",
+            "3a47d1e6",
+        ),
+        # a multi-valued RDN, whose entries are re-sorted as DER sorts a SET
+        (
+            "301c311a300a06035504030c035a6564300c060355040a0c05416c706861",
+            "ea43f420",
+            "12bce3ca",
+        ),
+        # a NumericString serial is not a type OpenSSL folds: hashed as written
+        (
+            "3028310e300c0603550405120531322033343116301406035504030c0d53657269616c"
+            "20486f6c646572",
+            "71ca461e",
+            "e517d4ed",
+        ),
+        # bytes above 0x7F are left alone; only the double space is folded
+        (
+            "301a3118301606035504030c0fc3856e67737472c3b66d20204c6162",
+            "f46cadc2",
+            "0ecc1048",
+        ),
+    ],
+)
+def test_name_hashes_are_the_ones_openssl_gives(der_hex, new, old):
+    from xrdclient.crypto.x509 import name_hashes
+
+    assert name_hashes(bytes.fromhex(der_hex)) == (new, old)
+
+
+def test_the_issuer_hashes_of_a_certificate_name_its_ca():
+    from _pki import proxy_chain, throwaway_key
+    from xrdclient.crypto.x509 import issuer_hashes, load_certificates
+
+    _proxy, user, ca = load_certificates(proxy_chain(throwaway_key(0)))
+    assert issuer_hashes(user) == ("33027a7e", "b5f5da31")
+    assert issuer_hashes(ca) == issuer_hashes(user)  # a CA signs itself

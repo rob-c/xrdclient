@@ -33,6 +33,7 @@ from xrdclient.auth.gsi import (
     BUCKET_VERSION,
     BUCKET_X509,
     BUCKET_X509_REQ,
+    CLIENT_DIGESTS,
     CLIENT_OPTS_DEFAULT,
     REFUSAL,
     STEP_CLIENT_CERT,
@@ -50,6 +51,8 @@ from xrdclient.auth.gsi import (
     answer_proxy_request,
     build_cert_response,
     build_certreq,
+    choose_digest,
+    client_ca_hashes,
     decode_message,
     encode_message,
     encode_public_blob,
@@ -354,7 +357,9 @@ def test_available_finds_the_proxy_the_environment_points_at(monkeypatch, tmp_pa
     credential = GSICredential.available(OFFER, Config(), username="jane", host="srv")
     assert isinstance(credential, GSICredential)
     assert credential.cryptomod == "ssl"
-    assert credential.issuer_hash == "1a2b3c4d.0"  # taken from the offer's ca:
+    # Our CA's names (``openssl x509 -issuer_hash``/``-issuer_hash_old`` of the
+    # user certificate), not the offer's ``ca:``, which is the server's own.
+    assert credential.issuer_hash == "33027a7e.0|b5f5da31.0"
 
 
 def test_available_returns_none_when_there_is_nothing_to_use(monkeypatch, tmp_path, key):
@@ -706,3 +711,72 @@ def test_the_stock_environment_variable_turns_delegation_on(monkeypatch, value, 
     else:
         monkeypatch.setenv("XrdSecGSIDELEGPROXY", value)
     assert Config().gsi_delegate is expected
+
+
+# -- which CA, and which digest ------------------------------------------------
+#
+# Both were once constants: the CA hash echoed the server's own ``ca:`` and the
+# digest was always ``sha256``. That worked against EOS only because its host
+# certificate and a CERN user's come from the same CA, and it failed against
+# every dCache door (``sha1:md5`` only) and every xrootd whose host CA differs
+# from the user's ("chain is inconsistent: kXGC_cert").
+
+
+def test_the_certreq_names_our_ca_not_the_servers(monkeypatch, tmp_path, key):
+    path = tmp_path / "x509up_u1000"
+    path.write_bytes(proxy_chain(key))
+    monkeypatch.setenv("X509_USER_PROXY", str(path))
+    offer = Offer("gsi", "v:10600,c:ssl,ca:82977a7e.0|5a04724c.0")  # CNAF's host CA
+    credential = GSICredential.available(offer, Config(), username="j", host="srv")
+    sent = find_bucket(credential.initial(), BUCKET_ISSUER_HASH)
+    assert sent == b"33027a7e.0|b5f5da31.0"
+
+
+def test_the_ca_hashes_skip_the_proxies_and_the_anchor(proxy):
+    """The issuer of the end-entity certificate: not a proxy's, not the CA's own."""
+    assert [c.is_proxy for c in proxy.chain] == [True, False, False]
+    assert client_ca_hashes(proxy) == "33027a7e.0|b5f5da31.0"
+    deeper = dataclasses.replace(proxy, chain=(proxy.chain[0], *proxy.chain))
+    assert client_ca_hashes(deeper) == "33027a7e.0|b5f5da31.0"
+
+
+def test_a_chain_with_nothing_to_hash_falls_back_to_the_offer(monkeypatch, proxy):
+    anchor_only = dataclasses.replace(proxy, chain=(proxy.chain[-1],))
+    assert client_ca_hashes(anchor_only) == ""
+    monkeypatch.setattr(gsi, "load_proxy", lambda path: anchor_only)
+    monkeypatch.setattr(gsi.os.path, "isfile", lambda path: True)
+    credential = GSICredential.available(OFFER, Config(), username="j", host="h")
+    assert credential.issuer_hash == "1a2b3c4d.0"
+
+
+def test_an_unhashable_end_entity_certificate_falls_back_to_the_offer(proxy):
+    broken = dataclasses.replace(proxy.chain[1], der=b"\x30\x00")
+    assert client_ca_hashes(dataclasses.replace(proxy, chain=(proxy.chain[0], broken))) == ""
+
+
+@pytest.mark.parametrize(
+    ("offered", "chosen"),
+    [
+        (None, b"sha256"),  # a server that predates the list
+        (b"", b"sha256"),
+        (b"sha256", b"sha256"),  # current xrootd (EOS, CNAF)
+        (b"sha1:md5", b"sha1"),  # dCache, and RAL's xrootd
+        (b"sha1:sha256", b"sha256"),  # our preference, not the server's order
+        (b"SHA1 : md5", b"sha1"),
+    ],
+)
+def test_the_digest_is_ours_that_the_server_lists_first(offered, chosen):
+    assert CLIENT_DIGESTS == ("sha256", "sha1")
+    assert choose_digest(offered) == chosen
+
+
+def test_a_server_that_lists_no_digest_we_have_is_told_so():
+    with pytest.raises(CredentialError, match="only the digests md5"):
+        choose_digest(b"md5")
+
+
+def test_the_reply_carries_the_digest_the_server_offered(proxy, key):
+    """dCache answers anything else with "all sender digests are unsupported"."""
+    step, buckets = decode_message(server_challenge())
+    offered = encode_message(step, [*buckets, Bucket(BUCKET_MD_ALG, b"sha1:md5")])
+    assert find_bucket(build_cert_response(offered, proxy.pem(), key), BUCKET_MD_ALG) == b"sha1"

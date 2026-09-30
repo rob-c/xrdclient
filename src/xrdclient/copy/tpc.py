@@ -17,6 +17,7 @@ import time
 from collections.abc import Callable
 
 from ..config import Config
+from ..errors import ChecksumMismatchError
 from ..flags import Access, OpenFlags
 from ..proto import constants as c
 from ..proto import requests as r
@@ -24,7 +25,7 @@ from ..proto import responses as rp
 from ..proto.frames import Request
 from ..session import Router
 from ..url import XRootDURL, parse
-from .engine import CopyResult, _compare_ends
+from .engine import CopyResult, _compare_ends, _probe, _remove
 from .limits import CopyTimeoutError
 
 __all__ = ["third_party"]
@@ -73,7 +74,7 @@ def third_party(
     posc: bool = True,
     token_mode: str = "",
     timeout: float | None = None,
-    verify: bool = False,
+    verify: bool | None = None,
     algorithm: str | None = None,
     init_timeout: float | None = None,
     coerce: bool = False,
@@ -96,11 +97,16 @@ def third_party(
     may report through a ``kXR_waitresp`` deferral.
 
     No byte passes through this process, so there is no stream to digest.
-    ``verify`` instead asks both servers for their checksum of the file once
-    the transfer is done - ``algorithm``, or ``config.preferred_checksum`` -
-    and raises :class:`~xrdclient.errors.ChecksumMismatchError` if they
-    differ, or the server's error if either end cannot answer: verification
-    asked for by name is never skipped quietly.
+    Verification instead asks both servers for their checksum of the file
+    once the transfer is done - ``algorithm``, or
+    ``config.preferred_checksum`` - and raises
+    :class:`~xrdclient.errors.ChecksumMismatchError` if they differ, having
+    removed the destination this copy wrote. It is on by default (``None``
+    follows ``config.verify_checksums``), because a destination can call a
+    pull finished that never happened: RAL's Echo answered one from EOS with
+    success and a full-size file of no data. Left to the default, an end that
+    cannot say its checksum leaves the copy unverified; ``verify=True``
+    raises the server's error instead, and ``verify=False`` skips it.
 
     Over ``root://``, ``timeout`` bounds the wait for the transfer itself and
     ``init_timeout`` everything before it - opening both ends and arming the
@@ -115,17 +121,64 @@ def third_party(
     else:
         _require_root_pair(su, du)
         cfg = _timeout_config(cfg, timeout)
-        result = _root_copy(
-            su,
-            du,
-            cfg,
-            _Options(overwrite, posc, coerce, token_mode),
-            _starting(init_timeout),
-        )
-    if not verify:
+        options = _Options(overwrite, posc, coerce, token_mode)
+        result = _root_transfer(su, du, cfg, options, init_timeout)
+    return _verified(result, su, du, cfg, verify, algorithm)
+
+
+def _root_transfer(
+    su: XRootDURL, du: XRootDURL, cfg: Config, options: _Options, init_timeout: float | None
+) -> CopyResult:
+    """The ``root://`` rendezvous; an empty destination it leaves on failure is removed."""
+    try:
+        return _root_copy(su, du, cfg, options, _starting(init_timeout))
+    except OSError:
+        discard_if_empty(du, cfg)
+        raise
+
+
+def _verified(
+    result: CopyResult,
+    su: XRootDURL,
+    du: XRootDURL,
+    cfg: Config,
+    verify: bool | None,
+    algorithm: str | None,
+) -> CopyResult:
+    """``result``, once both servers agree on the file - see :func:`third_party`."""
+    if verify is False or (verify is None and not cfg.verify_checksums):
         return result
-    checksum = _compare_ends(su, du, cfg, algorithm or cfg.preferred_checksum, strict=True)
+    try:
+        checksum = _compare_ends(
+            su, du, cfg, algorithm or cfg.preferred_checksum, strict=bool(verify)
+        )
+    except ChecksumMismatchError:
+        _remove_quietly(du, cfg)  # this copy wrote it, and it is wrong
+        raise
     return dataclasses.replace(result, checksum=checksum)
+
+
+def discard_if_empty(url: XRootDURL, config: Config) -> None:
+    """After a failed third-party copy: remove the destination if it is empty.
+
+    A destination names the file before it pulls - EOS does, then refuses
+    the copy - and an empty file left there looks like a finished copy of an
+    empty one. A destination with bytes in it is left alone. Best effort.
+    """
+    try:
+        there = _probe(url, config)
+        if there is not None and there[0] == 0:
+            _remove(url, config)
+    except OSError:
+        pass
+
+
+def _remove_quietly(url: XRootDURL, config: Config) -> None:
+    """Best effort: a failed removal must not hide the mismatch."""
+    try:
+        _remove(url, config)
+    except OSError:
+        pass
 
 
 @dataclasses.dataclass(frozen=True)
@@ -172,7 +225,7 @@ def _root_copy(
     try:
         # 1. Placement: open the source as XrdCl does (``tpc.stage=placement``)
         #    and keep the data server it was redirected to - ``tpcSource``.
-        size = _place_source(src_router, su)
+        size, capability = _place_source(src_router, su)
         check()
         opaque = _dst_opaque(key, su, src_router.endpoint, size, options.token_mode)
         flags = _dst_flags(options.overwrite, options.posc, coerce=options.coerce)
@@ -188,6 +241,8 @@ def _root_copy(
         puller = dst_router.url.host
         check()
         opaque = _src_opaque(key, puller, options.token_mode)
+        if capability:
+            opaque = f"{opaque}&{capability}"
         _rendezvous(src_router, dst_router, handle, su, opaque, check)
         dst_router.execute(r.Close(handle))
     finally:
@@ -209,20 +264,30 @@ def _dst_flags(overwrite: bool, posc: bool, *, coerce: bool = False) -> int:
     return int(flags) | c.kXR_retstat
 
 
-def _place_source(router: Router, source: XRootDURL) -> int:
+def _place_source(router: Router, source: XRootDURL) -> tuple[int, str]:
     """Open ``source`` for placement, leaving ``router`` on its data server.
 
-    Returns the size the open's ``kXR_retstat`` reported, or ``-1`` for a
-    server that sent none. The handle is closed straight away; the source is
-    opened again, with the key, once the destination has armed the pull.
+    Returns the size the open's ``kXR_retstat`` reported (``-1`` for a
+    server that sent none), and the CGI the redirect to the data server
+    added. The handle is closed straight away; the source is opened again,
+    with the key, once the destination has armed the pull - on that same
+    data server, and so with that same CGI: EOS's disk servers only open a
+    file for a request carrying the capability its head node signed
+    (``cap.sym``/``cap.msg``), and refuse one without it as "capability
+    illegal". XrdCl re-opens the placement open's last URL, which has it.
     """
-    result = router.execute(
-        r.Open(f"{source.path}?tpc.stage=placement", int(OpenFlags.READ) | c.kXR_retstat),
-        path=source.path,
-    )
+    request = r.Open(f"{source.path}?tpc.stage=placement", int(OpenFlags.READ) | c.kXR_retstat)
+    result = router.execute(request, path=source.path)
     handle, info, _ = rp.parse_open(result.data, source.path)
     _quietly(router, r.Close(handle))
-    return info.st_size if info is not None else -1
+    return (info.st_size if info is not None else -1), _redirect_cgi(request.path)
+
+
+def _redirect_cgi(path: str) -> str:
+    """The CGI a redirect put on ``path``, less the placement's own."""
+    _, _, query = path.partition("?")
+    kept = [f for f in query.split("&") if f and not f.startswith("tpc.stage=")]
+    return "&".join(kept)
 
 
 def _rendezvous(

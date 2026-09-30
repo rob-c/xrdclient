@@ -629,9 +629,10 @@ def test_a_deferred_answer_given_up_on_is_dropped_when_it_comes(big, small):
     def later(conn, sid, params, body):
         yield S.frame(sid, c.kXR_waitresp, struct.pack(">i", 5))
         # A deferred answer comes later, not in the same breath: the client
-        # gives up at once (5 s is over its 1 s budget), so this pause is
-        # what lets the test see the id still held before the answer lands.
-        time.sleep(0.5)
+        # waits out its 1 s budget for it and gives up, so this pause - past
+        # the budget - is what lets the test see the id still held before
+        # the answer lands.
+        time.sleep(1.5)
         for reply in S._h_stat(conn, sid, params, body):
             yield S.frame(0, c.kXR_attn, struct.pack(">i", c.kXR_asynresp) + bytes(4) + reply)
 

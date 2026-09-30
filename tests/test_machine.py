@@ -887,3 +887,65 @@ def test_a_late_status_reply_to_an_abandoned_stream_is_skipped_whole(resptype, d
     machine.receive_data(status_frame(sid, c.kXR_pgread, resptype, data) + ok(after, b"pong"))
     assert only(machine, m.Completed).data == b"pong"
     assert machine.idle() is freed
+
+
+
+# --------------------------------------------------------------------------
+# A mechanism the server turns down
+# --------------------------------------------------------------------------
+
+
+class _Refusable(Credential):
+    """A credential whose first blob the server gets to reject."""
+
+    name = "gsi"
+
+    def initial(self):
+        return b"proxy"
+
+    @classmethod
+    def available(cls, offer, config, *, username, host):
+        return cls()
+
+
+def _refused_at_login(*credentials, sec="&P=gsi&P=host"):
+    machine = new(credentials=iter(credentials))
+    machine.start()
+    machine.data_to_send()
+    machine.receive_data(handshake_reply())
+    machine.receive_data(ok(1, protocol_body()))
+    machine.receive_data(ok(2, login_body(sec=sec)))
+    auth = machine.data_to_send()[-(24 + len(b"proxy")) :]  # the last frame out
+    assert struct.unpack(">H", auth[2:4])[0] == c.kXR_auth
+    assert (auth[16:20], auth[24:]) == (b"gsi\x00", b"proxy")
+    machine.receive_data(error(3, 3030, ""))  # EOS's eosuser redirector, verbatim
+    return machine
+
+
+def test_a_mechanism_the_server_refuses_gives_way_to_the_next():
+    """XrdCl's ladder: eosuser refuses gsi, takes host/unix, then redirects home."""
+    machine = _refused_at_login(_Refusable(), HostCredential())
+    assert machine.data_to_send()[24:] == b"host\x00"
+    assert machine.mechanism == "host"
+    assert machine._auth_rejected["gsi"] == "refused by the server: [3030] no reason given"
+    machine.receive_data(ok(3))
+    assert machine.state is m.State.READY
+
+
+def test_when_every_mechanism_is_refused_the_servers_error_stands():
+    """Its code survives - the compat layer reports it as the errno - with the why."""
+    machine = _refused_at_login(_Refusable(), sec="&P=gsi")
+    event = only(machine, m.Failed)
+    assert isinstance(event.error, ServerError)
+    assert event.error.code == 3030
+    assert "gsi: refused by the server: [3030]" in str(event.error)
+
+
+def test_the_last_refusal_is_the_one_reported():
+    machine = _refused_at_login(_Refusable(), HostCredential())
+    machine.data_to_send()
+    machine.receive_data(error(3, 3010, "unix is not allowed here"))
+    event = only(machine, m.Failed)
+    assert event.error.code == 3010
+    assert "unix is not allowed here" in str(event.error)
+    assert "gsi: refused by the server: [3030]" in str(event.error)

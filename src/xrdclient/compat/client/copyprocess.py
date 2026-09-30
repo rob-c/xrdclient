@@ -52,6 +52,7 @@ from . import env
 from ._status import (
     OK,
     errCheckSumError,
+    errErrorResponse,
     errInvalidArgs,
     errLocalError,
     errOperationInterrupted,
@@ -260,7 +261,9 @@ def _job_failure(exc: Exception, job: _Job) -> XRootDStatus:
     if named is not None:
         return _named(*named)
     if not isinstance(exc, OSError) or isinstance(exc, errors.XRootDError):
-        return from_exception(exc)
+        return _server_failure(exc, job) if isinstance(exc, errors.ServerError) else (
+            from_exception(exc)
+        )
     eno = exc.errno or 0
     detail = (exc.strerror or str(exc)).lower()
     source = parse(job.source)
@@ -268,6 +271,31 @@ def _job_failure(exc: Exception, job: _Job) -> XRootDStatus:
     return status(
         errLocalError, errno=_LOCAL_ERRNOS.get(eno, eno), message=f"{detail}:  ({end})"
     )
+
+
+def _server_failure(exc: errors.ServerError, job: _Job) -> XRootDStatus:
+    """A server's refusal, naming the end it came from as XrdCl does.
+
+    ``[3011] Unable to open file ...; No such file or directory (source)``:
+    the end is what tells a user whether the file was missing or the
+    destination was refused, and XrdCl always says it.
+    """
+    reported = from_exception(exc)
+    where = exc.path
+    ends = (("source", job.source), ("destination", job.target))
+    end = next((name for name, url in ends if where and _names_path(url, where)), None)
+    if end is None:
+        return reported
+    return status(errErrorResponse, errno=exc.code, message=f"{exc.message} ({end})")
+
+
+def _names_path(url: str, path: str) -> bool:
+    """Whether ``url`` is the file ``path`` a server named in its error."""
+    try:
+        mine = parse(url).path
+    except ValueError:
+        return False
+    return mine.rstrip("/").lstrip("/") == path.rstrip("/").lstrip("/")
 
 
 #: What XrdCl reports for the engine's own failures that have no status of
@@ -396,6 +424,10 @@ def _transfer(job: _Job, job_id: int, target: str, handler: Any) -> Any:
                 timeout=job.tpctimeout or None,
                 init_timeout=job.inittimeout or None,
                 coerce=job.coerce,
+                # XrdCl verifies only what ``checksummode`` asks for, and this
+                # job does that itself; the library's own default check
+                # would add queries the bindings never make.
+                verify=False,
             )
         except (errors.UnsupportedError, ValueError):
             if job.thirdparty == "only":

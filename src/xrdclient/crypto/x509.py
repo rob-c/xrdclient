@@ -26,13 +26,16 @@ from .der import (
     TAG_INTEGER,
     TAG_OCTET_STRING,
     TAG_OID,
+    TAG_SET,
     TAG_UTC_TIME,
     DERError,
     Element,
+    encode,
     oid_string,
     parse,
     raw_children,
     read_integer,
+    sequence,
 )
 from .rsa import RSAPublicKey, pem_blocks, public_key_from_bitstring
 
@@ -367,6 +370,75 @@ def decode_name(der: bytes) -> Name:
     """A DER ``Name`` as a :class:`Name`."""
     element, _ = parse(der)
     return _decode_name(element)
+
+
+# The string types OpenSSL folds to lower-case UTF-8 before hashing a name
+# (``ASN1_MASK_CANON``), with how each one's bytes read as text.
+_CANON_STRINGS = {
+    0x0C: "utf-8",  # UTF8String
+    0x13: "latin-1",  # PrintableString
+    0x14: "latin-1",  # T61String: OpenSSL reads it as Latin-1
+    0x16: "latin-1",  # IA5String
+    0x1A: "latin-1",  # VisibleString
+    0x1C: "utf-32-be",  # UniversalString
+    0x1E: "utf-16-be",  # BMPString
+}
+_ASCII_SPACE = b" \t\n\v\f\r"
+
+
+def _canonical_value(tag: int, value: bytes) -> bytes:
+    """One attribute value as OpenSSL's ``asn1_string_canon`` leaves it.
+
+    Leading and trailing space goes, each run of inner space becomes one, and
+    ASCII letters are lowered; bytes above 0x7F pass through untouched.
+    """
+    encoding = _CANON_STRINGS.get(tag)
+    if encoding is None:
+        return encode(tag, value)
+    text = value.decode(encoding, "replace").encode("utf-8").strip(_ASCII_SPACE)
+    out = bytearray()
+    spaced = False
+    for byte in text:
+        if byte < 0x80 and byte in _ASCII_SPACE:
+            if not spaced:
+                out.append(0x20)
+            spaced = True
+            continue
+        spaced = False
+        out.append(byte + 0x20 if 0x41 <= byte <= 0x5A else byte)
+    return encode(0x0C, bytes(out))
+
+
+def name_hashes(name_der: bytes) -> tuple[str, str]:
+    """``openssl x509 -subject_hash`` and ``-subject_hash_old`` of a DER ``Name``.
+
+    These are the file names a CA directory knows a certificate authority by
+    (``<hash>.0``), and what GSI uses to say which authority stands behind a
+    certificate: the new hash is SHA-1 over the canonical form of the name,
+    the old one MD5 over its DER, each as the first four bytes read
+    little-endian.
+    """
+    import hashlib
+
+    canonical = bytearray()
+    for rdn in raw_children(name_der):
+        entries = []
+        for attribute in raw_children(rdn):
+            oid, value = parse(attribute)[0].children()
+            entries.append(
+                sequence(encode(oid.tag, oid.value), _canonical_value(value.tag, value.value))
+            )
+        canonical += encode(TAG_SET, b"".join(sorted(entries)))
+
+    def short(digest: bytes) -> str:
+        return f"{int.from_bytes(digest[:4], 'little'):08x}"
+
+    return short(hashlib.sha1(bytes(canonical)).digest()), short(hashlib.md5(name_der).digest())
+
+
+def issuer_hashes(certificate: Certificate) -> tuple[str, str]:
+    """:func:`name_hashes` of the authority that signed ``certificate``."""
+    return name_hashes(certificate_fields(certificate.der)["issuer"])
 
 
 def certificate_fields(der: bytes) -> dict[str, bytes]:

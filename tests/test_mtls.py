@@ -128,3 +128,51 @@ def test_the_proxy_is_taken_from_the_grid_environment(monkeypatch, tmp_path):
     monkeypatch.setenv("X509_USER_PROXY", str(path))
     assert Config().proxy == str(path)
     assert tls_context(Config()).verify_mode is ssl.CERT_REQUIRED
+
+
+
+def test_with_nothing_named_the_default_proxy_is_presented(monkeypatch, tmp_path):
+    """``/tmp/x509up_u<uid>``, which gfal2 and XrdCl present unasked.
+
+    Without it ``https://`` to a grid storage element went out anonymously,
+    and EOS, dCache and StoRM answer that with ``403`` rather than a ``401``
+    that would have prompted a retry with the proxy.
+    """
+    path = tmp_path / "x509up_u1000"
+    path.write_bytes(proxy_chain(throwaway_key(0)))
+    monkeypatch.setattr("xrdclient.transport.base.default_proxy_path", lambda: str(path))
+    loaded = []
+    monkeypatch.setattr(ssl.SSLContext, "load_cert_chain", lambda self, p: loaded.append(p))
+    for build in BUILDERS:
+        build(Config(proxy=None))
+    assert loaded == [str(path), str(path)]
+
+
+def test_a_default_proxy_that_will_not_load_is_passed_over(monkeypatch, tmp_path, caplog):
+    """A guessed file must not break a request that needs no certificate."""
+    path = tmp_path / "x509up_u1000"
+    path.write_text("not a proxy")
+    monkeypatch.setattr("xrdclient.transport.base.default_proxy_path", lambda: str(path))
+    with caplog.at_level("WARNING"):
+        context = tls_context(Config(proxy=None))
+    assert context.verify_mode is ssl.CERT_REQUIRED
+    assert f"not presenting the X.509 proxy {path}" in caplog.text
+
+
+def test_a_named_proxy_is_never_swapped_for_the_default(monkeypatch, tmp_path):
+    """``$X509_USER_PROXY`` pointing nowhere is an error, not a cue to guess."""
+    default = tmp_path / "x509up_u1000"
+    default.write_bytes(proxy_chain(throwaway_key(0)))
+    monkeypatch.setattr("xrdclient.transport.base.default_proxy_path", lambda: str(default))
+    with pytest.raises(OSError, match=r"absent\.pem"):
+        tls_context(Config(proxy=str(tmp_path / "absent.pem")))
+
+
+@pytest.mark.parametrize("build", BUILDERS)
+def test_an_unusable_proxy_reads_as_one_sentence(build, tmp_path):
+    """Not ``('cannot use the X.509 proxy ...',)``, which a one-argument SSLError prints."""
+    path = tmp_path / "corrupt.pem"
+    path.write_bytes(proxy_chain(throwaway_key(0))[:600])
+    with pytest.raises(ssl.SSLError) as caught:
+        build(Config(proxy=str(path)))
+    assert str(caught.value).startswith(f"cannot use the X.509 proxy {path}: ")

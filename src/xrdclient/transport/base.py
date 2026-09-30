@@ -7,10 +7,15 @@ runs over a real connection, a TLS connection, or an in-memory pipe in tests.
 
 from __future__ import annotations
 
+import os
 import ssl
 from abc import ABC, abstractmethod
 
+from .._log import get_logger
 from ..config import Config
+from ..crypto.x509 import default_proxy_path
+
+_log = get_logger("transport")
 
 __all__ = ["Transport", "tls_context"]
 
@@ -32,8 +37,37 @@ def tls_context(config: Config) -> ssl.SSLContext:
         except OSError as exc:
             # ssl's own message names neither the file nor the setting that
             # chose it, and a stale X509_USER_PROXY is how most people get here.
-            raise type(exc)(f"cannot use the X.509 proxy {config.proxy}: {exc}") from exc
+            raise _unusable_proxy(exc, config.proxy) from exc
+        return ctx
+    _present_default_proxy(ctx)
     return ctx
+
+
+def _unusable_proxy(exc: OSError, path: str) -> OSError:
+    """``exc`` again, saying which file - as one message, not an ``args`` tuple."""
+    # ``(errno, message)``, because an ``SSLError`` given one argument prints
+    # it as a tuple: ``('cannot use the X.509 proxy ...',)``.
+    reason = exc.strerror or str(exc)
+    return type(exc)(exc.errno or 0, f"cannot use the X.509 proxy {path}: {reason}")
+
+
+def _present_default_proxy(ctx: ssl.SSLContext) -> None:
+    """Offer ``/tmp/x509up_u<uid>`` when nothing named a proxy, as gfal2 and XrdCl do.
+
+    ``roots://`` GSI has always found it there; without this, ``https://`` to a
+    grid storage element went out with no certificate and every request that
+    needed one came back ``403``. A discovered file is a guess, so one that
+    will not load is passed over with a warning rather than failing a request
+    that may not need a certificate at all. A proxy somebody *named* - in
+    ``Config(proxy=)`` or ``$X509_USER_PROXY`` - is never replaced by this one.
+    """
+    path = default_proxy_path()
+    if not os.path.isfile(path):
+        return
+    try:
+        ctx.load_cert_chain(path)
+    except OSError as exc:
+        _log.warning("not presenting the X.509 proxy %s: %s", path, exc)
 
 
 class Transport(ABC):

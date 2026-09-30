@@ -298,6 +298,9 @@ class SessionMachine:
         self._credential: Credential | None = None
         self._auth_rejected: dict[str, str] = {}
         self._offered: list[str] = []
+        #: The last refusal a server sent mid-exchange, kept to be the
+        #: session's error should every mechanism after it fail too.
+        self._auth_refusal: ServerError | None = None
 
     # ------------------------------------------------------------------
     # Outbound
@@ -678,8 +681,7 @@ class SessionMachine:
 
     def _bringup(self, status: int, body: bytes) -> None:
         if status == c.kXR_error:
-            info = rp.parse_error(body)
-            self._fail(ServerError(info.code, info.message))
+            self._bringup_error(body)
             return
         if status not in (c.kXR_ok, c.kXR_authmore):
             self._fail(
@@ -720,6 +722,18 @@ class SessionMachine:
             self._auth_step(body)
         else:
             self._become_ready()
+
+    def _bringup_error(self, body: bytes) -> None:
+        """A ``kXR_error`` before the session is up: fatal, except mid-login.
+
+        A server refusing the mechanism in play is the cue to try the next
+        one, as XrdCl does; anything else ends the bring-up.
+        """
+        info = rp.parse_error(body)
+        if self.state is State.AUTH and self._credential is not None:
+            self._auth_refused(info.code, info.message)
+            return
+        self._fail(ServerError(info.code, info.message))
 
     def _handshaken(self, body: bytes) -> None:
         """Take the handshake reply - its protocol version - and move on."""
@@ -779,7 +793,35 @@ class SessionMachine:
             self.mechanism = cred.name
             self._out += encode(r.Auth(cred.name, blob), _SID_AUTH)
             return
+        refusal = self._auth_refusal
+        if refusal is not None:
+            # A server said no: keep its error (and its code, which the
+            # compat layer reports as the errno) but say what else was tried.
+            detail = "; ".join(f"{k}: {v}" for k, v in self._auth_rejected.items())
+            self._fail(ServerError(refusal.code, f"{refusal.message.strip()} [{detail}]".strip()))
+            return
         self._fail(NoMechanismError(offered=self._offered, tried=self._auth_rejected))
+
+    @property
+    def skipped(self) -> dict[str, str]:
+        """Each mechanism the login did not use, and why."""
+        return dict(self._auth_rejected)
+
+    def _auth_refused(self, code: int, message: str) -> None:
+        """The server turned the mechanism in play down: try the next one.
+
+        This is what XrdCl does, and it matters: EOS's ``eosuser`` redirector
+        refuses a grid proxy's ``gsi`` but takes ``unix``, then redirects to
+        the instance that holds the user's home, where ``gsi`` is accepted.
+        Stopping at the first refusal would leave that home unreachable.
+        """
+        cred = self._credential
+        assert cred is not None  # guarded by the caller
+        why = f"refused by the server: [{code}] {message.strip() or 'no reason given'}"
+        self._auth_rejected[cred.name] = why
+        self._auth_refusal = ServerError(code, message)
+        self._credential = None
+        self._next_credential("")
 
     def _auth_step(self, challenge: bytes) -> None:
         cred = self._credential

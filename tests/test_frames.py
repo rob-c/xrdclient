@@ -312,7 +312,7 @@ def test_only_reading_fattr_subcodes_are_replayable():
 @pytest.mark.parametrize(
     "request_",
     [
-        r.Open("/a", 0),
+        r.Open("/a", int(c.kXR_open_updt | c.kXR_new)),  # a create: a write, not replayable
         r.Write(b"H", 0, b"x"),
         r.Mkdir("/a"),
         r.Rm("/a"),
@@ -339,6 +339,22 @@ def test_mutating_requests_are_signed_and_not_replayable(request_):
 def test_read_only_requests_are_replayable(request_):
     assert request_.idempotent is True
     assert request_.signed is False
+
+
+@pytest.mark.parametrize(
+    ("options", "replayable"),
+    [
+        (c.kXR_open_read, True),  # a read-only open replays after a dropped link
+        (c.kXR_open_read | c.kXR_retstat, True),
+        (0, True),  # no flags at all is still only a read
+        (c.kXR_open_updt | c.kXR_new, False),  # create
+        (c.kXR_delete, False),  # truncate-on-open
+        (c.kXR_open_updt | c.kXR_open_wrto, False),  # open for writing
+        (c.kXR_open_apnd, False),  # append
+    ],
+)
+def test_an_open_is_replayable_only_when_it_only_reads(options, replayable):
+    assert r.Open("/a", options).idempotent is replayable
 
 
 #: One instance of every request the protocol module exports. The gate below
@@ -369,7 +385,7 @@ SAMPLES = [
     r.Chmod("/a", 0o644),
     r.Truncate("/a", 1),
     r.Set("x=1"),
-    r.Open("/a", 0),
+    r.Open("/a", int(c.kXR_open_updt | c.kXR_new)),  # the mutating open; read-only is tested above
     r.Close(b"H"),
     r.Read(b"H", 0, 1),
     r.Write(b"H", 0, b"x"),

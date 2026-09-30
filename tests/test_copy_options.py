@@ -549,7 +549,7 @@ def test_blocks_come_back_to_whoever_asks_next():
 def test_third_party_coerce_forces_the_destination_open(server):
     with FakeServer() as dst:
         opened = _opens(dst)
-        xrdclient.third_party(server.url / "data/a.root", dst.url / "p", coerce=True)
+        xrdclient.third_party(server.url / "data/a.root", dst.url / "p", coerce=True, verify=False)
     assert any(o & OpenFlags.FORCE for o in opened)
 
 
@@ -576,7 +576,9 @@ def test_third_party_init_timeout_bounds_each_step_of_the_set_up(server, end, op
 
         slowed.handlers[opcode] = late
         with pytest.raises(CopyTimeoutError, match="init_timeout"):
-            xrdclient.third_party(server.url / "data/a.root", dst.url / "p", init_timeout=0.2)
+            xrdclient.third_party(
+                server.url / "data/a.root", dst.url / "p", init_timeout=0.2, verify=False,
+            )
     assert delays == [1]
 
 
@@ -589,7 +591,7 @@ def test_third_party_without_an_init_timeout_waits(server):
             yield from answer(conn, sid, params, body)
 
         dst.handlers[c.kXR_open] = late
-        result = xrdclient.third_party(server.url / "data/a.root", dst.url / "p")
+        result = xrdclient.third_party(server.url / "data/a.root", dst.url / "p", verify=False)
     assert result.size == 11
 
 

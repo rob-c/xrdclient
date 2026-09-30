@@ -1008,6 +1008,20 @@ def test_a_force_retry_overwrites_what_the_failure_left(root, tmp_path, monkeypa
     assert (tmp_path / "x").read_bytes() == TEXT
 
 
+def test_a_server_refusal_names_the_end_it_came_from(root, tmp_path):
+    """``... No such file or directory (source)``, as XrdCl words it.
+
+    Checked against XrdCl 5.9.7 on EOS: a missing source ends ``(source)``
+    and a refused destination ``(destination)``, before the newline.
+    """
+    process = client.CopyProcess()
+    process.add_job(root + "/d/absent.txt", str(tmp_path / "out"))
+    _, results = process.run()
+    message = results[0]["status"].message
+    assert message.startswith("[ERROR] Server responded with an error: [3011] ")
+    assert message.endswith(" (source)\n")
+
+
 def test_a_target_that_exists_is_a_local_error_as_in_xrdcl(root, tmp_path):
     (tmp_path / "there").write_bytes(b"x")
     (tmp_path / "dir").mkdir()

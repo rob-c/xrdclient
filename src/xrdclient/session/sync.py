@@ -20,7 +20,7 @@ from .._compat import SLOTS
 from .._log import get_logger
 from ..config import Config
 from ..errors import ConnectionError as XrdConnectionError
-from ..errors import ProtocolError, WaitLimitError, XRootDError
+from ..errors import ProtocolError, ServerError, WaitLimitError, XRootDError, kXR_NotAuthorized
 from ..errors import TimeoutError as XrdTimeoutError
 from ..proto import constants as c
 from ..proto import machine as m
@@ -77,6 +77,8 @@ class _AwaitState:
     deadline: float | None
     #: When the caller's own :func:`~xrdclient.deadline` runs out, if it set one.
     expires: float | None = None
+    #: When a ``kXR_waitresp`` has waited out :attr:`Config.wait_budget`.
+    parked_until: float | None = None
 
 
 def _expiry() -> float | None:
@@ -389,11 +391,38 @@ class Session:
                 raise XrdConnectionError(f"session to {self.endpoint} is closed")
             if pathid and pathid not in self._paths:
                 raise ValueError(f"data path {pathid} is not bound to {self.endpoint}")
-            if arrive_on_path and self._use_arrival_path(request):
-                sid = self._m.submit(request, path=path, arrive_on_path=True)
-                return self._await_arrival(sid, on_chunk, pathid)
-            sid = self._m.submit(request, path=path)
-            return self._await(sid, on_chunk, pathid if request.reply_on_path else 0)
+            try:
+                if arrive_on_path and self._use_arrival_path(request):
+                    sid = self._m.submit(request, path=path, arrive_on_path=True)
+                    return self._await_arrival(sid, on_chunk, pathid)
+                sid = self._m.submit(request, path=path)
+                return self._await(sid, on_chunk, pathid if request.reply_on_path else 0)
+            except ServerError as exc:
+                self._explain_refusal(exc)
+                raise
+
+    #: Mechanisms that prove who someone is; the rest only assert it.
+    _IDENTIFYING = ("gsi", "ztn", "krb5")
+
+    def _explain_refusal(self, exc: ServerError) -> None:
+        """Say why a refused request was sent as nobody in particular.
+
+        A login falls through to ``unix`` when the proxy is missing or
+        expired, and the server's answer to what follows is then only
+        "unauthorized identity used" - true, and no help. The reason the
+        proxy was passed over was known at login; this puts it where the
+        person reading the error will see it.
+        """
+        if exc.code != kXR_NotAuthorized or exc.hint:
+            return
+        used = self._m.mechanism
+        if used in self._IDENTIFYING:
+            return
+        skipped = self._m.skipped
+        reasons = [f"{name} was not used - {skipped[name]}" for name in self._IDENTIFYING
+                   if name in skipped]
+        if reasons:
+            exc.explain(f"logged in as {used or 'nobody'}: " + "; ".join(reasons))
 
     @contextmanager
     def _held(self) -> Iterator[None]:
@@ -487,13 +516,35 @@ class Session:
         # Absolute, over the whole logical operation: see Config.stall_deadline.
         state = _AwaitState(0, 0.0, 0, self._armed(), _expiry())
         while True:
-            for event in self._events_for(sid, pathid, state.deadline, state.expires):
+            for event in self._events_until(sid, pathid, state):
                 if type(event) is m.Completed:
                     # Completed carries the whole body; stream only its unseen tail.
                     if on_chunk is not None and len(event.data) > state.streamed:
                         on_chunk(event.data[state.streamed :])
                     return Result(event.data, event.status)
                 self._consume_event(event, sid, on_chunk, state)
+
+    def _events_until(self, sid: int, pathid: int, state: _AwaitState) -> list[m.Event]:
+        """The next events for ``sid``, within every clock that applies to it.
+
+        A deferred answer's wait budget runs as a caller's deadline would -
+        the connection is kept, and the id stays held for the late answer -
+        and reads as the :class:`WaitLimitError` it is.
+        """
+        parked = state.parked_until
+        expires = state.expires
+        if parked is not None and (expires is None or parked < expires):
+            expires = parked
+        try:
+            return self._events_for(sid, pathid, state.deadline, expires)
+        except dl.OperationExpiredError:
+            if expires is not parked or parked is None:
+                raise
+            raise WaitLimitError(
+                f"the deferred answer did not come within the "
+                f"{self.config.wait_budget:.0f}s budget for one operation",
+                attempts=state.waits,
+            ) from None
 
     def _consume_event(
         self,
@@ -516,6 +567,9 @@ class Session:
             self._wait_event(event, sid, state)
 
     def _wait_event(self, event: m.Waiting, sid: int, state: _AwaitState) -> None:
+        if not event.resend:
+            self._wait_for_answer(event, sid, state)
+            return
         # Parking is not stalling, but repeated delays share one budget.
         state.parked += event.seconds
         if state.parked > self.config.wait_budget:
@@ -526,9 +580,6 @@ class Session:
                 f"over the {self.config.wait_budget:.0f}s budget for one operation",
                 state.waits,
             )
-        if not event.resend:
-            state.deadline = self._armed(event.seconds)
-            return
         if state.expires is not None and time.monotonic() + event.seconds >= state.expires:
             # XrdCl's rule: a resend that would go out after the request has
             # expired is not waited for - it expires now.
@@ -551,6 +602,33 @@ class Session:
         self._flush()
         state.streamed = 0  # the body starts over on the resend
         state.deadline = self._armed()
+
+    def _wait_for_answer(self, event: m.Waiting, sid: int, state: _AwaitState) -> None:
+        """``kXR_waitresp``: the answer comes later, on its own - wait for it.
+
+        Its seconds are the most the server may take, not what it will: EOS
+        parks the ``kXR_sync`` of a third-party copy for up to an hour and
+        answers when the copy is done, usually far sooner. So the wait is
+        armed for as much of it as :attr:`Config.wait_budget` has left, and
+        only running out of that is giving up - never the promise alone, which
+        XrdCl does not hold against a request either.
+        """
+        budget = self.config.wait_budget
+        left = float("inf") if budget <= 0 else budget - state.parked
+        # Zero names no bound at all: as long as the budget allows.
+        allowed = min(event.seconds, left) if event.seconds > 0 else left
+        if allowed <= 0:
+            self._give_up(
+                sid,
+                event,
+                f"{type(event.request).__name__} has already waited out the "
+                f"{budget:.0f}s budget for one operation",
+                state.waits,
+            )
+        state.deadline = self._armed(0 if allowed == float("inf") else allowed)
+        if allowed != float("inf"):
+            state.parked += allowed
+            state.parked_until = time.monotonic() + allowed
 
     def _give_up(self, sid: int, event: m.Waiting, message: str, attempts: int) -> NoReturn:
         """Stop waiting on ``sid``, freeing it when nothing more will come.

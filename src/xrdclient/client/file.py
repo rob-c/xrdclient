@@ -24,6 +24,7 @@ from ..errors import (
     ServerError,
     TransientError,
     UnsupportedError,
+    WaitLimitError,
     XRootDError,
     kXR_InvalidRequest,
     kXR_Unsupported,
@@ -441,21 +442,40 @@ class File:
         return bool(wanted) and not (self._flags & _WRITING)
 
     def _execute(self, build: Callable[[bytes], Request], **kwargs: object) -> Result:
-        """Run a handle-bearing request, re-opening once if the server is lost.
+        """Run a handle-bearing request, re-opening if the server is lost.
 
         ``build`` takes the handle rather than closing over it, because a
         recovered file has a different one: the retry has to be issued against
-        the new handle, not the dead one.
+        the new handle, not the dead one. A link that keeps flaking is met with
+        up to :attr:`~xrdclient.config.Config.connect_retries` re-opens, not one,
+        so a handle-bound request (a ``stat`` of the open file, a checkpoint)
+        survives what the bulk read beside it already survives; the re-open is
+        inside the retry too, so a drop *during* recovery is just another try.
+        A write handle is never re-opened (:attr:`recoverable`), and a caller's
+        expired deadline ends it at once.
         """
         kwargs.setdefault("path", self.url.path)
-        try:
-            return self._router.execute(build(self.handle), **kwargs)  # type: ignore[arg-type]
-        except TransientError as exc:
-            if not self.recoverable or isinstance(exc, OperationExpiredError):
-                raise
-            _log.debug("recovering %s after %s", self.url, exc)
-            handle = self._reopen()
-            return self._router.execute(build(handle), **kwargs)  # type: ignore[arg-type]
+        attempts = 0
+        reopen = False
+        while True:
+            try:
+                if reopen:
+                    self._reopen()
+                    reopen = False
+                return self._router.execute(build(self.handle), **kwargs)  # type: ignore[arg-type]
+            except TransientError as exc:
+                # A busy server (kXR_wait past the budget) and an expired
+                # deadline are not a dropped link: re-opening the handle would
+                # not help, so they stand, as they do at the router.
+                if not self.recoverable or isinstance(
+                    exc, (OperationExpiredError, WaitLimitError)
+                ):
+                    raise
+                attempts += 1
+                if attempts > self.config.connect_retries:
+                    raise
+                _log.debug("recovering %s after %s (attempt %d)", self.url, exc, attempts)
+                reopen = True
 
     def _reopen(self) -> bytes:
         """Get the handle back on a fresh connection, from the original URL.

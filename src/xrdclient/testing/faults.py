@@ -26,6 +26,7 @@ that a retry really did open a second connection.
 
 from __future__ import annotations
 
+import random
 import socket
 import threading
 import time
@@ -77,6 +78,8 @@ class FaultProxy:
         self._corrupt: dict[int, int] = {}
         self._chop = 0
         self._filter: Callable[[bytes], bytes] | None = None
+        self._flaky = 0.0
+        self._flaky_random: random.Random | None = None
 
         self._server = threading.Thread(target=self._accept_loop, daemon=True)
         self._server.start()
@@ -108,22 +111,17 @@ class FaultProxy:
     @property
     def armed(self) -> list[str]:
         """The names of the faults currently in force."""
-        names = []
-        if self._drop_after is not None:
-            names.append("drop")
-        if self._stall_after is not None:
-            names.append("stall")
-        if self._delay:
-            names.append("delay")
-        if self._corrupt:
-            names.append("corrupt")
-        if self._chop:
-            names.append("chop")
-        if self._filter is not None:
-            names.append("filter")
-        if not self._accepting.is_set():
-            names.append("refuse")
-        return names
+        conditions = [
+            ("drop", self._drop_after is not None),
+            ("stall", self._stall_after is not None),
+            ("delay", bool(self._delay)),
+            ("corrupt", bool(self._corrupt)),
+            ("chop", bool(self._chop)),
+            ("filter", self._filter is not None),
+            ("flaky", bool(self._flaky)),
+            ("refuse", not self._accepting.is_set()),
+        ]
+        return [name for name, on in conditions if on]
 
     def drop_after(self, offset: int = 0) -> FaultProxy:
         """Close the connection once ``offset`` bytes have come back.
@@ -171,6 +169,28 @@ class FaultProxy:
         self._filter = filter
         return self
 
+    def flaky(self, probability: float, *, seed: int | None = None) -> FaultProxy:
+        """A link that keeps flaking in and out: every chunk may be the last.
+
+        Each chunk the server sends is delivered, then with ``probability``
+        the connection is cut then and there - so a transfer is disconnected
+        at a random stage, the client reconnects, and the next connection may
+        be cut too. Unlike :meth:`drop_after`, which fires once at a fixed
+        offset, this fires again and again at unpredictable points, which is
+        how a lossy or overloaded link actually behaves. It is what a client's
+        reconnect-and-resume has to survive to be called resilient.
+
+        ``seed`` makes the sequence of cuts reproducible, so a test that finds
+        a break can be re-run to the same break. ``probability`` is per chunk,
+        not per byte: a 64 KiB reply arrives in one chunk on loopback, so the
+        realistic way to disconnect mid-stream is to :meth:`chop` first, then
+        ``flaky`` sees each piece. The delivered chunk goes out *before* the
+        cut, so a reset never loses bytes the client had not yet been given.
+        """
+        self._flaky = max(0.0, min(1.0, probability))
+        self._flaky_random = random.Random(seed) if seed is not None else random.Random()
+        return self
+
     def refuse(self) -> FaultProxy:
         """Stop accepting connections; new ones are closed immediately."""
         self._accepting.clear()
@@ -189,6 +209,8 @@ class FaultProxy:
         self._corrupt.clear()
         self._chop = 0
         self._filter = None
+        self._flaky = 0.0
+        self._flaky_random = None
         self._accepting.set()
         return self
 
@@ -286,7 +308,19 @@ class FaultProxy:
             return True, seen
         if self._drop_after is not None and seen >= self._drop_after:
             return False, seen
-        return True, self._deliver(client, chunk, seen)
+        seen = self._deliver(client, chunk, seen)
+        # The chunk is out; only now may a flaky link drop, so the client is
+        # cut after being handed those bytes, never instead of them.
+        return not self._should_flake(), seen
+
+    def _should_flake(self) -> bool:
+        """Whether a flaky link cuts the connection after this chunk."""
+        rng = self._flaky_random
+        if not self._flaky or rng is None:
+            return False
+        # One RNG serves every connection's thread, and Random is not thread-safe.
+        with self._lock:
+            return rng.random() < self._flaky
 
     def _deliver(self, client: socket.socket, chunk: bytes, seen: int) -> int:
         """Doctor, delay, account for, and send one server chunk."""
@@ -302,7 +336,12 @@ class FaultProxy:
         return seen
 
     def _pump(self, client: socket.socket, upstream: socket.socket) -> bool:
-        """Move one client chunk upstream. False when the client has gone."""
+        """Move one client chunk upstream. False when the client has gone.
+
+        A flaky link may drop here too, after the chunk is delivered - so an
+        upload is cut mid-body, not only a download. The bytes go up first,
+        so the far end has them and the cut falls between chunks.
+        """
         chunk = _read(client)
         if chunk is None:
             return True
@@ -310,7 +349,7 @@ class FaultProxy:
             return False
         upstream.sendall(chunk)
         self.bytes_from_client += len(chunk)
-        return True
+        return not self._should_flake()
 
     def _doctor(self, chunk: bytes, seen: int) -> bytes:
         """Apply the byte-level faults to one outbound chunk."""
