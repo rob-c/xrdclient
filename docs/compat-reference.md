@@ -365,6 +365,10 @@ string, `None` for a key it lacks.
 | `DataServerTTL` | `Config.pool_idle_ttl` | seconds an idle connection is kept |
 | `ReadRecovery` (string) | `Config.recover_handles`, which `CopyProcess` sources use; a `File`'s own `ReadRecovery` property is separate, as in XrdCl | `"true"` or not |
 | `CPInitTimeout`, `CPTPCTimeout`, `CPTimeout`, `XRateThreshold`, `CpRetry`, `CpRetryPolicy` | the matching `CopyProcess.add_job` defaults | |
+| `MetalinkProcessing` | `Config.metalink_processing` | zero disables descriptor handling |
+| `MaxMetalinkWait` | `Config.max_metalink_wait` | seconds while another replica remains |
+| `TlsMetalink` | `Config.tls_metalink` | nonzero upgrades XRootD replica URLs to TLS |
+| `ZipMtlnCksum` | `Config.zip_metalink_checksum` | nonzero applies the descriptor checksum to a selected ZIP member |
 
 `CPParallelChunks` sets `in_flight`, the number of chunks a copy keeps in
 flight, which is what XrdCl's key means - whether it is put through
@@ -384,7 +388,8 @@ Every other key XrdCl registers is stored and read back, and changes nothing;
 | `TCPKeepAlive`, `TCPKeepAliveTime`, `TCPKeepAliveInterval`, `TCPKeepProbes`, `NoDelay` | TCP keepalive and `TCP_NODELAY` are always on, with the operating system's timings |
 | `NetworkStack`, `PreferIPv4`, `IPNoShuffle` | a connection takes the addresses in the resolver's order |
 | `MultiProtocol` | every connection negotiates its own protocol |
-| `MetalinkProcessing`, `LocalMetalinkFile`, `MaxMetalinkWait`, `TlsMetalink`, `ZipMtlnCksum`, `XCpBlockSize` | metalinks and extreme copy are not supported |
+| `LocalMetalinkFile` | the old `root://localfile//...` spelling is not accepted; use a local path or `file://` URL |
+| `XCpBlockSize` | extreme copy chooses blocks internally |
 | `PreserveLocateTried`, `NotAuthorizedRetryLimit`, `RetryWrtAtLBLimit`, `OpenRecovery`, `WriteRecovery` | those retries are not made: a refusal is final, and a file open for writing is never re-opened |
 | `PreserveXAttrs`, `CpUsePgWrtRd`, `CpTarget` | copies decide these themselves |
 | `NoTlsOK`, `TlsNoData`, `WantTlsOnNoPgrw`, `TlsDbgLvl` | TLS is always available, encrypts everything once on, and logs under `TlsMsg` |

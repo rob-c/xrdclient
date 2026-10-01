@@ -10,9 +10,11 @@ mock's idea of ``recv``, not the one the standard library has.
 from __future__ import annotations
 
 import contextlib
+import gc
 import socket
 import ssl
 import threading
+import weakref
 from collections import deque
 
 import pytest
@@ -300,6 +302,22 @@ def test_closing_twice_is_allowed():
         transport.close()
         transport.close()
         assert transport.closed
+
+
+def test_an_abandoned_transport_closes_its_socket():
+    class Watched:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    sock = Watched()
+    transport = SocketTransport(sock, "storage", 1094)
+    reference = weakref.ref(transport)
+    del transport
+    gc.collect()
+    assert reference() is None
+    assert sock.closed
 
 
 # ----------------------------------------------------------------------

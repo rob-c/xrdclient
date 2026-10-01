@@ -29,13 +29,39 @@ from . import constants as c
 from .buffer import Reader
 
 __all__ = [
-    "ErrorInfo", "RedirectInfo", "WaitInfo", "AttnInfo", "StatusInfo",
-    "LoginInfo", "ReadVSegment", "FattrItem", "FattrResult",
-    "parse_protocol", "parse_login", "parse_bind", "parse_stat", "parse_statvfs", "parse_statx",
-    "parse_dirlist", "parse_locate", "parse_open", "parse_checksum",
-    "parse_checkpoint", "parse_readlink", "parse_space", "parse_prepare_status",
-    "parse_error", "parse_redirect", "parse_wait", "parse_waitresp", "parse_attn",
-    "parse_status", "parse_pgwrite_cse", "parse_readv", "parse_fattr", "parse_fattr_list",
+    "ErrorInfo",
+    "RedirectInfo",
+    "WaitInfo",
+    "AttnInfo",
+    "StatusInfo",
+    "LoginInfo",
+    "ReadVSegment",
+    "FattrItem",
+    "FattrResult",
+    "parse_protocol",
+    "parse_login",
+    "parse_bind",
+    "parse_stat",
+    "parse_statvfs",
+    "parse_statx",
+    "parse_dirlist",
+    "parse_locate",
+    "parse_open",
+    "parse_checksum",
+    "parse_checkpoint",
+    "parse_readlink",
+    "parse_space",
+    "parse_prepare_status",
+    "parse_error",
+    "parse_redirect",
+    "parse_wait",
+    "parse_waitresp",
+    "parse_attn",
+    "parse_status",
+    "parse_pgwrite_cse",
+    "parse_readv",
+    "parse_fattr",
+    "parse_fattr_list",
     "parse_fattr_tree",
 ]
 
@@ -268,9 +294,7 @@ class LoginInfo:
     def mechanisms(self) -> tuple[str, ...]:
         """Protocol names offered by the server, most preferred first."""
         return tuple(
-            part[2:].split(",", 1)[0]
-            for part in self.sec.split("&")
-            if part.startswith("P=")
+            part[2:].split(",", 1)[0] for part in self.sec.split("&") if part.startswith("P=")
         )
 
 

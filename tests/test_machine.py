@@ -651,17 +651,13 @@ def test_an_embedded_async_response_is_delivered_to_its_stream():
     machine = ready()
     sid = machine.submit(r.Prepare(["/a"]))
     inner = ok(sid, b"staged")
-    machine.receive_data(
-        frame(0, c.kXR_attn, struct.pack(">ii", c.kXR_asynresp, 0) + inner)
-    )
+    machine.receive_data(frame(0, c.kXR_attn, struct.pack(">ii", c.kXR_asynresp, 0) + inner))
     assert only(machine, m.Completed).data == b"staged"
 
 
 def test_a_plain_attn_becomes_a_notice():
     machine = ready()
-    machine.receive_data(
-        frame(0, c.kXR_attn, struct.pack(">i", c.kXR_asyncms) + b"going down\x00")
-    )
+    machine.receive_data(frame(0, c.kXR_attn, struct.pack(">i", c.kXR_asyncms) + b"going down\x00"))
     event = only(machine, m.Attention)
     assert event.info.message == "going down"
 
@@ -887,7 +883,6 @@ def test_a_late_status_reply_to_an_abandoned_stream_is_skipped_whole(resptype, d
     machine.receive_data(status_frame(sid, c.kXR_pgread, resptype, data) + ok(after, b"pong"))
     assert only(machine, m.Completed).data == b"pong"
     assert machine.idle() is freed
-
 
 
 # --------------------------------------------------------------------------

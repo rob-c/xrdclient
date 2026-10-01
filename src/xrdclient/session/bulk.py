@@ -618,9 +618,7 @@ class BulkReader:
         try:
             return int(transport.receive_into(view))
         except XrdTimeoutError as exc:
-            raise dl.OperationExpiredError(
-                "the bulk transfer expired before it completed"
-            ) from exc
+            raise dl.OperationExpiredError("the bulk transfer expired before it completed") from exc
         finally:
             transport.settimeout(self._resting)
 

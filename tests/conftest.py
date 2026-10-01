@@ -138,9 +138,7 @@ def config() -> Config:
     the on-by-default behaviour has its own coverage in
     ``test_data_streams_default.py``.
     """
-    return Config(
-        username="tester", auth_order=("host",), require_tls=False, data_streams=0
-    )
+    return Config(username="tester", auth_order=("host",), require_tls=False, data_streams=0)
 
 
 @pytest.fixture

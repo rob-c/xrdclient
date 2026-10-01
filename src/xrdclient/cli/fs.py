@@ -35,6 +35,7 @@ from . import (
     interactive,
     size_arg,
     stdout_bytes,
+    version_flag,
 )
 
 __all__ = ["main"]
@@ -566,6 +567,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROGRAM, description="Inspect and change a remote namespace."
     )
+    version_flag(parser)
     subs = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     def command(name: str, handler: Callable[..., int], help_text: str) -> argparse.ArgumentParser:

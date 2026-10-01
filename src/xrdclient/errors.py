@@ -25,6 +25,7 @@ __all__ = [
     "RedirectLimitError",
     "WaitLimitError",
     "ChecksumMismatchError",
+    "MetalinkError",
     "PageIntegrityError",
     "TooLargeError",
     "raise_for_status",
@@ -42,6 +43,10 @@ def _rebuild(cls: type, args: tuple, kwargs: dict) -> BaseException:  # type: ig
 
 class ProtocolError(XRootDError):
     """A malformed frame, an unexpected opcode, or a version mismatch."""
+
+
+class MetalinkError(ProtocolError, ValueError):
+    """A Metalink descriptor is unsafe, malformed, or unusable."""
 
 
 class ConnectionError(XRootDError, builtins.ConnectionError):

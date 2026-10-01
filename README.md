@@ -292,9 +292,8 @@ bucket — signatures checked against the AWS specification rather than trusted.
 The wire protocol, session state machine, the whole authentication ladder,
 file and namespace APIs, `pathlib` bindings, the async facade, HTTP/WebDAV,
 S3, the copy engine, the bulk data plane, the CLI and the fsspec bindings are
-implemented and tested —
-2,815 tests, of which the great majority need no network, no KDC and no
-`openssl`. The remainder are the interoperability suite, which runs against a
+implemented and tested. The great majority of tests need no network, no KDC
+and no `openssl`. The remainder are the interoperability suite, which runs against a
 real `xrootd` daemon and reads back what `xrdcp` and `xrdfs` write, and the
 parity suite, which runs every operation through this client and the official
 XRootD bindings and compares the answers field by field. Coverage is 100% of
@@ -339,6 +338,8 @@ Not yet: HTTP/2.
 
 Full documentation is in [`docs/`](docs/) (`mkdocs serve` to read it), with
 [`SECURITY.md`](SECURITY.md) for the threat model,
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the engineering contract,
+[`CHANGELOG.md`](CHANGELOG.md) for release notes,
 [`benchmarks/bench.py`](benchmarks/bench.py) for the measurements,
 [`docs/superpowers/plans/`](docs/superpowers/plans/) for the roadmap and
 [`docs/superpowers/specs/`](docs/superpowers/specs/) for the design.

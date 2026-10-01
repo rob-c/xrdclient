@@ -247,9 +247,7 @@ class Config:
     username: str = field(default_factory=_default_user)
 
     # -- timeouts and retries (XRD_* names match the official client) --
-    connect_timeout: float = field(
-        default_factory=lambda: _env_float("XRD_CONNECTIONWINDOW", 30.0)
-    )
+    connect_timeout: float = field(default_factory=lambda: _env_float("XRD_CONNECTIONWINDOW", 30.0))
     request_timeout: float = field(default_factory=lambda: _env_float("XRD_REQUESTTIMEOUT", 300.0))
     stream_timeout: float = field(default_factory=lambda: _env_float("XRD_STREAMTIMEOUT", 60.0))
     connect_retries: int = field(default_factory=lambda: _env_int("XRD_CONNECTIONRETRY", 3))
@@ -271,9 +269,7 @@ class Config:
     #: absolute. A ``kXR_wait`` or ``kXR_waitresp`` restarts it - a server
     #: saying "staging from tape" is not stalling, and
     #: :attr:`wait_budget` bounds that parking instead. ``0`` waits forever.
-    stall_deadline: float = field(
-        default_factory=lambda: _env_float("XRD_STALLDEADLINE", 1800.0)
-    )
+    stall_deadline: float = field(default_factory=lambda: _env_float("XRD_STALLDEADLINE", 1800.0))
     #: Ceiling on the *cumulative* delay one operation may be asked to park
     #: for. A single wait is already clamped by :attr:`wait_cap`; this is what
     #: stops a server answering every resend with another one.
@@ -293,6 +289,13 @@ class Config:
     #: disappears into the transfer, small enough that ``bulk_workers *
     #: bulk_depth`` of them is a sane amount of memory.
     bulk_chunk: int = field(default_factory=lambda: _env_int("XRD_BULKCHUNK", 1 << 22))
+    #: Smallest read request a bulk worker may fall back to after the link
+    #: repeatedly dies before one whole request arrives.  The healthy path
+    #: keeps :attr:`bulk_chunk`; only recovery halves towards this floor, so a
+    #: lossy link can make progress without taxing a fast one.
+    bulk_recovery_chunk: int = field(
+        default_factory=lambda: _env_int("XRD_BULKRECOVERYCHUNK", 64 << 10)
+    )
     #: Bulk requests in flight per connection. The point of the pipeline: the
     #: server is answering the next one while this one is being written out.
     bulk_depth: int = field(default_factory=lambda: _env_int("XRD_BULKDEPTH", 4))
@@ -303,9 +306,7 @@ class Config:
     #: tens of seconds. It refills whenever bytes arrive, so a transfer that
     #: keeps making progress is never killed by the sum of old outages; the
     #: whole operation is still bounded by :attr:`stall_deadline`.
-    bulk_recovery: float = field(
-        default_factory=lambda: _env_float("XRD_BULKRECOVERY", 120.0)
-    )
+    bulk_recovery: float = field(default_factory=lambda: _env_float("XRD_BULKRECOVERY", 120.0))
     #: Whether a transfer that *can* use the bulk data plane does. Turning it
     #: off puts every read back through the ordinary event path, which is the
     #: comparison to make when something looks wrong.
@@ -380,9 +381,7 @@ class Config:
     #: Off, as in the stock client; ``$XrdSecGSIDELEGPROXY`` set to a positive
     #: number turns it on, as it does there. Only done once the server's
     #: certificate chains to a CA in :attr:`ca_path` and names the host.
-    gsi_delegate: bool = field(
-        default_factory=lambda: _env_int("XrdSecGSIDELEGPROXY", 0) > 0
-    )
+    gsi_delegate: bool = field(default_factory=lambda: _env_int("XrdSecGSIDELEGPROXY", 0) > 0)
     #: Ask for missing credentials rather than failing. ``None`` - the default,
     #: overridable with ``$XRD_PROMPT`` - means "only if somebody is there",
     #: which is a terminal on both stdin and stderr. See :mod:`xrdclient.auth.prompt`.
@@ -398,6 +397,21 @@ class Config:
     recover_handles: bool = True
     verify_checksums: bool = True
     preferred_checksum: str = "adler32"
+    #: Treat ``.meta4`` and ``.metalink`` sources as virtual redirectors, as
+    #: XrdCl does. ``$XRD_METALINKPROCESSING=0`` makes them ordinary files.
+    metalink_processing: bool = field(
+        default_factory=lambda: _env_flag("XRD_METALINKPROCESSING") is not False
+    )
+    #: Upgrade ``root``/``xroot`` replica URLs found in a Metalink to TLS.
+    tls_metalink: bool = field(default_factory=lambda: bool(_env_flag("XRD_TLSMETALINK")))
+    #: Cumulative ``kXR_wait`` seconds tolerated from a Metalink replica while
+    #: another replica remains. The last replica retains :attr:`wait_budget`.
+    max_metalink_wait: float = field(
+        default_factory=lambda: _env_float("XRD_MAXMETALINKWAIT", 60.0)
+    )
+    #: For ``--zip`` through a Metalink, treat the descriptor checksum as the
+    #: selected member's checksum. Off matches XrdCl's safety default.
+    zip_metalink_checksum: bool = field(default_factory=lambda: bool(_env_flag("XRD_ZIPMTLNCKSUM")))
     #: Give S3 directories a presence: ``mkdir`` writes a zero-length
     #: ``dir/`` marker object, ``stat`` believes one, listings hide them.
     #: Off - the default - directories remain the fiction every prefix is.

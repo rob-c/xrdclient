@@ -17,12 +17,43 @@ from .buffer import Writer
 from .frames import Request, encode
 
 __all__ = [
-    "Protocol", "Login", "Auth", "Ping", "EndSession", "Bind",
-    "Stat", "StatVFS", "Statx", "Dirlist", "Locate", "Query", "Prepare",
-    "Mkdir", "Rm", "Rmdir", "Mv", "Symlink", "Link", "Readlink", "Setattr",
-    "Chmod", "Truncate", "Set",
-    "Open", "Close", "Read", "Write", "Sync",
-    "ReadV", "WriteV", "Clone", "PgRead", "PgWrite", "ChkPoint", "Fattr", "Sigver",
+    "Protocol",
+    "Login",
+    "Auth",
+    "Ping",
+    "EndSession",
+    "Bind",
+    "Stat",
+    "StatVFS",
+    "Statx",
+    "Dirlist",
+    "Locate",
+    "Query",
+    "Prepare",
+    "Mkdir",
+    "Rm",
+    "Rmdir",
+    "Mv",
+    "Symlink",
+    "Link",
+    "Readlink",
+    "Setattr",
+    "Chmod",
+    "Truncate",
+    "Set",
+    "Open",
+    "Close",
+    "Read",
+    "Write",
+    "Sync",
+    "ReadV",
+    "WriteV",
+    "Clone",
+    "PgRead",
+    "PgWrite",
+    "ChkPoint",
+    "Fattr",
+    "Sigver",
 ]
 
 
@@ -171,9 +202,7 @@ class Stat(Request):
     __slots__ = ("path", "options", "fhandle")
     opcode = c.kXR_stat
 
-    def __init__(
-        self, path: str = "", options: int = 0, fhandle: bytes = c.NULL_FHANDLE
-    ) -> None:
+    def __init__(self, path: str = "", options: int = 0, fhandle: bytes = c.NULL_FHANDLE) -> None:
         self.path = path
         self.options = options
         self.fhandle = fhandle
@@ -871,9 +900,7 @@ class ChkPoint(Request):
     #: The three the server knows how to undo, and so the three it will run.
     EXECUTABLE = frozenset({c.kXR_write, c.kXR_pgwrite, c.kXR_truncate})
 
-    def __init__(
-        self, fhandle: bytes, subcode: int, data: bytes = b"", tail: bytes = b""
-    ) -> None:
+    def __init__(self, fhandle: bytes, subcode: int, data: bytes = b"", tail: bytes = b"") -> None:
         self.fhandle = fhandle
         self.subcode = subcode
         self.data = data
@@ -895,7 +922,7 @@ class ChkPoint(Request):
                 f"not {c.request_name(inner.opcode)}"
             )
         frame = encode(inner, 0)
-        return cls(fhandle, c.kXR_ckpXeq, frame[:c.REQUEST_HDRLEN], frame[c.REQUEST_HDRLEN:])
+        return cls(fhandle, c.kXR_ckpXeq, frame[: c.REQUEST_HDRLEN], frame[c.REQUEST_HDRLEN :])
 
     def params(self, w: Writer) -> None:
         w.padded(self.fhandle, 4).zeros(11).u8(self.subcode)

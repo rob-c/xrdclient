@@ -218,9 +218,7 @@ def test_a_webdav_endpoint_is_diagnosed_the_same_way_without_a_protocol_reply(da
     assert report.ok
 
 
-def test_a_server_that_will_not_answer_is_not_confused_with_one_that_is_absent(
-    server, monkeypatch
-):
+def test_a_server_that_will_not_answer_is_not_confused_with_one_that_is_absent(server, monkeypatch):
     from xrdclient.client import FileSystem
 
     monkeypatch.setattr(

@@ -105,9 +105,7 @@ def _ordered(found: dict[str, PrepareStatus], paths: Sequence[str]) -> list[Prep
     ]
 
 
-def stage(
-    client: HTTPClient, base: XRootDURL, paths: Sequence[str], *, lifetime: str = ""
-) -> str:
+def stage(client: HTTPClient, base: XRootDURL, paths: Sequence[str], *, lifetime: str = "") -> str:
     """Ask for these files to be brought online. Returns the request id.
 
     ``lifetime`` is an ISO 8601 duration - ``"P1D"`` for a day - and asks the
@@ -130,7 +128,10 @@ def stage_files(client: HTTPClient, base: XRootDURL, files: Sequence[Mapping[str
     """
     target = _at(base, "stage")
     res = client.request(
-        "POST", target, body=json.dumps({"files": list(files)}).encode(), headers=_JSON,
+        "POST",
+        target,
+        body=json.dumps({"files": list(files)}).encode(),
+        headers=_JSON,
         expect=(200, 201),
     )
     document = _document(res.body, target)
@@ -213,9 +214,7 @@ def discover(client: HTTPClient, base: XRootDURL) -> dict[str, str]:
     }
 
 
-def archive_info(
-    client: HTTPClient, base: XRootDURL, paths: Sequence[str]
-) -> list[PrepareStatus]:
+def archive_info(client: HTTPClient, base: XRootDURL, paths: Sequence[str]) -> list[PrepareStatus]:
     """Where each of these files lives, without asking for any of it to move."""
     found = {}
     for entry in archive_entries(client, base, paths):
@@ -228,7 +227,10 @@ def archive_entries(client: HTTPClient, base: XRootDURL, paths: Sequence[str]) -
     """The ``archiveinfo`` reply's entries, as the site wrote them."""
     target = _at(base, "archiveinfo")
     res = client.request(
-        "POST", target, body=json.dumps({"paths": list(paths)}).encode(), headers=_JSON,
+        "POST",
+        target,
+        body=json.dumps({"paths": list(paths)}).encode(),
+        headers=_JSON,
         expect=(200,),
     )
     return _entries(_document(res.body, target))

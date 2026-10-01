@@ -23,11 +23,11 @@ from collections.abc import Callable, Sequence
 from typing import Any, TextIO, TypedDict, cast
 
 from ..config import Config
-from ..copy import CopyResult, copy, copy_tree, third_party
+from ..copy import CopyResult, append_zip, copy, copy_tree, third_party
 from ..errors import XRootDError
 from ..types import human_bytes as _human
 from ..url import XRootDURL, parse
-from . import OK, USAGE, Endpoints, common_flags, config_from, dumps, fail, size_arg
+from . import OK, USAGE, Endpoints, common_flags, config_from, dumps, fail, size_arg, version_flag
 
 __all__ = ["main"]
 
@@ -45,6 +45,7 @@ def _parser() -> argparse.ArgumentParser:
             "will run again, since without the slash the second run nests into DEST/SRC."
         ),
     )
+    version_flag(parser)
     parser.add_argument(
         "source",
         nargs="+",
@@ -154,6 +155,12 @@ def _parser() -> argparse.ArgumentParser:
 def _xrdcp_flags(parser: argparse.ArgumentParser) -> None:
     """The transfer controls ``xrdcp`` has, under ``xrdcp``'s names."""
     parser.add_argument(
+        "-z",
+        "--zip",
+        metavar="MEMBER",
+        help="copy MEMBER from each source ZIP archive (xrdcl.unzip)",
+    )
+    parser.add_argument(
         "-y",
         "--sources",
         type=int,
@@ -185,6 +192,21 @@ def _xrdcp_flags(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         default=None,
         help="the source may still be growing: read to its end, not to its size",
+    )
+    parser.add_argument(
+        "--zip-append",
+        action="store_true",
+        help="append each source as a stored member of the destination ZIP archive",
+    )
+    parser.add_argument(
+        "--tlsmetalink",
+        action="store_true",
+        help="upgrade root/xroot replica URLs in Metalinks to TLS",
+    )
+    parser.add_argument(
+        "--zip-mtln-cksum",
+        action="store_true",
+        help="with --zip, verify the member against its Metalink checksum",
     )
     parser.add_argument(
         "-F",
@@ -311,6 +333,17 @@ def _tree_misuse(args: argparse.Namespace) -> str | None:
         args.include or args.exclude or args.sync or args.delete or args.parallel
     ):
         return "--include, --exclude, --sync, --delete and --parallel describe a tree; add -r"
+    return _archive_tree_misuse(args)
+
+
+def _archive_tree_misuse(args: argparse.Namespace) -> str | None:
+    """ZIP operations each address one archive and never a directory tree."""
+    if not args.recursive:
+        return None
+    if args.zip:
+        return "--zip selects one file inside an archive and cannot be recursive"
+    if args.zip_append:
+        return "--zip-append adds files, not directory trees; omit -r"
     return None
 
 
@@ -332,12 +365,38 @@ def _count_misuse(args: argparse.Namespace) -> str | None:
 
 def _transfer_misuse(args: argparse.Namespace) -> str | None:
     """Reject transfer strategies whose promises contradict one another."""
+    for check in (_tpc_local_misuse, _resume_misuse, _overwrite_misuse, _zip_misuse):
+        complaint = check(args)
+        if complaint is not None:
+            return complaint
+    return None
+
+
+def _tpc_local_misuse(args: argparse.Namespace) -> str | None:
     if args.tpc and (args.dry_run or args.remove_source):
         return "--tpc hands the transfer to the servers; --dry-run and --remove-source cannot"
+    return None
+
+
+def _resume_misuse(args: argparse.Namespace) -> str | None:
     if args.resume and (args.tpc or args.no_clobber):
         return "--continue needs a partial DEST to carry on from; --tpc and -n forbid one"
+    return None
+
+
+def _overwrite_misuse(args: argparse.Namespace) -> str | None:
     if args.force and args.no_clobber:
         return "-f overwrites DEST and -n refuses to; they cannot both be what you meant"
+    return None
+
+
+def _zip_misuse(args: argparse.Namespace) -> str | None:
+    if args.zip and args.tpc:
+        return "--zip is expanded by this client and cannot be combined with --tpc"
+    if args.zip and args.zip_append:
+        return "--zip reads a member and --zip-append writes one; choose one"
+    if args.zip_append and (args.tpc or args.resume or args.force or args.no_clobber):
+        return "--zip-append cannot be combined with --tpc, --continue, -f or -n"
     return None
 
 
@@ -368,6 +427,10 @@ _LIMITS: tuple[tuple[Callable[[argparse.Namespace], bool], str], ...] = (
 
 def _limit_misuse(args: argparse.Namespace) -> str | None:
     """Hold the ``xrdcp`` flags to ``xrdcp``'s ranges, and to what they can combine with."""
+    if args.zip and (args.sources or 0) > 1:
+        return "--zip reads one archive stream and cannot be combined with --sources"
+    if args.zip_append and (args.sources or 0) > 1:
+        return "--zip-append reads each source once and cannot be combined with --sources"
     return next((complaint for broken, complaint in _LIMITS if broken(args)), None)
 
 
@@ -412,6 +475,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return USAGE
     config = _copy_config(args)
     sources = [_source(s) for s in args.source]
+    if args.zip:
+        sources = [source.with_query(**{"xrdcl.unzip": args.zip}) for source in sources]
     dest = parse(args.dest)
     show = args.progress if args.progress is not None else (sys.stderr.isatty() and not args.quiet)
 
@@ -435,6 +500,10 @@ def _copy_config(args: argparse.Namespace) -> Config:
         config = config.evolve(parallel_chunks=args.stripes)
     if args.streams is not None:
         config = config.evolve(data_streams=args.streams)
+    if args.tlsmetalink:
+        config = config.evolve(tls_metalink=True)
+    if args.zip_mtln_cksum:
+        config = config.evolve(zip_metalink_checksum=True)
     return config
 
 
@@ -447,6 +516,8 @@ def _transfers(
     show: bool,
 ) -> list[CopyResult] | None:
     """Run a valid single-target invocation, or report an ambiguous target."""
+    if args.zip_append:
+        return _run(sources, dest, args, config, into=False, show=show)
     with Endpoints(config) as endpoints:
         into = _is_dir(dest, endpoints)
         if len(sources) > 1 and not into:
@@ -495,7 +566,11 @@ def _run(
     options = _copy_options(args)
     results: list[CopyResult] = []
     for source in sources:
-        target = _destination(source, dest, into=into)
+        target = (
+            dest / posixpath.basename(args.zip.rstrip("/"))
+            if into and args.zip
+            else _destination(source, dest, into=into)
+        )
         bar = Bar(posixpath.basename(source.path.rstrip("/")) or str(source)) if show else None
         try:
             results.extend(_copy_one(source, target, args, config, bar, options))
@@ -542,6 +617,18 @@ def _copy_one(
     options: _CopyOptions,
 ) -> list[CopyResult]:
     """Copy one resolved source using the selected transfer strategy."""
+    if args.zip_append:
+        return [
+            append_zip(
+                source,
+                target,
+                chunk_size=args.chunk_size,
+                progress=bar,
+                config=config,
+                dry_run=args.dry_run,
+                remove_source=args.remove_source,
+            )
+        ]
     if args.tpc:
         return [_third_party(source, target, args, config)]
     if args.recursive:

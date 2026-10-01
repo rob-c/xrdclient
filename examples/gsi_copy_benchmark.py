@@ -88,7 +88,10 @@ subjectAltName = DNS:{host}, DNS:localhost, IP:127.0.0.1
 def run(*argv: str, quiet: bool = True, **kwargs: object) -> subprocess.CompletedProcess:
     """One command, with its output kept unless it fails."""
     done = subprocess.run(  # the check is two lines below
-        argv, capture_output=quiet, text=True, **kwargs  # type: ignore[call-overload]
+        argv,
+        capture_output=quiet,
+        text=True,
+        **kwargs,  # type: ignore[call-overload]
     )
     if done.returncode != 0:
         if quiet:
@@ -120,13 +123,34 @@ def build_pki(root: Path, host: str) -> Path:
         openssl("genrsa", "-out", str(certs / f"{name}.key"), "2048")
 
     def request(name: str, subject: str) -> None:
-        openssl("req", "-new", "-key", str(certs / f"{name}.key"),
-                "-out", str(certs / f"{name}.csr"), "-subj", subject)
+        openssl(
+            "req",
+            "-new",
+            "-key",
+            str(certs / f"{name}.key"),
+            "-out",
+            str(certs / f"{name}.csr"),
+            "-subj",
+            subject,
+        )
 
     def sign(name: str, issuer: str, serial: str, ext: str | None) -> None:
-        argv = ["x509", "-req", "-in", str(certs / f"{name}.csr"),
-                "-CA", str(certs / f"{issuer}.pem"), "-CAkey", str(certs / f"{issuer}.key"),
-                "-set_serial", serial, "-days", "1", "-out", str(certs / f"{name}.pem")]
+        argv = [
+            "x509",
+            "-req",
+            "-in",
+            str(certs / f"{name}.csr"),
+            "-CA",
+            str(certs / f"{issuer}.pem"),
+            "-CAkey",
+            str(certs / f"{issuer}.key"),
+            "-set_serial",
+            serial,
+            "-days",
+            "1",
+            "-out",
+            str(certs / f"{name}.pem"),
+        ]
         if ext:
             argv += ["-extfile", str(certs / ext)]
             if ext == "proxy.ext":
@@ -135,10 +159,25 @@ def build_pki(root: Path, host: str) -> Path:
 
     # the CA, self-signed, and trusted by both ends
     key("ca")
-    openssl("req", "-new", "-x509", "-key", str(certs / "ca.key"), "-out", str(certs / "ca.pem"),
-            "-days", "1", "-subj", "/O=example/CN=Demo CA", "-extensions", "v3_ca",
-            "-addext", "basicConstraints=critical,CA:TRUE",
-            "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+    openssl(
+        "req",
+        "-new",
+        "-x509",
+        "-key",
+        str(certs / "ca.key"),
+        "-out",
+        str(certs / "ca.pem"),
+        "-days",
+        "1",
+        "-subj",
+        "/O=example/CN=Demo CA",
+        "-extensions",
+        "v3_ca",
+        "-addext",
+        "basicConstraints=critical,CA:TRUE",
+        "-addext",
+        "keyUsage=critical,keyCertSign,cRLSign",
+    )
 
     # what the server presents, and what we check it against
     key("host")
@@ -211,8 +250,16 @@ def free_port() -> int:
 
 
 @contextlib.contextmanager
-def server(root: Path, certs: Path, export: Path, port: int, *, local: bool, keep: bool,
-           image: str | None = None):
+def server(
+    root: Path,
+    certs: Path,
+    export: Path,
+    port: int,
+    *,
+    local: bool,
+    keep: bool,
+    image: str | None = None,
+):
     """The daemon, in a container or on this machine, and its URL."""
     config = root / "demo.cfg"
     if local:
@@ -252,17 +299,27 @@ def server(root: Path, certs: Path, export: Path, port: int, *, local: bool, kee
     name = f"xrdclient-gsi-{port}"
     run("docker", "rm", "-f", name, quiet=True) if _exists(name) else None
     run(
-        "docker", "run", "-d", "--name", name,
-        "-p", f"{port}:{port}",
-        "-v", f"{config}:/etc/xrootd/demo.cfg:ro",
-        "-v", f"{certs}:/certs:ro",
-        "-v", f"{export}:/data",
-        "--entrypoint", "xrootd",
+        "docker",
+        "run",
+        "-d",
+        "--name",
+        name,
+        "-p",
+        f"{port}:{port}",
+        "-v",
+        f"{config}:/etc/xrootd/demo.cfg:ro",
+        "-v",
+        f"{certs}:/certs:ro",
+        "-v",
+        f"{export}:/data",
+        "--entrypoint",
+        "xrootd",
         image,
         # no ``-l``: the daemon locks a file beside whatever that names, and
         # ``/dev/.lock`` is not writable. Unlogged, it writes to stdout, which
         # is where ``docker logs`` reads from anyway.
-        "-c", "/etc/xrootd/demo.cfg",
+        "-c",
+        "/etc/xrootd/demo.cfg",
     )
     try:
         yield f"root://127.0.0.1:{port}/", name
@@ -281,19 +338,38 @@ def pick_image(preferred: str | None) -> str | None:
     named image wins if it was given; otherwise the first candidate that has
     both the daemon and ``libXrdSecgsi`` in it does. ``None`` means "build".
     """
-    listed = subprocess.run(["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
-                            capture_output=True, text=True, check=False).stdout.split()
-    candidates = [preferred] if preferred else [
-        name for name in listed
-        if any(word in name for word in ("xrootd", "xrdclient-gsi-demo", "eos"))
-    ]
+    listed = subprocess.run(
+        ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.split()
+    candidates = (
+        [preferred]
+        if preferred
+        else [
+            name
+            for name in listed
+            if any(word in name for word in ("xrootd", "xrdclient-gsi-demo", "eos"))
+        ]
+    )
     for name in candidates:
         if name not in listed and preferred is None:
             continue
         probe = subprocess.run(
-            ["docker", "run", "--rm", "--entrypoint", "sh", name, "-c",
-             "command -v xrootd >/dev/null && ls /usr/lib64/libXrdSecgsi* >/dev/null 2>&1"],
-            capture_output=True, text=True, check=False,
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--entrypoint",
+                "sh",
+                name,
+                "-c",
+                "command -v xrootd >/dev/null && ls /usr/lib64/libXrdSecgsi* >/dev/null 2>&1",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
         )
         if probe.returncode == 0:
             return name
@@ -303,7 +379,9 @@ def pick_image(preferred: str | None) -> str | None:
 def _exists(name: str) -> bool:
     done = subprocess.run(
         ["docker", "ps", "-aq", "-f", f"name=^{name}$"],
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     return bool(done.stdout.strip())
 
@@ -326,7 +404,9 @@ def wait_ready(url: str, config: xrdclient.Config, where: object, seconds: float
     elif isinstance(where, str):
         logs = subprocess.run(
             ["docker", "logs", "--tail", "40", where],
-            capture_output=True, text=True, check=False,
+            capture_output=True,
+            text=True,
+            check=False,
         )
         sys.stderr.write(logs.stdout)
     raise SystemExit(f"the server never came up: {last}")
@@ -379,8 +459,9 @@ print("ELAPSED", time.perf_counter() - start, bool(status.ok))
 """
     for _ in range(repeat):
         # the bindings are a system package, not one of this project's
-        done = subprocess.run(["python3", "-c", script],
-                              capture_output=True, text=True, check=False, env=env)
+        done = subprocess.run(
+            ["python3", "-c", script], capture_output=True, text=True, check=False, env=env
+        )
         line = [l for l in done.stdout.splitlines() if l.startswith("ELAPSED")]
         if not line:
             return  # no bindings here, or they refused; the others still stand
@@ -409,8 +490,11 @@ def arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--keep", action="store_true", help="leave the server running")
     parser.add_argument("--local", action="store_true", help="run xrootd here, not in Docker")
     parser.add_argument("--image", help="image to serve from (default: any local one with xrootd)")
-    parser.add_argument("--brix", default=shutil.which("brix-xrdcp") or "",
-                        help="path to a BriX client to compare against, if it is not on PATH")
+    parser.add_argument(
+        "--brix",
+        default=shutil.which("brix-xrdcp") or "",
+        help="path to a BriX client to compare against, if it is not on PATH",
+    )
     return parser.parse_args(argv)
 
 
@@ -448,8 +532,11 @@ def measure(remote: str, size: int, settings, root: Path, env: dict, args) -> No
 
     rates = []
     for elapsed in bindings(remote, root / "bindings.bin", env, args.repeat):
-        print(f"  {'XRootD python bindings':<34} {elapsed:6.2f} s   "
-              f"{size / elapsed / (1 << 20):7.1f} MiB/s", flush=True)
+        print(
+            f"  {'XRootD python bindings':<34} {elapsed:6.2f} s   "
+            f"{size / elapsed / (1 << 20):7.1f} MiB/s",
+            flush=True,
+        )
         rates.append(size / elapsed / (1 << 20))
     if rates:
         print(f"  {'-> median':<34} {'':6}     {statistics.median(rates):7.1f} MiB/s")
@@ -475,13 +562,18 @@ def main(argv: list[str] | None = None) -> int:
             verify_tls=False,  # the host certificate is this script's own
         )
         image = None if args.local else pick_image(args.image)
-        with server(root, certs, export, port, local=args.local, keep=args.keep,
-                    image=image) as (url, where):
+        with server(root, certs, export, port, local=args.local, keep=args.keep, image=image) as (
+            url,
+            where,
+        ):
             wait_ready(url, settings, where)
             remote = f"{url}{export}/{name}" if args.local else f"{url}/data/{name}"
             print(f"\n{args.size} MiB over gsi+root://, {args.repeat} runs each\n")
-            env = {**os.environ, "X509_USER_PROXY": str(certs / "proxy.pem.full"),
-                   "X509_CERT_DIR": str(certs / "ca")}
+            env = {
+                **os.environ,
+                "X509_USER_PROXY": str(certs / "proxy.pem.full"),
+                "X509_CERT_DIR": str(certs / "ca"),
+            }
             measure(remote, size, settings, root, env, args)
         return 0
     finally:

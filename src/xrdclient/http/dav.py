@@ -207,8 +207,8 @@ def digest(
 ) -> ChecksumInfo:
     """The server's own checksum, negotiated with RFC 3230 ``Want-Digest``.
 
-        >>> digest("https://dav.example.org/store/f.root", "adler32")
-        ChecksumInfo(algorithm='adler32', value='9f1c0a3b')
+    >>> digest("https://dav.example.org/store/f.root", "adler32")
+    ChecksumInfo(algorithm='adler32', value='9f1c0a3b')
     """
     cfg = config or Config()
     target = parse(url)
@@ -228,9 +228,7 @@ def digest(
         raw = response.header("Content-MD5")
         value = _as_hex(raw.strip(), "md5") if raw else ""
     if not value:
-        raise UnsupportedError(
-            kXR_Unsupported, f"no {wanted} digest offered", path=target.path
-        )
+        raise UnsupportedError(kXR_Unsupported, f"no {wanted} digest offered", path=target.path)
     return ChecksumInfo(algorithm=wanted, value=value)
 
 
@@ -514,9 +512,7 @@ class HTTPFileSystem(FileSystem):
         # resource on the name answers 405 too, and ``exist_ok`` does not
         # forgive that - what exists must be a collection.
         try:
-            self.client.request(
-                "MKCOL", target, expect=(201,), errors={405: kXR_ItExists}
-            )
+            self.client.request("MKCOL", target, expect=(201,), errors={405: kXR_ItExists})
         except FileExistsError:
             if not exist_ok or not self.isdir(target.path):
                 raise
@@ -759,4 +755,3 @@ class HTTPFileSystem(FileSystem):
 
     def xattrs(self, path: str) -> dict[str, bytes]:
         raise self._unsupported("extended attributes")
-

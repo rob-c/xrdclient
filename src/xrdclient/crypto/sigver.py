@@ -24,16 +24,33 @@ from ..proto import constants as c
 from .aes import BLOCK_SIZE, cbc_decrypt, cbc_encrypt
 
 __all__ = [
-    "SIGNED_OPCODES", "LEVEL_OPCODES", "Signer",
-    "is_signed", "sigver_hash", "sigver_sign", "sigver_verify",
+    "SIGNED_OPCODES",
+    "LEVEL_OPCODES",
+    "Signer",
+    "is_signed",
+    "sigver_hash",
+    "sigver_sign",
+    "sigver_verify",
 ]
 
 #: Opcodes that mutate state, and so are signed from ``kXR_secStandard`` up.
 SIGNED_OPCODES = frozenset(
     {
-        c.kXR_chmod, c.kXR_fattr, c.kXR_mkdir, c.kXR_mv, c.kXR_open,
-        c.kXR_pgwrite, c.kXR_prepare, c.kXR_rm, c.kXR_rmdir, c.kXR_set,
-        c.kXR_truncate, c.kXR_write, c.kXR_writev, c.kXR_chkpoint, c.kXR_clone,
+        c.kXR_chmod,
+        c.kXR_fattr,
+        c.kXR_mkdir,
+        c.kXR_mv,
+        c.kXR_open,
+        c.kXR_pgwrite,
+        c.kXR_prepare,
+        c.kXR_rm,
+        c.kXR_rmdir,
+        c.kXR_set,
+        c.kXR_truncate,
+        c.kXR_write,
+        c.kXR_writev,
+        c.kXR_chkpoint,
+        c.kXR_clone,
     }
 )
 
@@ -182,9 +199,7 @@ class Signer:
         payload = frame[c.REQUEST_HDRLEN : c.REQUEST_HDRLEN + dlen]
         nodata = opcode in _DATA_OPCODES and not self.secodata
         iv = os.urandom(BLOCK_SIZE) if self.embedded_iv else None
-        signature = sigver_sign(
-            self.key, self._seqno, header, payload, nodata=nodata, iv=iv
-        )
+        signature = sigver_sign(self.key, self._seqno, header, payload, nodata=nodata, iv=iv)
         return self._seqno, signature, nodata
 
     def __repr__(self) -> str:

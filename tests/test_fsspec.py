@@ -76,9 +76,7 @@ def test_text_mode_is_wrapped_the_way_fsspec_users_expect(xfs):
 
 def test_ranges_across_files_use_one_vector_read_each(server, xfs):
     server.add_file("/data/b.bin", b"0123456789")
-    chunks = xfs.cat_ranges(
-        ["/data/a.root", "/data/b.bin", "/data/a.root"], [0, 2, 6], [5, 5, 11]
-    )
+    chunks = xfs.cat_ranges(["/data/a.root", "/data/b.bin", "/data/a.root"], [0, 2, 6], [5, 5, 11])
     assert chunks == [b"hello", b"234", b"world"]
 
 

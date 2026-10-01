@@ -549,9 +549,7 @@ def test_a_file_on_tape_stats_as_offline(fs, server):
 def test_archive_info_says_where_each_file_lives(fs, server):
     server.nearline.add("/data/a.root")
     server.files["/data/b.root"] = bytearray(b"disk")
-    on_tape, on_disk, gone = fs.archive_info(
-        ["/data/a.root", "/data/b.root", "/data/none.root"]
-    )
+    on_tape, on_disk, gone = fs.archive_info(["/data/a.root", "/data/b.root", "/data/none.root"])
     assert (on_tape.on_tape, on_tape.online, on_tape.state) == (True, False, "NEARLINE")
     assert (on_disk.online, on_disk.state, bool(on_disk)) == (True, "ONLINE", True)
     assert (gone.exists, gone.error, gone.state) == (False, "no such file", "")

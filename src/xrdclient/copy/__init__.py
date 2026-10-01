@@ -15,11 +15,13 @@ from .engine import CopyResult, SyncMode, copy, copy_tree
 from .limits import CopyTimeoutError, RateThresholdError
 from .replicas import NoMoreReplicasError
 from .tpc import third_party
+from .zip import append_zip
 
 __all__ = [
     "copy",
     "copy_tree",
     "third_party",
+    "append_zip",
     "CopyResult",
     "SyncMode",
     "CopyTimeoutError",

@@ -137,9 +137,9 @@ class _Iterating:
 class _Opening:
     """What :func:`open` returns: awaitable, and an async context manager.
 
-        >>> fh = await xrdclient.aio.open(url)            # explicit close
-        >>> async with xrdclient.aio.open(url) as fh:     # closed for you
-        ...     ...
+    >>> fh = await xrdclient.aio.open(url)            # explicit close
+    >>> async with xrdclient.aio.open(url) as fh:     # closed for you
+    ...     ...
     """
 
     __slots__ = ("_factory", "_file")

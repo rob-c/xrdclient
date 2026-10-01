@@ -808,7 +808,9 @@ def test_a_template_open_can_answer_a_callback(fh, root, srv):
     got = []
     new = client.File()
     status = new.openusingtemplate(
-        fh, root + "/d/cb", OpenFlags.NEW | OpenFlags.SAMEFS,
+        fh,
+        root + "/d/cb",
+        OpenFlags.NEW | OpenFlags.SAMEFS,
         callback=lambda st, resp, hosts: (got.append((st, resp)), done.set()),
     )
     assert status.ok and done.wait(10)
@@ -1282,7 +1284,9 @@ def test_the_shell_wins_over_a_put(clean_env, monkeypatch):
 
 
 def test_puts_reach_the_native_configuration(clean_env, monkeypatch):
-    monkeypatch.undo()  # the real ``env.config``, not the test fixture's
+    # Bypass this module's autouse API hook. ``monkeypatch.undo()`` made this
+    # depend on fixture teardown order when xdist interleaved compat suites.
+    monkeypatch.setattr(env, "config", env._build_config)
     monkeypatch.setattr(env, "_ints", {})
     monkeypatch.setattr(env, "_strings", {})
     monkeypatch.delenv("XRD_REQUESTTIMEOUT", raising=False)
@@ -1674,14 +1678,18 @@ def test_copy_process_edge_cases_end_as_with_the_bindings(official, two_sandboxe
         for n, mode in enumerate(("end", "source", "target", "end2end", "none")):
             process.add_job(source, str(local / f"m{n}"), checksummode=mode, checksumtype="adler32")
         process.add_job(
-            source, str(local / "p"), checksummode="target", checksumtype="adler32",
+            source,
+            str(local / "p"),
+            checksummode="target",
+            checksumtype="adler32",
             checksumpreset="0badcafe",
         )
         assert process.prepare().ok
         status, results = process.run()
         files = sorted(
             (str(path.relative_to(local)), path.read_bytes())
-            for path in local.rglob("*") if path.is_file()
+            for path in local.rglob("*")
+            if path.is_file()
         )
         outcomes.append((_norm((status, results)), files))
     assert outcomes[0] == outcomes[1]
@@ -1793,7 +1801,7 @@ def test_an_http_url_gets_https_port_as_in_xrdcl(text, port):
 
 
 def test_cp_parallel_chunks_is_chunks_in_flight_as_in_xrdcl(clean_env, monkeypatch):
-    monkeypatch.undo()
+    monkeypatch.setattr(env, "config", env._build_config)
     monkeypatch.setattr(env, "_ints", {})
     monkeypatch.setattr(env, "_strings", {})
     client.EnvPutInt("CPParallelChunks", 7)

@@ -703,8 +703,7 @@ def test_a_server_that_mints_nothing_is_an_error(dav):
 def test_a_document_type_declaration_is_refused_before_parsing():
     """The entity-expansion attacks all need a DTD; none of them get one."""
     payload = (
-        b'<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol">]>'
-        b'<D:multistatus xmlns:D="DAV:"/>'
+        b'<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY lol "lol">]><D:multistatus xmlns:D="DAV:"/>'
     )
     with pytest.raises(ProtocolError, match="document type"):
         _parse(payload)
@@ -795,8 +794,10 @@ def test_a_minted_token_is_scoped_to_what_the_copy_does(monkeypatch):
     assert requests[0][1:] == (["activity:LIST,DOWNLOAD"], "PT30M")
     assert requests[1][1:] == (["activity:LIST,DOWNLOAD,MANAGE,UPLOAD,DELETE"], "PT20M")
     # Nothing to mint: plain http, a token already in hand, or a far end that cannot.
-    assert tpc._minted(xrdclient.url.parse("http://se/f"), config, None, write=False,
-                       timeout=None) is None
+    assert (
+        tpc._minted(xrdclient.url.parse("http://se/f"), config, None, write=False, timeout=None)
+        is None
+    )
     assert tpc._minted(far, xrdclient.Config(token="t"), None, write=False, timeout=None) is None
 
     def refuse(*args, **kwargs):
@@ -842,8 +843,10 @@ def test_a_copy_redirected_within_the_site_keeps_its_transfer_headers(dav, elsew
     client_module.relays_transfer_headers = lambda origin, target: True
     try:
         xrdclient.http.third_party(
-            elsewhere.url / "d/a.root", dav.url / "d/r.root",
-            remote_token="for-the-far-side", verify=False,
+            elsewhere.url / "d/a.root",
+            dav.url / "d/r.root",
+            remote_token="for-the-far-side",
+            verify=False,
             config=xrdclient.Config(token="mine"),
         )
     except OSError:
@@ -1306,8 +1309,11 @@ def test_a_reply_that_names_its_file_list_differently_is_still_read(fs, dav, sha
 
 
 def test_a_locality_that_is_neither_disk_nor_tape_is_a_file_you_cannot_have(fs, dav):
-    dav.handlers["POST"] = lambda *_: (200, b'{"files": [{"path": "/d/a.root", '
-                                            b'"locality": "LOST"}]}', {})
+    dav.handlers["POST"] = lambda *_: (
+        200,
+        b'{"files": [{"path": "/d/a.root", "locality": "LOST"}]}',
+        {},
+    )
     lost = fs.archive_info(["/d/a.root"])[0]
     assert (lost.exists, lost.error, lost.state) == (False, "lost", "LOST")
 

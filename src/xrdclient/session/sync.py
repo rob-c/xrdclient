@@ -419,8 +419,11 @@ class Session:
         if used in self._IDENTIFYING:
             return
         skipped = self._m.skipped
-        reasons = [f"{name} was not used - {skipped[name]}" for name in self._IDENTIFYING
-                   if name in skipped]
+        reasons = [
+            f"{name} was not used - {skipped[name]}"
+            for name in self._IDENTIFYING
+            if name in skipped
+        ]
         if reasons:
             exc.explain(f"logged in as {used or 'nobody'}: " + "; ".join(reasons))
 
@@ -657,9 +660,7 @@ class Session:
             if queued:
                 transport.send(queued)
 
-    def _receive(
-        self, pathid: int, deadline: float | None, expires: float | None = None
-    ) -> bytes:
+    def _receive(self, pathid: int, deadline: float | None, expires: float | None = None) -> bytes:
         """Read once from ``pathid``'s link, never past ``deadline`` or ``expires``.
 
         ``deadline`` is the stall clock, and running into it means the

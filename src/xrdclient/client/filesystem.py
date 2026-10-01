@@ -433,9 +433,7 @@ class FileSystem:
         res = self._router.execute(r.Statx(targets))
         flags = rp.parse_statx(res.data)
         if len(flags) != len(targets):
-            raise ProtocolError(
-                f"statx returned {len(flags)} flags for {len(targets)} paths"
-            )
+            raise ProtocolError(f"statx returned {len(flags)} flags for {len(targets)} paths")
         return [StatInfo(flags=f, path=p) for f, p in zip_strict(flags, targets)]
 
     def exists(self, path: str) -> bool:
@@ -712,9 +710,7 @@ class FileSystem:
         """Create a directory, with ``pathlib.Path.mkdir`` semantics."""
         target = self._abs(path)
         try:
-            self._router.execute(
-                r.Mkdir(target, permissions(mode), mkpath=parents), path=target
-            )
+            self._router.execute(r.Mkdir(target, permissions(mode), mkpath=parents), path=target)
         except FileExistsError:
             # ``exist_ok`` forgives an existing *directory*, as pathlib does;
             # a file squatting on the name is still an error.

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 from ..errors import XRootDError
 
-__all__ = ["ZipArchiveError", "ZipMember", "members"]
+__all__ = ["ZipArchiveError", "ZipDirectory", "ZipMember", "directory", "member", "members"]
 
 
 class ZipArchiveError(XRootDError):
@@ -32,6 +32,24 @@ class ZipMember:
     name: str
     #: What the member holds once inflated - the size a listing reports.
     size: int
+    compressed_size: int = 0
+    offset: int = 0
+    method: int = 0
+    crc32: int = 0
+    flags: int = 0
+    data_offset: int = 0
+
+
+@dataclass(frozen=True)
+class ZipDirectory:
+    """The intact central directory and the members parsed from it."""
+
+    offset: int
+    size: int
+    count: int
+    records: bytes
+    comment: bytes
+    members: tuple[ZipMember, ...]
 
 
 #: ``read(offset, length)``: the bytes of the archive there.
@@ -41,13 +59,16 @@ _EOCD = struct.Struct("<4s4H2IH")  # the end-of-central-directory record
 _LOCATOR = struct.Struct("<4sIQI")  # the ZIP64 end-of-central-directory locator
 _EOCD64 = struct.Struct("<4sQ2H2I4Q")  # the ZIP64 end-of-central-directory record
 _CDFH = struct.Struct("<4s6H3I5H2I")  # a central directory file header
+_LFH = struct.Struct("<4s5H3I2H")  # the member's local file header
 _FIELD = struct.Struct("<HH")  # an extra field's id and length
 
 _EOCD_SIG = b"PK\x05\x06"
 _LOCATOR_SIG = b"PK\x06\x07"
 _EOCD64_SIG = b"PK\x06\x06"
 _CDFH_SIG = b"PK\x01\x02"
+_LFH_SIG = b"PK\x03\x04"
 _ZIP64_FIELD = 0x0001
+_UTF8 = 0x0800
 
 #: How much of the end of the archive the first read takes: the record, the
 #: longest comment it can carry, and the ZIP64 locator in front of it.
@@ -83,20 +104,58 @@ def members(read: Reader, size: int) -> list[ZipMember]:
     nothing in it, as XrdCl has it; anything else without an intact central
     directory raises :class:`ZipArchiveError`.
     """
+    return list(directory(read, size).members)
+
+
+def directory(read: Reader, size: int) -> ZipDirectory:
+    """Read the archive's central directory, preserving its exact records."""
     if not size:
-        return []
+        return ZipDirectory(0, 0, 0, b"", b"", ())
     start = size - min(size, _TAIL)
     tail = read(start, size - start)
     at = _find_eocd(tail)
-    directory = _eocd(tail, at, size)
+    located = _eocd(tail, at)
+    comment_at = at + _EOCD.size
+    comment = tail[comment_at : comment_at + _EOCD.unpack_from(tail, at)[-1]]
+    # A ZIP writer may use ZIP64 before it strictly has to.  Follow the
+    # locator even when the whole (small) archive fitted in the tail read.
+    located = _zip64(read, tail, start, at) or located
+    if located.offset + located.size > size:
+        raise ZipArchiveError(_BAD_EOCD)
     if len(tail) == size:
-        # The whole archive came back: the directory is already here, and an
-        # archive this small has no need of ZIP64.
-        records = tail[directory.offset : directory.offset + directory.size]
+        # The whole archive came back: the directory is already here.
+        records = tail[located.offset : located.offset + located.size]
     else:
-        directory = _zip64(read, tail, start, at) or directory
-        records = read(directory.offset, directory.size)
-    return _records(records, directory.count, size)
+        records = read(located.offset, located.size)
+    found = tuple(_records(records, located.count, size))
+    return ZipDirectory(located.offset, located.size, located.count, records, comment, found)
+
+
+def member(read: Reader, size: int, name: str) -> ZipMember:
+    """The member called ``name``, including where its compressed bytes begin."""
+    found = next((item for item in members(read, size) if item.name == name), None)
+    if found is None:
+        raise KeyError(name)
+    header = read(found.offset, _LFH.size)
+    if len(header) != _LFH.size:
+        raise ZipArchiveError(_BAD_CD)
+    fields = _LFH.unpack(header)
+    if fields[0] != _LFH_SIG or fields[2] != found.flags or fields[3] != found.method:
+        raise ZipArchiveError(_BAD_CD)
+    name_len, extra_len = fields[9:11]
+    data_offset = found.offset + _LFH.size + name_len + extra_len
+    if data_offset + found.compressed_size > size:
+        raise ZipArchiveError(_BAD_CD)
+    return ZipMember(
+        found.name,
+        found.size,
+        found.compressed_size,
+        found.offset,
+        found.method,
+        found.crc32,
+        found.flags,
+        data_offset,
+    )
 
 
 def _find_eocd(tail: bytes) -> int:
@@ -107,10 +166,10 @@ def _find_eocd(tail: bytes) -> int:
     return at
 
 
-def _eocd(tail: bytes, at: int, size: int) -> _Directory:
+def _eocd(tail: bytes, at: int) -> _Directory:
     fields = _EOCD.unpack_from(tail, at)
     count, cd_size, cd_offset, comment = fields[4:]
-    if _EOCD.size + comment > len(tail) - at or cd_offset + cd_size > size:
+    if _EOCD.size + comment > len(tail) - at:
         raise ZipArchiveError(_BAD_EOCD)
     return _Directory(count, cd_size, cd_offset)
 
@@ -123,7 +182,7 @@ def _zip64(read: Reader, tail: bytes, start: int, at: int) -> _Directory | None:
     offset = _LOCATOR.unpack_from(tail, locator)[2]
     if start > offset:
         # The record is further back than the first read went.
-        record = read(offset, start + len(tail) - offset)
+        record = read(offset, _EOCD64.size)
     else:
         record = tail[offset - start :]
     if len(record) < _EOCD64.size or record[:4] != _EOCD64_SIG:
@@ -153,26 +212,41 @@ def _record(data: bytes, pos: int, size: int) -> tuple[ZipMember, int, int]:
     fields = _CDFH.unpack_from(data, pos)
     if fields[0] != _CDFH_SIG:
         raise ZipArchiveError(_BAD_CD)
+    flags, method, crc32 = fields[3], fields[4], fields[7]
     compressed, uncompressed, name_len, extra_len, comment_len = fields[8:13]
     disk, offset = fields[13], fields[16]
     end = pos + _CDFH.size + name_len + extra_len + comment_len
-    if end > len(data) or offset + compressed > size:
+    if end > len(data):
         raise ZipArchiveError(_BAD_CD)
     name = data[pos + _CDFH.size : pos + _CDFH.size + name_len]
     extra = data[pos + _CDFH.size + name_len : pos + _CDFH.size + name_len + extra_len]
-    wide = _wide_sizes(extra, (uncompressed, compressed, offset, disk))
+    wide = _wide_values(extra, (uncompressed, compressed, offset, disk))
     if wide is not None:
-        uncompressed = wide[0] if uncompressed == _U32 else uncompressed
-        compressed = wide[1]
-    return ZipMember(name.decode("utf-8", "replace"), uncompressed), compressed, end
+        uncompressed, compressed, offset, disk = wide
+    if offset + compressed > size:
+        raise ZipArchiveError(_BAD_CD)
+    return (
+        ZipMember(
+            name.decode("utf-8" if flags & _UTF8 else "cp437", "replace"),
+            uncompressed,
+            compressed,
+            offset,
+            method,
+            crc32,
+            flags,
+        ),
+        compressed,
+        end,
+    )
 
 
-def _wide_sizes(extra: bytes, narrow: tuple[int, int, int, int]) -> tuple[int, int] | None:
-    """The ZIP64 ``(uncompressed, compressed)`` sizes, if the header has that field.
+def _wide_values(
+    extra: bytes, narrow: tuple[int, int, int, int]
+) -> tuple[int, int, int, int] | None:
+    """Resolve every narrow value that overflowed into the ZIP64 field.
 
     Only the values the header overflowed are in it, in the order the format
-    lays them out - uncompressed size, compressed size, offset, disk - and
-    one it did not overflow reads as 0, as in XrdCl.
+    lays them out: uncompressed size, compressed size, offset, then disk.
     """
     present = [value == limit for value, limit in zip(narrow, _LIMITS)]
     expected = sum(width for width, there in zip(_WIDTHS, present) if there)
@@ -181,15 +255,20 @@ def _wide_sizes(extra: bytes, narrow: tuple[int, int, int, int]) -> tuple[int, i
         return None
     if len(field) != expected:
         raise ZipArchiveError(_BAD_CD)
-    return _sizes(field, present[0], present[1])
+    return _replace_wide(narrow, present, field)
 
 
-def _sizes(field: bytes, uncompressed: bool, compressed: bool) -> tuple[int, int]:
-    """The two sizes out of a ZIP64 field holding the ones flagged, in order."""
-    values = [int.from_bytes(field[at : at + 8], "little") for at in (0, 8)]
-    if not uncompressed:
-        values.insert(0, 0)
-    return values[0], values[1] if compressed else 0
+def _replace_wide(
+    narrow: tuple[int, int, int, int], present: list[bool], field: bytes
+) -> tuple[int, int, int, int]:
+    """Replace the overflow sentinels in one central-directory record."""
+    resolved = list(narrow)
+    pos = 0
+    for index, (there, width) in enumerate(zip(present, _WIDTHS)):
+        if there:
+            resolved[index] = int.from_bytes(field[pos : pos + width], "little")
+            pos += width
+    return resolved[0], resolved[1], resolved[2], resolved[3]
 
 
 def _find_field(extra: bytes) -> bytes | None:

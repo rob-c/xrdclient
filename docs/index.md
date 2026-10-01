@@ -82,8 +82,8 @@ before it:
 The wire protocol, the session state machine, the whole authentication ladder,
 file and namespace APIs, `pathlib` bindings, the async facade, HTTP/WebDAV,
 S3, the copy engine, the bulk data plane, the CLI and the fsspec bindings are
-implemented and tested - 2,815 tests, the great majority of which need no network, no KDC and no
-`openssl`, plus [interoperability and parity suites](interop.md) that run
+implemented and tested. The great majority of tests need no network, no KDC
+and no `openssl`, plus [interoperability and parity suites](interop.md) that run
 against a real `xrootd` daemon and the official bindings side by side.
 Coverage is 100% of statements and branches across the package, and `proto/`,
 `crypto/`, `client/` and `s3/` are gated at 100%;

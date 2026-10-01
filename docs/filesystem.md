@@ -96,6 +96,17 @@ archive, or a damaged one, raises `xrdclient.client._zip.ZipArchiveError`
 with XrdCl's words for what is wrong ("End-of-central-directory signature not
 found."); an empty file is an empty archive.
 
+Members are also ordinary seekable read handles:
+
+```python
+with xrdclient.open("root://host//store/run7/logs.zip", "r", member="sub/run.log") as log:
+    print(log.readline())
+```
+
+The archive stays remote. Stored data is ranged directly; deflated data is
+expanded progressively into a seek cache, and complete reads verify CRC32.
+See [Copying](copying.md#zip-members-and-append) for appending members.
+
 ## Changing the namespace
 
 ```python

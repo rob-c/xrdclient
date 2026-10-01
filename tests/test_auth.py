@@ -121,10 +121,7 @@ def test_a_live_token_produces_the_ztn_blob():
     token = jwt(int(time.time()) + 3600)
     blob = TokenCredential(token).initial()
     assert blob == (
-        b"ztn\x00\x00T\x00\x00"
-        + struct.pack(">H", len(token) + 1)
-        + token.encode()
-        + b"\x00"
+        b"ztn\x00\x00T\x00\x00" + struct.pack(">H", len(token) + 1) + token.encode() + b"\x00"
     )
 
 
@@ -504,8 +501,7 @@ def test_select_appends_offers_the_config_never_mentioned():
 def test_select_skips_mechanisms_this_client_cannot_do():
     rejected: dict[str, str] = {}
     names = [
-        c.name
-        for c in auth.select("&P=pwd&P=host", Config(), username="b", rejected=rejected)
+        c.name for c in auth.select("&P=pwd&P=host", Config(), username="b", rejected=rejected)
     ]
     assert names == ["host"]
     assert "not supported" in rejected["pwd"]

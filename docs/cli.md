@@ -5,6 +5,9 @@ Two commands, `xrd-fs` and `xrd-cp`, both taking whole URLs. Both understand
 failure, `2` a usage error. A third, `xrd-datasets`, is installed by a package
 above this one and shares the same flags - see below.
 
+`xrd-cp --version` and `xrd-fs --version` report the installed distribution
+version without opening a configuration file or a network connection.
+
 Common options on every subcommand:
 
 | Option | Meaning |
@@ -122,6 +125,9 @@ $ xrd-cp --remove-source /tmp/f.root root://host//store/f.root   # a move
 $ xrd-cp -c root://host//store/big.root /scratch/big.root   # carry on, do not restart
 $ xrd-cp -y 4 root://redirector//store/f.root /scratch/      # read four replicas at once
 $ xrd-cp -X 20M root://host//store/f.root /scratch/          # at most 20 MiB/s
+$ xrd-cp --zip data.root root://host//store/bundle.zip /scratch/data.root
+$ xrd-cp --zip-append /scratch/data.root root://host//store/bundle.zip
+$ xrd-cp --tlsmetalink replicas.meta4 /scratch/data.root
 ```
 
 Several sources are allowed when the destination is a directory. Progress is
@@ -149,6 +155,10 @@ The transfer controls `xrdcp` has keep `xrdcp`'s names and ranges (see
 | `--cptimeout SECONDS` | fail a transfer still running after SECONDS |
 | `-Z`, `--dynamic-src` | the source may still be growing: read to its end, not to its size |
 | `-F`, `--coerce` | open DEST with `kXR_force`, ignoring the server's file usage rules |
+| `-z`, `--zip MEMBER` | copy one member from a local or remote ZIP source |
+| `--zip-append` | append each source as a stored member of one ZIP destination |
+| `--tlsmetalink` | upgrade `root`/`xroot` replicas in a Metalink to TLS |
+| `--zip-mtln-cksum` | with `--zip`, treat the Metalink checksum as the member checksum |
 
 `--sources` cannot combine with `-c` (a copy from several sources cannot
 continue a partial one), and `--coerce` also applies to `--tpc`.

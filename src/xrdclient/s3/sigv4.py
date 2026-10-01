@@ -169,9 +169,7 @@ def sign(
             payload_hash,
         ]
     )
-    to_sign = "\n".join(
-        [ALGORITHM, stamp, scope, hashlib.sha256(canonical.encode()).hexdigest()]
-    )
+    to_sign = "\n".join([ALGORITHM, stamp, scope, hashlib.sha256(canonical.encode()).hexdigest()])
     signature = hmac.new(
         _signing_key(credentials.secret_key, stamp[:8], region, service),
         to_sign.encode(),

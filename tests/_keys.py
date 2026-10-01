@@ -10,7 +10,6 @@ nothing, and every certificate built on them is minted at test time with
 today's validity.
 """
 
-
 KEY_0 = """\
 -----BEGIN RSA PRIVATE KEY-----
 MIIEowIBAAKCAQEAjmcMiv63TaRywXkM9FokgIVfVs5DvYxgfdaxt27cFIAF32wm

@@ -285,6 +285,33 @@ working until something cuts them, which is what `cut()` is for.
 `stall_after` tests timeouts; a client that only handles a *closed* socket
 hangs forever on one that is merely silent.
 
+The external BRIX proxy adds deterministic probabilistic failures to a real
+XRootD daemon. These tests repeatedly sever 4 KiB-chunked connections and
+check that adaptive recovery still produces exact downloads and uploads. They
+also cover fixed-boundary truncation until self-heal, same-length wire
+corruption, and a compound tiny-MSS/jitter/silent-firewall-reap path:
+
+```console
+$ BRIX_FAULT_PROXY=/path/to/brix-fault-proxy \
+    pytest tests/test_brix_fault_proxy.py
+```
+
+The external BRIX FUSE filesystem tests the other half of a copy: short and
+zero-progress I/O, partial-write `ENOSPC`, torn and silently dropped writes,
+lying metadata, repeating stale-handle bursts, live file replacement, volatile
+writeback, dishonest `fsync` acknowledgement, and late or post-commit `fsync`
+failure. The durability cases verify that a copy does not report success while
+bytes are still only in a fallible cache:
+
+```console
+$ BRIX_FAULT_FS=/path/to/brix-fault-fs \
+    pytest tests/test_brix_fault_fs.py
+```
+
+Both tools are built by the adjacent `brix-cache/client` project. The suites
+are skipped when their environment variable is unset, so the ordinary test
+suite remains daemon- and FUSE-free.
+
 ## Suite markers
 
 Two pytest markers gate the tests that need more than Python:
@@ -315,6 +342,24 @@ The gate in `pyproject.toml` deliberately covers only the wire protocol, the
 cryptography and the client surface, because coverage of the optional adapters
 (fsspec, the CLI, `asyncio`) depends on which extras are installed. Run the
 second form to see the whole package.
+
+## Pre-commit quality gates
+
+CI treats formatting, static analysis, maintainability and the built package
+as separate contracts. Run the same checks locally before opening a change:
+
+```console
+$ ruff check src tests benchmarks tools examples
+$ ruff format --check src tests benchmarks tools examples
+$ mypy
+$ python tools/maintainability.py check
+$ python -m build && twine check --strict dist/*
+```
+
+Ruff includes a focused set of high-confidence security checks. Wider generic
+security rules are reviewed rather than enabled blindly because protocol code
+legitimately contains specified hashes, XML parsing and subprocess transports.
+The CI test matrix covers Python 3.9 through 3.14.
 
 ## Maintainability regression test
 

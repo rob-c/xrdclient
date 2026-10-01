@@ -467,9 +467,7 @@ class File:
                 # A busy server (kXR_wait past the budget) and an expired
                 # deadline are not a dropped link: re-opening the handle would
                 # not help, so they stand, as they do at the router.
-                if not self.recoverable or isinstance(
-                    exc, (OperationExpiredError, WaitLimitError)
-                ):
+                if not self.recoverable or isinstance(exc, (OperationExpiredError, WaitLimitError)):
                     raise
                 attempts += 1
                 if attempts > self.config.connect_retries:
@@ -622,9 +620,7 @@ class File:
         supported").
         """
         payload = bytes(data)
-        return self._execute(
-            lambda handle: r.Query(c.kXR_Qopaqug, payload, fhandle=handle)
-        ).data
+        return self._execute(lambda handle: r.Query(c.kXR_Qopaqug, payload, fhandle=handle)).data
 
     # ------------------------------------------------------------------
     # Reading

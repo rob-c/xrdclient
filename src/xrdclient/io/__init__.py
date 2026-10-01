@@ -9,7 +9,7 @@ local ones, including ``for line in f``.
 from __future__ import annotations
 
 import io
-from typing import IO, Any, BinaryIO, Literal, TextIO, overload
+from typing import IO, Any, BinaryIO, Literal, TextIO, cast, overload
 
 from ..client.file import File
 from ..config import Config
@@ -40,7 +40,24 @@ def open_url(  # type: ignore[overload-overlap]
     config: Config | None = ...,
     router: Router | None = ...,
     posc: bool = ...,
+    member: None = ...,
 ) -> XRootDRawIO: ...
+
+
+@overload
+def open_url(  # type: ignore[overload-overlap]
+    url: str | XRootDURL,
+    mode: OpenBinaryMode = ...,
+    *,
+    buffering: Literal[0],
+    encoding: None = ...,
+    errors: None = ...,
+    newline: None = ...,
+    config: Config | None = ...,
+    router: Router | None = ...,
+    posc: bool = ...,
+    member: str,
+) -> io.RawIOBase: ...
 
 
 @overload
@@ -55,6 +72,7 @@ def open_url(
     config: Config | None = ...,
     router: Router | None = ...,
     posc: bool = ...,
+    member: str | None = ...,
 ) -> BinaryIO: ...
 
 
@@ -70,6 +88,7 @@ def open_url(
     config: Config | None = ...,
     router: Router | None = ...,
     posc: bool = ...,
+    member: str | None = ...,
 ) -> TextIO: ...
 
 
@@ -85,6 +104,7 @@ def open_url(
     config: Config | None = ...,
     router: Router | None = ...,
     posc: bool = ...,
+    member: str | None = ...,
 ) -> IO[Any]: ...
 
 
@@ -99,6 +119,7 @@ def open_url(
     config: Config | None = None,
     router: Router | None = None,
     posc: bool = False,
+    member: str | None = None,
 ) -> IO[Any] | io.RawIOBase:
     """Open a remote file. Mirrors :func:`open`, including its return types.
 
@@ -114,6 +135,25 @@ def open_url(
     _base, binary, updating = parse_mode(mode)
     _validate_layers(binary, buffering, encoding)
     target = parse(url)
+    selected = member if member is not None else target.query.get("xrdcl.unzip")
+    if selected is not None:
+        if _base != "r" or updating:
+            raise ValueError("a ZIP member can only be opened for reading")
+        from .zip import open_member
+
+        query = {name: value for name, value in target.query.items() if name != "xrdcl.unzip"}
+        archive = target.evolve(query=query)
+        return open_member(
+            archive,
+            selected,
+            binary=binary,
+            buffering=buffering,
+            encoding=encoding,
+            errors=errors,
+            newline=newline,
+            config=config,
+            router=router,
+        )
     remote = _other_protocol(target, mode, buffering, encoding, errors, newline, config)
     if remote is not None:
         return remote
@@ -182,7 +222,7 @@ def _write_window(raw: XRootDRawIO, size: int, buffering: int) -> int:
 
 
 def _xrootd_layers(
-    raw: XRootDRawIO,
+    raw: io.RawIOBase,
     binary: bool,
     updating: bool,
     buffering: int,
@@ -198,7 +238,7 @@ def _xrootd_layers(
     if updating or (raw.readable() and raw.writable()):
         stream = io.BufferedRandom(raw, size)
     elif raw.writable():
-        stream = io.BufferedWriter(raw, _write_window(raw, size, buffering))
+        stream = io.BufferedWriter(raw, _write_window(cast("XRootDRawIO", raw), size, buffering))
     else:
         stream = io.BufferedReader(raw, size)
 

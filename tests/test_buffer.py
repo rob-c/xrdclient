@@ -7,7 +7,7 @@ from xrdclient.proto.buffer import Reader, Writer
 
 
 def test_reader_reads_every_width_big_endian():
-    r = Reader(bytes.fromhex("ff" "fffe" "fffffffd" "fffffffffffffffc"))
+    r = Reader(bytes.fromhex("fffffefffffffdfffffffffffffffc"))
     assert r.u8() == 0xFF
     assert r.u16() == 0xFFFE
     assert r.u32() == 0xFFFFFFFD
@@ -16,7 +16,7 @@ def test_reader_reads_every_width_big_endian():
 
 
 def test_reader_signed_widths():
-    r = Reader(bytes.fromhex("fffe" "fffffffd" "fffffffffffffffc"))
+    r = Reader(bytes.fromhex("fffefffffffdfffffffffffffffc"))
     assert r.i16() == -2
     assert r.i32() == -3
     assert r.i64() == -4
@@ -64,7 +64,7 @@ def test_negative_reads_are_rejected():
 
 def test_writer_is_chainable_and_big_endian():
     out = Writer().u8(1).u16(2).u32(3).i64(-1).bytes()
-    assert out == bytes.fromhex("01" "0002" "00000003" "ffffffffffffffff")
+    assert out == bytes.fromhex("01000200000003ffffffffffffffff")
 
 
 def test_writer_len_tracks_the_buffer():

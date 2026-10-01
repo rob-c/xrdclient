@@ -382,7 +382,9 @@ def _use_third_party(srv, tmp_path):
         return xrdclient.third_party(
             srv.url.with_path("/store/f.root"),
             destination.url.with_path("/pushed.root"),
-            config=CONFIG, verify=False)
+            config=CONFIG,
+            verify=False,
+        )
 
 
 def _use_file(srv, tmp_path):
@@ -436,6 +438,17 @@ def _use_move(srv, tmp):
     return xrdclient.read_text(target, config=CONFIG)
 
 
+def _use_append_zip(srv, tmp):
+    source, archive = tmp / "member", tmp / "surface.zip"
+    source.write_bytes(b"zip me")
+    return xrdclient.append_zip(source, archive).size
+
+
+def _use_parse_metalink(srv, tmp):
+    document = "<metalink><file name='f'><url>file:///tmp/f</url></file></metalink>"
+    return xrdclient.parse_metalink(document).replicas
+
+
 NAMES = {
     "Access": lambda srv, tmp: int(Access.OWNER_READ | Access.OWNER_WRITE) > 0,
     "Checkpoint": _use_checkpoint,
@@ -451,6 +464,7 @@ NAMES = {
     "File": _use_file,
     "FileSystem": lambda srv, tmp: xrdclient.FileSystem(srv.url, CONFIG).close(),
     "LocationInfo": lambda srv, tmp: xrdclient.LocationInfo(address="a:1094").address,
+    "MetalinkFile": lambda srv, tmp: xrdclient.MetalinkFile("f", ("file:///f",)).name,
     "LocateFlags": lambda srv, tmp: LocateFlags.FOR_DIRLIST | LocateFlags.NONE,
     "MkDirFlags": lambda srv, tmp: MkDirFlags.MAKEPATH | MkDirFlags.NONE,
     "OpenFlags": lambda srv, tmp: OpenFlags.READ | OpenFlags.UPDATE,
@@ -472,6 +486,7 @@ NAMES = {
     "XRootDURL": lambda srv, tmp: xrdclient.XRootDURL(host="a", port=1094).endpoint,
     "__version__": lambda srv, tmp: xrdclient.__version__.split(".")[0],
     "aio": _use_aio,
+    "append_zip": _use_append_zip,
     "configure": _use_config,
     "copy": _use_copy,
     "copy_tree": _use_copy_tree,
@@ -482,6 +497,7 @@ NAMES = {
     ).read(),
     "override": _use_config,
     "parse": lambda srv, tmp: xrdclient.parse("root://host:1094//store/f.root").path,
+    "parse_metalink": _use_parse_metalink,
     "third_party": _use_third_party,
     # the one-line verbs
     "ls": lambda srv, tmp: xrdclient.ls(srv.url.with_path("/store"), config=CONFIG),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import os
 import threading
@@ -39,6 +40,13 @@ def test_download_writes_the_local_file(server, tmp_path):
     assert target.read_bytes() == b"hello world"
     assert result.size == 11
     assert result.verified
+
+
+def test_stream_destination_refuses_zero_progress(monkeypatch):
+    monkeypatch.setattr(engine.os, "write", lambda *_: 0)
+    with pytest.raises(OSError) as caught:
+        engine._write_descriptor(123, memoryview(b"payload"))
+    assert caught.value.errno == errno.EIO
 
 
 def test_upload_writes_the_remote_file(src, server):
@@ -622,7 +630,9 @@ def test_a_parallel_download_reassembles_in_order(server, tmp_path):
 def test_a_parallel_transfer_verifies_by_comparing_the_two_files(server, tmp_path):
     server.add_file("/checked.bin", PAYLOAD)
     result = xrdclient.copy(
-        server.url / "checked.bin", tmp_path / "checked.bin", chunk_size=1024,
+        server.url / "checked.bin",
+        tmp_path / "checked.bin",
+        chunk_size=1024,
         config=xrdclient.Config(bulk=False),
     )
     assert result.verified
@@ -689,7 +699,10 @@ def test_a_source_shorter_than_it_claimed_stops_at_its_end(server, tmp_path, mon
     target = tmp_path / "short.bin"
     with pytest.raises(xrdclient.errors.XRootDError, match="incomplete"):
         xrdclient.copy(
-            server.url / "short.bin", target, chunk_size=1024, verify=False,
+            server.url / "short.bin",
+            target,
+            chunk_size=1024,
+            verify=False,
             config=xrdclient.Config(bulk=False),
         )
     assert target.read_bytes() == PAYLOAD
@@ -714,7 +727,9 @@ def test_third_party_emits_the_stock_rendezvous(server):
     """The dialect is the contract: stock XRootD accepts only this order."""
     with FakeServer() as dst:
         result = xrdclient.third_party(
-            server.url / "data/a.root", dst.url / "pulled.root", verify=False,
+            server.url / "data/a.root",
+            dst.url / "pulled.root",
+            verify=False,
         )
 
     assert result.size == 11
@@ -745,7 +760,10 @@ def _assert_rendezvous_order(dst):
 def test_third_party_can_carry_a_token_mode(server):
     with FakeServer() as dst:
         xrdclient.third_party(
-            server.url / "data/a.root", dst.url / "t.root", token_mode="delegate", verify=False,
+            server.url / "data/a.root",
+            dst.url / "t.root",
+            token_mode="delegate",
+            verify=False,
         )
     assert all(p.endswith("&tpc.token_mode=delegate") for p in dst.opened if "tpc.key" in p)
 
@@ -783,7 +801,10 @@ def test_the_root_only_options_are_refused_rather_than_ignored():
     with FakeDAVServer(files={"/d/a.root": b"x"}) as src, FakeDAVServer(dirs=["/d"]) as dst:
         with pytest.raises(ValueError, match="Credential header"):
             xrdclient.third_party(
-                src.url / "d/a.root", dst.url / "d/b.root", token_mode="delegate", verify=False,
+                src.url / "d/a.root",
+                dst.url / "d/b.root",
+                token_mode="delegate",
+                verify=False,
             )
 
 
@@ -791,7 +812,8 @@ def test_third_party_can_demand_an_exclusive_destination(server):
     with FakeServer(files={"/taken.root": b"x"}) as dst:
         with pytest.raises(FileExistsError):
             xrdclient.third_party(
-                server.url / "data/a.root", dst.url / "taken.root", overwrite=False, verify=False)
+                server.url / "data/a.root", dst.url / "taken.root", overwrite=False, verify=False
+            )
 
 
 def test_a_third_party_copy_takes_the_timeout_it_was_given(server, monkeypatch):
@@ -807,7 +829,10 @@ def test_a_third_party_copy_takes_the_timeout_it_was_given(server, monkeypatch):
     monkeypatch.setattr(engine_tpc, "Router", Recording)
     with FakeServer(dirs=["/"]) as dst:
         xrdclient.third_party(
-            server.url / "data/a.root", dst.url / "b.root", timeout=12.5, verify=False,
+            server.url / "data/a.root",
+            dst.url / "b.root",
+            timeout=12.5,
+            verify=False,
         )
     assert seen and set(seen) == {12.5}
 
@@ -850,7 +875,8 @@ def test_persist_on_close_can_be_declined(server):
     """Without ``posc`` the open carries no ``kXR_posc``; the rendezvous is the same."""
     with FakeServer() as dst:
         result = xrdclient.third_party(
-            server.url / "data/a.root", dst.url / "plain.root", posc=False, verify=False)
+            server.url / "data/a.root", dst.url / "plain.root", posc=False, verify=False
+        )
     assert result.size == 11
     assert "/plain.root" in dst.files
 
@@ -1000,7 +1026,9 @@ def test_third_party_names_the_data_servers_it_landed_on_not_the_redirectors(ser
         dst_rdr.redirects[c.kXR_open] = ("127.0.0.1", dst.address[1], "")
         result = xrdclient.third_party(
             f"root://localhost:{src_rdr.address[1]}//data/a.root",
-            f"root://localhost:{dst_rdr.address[1]}//pulled.root", verify=False)
+            f"root://localhost:{dst_rdr.address[1]}//pulled.root",
+            verify=False,
+        )
         (dst_open,) = [p for p in dst.opened if "tpc.key" in p]
         (src_open,) = [p for p in server.opened if "tpc.key" in p]
     assert result.size == 11

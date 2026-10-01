@@ -45,7 +45,5 @@ class HostCredential(Credential):
         return b"host\x00"
 
     @classmethod
-    def available(
-        cls, offer: Offer, config: Config, *, username: str, host: str
-    ) -> HostCredential:
+    def available(cls, offer: Offer, config: Config, *, username: str, host: str) -> HostCredential:
         return cls()

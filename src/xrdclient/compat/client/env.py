@@ -148,6 +148,10 @@ _FIELDS: dict[str, tuple[str, Any]] = {
     "substreamsperchannel": ("data_streams", lambda n: max(int(n) - 1, 0)),
     "dataserverttl": ("pool_idle_ttl", float),
     "readrecovery": ("recover_handles", lambda value: str(value) == "true"),
+    "metalinkprocessing": ("metalink_processing", lambda value: bool(int(value))),
+    "tlsmetalink": ("tls_metalink", lambda value: bool(int(value))),
+    "maxmetalinkwait": ("max_metalink_wait", float),
+    "zipmtlncksum": ("zip_metalink_checksum", lambda value: bool(int(value))),
 }
 
 #: What each key XrdCl registers does here. The ones with a native equivalent
@@ -184,11 +188,11 @@ EFFECTS: dict[str, str] = {
     "PreferIPv4": "none: connections take whichever address the resolver gives first",
     "IPNoShuffle": "none: addresses are tried in the resolver's order",
     "MultiProtocol": "none: every connection negotiates its own protocol",
-    "MetalinkProcessing": "none: metalinks are not supported",
+    "MetalinkProcessing": "Config.metalink_processing",
     "LocalMetalinkFile": "none: metalinks are not supported",
-    "MaxMetalinkWait": "none: metalinks are not supported",
-    "TlsMetalink": "none: metalinks are not supported",
-    "ZipMtlnCksum": "none: metalinks are not supported",
+    "MaxMetalinkWait": "Config.max_metalink_wait",
+    "TlsMetalink": "Config.tls_metalink",
+    "ZipMtlnCksum": "Config.zip_metalink_checksum",
     "XCpBlockSize": "none: extreme copy is not supported",
     "AioSignal": "none: there is no POSIX AIO",
     "PreserveLocateTried": "none: a redirect's tried= CGI is not kept",
@@ -333,14 +337,19 @@ def _settle() -> None:
     _request_timeout = max(int(chosen or 0), 0)
 
 
-def config() -> Config:
-    """A native :class:`Config` with every setting put here applied to it."""
+def _build_config() -> Config:
+    """Build a native configuration without going through the patchable API hook."""
     with _lock:
         put: dict[str, Any] = {**_strings, **_ints}
     changes = {
         _FIELDS[key][0]: _FIELDS[key][1](value) for key, value in put.items() if key in _FIELDS
     }
     return Config(**changes)
+
+
+def config() -> Config:
+    """A native :class:`Config` with every setting put here applied to it."""
+    return _build_config()
 
 
 # -- logging -------------------------------------------------------------------

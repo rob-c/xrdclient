@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import zipfile
 import zlib
 from pathlib import Path
 
@@ -374,6 +375,90 @@ def test_we_read_back_what_xrdcp_wrote(real_server, rfs, sandbox, tmp_path):
     )
     assert rfs.read_bytes(remote) == BLOB
     assert int(rfs.checksum(remote).value, 16) == zlib.adler32(BLOB)
+
+
+def test_xrdcp_extracts_the_zip_member_we_appended(real_server, sandbox, tmp_path):
+    source = tmp_path / "ours.bin"
+    source.write_bytes(BLOB)
+    remote = f"{sandbox}/ours.zip"
+    xrdclient.append_zip(
+        source,
+        url_for(real_server, remote),
+        member="nested/member.bin",
+        config=_REAL_CONFIG,
+    )
+    out = tmp_path / "from-xrdcp.bin"
+    subprocess.run(
+        [
+            _tool("xrdcp"),
+            "-f",
+            "-s",
+            "--zip",
+            "nested/member.bin",
+            url_for(real_server, remote),
+            str(out),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+    assert out.read_bytes() == BLOB
+
+
+def test_we_extract_the_member_xrdcp_appended(real_server, sandbox, tmp_path):
+    source = tmp_path / "theirs.bin"
+    source.write_bytes(BLOB[::-1])
+    remote = f"{sandbox}/theirs.zip"
+    subprocess.run(
+        [
+            _tool("xrdcp"),
+            "-s",
+            "--zip-append",
+            str(source),
+            url_for(real_server, remote),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+    with xrdclient.open(
+        url_for(real_server, remote),
+        "rb",
+        member="theirs.bin",
+        config=_REAL_CONFIG,
+    ) as member:
+        assert member.read() == BLOB[::-1]
+    with zipfile.ZipFile(remote) as archive:
+        assert archive.testzip() is None
+
+
+def test_xrdcp_and_we_follow_the_same_metalink_replicas(real_server, rfs, sandbox, tmp_path):
+    remote = f"{sandbox}/metalink-good.bin"
+    rfs.write_bytes(remote, BLOB)
+    good = url_for(real_server, remote).replace("127.0.0.1", "localhost")
+    descriptor = tmp_path / "replicas.meta4"
+    descriptor.write_text(
+        '<metalink xmlns="urn:ietf:params:xml:ns:metalink">'
+        f'<file name="data.bin"><size>{len(BLOB)}</size>'
+        f'<url priority="1">{url_for(real_server, f"{sandbox}/missing.bin")}</url>'
+        f'<url priority="2">{good}</url>'
+        "</file></metalink>"
+    )
+    ours = tmp_path / "ours-from-metalink.bin"
+    theirs = tmp_path / "theirs-from-metalink.bin"
+
+    result = xrdclient.copy(descriptor, ours, config=_REAL_CONFIG)
+    completed = subprocess.run(
+        [_tool("xrdcp"), "-f", "-s", os.fspath(descriptor), os.fspath(theirs)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert result.replica == good
+    assert ours.read_bytes() == theirs.read_bytes() == BLOB
 
 
 def test_xrdfs_sees_the_directory_we_made(real_server, rfs, sandbox):

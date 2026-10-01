@@ -60,8 +60,9 @@ def test_a_proxy_is_loaded_as_the_client_chain(build, proxy, ca_file):
     context = build(Config(proxy=proxy, ca_file=ca_file))
     assert context.verify_mode is ssl.CERT_REQUIRED
     assert context.check_hostname
-    assert any(dict(cert["subject"][0]).get("commonName") == "Test CA"
-               for cert in context.get_ca_certs())  # the configured CA is in the store
+    assert any(
+        dict(cert["subject"][0]).get("commonName") == "Test CA" for cert in context.get_ca_certs()
+    )  # the configured CA is in the store
 
 
 @pytest.mark.parametrize("build", BUILDERS)
@@ -128,7 +129,6 @@ def test_the_proxy_is_taken_from_the_grid_environment(monkeypatch, tmp_path):
     monkeypatch.setenv("X509_USER_PROXY", str(path))
     assert Config().proxy == str(path)
     assert tls_context(Config()).verify_mode is ssl.CERT_REQUIRED
-
 
 
 def test_with_nothing_named_the_default_proxy_is_presented(monkeypatch, tmp_path):

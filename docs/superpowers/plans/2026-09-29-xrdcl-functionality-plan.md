@@ -29,7 +29,7 @@ topics, every meaningful `EnvPutInt` key; and the `CopyProcess` options
 (`sourcelimit`, `dynamicsource`, `xrate`, `xrateThreshold`, `cptimeout`,
 `inittimeout`, `coerce`) with matching `xrd-cp` flags.
 
-## Phase 2 - ZIP archives (L)
+## Phase 2 - ZIP archives (done, 2026-09-30)
 
 XrdCl reads and writes members of ZIP archives on the server without
 unpacking them: `XrdClZipArchive.cc`, `XrdClZipOperations.hh`,
@@ -47,7 +47,12 @@ unpacking them: `XrdClZipArchive.cc`, `XrdClZipOperations.hh`,
 - Verify: archives made by `zip`, Python's `zipfile` and XrdCl itself, read
   and appended through both clients and checked with `unzip -t`.
 
-## Phase 3 - metalink sources (M)
+Implemented in `io/zip.py` and `copy/zip.py`, including stored and deflated
+reads, bounded seek caching, CRC checks, ZIP64, transactional local and remote
+append, both CLI forms, and bidirectional interoperability tests with stock
+`xrdcp`.
+
+## Phase 3 - metalink sources (done, 2026-09-30)
 
 XrdCl accepts a Metalink file (`.meta4`, `.metalink`, local or remote) as a
 copy source: the replicas it lists become alternative sources, its checksums
@@ -59,6 +64,11 @@ become the expected ones, and a failing replica fails over to the next
   multi-source reader built in phase 1, and verify checksums from the file.
 - Verify: `xrdcp` and `xrd-cp` on the same metalink over two real daemons,
   with one replica removed mid-run.
+
+Implemented with bounded Metalink 3/4 parsing, priority and checksum handling,
+replica failover, wait budgets, TLS upgrades, ZIP composition and the XrdCl
+environment keys. A side-by-side test drives this client and stock `xrdcp`
+through distinct replica host identities on a real daemon.
 
 ## Phase 4 - `xrdcp` and `xrdfs` option parity (M)
 

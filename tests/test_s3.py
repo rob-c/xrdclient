@@ -46,9 +46,7 @@ def bucket():
 @pytest.fixture
 def fs(bucket):
     """A filesystem over it, signing with the credentials it demands."""
-    with S3FileSystem(
-        bucket.url, credentials=CREDENTIALS, endpoint=bucket.endpoint
-    ) as filesystem:
+    with S3FileSystem(bucket.url, credentials=CREDENTIALS, endpoint=bucket.endpoint) as filesystem:
         yield filesystem
 
 
@@ -177,9 +175,7 @@ def test_credentials_come_from_the_environment_when_it_has_them(monkeypatch):
     assert Credentials.discover() == found
 
 
-def test_credentials_come_from_the_shared_file_when_the_environment_is_quiet(
-    tmp_path, monkeypatch
-):
+def test_credentials_come_from_the_shared_file_when_the_environment_is_quiet(tmp_path, monkeypatch):
     monkeypatch.undo()  # the autouse fixture stubs ``from_file`` out
     for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE"):
         monkeypatch.delenv(name, raising=False)
@@ -789,9 +785,7 @@ def test_a_request_that_carries_no_signature_at_all_is_refused(bucket, method, t
         pytest.param(
             {"Authorization": SIGNED.replace(ACCESS, "AKIAWRONGACCOUNTKEY")}, id="wrong-account"
         ),
-        pytest.param(
-            {"Authorization": SIGNED, "x-amz-date": "20240103T030405Z"}, id="stale-scope"
-        ),
+        pytest.param({"Authorization": SIGNED, "x-amz-date": "20240103T030405Z"}, id="stale-scope"),
         pytest.param(
             {
                 "Authorization": SIGNED,

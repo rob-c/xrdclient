@@ -27,7 +27,9 @@ pipe or a socket that cannot seek.
 
 from __future__ import annotations
 
+import errno
 import os
+import stat
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -125,8 +127,17 @@ def _opened(url: XRootDURL, config: Config) -> Iterator[File]:
 class _Transfer:
     """The shared state of one fan-out: progress, restarts, and first error."""
 
-    __slots__ = ("config", "url", "chunk", "depth", "moved", "restarts", "_lock", "_progress",
-                 "total")
+    __slots__ = (
+        "config",
+        "url",
+        "chunk",
+        "depth",
+        "moved",
+        "restarts",
+        "_lock",
+        "_progress",
+        "total",
+    )
 
     def __init__(
         self,
@@ -179,16 +190,21 @@ class _Transfer:
         closing it.
         """
         done = 0
-        recovery = _Recovery(self.config)
+        recovery = _Recovery(self.config, self.chunk)
         while True:
+            attempt_start = done
             try:
                 borrowed, opened = opened, None
                 with (
-                    nullcontext(borrowed) if borrowed is not None
-                    else _opened(self.url, self.config)
-                ) as handle, handle.session.bulk(
-                    handle.handle, chunk=self.chunk, depth=self.depth
-                ) as reader:
+                    (
+                        nullcontext(borrowed)
+                        if borrowed is not None
+                        else _opened(self.url, self.config)
+                    ) as handle,
+                    handle.session.bulk(
+                        handle.handle, chunk=recovery.chunk, depth=self.depth
+                    ) as reader,
+                ):
                     for offset, view in reader.stream(start + done, length - done):
                         consume(offset, view)
                         done += len(view)
@@ -198,18 +214,20 @@ class _Transfer:
                 # span is either complete or the file stopped short of it.
                 return done
             except _TRANSIENT as exc:
-                waiting = recovery.pause()
+                waiting = recovery.pause(made_progress=done > attempt_start)
                 if waiting is None:
                     raise
                 pause, left = waiting
                 self.restarted()
                 _log.warning(
                     "bulk worker on %s lost the server %d bytes into its span at "
-                    "offset %d (%s); resuming in %.1fs, %.0fs of recovery left",
+                    "offset %d (%s); resuming with %d-byte reads in %.1fs, "
+                    "%.0fs of recovery left",
                     self.url.host,
                     done,
                     start,
                     exc,
+                    recovery.chunk,
                     pause,
                     left,
                 )
@@ -226,21 +244,25 @@ class _Recovery:
     sum of outages it already survived.
     """
 
-    __slots__ = ("_backoff", "_budget", "_expires", "_tries")
+    __slots__ = ("_backoff", "_budget", "_expires", "_floor", "_tries", "chunk")
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, chunk: int) -> None:
         self._budget = config.bulk_recovery
         self._backoff = config.retry_backoff
         self._expires = time.monotonic() + self._budget
+        self._floor = min(max(config.bulk_recovery_chunk, 1), chunk)
         self._tries = 0
+        self.chunk = chunk
 
     def progressed(self) -> None:
         """Bytes arrived: the allowance starts again."""
         self._tries = 0
         self._expires = time.monotonic() + self._budget
 
-    def pause(self) -> tuple[float, float] | None:
+    def pause(self, *, made_progress: bool = False) -> tuple[float, float] | None:
         """How long to wait and how much budget is left, or ``None`` to stop."""
+        if not made_progress:
+            self.chunk = max(self._floor, self.chunk // 2)
         self._tries += 1
         left = self._expires - time.monotonic()
         if left <= 0:
@@ -260,7 +282,36 @@ def _seekable(fd: int) -> bool:
 def _write_all(fd: int, view: memoryview) -> None:
     written = 0
     while written < len(view):
-        written += os.write(fd, view[written:])
+        count = os.write(fd, view[written:])
+        if count <= 0:
+            raise OSError(errno.EIO, "local write made no progress")
+        written += count
+
+
+def _preallocate(fd: int, size: int) -> None:
+    """Size a destination, preserving capacity and integrity failures."""
+    try:
+        os.ftruncate(fd, size)
+    except OSError as exc:
+        # Pipes and devices may reject sizing but still accept writes. A
+        # regular file (including FUSE) is different when it reports a real
+        # storage failure. Some filesystems merely do not support pre-sizing;
+        # retain the old grow-as-we-write fallback for those.
+        unsupported = {None, errno.EINVAL, errno.ENOSYS, errno.ESPIPE}
+        if hasattr(errno, "ENOTSUP"):
+            unsupported.add(errno.ENOTSUP)
+        if stat.S_ISREG(os.fstat(fd).st_mode) and exc.errno not in unsupported:
+            raise
+
+
+def _pwrite_all(fd: int, view: memoryview, offset: int) -> None:
+    """Land all of ``view`` or fail if the filesystem stops progressing."""
+    written = 0
+    while written < len(view):
+        count = os.pwrite(fd, view[written:], offset + written)
+        if count <= 0:
+            raise OSError(errno.EIO, "local pwrite made no progress")
+        written += count
 
 
 def _begin(
@@ -393,18 +444,13 @@ def download(
                 depth=depth,
                 size=total,
             )
-        try:
-            os.ftruncate(fd, total)  # one allocation, not a growing file per worker
-        except OSError:
-            pass  # a device that cannot be sized; pwrite still lands where it should
-
-        def writer(offset: int, view: memoryview) -> None:
-            written = 0
-            while written < len(view):
-                written += os.pwrite(fd, view[written:], offset + written)
+        _preallocate(fd, total)  # one allocation, not a growing file per worker
 
         started = time.monotonic()
-        _run(_jobs(transfer, total, count, writer, first) or [lambda: None])
+        _run(
+            _jobs(transfer, total, count, lambda o, v: _pwrite_all(fd, v, o), first)
+            or [lambda: None]
+        )
         elapsed = time.monotonic() - started
 
     if transfer.moved != total:
@@ -488,7 +534,6 @@ def _ordered_run(
     elapsed = time.monotonic() - started
     if transfer.moved != total:
         raise XRootDError(
-            f"{target}: stream ended with {transfer.moved} of {total} bytes; "
-            "the file is incomplete"
+            f"{target}: stream ended with {transfer.moved} of {total} bytes; the file is incomplete"
         )
     return BulkResult(transfer.moved, elapsed, count, transfer.restarts)

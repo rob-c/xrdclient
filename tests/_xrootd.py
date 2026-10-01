@@ -97,9 +97,7 @@ class RealServer:
     # ------------------------------------------------------------------
 
     def start(self) -> RealServer:
-        self._config.write_text(
-            CONFIG.format(port=self.port, root=self.root, admin=self._admin)
-        )
+        self._config.write_text(CONFIG.format(port=self.port, root=self.root, admin=self._admin))
         with self._log.open("wb") as handle:
             self._proc = subprocess.Popen(
                 [str(XROOTD), "-c", str(self._config), "-n", "test"],

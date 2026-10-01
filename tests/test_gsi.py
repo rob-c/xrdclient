@@ -648,7 +648,10 @@ def test_proxy_requests_that_cannot_be_signed_get_a_reason(pki, proxy):
     for request, reason in cases:
         plain = server_reads_sigpxy(
             answer_proxy_request(
-                proxy_request_message(session.key, request), session, proxy, proxy.key,
+                proxy_request_message(session.key, request),
+                session,
+                proxy,
+                proxy.key,
                 allowed=True,
             ),
             session.key,
@@ -671,8 +674,11 @@ def test_a_proxy_request_that_does_not_decrypt_or_has_no_body_is_refused(delegat
     session = Session(b"k" * 16, True)
     with pytest.raises(CredentialError, match="no main buffer"):
         answer_proxy_request(
-            encode_message(STEP_SERVER_PXYREQ, []), session, delegating_proxy,
-            delegating_proxy.key, allowed=True,
+            encode_message(STEP_SERVER_PXYREQ, []),
+            session,
+            delegating_proxy,
+            delegating_proxy.key,
+            allowed=True,
         )
     garbled = encode_message(STEP_SERVER_PXYREQ, [Bucket(BUCKET_MAIN, b"\x00" * 40)])
     with pytest.raises(CredentialError, match="cannot decrypt"):

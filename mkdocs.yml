@@ -1,6 +1,6 @@
 site_name: xrdclient
 site_description: A pure-Python, Pythonic client for XRootD and HEP WebDAV
-site_url: https://example.org/xrdclient/
+site_url: https://rob-c.github.io/xrdclient/
 repo_url: https://github.com/rob-c/xrdclient
 copyright: LGPL-3.0-or-later
 
@@ -60,6 +60,7 @@ nav:
       - Maintainability metrics: maintainability.md
       - Interoperability and parity: interop.md
       - Security: security.md
+      - Releasing: releasing.md
   - Design notes:
       - Design: superpowers/specs/2026-07-31-pyxrootd-client-design.md
       - Roadmap: superpowers/plans/2026-07-31-pyxrootd-client-roadmap.md

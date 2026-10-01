@@ -91,7 +91,8 @@ class Timer:
         for case, rows in cases.items():
             best = min(float(r["seconds"]) for r in rows) or 1e-9  # type: ignore[arg-type]
             parts = " ".join(
-                f"{r['client']}={float(r['seconds']) / best:.2f}x" for r in rows  # type: ignore[arg-type]
+                f"{r['client']}={float(r['seconds']) / best:.2f}x"
+                for r in rows  # type: ignore[arg-type]
             )
             print(f"  {case:<24} {parts}")
 
@@ -155,9 +156,7 @@ def bench_read(timer: Timer, base: str, remote: str, size: int) -> None:
     if shutil.which("xrdcp"):
 
         def tool() -> int:
-            subprocess.run(
-                ["xrdcp", "-f", "-s", url, "/dev/null"], check=True, capture_output=True
-            )
+            subprocess.run(["xrdcp", "-f", "-s", url, "/dev/null"], check=True, capture_output=True)
             return size
 
         timer.run("read whole file", "xrdcp", tool)

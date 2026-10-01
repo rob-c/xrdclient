@@ -299,9 +299,7 @@ class FaultProxy:
             return False, seen
         return self._forward_chunk(client, chunk, seen)
 
-    def _forward_chunk(
-        self, client: socket.socket, chunk: bytes, seen: int
-    ) -> tuple[bool, int]:
+    def _forward_chunk(self, client: socket.socket, chunk: bytes, seen: int) -> tuple[bool, int]:
         """Apply an armed stop or deliver one non-empty server chunk."""
         if self._stall_after is not None and seen >= self._stall_after:
             time.sleep(0.05)

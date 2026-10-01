@@ -266,8 +266,7 @@ def test_reprs_do_not_leak_the_key(proxy_file):
     proxy = load_proxy(str(proxy_file))
     text = repr(proxy)
     assert text == (
-        "ProxyCredential(subject='/DC=org/DC=example/CN=Jane Doe/CN=1234567890', "
-        "key=<redacted>)"
+        "ProxyCredential(subject='/DC=org/DC=example/CN=Jane Doe/CN=1234567890', key=<redacted>)"
     )
     assert str(proxy.key.d) not in text
     assert "der" not in repr(proxy.certificate)  # 2 kB of DER is not a repr

@@ -16,7 +16,7 @@ import pytest
 
 pytest.importorskip("mypy", reason="mypy is part of the dev extra")
 
-SOURCE = '''
+SOURCE = """
 import xrdclient
 
 url = "root://host//store/f.root"
@@ -30,7 +30,7 @@ fs = xrdclient.FileSystem("root://host")
 reveal_type(fs.read_bytes("/f"))
 reveal_type(fs.read_text("/f"))
 reveal_type(xrdclient.XRootDPath(url).stat())
-'''
+"""
 
 EXPECTED = [
     'Revealed type is "bytes"',

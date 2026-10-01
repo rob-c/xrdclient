@@ -33,9 +33,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ._version import __version__
 from .client import Checkpoint, File, FileSystem
 from .config import Config, configure, current, find_config_file, override
-from .copy import CopyResult, SyncMode, copy, copy_tree, third_party
+from .copy import CopyResult, SyncMode, append_zip, copy, copy_tree, third_party
 from .easy import (
     checksum,
     exists,
@@ -61,6 +62,7 @@ from .errors import (
     ConnectionError,
     CredentialError,
     InvalidArgumentError,
+    MetalinkError,
     NoMechanismError,
     NoSpaceError,
     NotFoundError,
@@ -91,6 +93,7 @@ from .flags import (
     StatInfoFlags,
 )
 from .io import open_url as open
+from .metalink import MetalinkFile, parse_metalink
 from .path import XRootDPath
 from .path import XRootDPath as Path  # ``xrdclient.Path`` reads the way pathlib does
 from .session.deadline import OperationExpiredError, deadline
@@ -116,9 +119,6 @@ if TYPE_CHECKING:  # bound at runtime by ``__getattr__`` below, named here so
     # that a type checker and the documentation can both see what they are
     from .doctor import Check, Report, diagnose
 del TYPE_CHECKING  # imported for the block above, not part of the package
-
-__version__ = "0.1.0"
-
 
 #: Names that live in a submodule nobody should pay to import. Each is bound
 #: on first use by :func:`__getattr__`; the value is the module it comes from.
@@ -163,8 +163,12 @@ __all__ = [
     "copy",
     "copy_tree",
     "third_party",
+    "append_zip",
     "CopyResult",
     "SyncMode",
+    "MetalinkFile",
+    "MetalinkError",
+    "parse_metalink",
     # diagnosing
     "diagnose",
     "Check",

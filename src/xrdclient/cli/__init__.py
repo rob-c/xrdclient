@@ -15,6 +15,7 @@ import json
 import sys
 from typing import IO, Any, cast
 
+from .._version import __version__
 from ..config import Config
 from ..url import XRootDURL, parse
 
@@ -29,6 +30,7 @@ __all__ = [
     "interactive",
     "size_arg",
     "common_flags",
+    "version_flag",
     "stdout_bytes",
 ]
 
@@ -138,6 +140,11 @@ def common_flags(parser: argparse.ArgumentParser) -> None:
     asking.add_argument(
         "--no-prompt", action="store_true", help="never ask for credentials; fail instead"
     )
+
+
+def version_flag(parser: argparse.ArgumentParser) -> None:
+    """Add the distribution version without importing the client machinery."""
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
 
 def configure_logging(verbosity: int) -> None:

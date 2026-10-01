@@ -553,8 +553,10 @@ def test_a_directory_is_served_under_both_its_bare_names_and_its_real_paths(tmp_
     (tmp_path / "inner").mkdir()
     server = from_directory(tmp_path, port=0)
     assert set(server.files) == {
-        "/mnist.root", "/notes.txt",
-        (tmp_path / "mnist.root").as_posix(), (tmp_path / "notes.txt").as_posix(),
+        "/mnist.root",
+        "/notes.txt",
+        (tmp_path / "mnist.root").as_posix(),
+        (tmp_path / "notes.txt").as_posix(),
     }
     with server, xrdclient.FileSystem(server.url) as fs:
         assert fs.read_bytes("/mnist.root") == b"pretend ROOT"
@@ -565,7 +567,9 @@ def test_a_pattern_takes_only_the_files_it_names(tmp_path):
     (tmp_path / "a.root").write_bytes(b"one")
     (tmp_path / "b.txt").write_bytes(b"two")
     assert set(from_directory(tmp_path, port=0, pattern="*.root").files) == {
-        "/a.root", (tmp_path / "a.root").as_posix()}
+        "/a.root",
+        (tmp_path / "a.root").as_posix(),
+    }
 
 
 def test_serving_a_directory_from_the_command_line_reads_back_over_the_wire(tmp_path, capsys):

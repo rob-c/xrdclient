@@ -48,6 +48,56 @@ A mismatch raises `ChecksumMismatchError`, which carries both digests.
     serves you wrong bytes can serve you the matching digest. See
     [Security](security.md).
 
+## Metalink sources
+
+A local or remote source ending in `.meta4` or `.metalink` is a virtual
+redirector, as it is in XrdCl. Metalink 3 and 4 descriptors are parsed with
+bounded memory, replicas are tried in their declared priority order, and the
+first supported declared checksum is verified while the bytes move:
+
+```python
+result = xrdclient.copy("dataset.meta4", "/scratch/dataset.root")
+print(result.replica)  # the concrete URL that succeeded
+```
+
+`Config(metalink_processing=False)` copies the descriptor as an ordinary
+file. `tls_metalink=True` upgrades `root` and `xroot` replicas to their TLS
+forms. While another replica remains, `max_metalink_wait` limits how long a
+busy server may answer `kXR_wait`; the last replica retains the normal
+`wait_budget`.
+
+Metalink and ZIP selection compose: `open_url`'s `xrdcl.unzip` selector (or
+`xrd-cp --zip`) is applied to every archive replica. The descriptor checksum
+is ignored for the selected member by default because it normally describes
+the archive; opt in with `zip_metalink_checksum=True` or
+`--zip-mtln-cksum` when the catalogue declares the member checksum instead.
+
+## ZIP members and append
+
+Read one member without downloading the archive around it:
+
+```python
+with xrdclient.open("root://host//store/bundle.zip", "rb", member="run/data.root") as f:
+    header = f.read(4096)
+```
+
+Stored members are served directly by ranged reads. Deflated members are
+inflated progressively into a bounded-memory, disk-spilling seek cache; full
+reads verify size and CRC32. ZIP64, archive prefixes, comments and legacy
+CP437 names are supported.
+
+`append_zip` streams one stored member into a local or `root://` archive and
+rewrites only its central-directory tail:
+
+```python
+xrdclient.append_zip("result.root", "root://host//store/results.zip")
+```
+
+Existing records and comments are preserved byte-for-byte. A failed local
+append restores the old tail; an existing remote archive uses an XRootD
+checkpoint. The command-line forms are `xrd-cp --zip MEMBER` and
+`xrd-cp --zip-append`.
+
 ## Progress
 
 ```python
@@ -71,6 +121,23 @@ xrdclient.copy(src, dst, remove_source=True)  # a move: the source goes after ve
 passed, so a failed digest leaves the original where it was. `dry_run` returns
 a `CopyResult` with the size the source reported and `seconds` of zero, which
 is why its `str` leaves the rate off.
+
+A completed regular local target is synced once before success is reported.
+This makes a late `ENOSPC` or `EIO` from a FUSE cache, network filesystem, or
+failing disk visible before verification and `remove_source`. The barrier is
+outside the chunk loop, so it does not reduce streaming throughput; pipes,
+sockets, and devices are not synced. The synced file's stable size must also
+match the bytes copied, which catches a cache that acknowledges `fsync` without
+publishing its writeback journal.
+
+A read-only local source is reopened at the current proven offset after
+transient `EAGAIN`, `EBUSY`, `EINTR`, `ESTALE`, or `ETIMEDOUT`, bounded by
+`connect_retries` and `retry_backoff`. After the first fault only that reader
+downshifts to 4 KiB requests, so a repeating bad-callback burst cannot starve a
+large read while the healthy path stays unchanged. Reopening is accepted only
+when device, inode, size, and nanosecond modification/change times still name
+the same file generation; a replacement is failed with `ESTALE`, never spliced
+onto bytes already copied.
 
 ## Resuming
 

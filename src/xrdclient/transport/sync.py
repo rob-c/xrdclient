@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import socket
 import ssl
+import weakref
 
 from .._compat import TIMEOUTS
 from .._log import get_logger
@@ -20,10 +21,12 @@ _log = get_logger(__name__)
 class SocketTransport(Transport):
     """A TCP connection, optionally upgraded to TLS."""
 
-    __slots__ = ("_sock", "host", "port")
+    __slots__ = ("__weakref__", "_finalizer", "_sock", "host", "port")
 
     def __init__(self, sock: socket.socket, host: str, port: int) -> None:
         self._sock = sock
+        close = getattr(sock, "close", lambda: None)
+        self._finalizer = weakref.finalize(self, close)
         self.host = host
         self.port = port
 
@@ -79,6 +82,8 @@ class SocketTransport(Transport):
             self._sock = ctx.wrap_socket(self._sock, server_hostname=hostname)
         except ssl.SSLError as exc:
             raise XrdConnectionError(f"TLS handshake with {hostname} failed: {exc}") from exc
+        self._finalizer.detach()
+        self._finalizer = weakref.finalize(self, self._sock.close)
         _log.debug("TLS established with %s (%s)", hostname, self._sock.version())
 
     def settimeout(self, timeout: float | None) -> None:
@@ -89,6 +94,8 @@ class SocketTransport(Transport):
             self._sock.close()
         except OSError:
             pass
+        finally:
+            self._finalizer.detach()
 
     def __repr__(self) -> str:
         kind = "tls" if isinstance(self._sock, ssl.SSLSocket) else "tcp"

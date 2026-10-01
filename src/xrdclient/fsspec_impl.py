@@ -22,9 +22,7 @@ try:
     from fsspec.spec import AbstractFileSystem
     from fsspec.utils import stringify_path
 except ImportError as exc:  # pragma: no cover - exercised by the extra, not by us
-    raise ImportError(
-        "fsspec is not installed; pip install fsspec"
-    ) from exc
+    raise ImportError("fsspec is not installed; pip install fsspec") from exc
 
 from ._compat import zip_strict
 from .client import FileSystem

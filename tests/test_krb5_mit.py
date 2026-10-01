@@ -312,7 +312,8 @@ def _skewed(tmp_path, enctype: int, name: str, seconds: int, micros: int):
 def test_the_ap_req_authenticator_uses_the_kdcs_clock_as_kinit_measured_it(tmp_path, enctype):
     """A host 299.75 s fast still sends xrdcp's authenticator, as MIT's kdc_timesync does."""
     service = next(
-        t for t in _skewed(tmp_path, enctype, "service_ccache", -300, 250_000)
+        t
+        for t in _skewed(tmp_path, enctype, "service_ccache", -300, 250_000)
         if t.server.same_name(SERVICE)
     )
     assert service.kdc_offset == -299.75
@@ -338,7 +339,12 @@ def test_the_tgs_authenticator_uses_the_kdcs_clock_and_the_ticket_keeps_it(tmp_p
 
     clock = float(CAPTURED[str(enctype)]["our_clock"])
     ticket = tgs.request_ticket(
-        tgt, SERVICE, Profile(), etypes=[enctype], clock=lambda: clock - 3600, send=send,
+        tgt,
+        SERVICE,
+        Profile(),
+        etypes=[enctype],
+        clock=lambda: clock - 3600,
+        send=send,
         nonce=12345678,
     )
     assert ticket.kdc_offset == 3600

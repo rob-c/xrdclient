@@ -72,7 +72,7 @@ def test_pack_pages_prefixes_each_page_with_its_crc():
     data = b"a" * (PAGE_SIZE + 10)
     packed = pack_pages(data, 0)
     assert len(packed) == len(data) + 8
-    assert packed[4:4 + PAGE_SIZE] == data[: PAGE_SIZE]
+    assert packed[4 : 4 + PAGE_SIZE] == data[:PAGE_SIZE]
 
 
 def test_pack_unpack_round_trips_on_a_page_boundary():
@@ -495,8 +495,7 @@ def test_a_fresh_signer_starts_its_sequence_at_zero():
         ),
         # a NumericString serial is not a type OpenSSL folds: hashed as written
         (
-            "3028310e300c0603550405120531322033343116301406035504030c0d53657269616c"
-            "20486f6c646572",
+            "3028310e300c0603550405120531322033343116301406035504030c0d53657269616c20486f6c646572",
             "71ca461e",
             "e517d4ed",
         ),

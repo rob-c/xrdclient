@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import re
 
 import pytest
 
@@ -95,6 +96,14 @@ def test_the_command_line_carries_the_configuration():
     config = config_from(args)
     assert (config.token, config.username, config.verify_tls) == ("t", "me", False)
     assert config.prompt is False
+
+
+@pytest.mark.parametrize("parser", [cp_cli._parser, fs_cli._parser])
+def test_commands_report_the_distribution_version(parser, capsys):
+    with pytest.raises(SystemExit) as stopped:
+        parser().parse_args(["--version"])
+    assert stopped.value.code == 0
+    assert re.fullmatch(r"xrd-(?:cp|fs) \d+\.\d+\.\d+\n", capsys.readouterr().out)
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +394,7 @@ def test_no_clobber_refuses_an_existing_target(url, tmp_path, capsys):
 
 def test_json_reports_the_transfer(url, tmp_path, capsys):
     code = cp_cli.main(["--json", url + "data/a.root", str(tmp_path / "o.root")])
-    record, = json.loads(capsys.readouterr().out)
+    (record,) = json.loads(capsys.readouterr().out)
     assert code == 0
     assert record["size"] == len(BODY)
     assert record["verified"] is True
@@ -395,13 +404,13 @@ def test_json_reports_the_transfer(url, tmp_path, capsys):
 def test_verification_can_be_demanded(url, tmp_path, capsys):
     argv = ["--verify", "-a", "adler32", "--json", url + "data/a.root", str(tmp_path / "a")]
     assert cp_cli.main(argv) == 0
-    record, = json.loads(capsys.readouterr().out)
+    (record,) = json.loads(capsys.readouterr().out)
     assert record["checksum"] == "adler32:1a0b045d"
 
 
 def test_verification_can_be_skipped(url, tmp_path, capsys):
     assert cp_cli.main(["--no-verify", "--json", url + "data/a.root", str(tmp_path / "b")]) == 0
-    record, = json.loads(capsys.readouterr().out)
+    (record,) = json.loads(capsys.readouterr().out)
     assert (record["verified"], record["checksum"]) == (False, None)
 
 
@@ -576,7 +585,10 @@ def test_tail_prints_the_last_ten_lines_by_default(lines, capsys):
 
 def test_tail_takes_a_line_count(lines, capsys):
     assert run(["tail", "-n", "2", lines + "data/log.txt"], capsys)[1].split() == [
-        "line", "19", "line", "20",
+        "line",
+        "19",
+        "line",
+        "20",
     ]
 
 

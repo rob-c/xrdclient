@@ -301,7 +301,7 @@ def test_an_external_entity_is_never_fetched(dav, fs):
 def test_a_document_type_hidden_past_the_first_kilobyte_is_still_refused(dav, fs):
     padding = "<!--" + "x" * 2000 + "-->"
     body = (
-        f"{XML}{padding}<!DOCTYPE D:multistatus [<!ENTITY xxe SYSTEM \"{_bait(dav)}\">]>"
+        f'{XML}{padding}<!DOCTYPE D:multistatus [<!ENTITY xxe SYSTEM "{_bait(dav)}">]>'
         '<D:multistatus xmlns:D="DAV:"/>'
     ).encode()
     dav.handlers["PROPFIND"] = canned(body)
@@ -314,7 +314,7 @@ def test_an_entity_declared_past_the_guard_still_fetches_nothing(dav, fs):
     """Belt and braces: :mod:`xml.etree` resolves no external entity either."""
     padding = "<!--" + "x" * 5000 + "-->"
     body = (
-        f"{XML}{padding}<!DOCTYPE D:multistatus [<!ENTITY xxe SYSTEM \"{_bait(dav)}\">]>"
+        f'{XML}{padding}<!DOCTYPE D:multistatus [<!ENTITY xxe SYSTEM "{_bait(dav)}">]>'
         '<D:multistatus xmlns:D="DAV:"><D:response><D:href>&xxe;</D:href>'
         "</D:response></D:multistatus>"
     ).encode()
@@ -326,8 +326,7 @@ def test_an_entity_declared_past_the_guard_still_fetches_nothing(dav, fs):
 
 def test_a_billion_laughs_never_starts_expanding(dav, fs):
     laughs = "".join(
-        f'<!ENTITY lol{i} "&lol{i - 1};&lol{i - 1};&lol{i - 1};&lol{i - 1};">'
-        for i in range(1, 12)
+        f'<!ENTITY lol{i} "&lol{i - 1};&lol{i - 1};&lol{i - 1};&lol{i - 1};">' for i in range(1, 12)
     )
     body = (
         f'{XML}<!DOCTYPE lolz [<!ENTITY lol "lol">{laughs}]>'

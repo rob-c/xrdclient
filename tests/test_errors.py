@@ -120,7 +120,7 @@ def test_pickled_server_error_keeps_code_and_path():
 
 
 def test_a_server_timeout_is_caught_by_the_same_except_as_a_client_one():
-    """"It was slow" reads the same to a caller whichever end gave up first,
+    """ "It was slow" reads the same to a caller whichever end gave up first,
     and both are worth retrying."""
     with pytest.raises(e.TimeoutError) as info:
         e.raise_for_status(e.kXR_ReqTimedOut, "took too long", path="/a")
@@ -133,7 +133,7 @@ def test_a_server_timeout_is_caught_by_the_same_except_as_a_client_one():
 
 
 def test_tls_required_names_the_fix():
-    """"Permission denied" would send someone to chmod; the real fix is one
+    """ "Permission denied" would send someone to chmod; the real fix is one
     scheme change, so the message says which."""
     with pytest.raises(PermissionError) as info:
         e.raise_for_status(e.kXR_TLSRequired, "TLS required", path="/store/f")

@@ -49,6 +49,11 @@ minutes.
 
 | Field | Default | Environment |
 | --- | --- | --- |
+| `bulk_workers` | `2` | `XRD_BULKWORKERS` |
+| `bulk_chunk` | 4 MiB | `XRD_BULKCHUNK` |
+| `bulk_recovery_chunk` | 64 KiB | `XRD_BULKRECOVERYCHUNK` |
+| `bulk_depth` | `4` | `XRD_BULKDEPTH` |
+| `bulk_recovery` | 120 s | `XRD_BULKRECOVERY` |
 | `chunk_size` | 4 MiB | `XRD_CPCHUNKSIZE` |
 | `readahead` | 1 MiB | `XRD_READAHEAD` |
 | `parallel_chunks` | `4` | `XRD_CPPARALLELSPANS` |
@@ -173,6 +178,10 @@ is checked against `ca_path` and the host name first; see
 | `recover_handles` | `True` | silently re-open a read-only file whose data server vanished mid-read |
 | `verify_checksums` | `True` | compare checksums after a copy |
 | `preferred_checksum` | `"adler32"` | algorithm asked for first |
+| `metalink_processing` | `True` | treat `.meta4` and `.metalink` sources as replica catalogues |
+| `tls_metalink` | `False` | upgrade `root`/`xroot` Metalink replicas to TLS |
+| `max_metalink_wait` | `60.0` | `kXR_wait` budget for a replica while another remains |
+| `zip_metalink_checksum` | `False` | with a selected ZIP member, use the Metalink checksum |
 | `s3_folder_markers` | `False` | make `mkdir` on S3 write a zero-length `dir/` marker object |
 `recover_handles=False` turns a lost data server into a `TransientError` at the
 call that hit it, which is what you want when your job would rather fail than

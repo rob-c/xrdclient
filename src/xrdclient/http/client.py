@@ -435,9 +435,7 @@ class HTTPClient:
             response.close()
         return Response(response.status, response.reason, response.msg, payload, str(url))
 
-    def _ask_for_credentials(
-        self, url: XRootDURL, response: http.client.HTTPResponse
-    ) -> bool:
+    def _ask_for_credentials(self, url: XRootDURL, response: http.client.HTTPResponse) -> bool:
         """Ask for what a ``401`` says is needed. ``True`` if worth retrying.
 
         HTTP has no security trailer, so the challenge stands in for one:
@@ -713,9 +711,7 @@ def _url_token(url: XRootDURL) -> str | None:
     return None
 
 
-def _without_credentials(
-    headers: dict[str, str], *, keep_transfer: bool = False
-) -> dict[str, str]:
+def _without_credentials(headers: dict[str, str], *, keep_transfer: bool = False) -> dict[str, str]:
     """``headers`` less any that would authenticate the request.
 
     ``keep_transfer`` keeps the ``TransferHeader*`` family, which a

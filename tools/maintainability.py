@@ -113,9 +113,7 @@ def _npath_expression(node: ast.AST | None) -> int:
         # Short-circuiting can stop after any operand.
         return _sum(_npath_expression(value) for value in node.values)
     if isinstance(node, ast.IfExp):
-        alternatives = _saturating_add(
-            _npath_expression(node.body), _npath_expression(node.orelse)
-        )
+        alternatives = _saturating_add(_npath_expression(node.body), _npath_expression(node.orelse))
         return _saturating_multiply(_npath_expression(node.test), alternatives)
     if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
         return _npath_comprehension(node)
@@ -450,9 +448,7 @@ def _count_text(failures: Sequence[Violation]) -> str:
     return ", ".join(f"{metric}={counts[metric]}" for metric in METRICS)
 
 
-def hotspot_functions(
-    report: Report, limits: Mapping[str, float]
-) -> tuple[FunctionMetrics, ...]:
+def hotspot_functions(report: Report, limits: Mapping[str, float]) -> tuple[FunctionMetrics, ...]:
     result = []
     for function in report.functions:
         if any(float(getattr(function, metric)) > float(limits[metric]) for metric in METRICS):
@@ -551,9 +547,7 @@ def render_csv(report: Report) -> str:
     return output.getvalue()
 
 
-def _ranked_hotspots(
-    report: Report, limits: Mapping[str, float]
-) -> tuple[FunctionMetrics, ...]:
+def _ranked_hotspots(report: Report, limits: Mapping[str, float]) -> tuple[FunctionMetrics, ...]:
     return tuple(
         sorted(
             hotspot_functions(report, limits),
@@ -565,9 +559,7 @@ def _ranked_hotspots(
 
 def _failed_metrics(function: FunctionMetrics, limits: Mapping[str, float]) -> list[str]:
     return [
-        metric
-        for metric in METRICS
-        if float(getattr(function, metric)) > float(limits[metric])
+        metric for metric in METRICS if float(getattr(function, metric)) > float(limits[metric])
     ]
 
 
@@ -655,8 +647,7 @@ def _check(report: Report, policy: Policy) -> int:
         return 0
     hotspot_count = len(hotspot_functions(report, policy.limits))
     print(
-        f"Maintainability violations: {len(failures)} metrics across "
-        f"{hotspot_count} functions",
+        f"Maintainability violations: {len(failures)} metrics across {hotspot_count} functions",
         file=sys.stderr,
     )
     print(f"By metric: {_count_text(failures)}", file=sys.stderr)

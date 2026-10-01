@@ -430,7 +430,10 @@ def _send_blast(peer: socket.socket, blast: bytes) -> None:
 
 def _flood(listener: socket.socket, blast: bytes) -> None:
     while True:
-        peer, _ = listener.accept()
+        try:
+            peer, _ = listener.accept()
+        except OSError:
+            return  # the owning test closed the listener
         threading.Thread(target=_send_blast, args=(peer, blast), daemon=True).start()
 
 
@@ -563,8 +566,13 @@ def test_a_link_too_broken_to_finish_fails_cleanly(broken):
 
     broken.chop(512).flaky(0.9, seed=2)
     stingy = Config(
-        username="tester", auth_order=("host",), request_timeout=1.0, connect_timeout=1.0,
-        connect_retries=3, retry_backoff=0.0, recover_handles=True,
+        username="tester",
+        auth_order=("host",),
+        request_timeout=1.0,
+        connect_timeout=1.0,
+        connect_retries=3,
+        retry_backoff=0.0,
+        recover_handles=True,
     )
     with pytest.raises((XrdConnectionError, TransientError)):
         xrdclient.read_bytes(broken.url.with_path("/data/big.root"), config=stingy)
@@ -577,8 +585,13 @@ def test_a_handle_op_gives_up_after_the_reconnect_budget(broken):
     each re-open fails and the budget runs out - a clear error, not an endless
     loop of reconnects."""
     stingy = Config(
-        username="tester", auth_order=("host",), request_timeout=1.0, connect_timeout=1.0,
-        connect_retries=2, retry_backoff=0.0, recover_handles=True,
+        username="tester",
+        auth_order=("host",),
+        request_timeout=1.0,
+        connect_timeout=1.0,
+        connect_retries=2,
+        retry_backoff=0.0,
+        recover_handles=True,
     )
     with File(broken.url.with_path("/data/big.root"), stingy) as handle:
         assert handle.stat(refresh=True).st_size == len(PAYLOAD)  # healthy link

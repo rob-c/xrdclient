@@ -124,6 +124,12 @@ arrives refills it, so a long transfer is never killed by the sum of the
 outages it already survived, and the wait between attempts doubles up to five
 seconds so that a server which has come back is used promptly.
 
+If a connection repeatedly dies before one whole request lands, the worker
+halves that request towards `bulk_recovery_chunk` (64 KiB by default,
+`XRD_BULKRECOVERYCHUNK`). This matters on a link whose reset probability grows
+with bytes in flight: the healthy path still uses 4 MiB requests, while only
+the damaged connection pays for smaller recovery reads.
+
 The budget deliberately does not cover first contact. Until one request has
 been answered there is nothing to distinguish a server that is restarting from
 a host that does not exist, so a name that does not resolve fails at once

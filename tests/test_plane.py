@@ -478,9 +478,7 @@ def test_a_vector_read_on_a_lost_connection_is_read_again_elsewhere(big, small, 
         assert handle.recoveries == 1
 
 
-def test_a_vector_read_on_a_lost_connection_fails_where_it_cannot_recover(
-    big, small, monkeypatch
-):
+def test_a_vector_read_on_a_lost_connection_fails_where_it_cannot_recover(big, small, monkeypatch):
     with _reader(big, replace(small, recover_handles=False)) as handle:
         _lose_the_first_send(monkeypatch, handle)
         with pytest.raises(TransientError, match="went away"):

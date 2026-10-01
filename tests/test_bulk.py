@@ -9,6 +9,7 @@ lengths, same errors - however differently they get there.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import threading
@@ -17,6 +18,7 @@ import time
 import pytest
 
 import xrdclient
+from xrdclient.client import bulk as bulk_module
 from xrdclient.client.bulk import BulkResult, download, stream
 from xrdclient.client.file import File
 from xrdclient.config import Config
@@ -244,9 +246,7 @@ def test_download_reports_progress(tmp_path, bulk_server, cfg):
         with lock:
             seen.append((done, total))
 
-    download(
-        _url(bulk_server), tmp_path / "p.bin", config=cfg, progress=note
-    )
+    download(_url(bulk_server), tmp_path / "p.bin", config=cfg, progress=note)
     assert seen
     assert seen[-1][0] == len(PAYLOAD)
     assert {total for _, total in seen} == {len(PAYLOAD)}
@@ -434,6 +434,93 @@ def test_an_outage_longer_than_the_old_retry_count_is_survived(tmp_path, bulk_se
     assert target.read_bytes() == PAYLOAD
 
 
+def test_repeated_failures_adapt_the_request_without_changing_the_healthy_size():
+    recovery = bulk_module._Recovery(
+        Config(bulk_recovery=10, bulk_recovery_chunk=64 << 10, retry_backoff=0),
+        4 << 20,
+    )
+    assert recovery.chunk == 4 << 20
+    assert recovery.pause() is not None
+    assert recovery.chunk == 2 << 20
+    assert recovery.pause() is not None
+    assert recovery.chunk == 1 << 20
+    recovery.progressed()
+    assert recovery.pause(made_progress=True) is not None
+    assert recovery.chunk == 1 << 20
+
+
+def test_recovery_request_size_has_a_floor():
+    recovery = bulk_module._Recovery(
+        Config(bulk_recovery=10, bulk_recovery_chunk=64 << 10, retry_backoff=0),
+        1 << 20,
+    )
+    for _ in range(8):
+        assert recovery.pause() is not None
+    assert recovery.chunk == 64 << 10
+
+
+def test_expired_recovery_budget_stops_immediately():
+    recovery = bulk_module._Recovery(
+        Config(bulk_recovery=0, bulk_recovery_chunk=64 << 10, retry_backoff=0),
+        1 << 20,
+    )
+    assert recovery.pause() is None
+    assert recovery.chunk == 512 << 10
+
+
+def test_regular_file_preallocation_preserves_enospc(tmp_path, monkeypatch):
+    fd = os.open(tmp_path / "full", os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+
+        def full(_fd: int, _size: int) -> None:
+            raise OSError(errno.ENOSPC, "filesystem nearly full")
+
+        monkeypatch.setattr(bulk_module.os, "ftruncate", full)
+        with pytest.raises(OSError) as caught:
+            bulk_module._preallocate(fd, 1 << 20)
+        assert caught.value.errno == errno.ENOSPC
+    finally:
+        os.close(fd)
+
+
+def test_non_regular_destination_may_refuse_preallocation(monkeypatch):
+    read_fd, write_fd = os.pipe()
+
+    def unsupported(_fd: int, _size: int) -> None:
+        raise OSError(errno.EINVAL, "not a regular file")
+
+    try:
+        monkeypatch.setattr(bulk_module.os, "ftruncate", unsupported)
+        bulk_module._preallocate(write_fd, 1 << 20)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_stream_write_retries_partial_progress_and_rejects_a_stall(monkeypatch):
+    landed = bytearray()
+
+    def partial(_fd: int, view: memoryview) -> int:
+        count = min(len(view), 2)
+        landed.extend(view[:count])
+        return count
+
+    monkeypatch.setattr(bulk_module.os, "write", partial)
+    bulk_module._write_all(123, memoryview(b"payload"))
+    assert landed == b"payload"
+    monkeypatch.setattr(bulk_module.os, "write", lambda *_: 0)
+    with pytest.raises(OSError) as caught:
+        bulk_module._write_all(123, memoryview(b"payload"))
+    assert caught.value.errno == errno.EIO
+
+
+def test_zero_progress_from_a_local_filesystem_is_eio(monkeypatch):
+    monkeypatch.setattr(bulk_module.os, "pwrite", lambda *_: 0)
+    with pytest.raises(OSError) as caught:
+        bulk_module._pwrite_all(123, memoryview(b"payload"), 0)
+    assert caught.value.errno == errno.EIO
+
+
 def test_a_verified_copy_compares_both_ends(tmp_path, bulk_server, cfg):
     """The fast path is an out-of-order transfer, so it verifies by comparison."""
     target = tmp_path / "verified.bin"
@@ -544,9 +631,7 @@ def test_a_verifiable_stream_is_still_digested(tmp_path, bulk_server, cfg):
     """Where the server does answer, the digest is taken and compared."""
     target = tmp_path / "verified-stream.bin"
     with open(target, "wb") as fh:
-        result = xrdclient.copy(
-            _url(bulk_server), fh, config=cfg, verify=True, algorithm="adler32"
-        )
+        result = xrdclient.copy(_url(bulk_server), fh, config=cfg, verify=True, algorithm="adler32")
     assert target.read_bytes() == PAYLOAD
     assert result.checksum is not None
     assert result.verified

@@ -116,9 +116,7 @@ def encode(req: Request, streamid: int) -> bytes:
     """Serialise ``req`` into a complete wire frame."""
     params = req.header_params()
     if len(params) != 16:
-        raise ProtocolError(
-            f"{type(req).__name__}.params wrote {len(params)} bytes, expected 16"
-        )
+        raise ProtocolError(f"{type(req).__name__}.params wrote {len(params)} bytes, expected 16")
     body = req.payload()
     dlen = len(body) + len(req.path_data())
     if dlen > c.MAX_FRAME_PAYLOAD:

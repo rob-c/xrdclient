@@ -225,6 +225,9 @@ class FakeServer:
         #: The flags are what tell a retransmission (``kXR_pgRetry``) from a
         #: first attempt.
         self.pgwrites: list[tuple[int, int, int]] = []
+        #: ``(path, offset, length)`` of every ordinary read, in order. This
+        #: makes range-sensitive clients testable without changing replies.
+        self.reads: list[tuple[str, int, int]] = []
         #: ``opcode -> (host, port, token)``, consumed once each.
         self.redirects: dict[int, tuple[str, int, str]] = {}
         #: ``opcode -> count`` of ``kXR_wait`` replies to send first.
@@ -374,6 +377,8 @@ class FakeServer:
                 sock.shutdown(socket.SHUT_RDWR)  # type: ignore[attr-defined]
             except OSError:
                 pass
+            finally:
+                sock.close()  # type: ignore[attr-defined]
 
     def stop(self) -> None:
         """Stop serving and release the port. Idempotent."""
@@ -869,7 +874,9 @@ def _h_close(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterato
 
 def _h_read(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
     offset, length = struct.unpack(">qi", params[4:16])
-    data = conn._file(conn._path(params, b"", at=slice(0, 4)))[offset : offset + length]
+    path = conn._path(params, b"", at=slice(0, 4))
+    conn.s.reads.append((path, offset, length))
+    data = conn._file(path)[offset : offset + length]
     step = conn.s.chunk_reads
     if step and len(data) > step:
         for start in range(0, len(data) - step, step):

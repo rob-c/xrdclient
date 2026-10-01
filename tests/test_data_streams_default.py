@@ -17,6 +17,7 @@ Both kinds of server are here: the shared ``server`` fixture is the standard,
 push-only kind, and ``arrival_server`` is one that answers what arrives on the
 path, which is what a BriX gateway does.
 """
+
 from __future__ import annotations
 
 import struct
@@ -46,6 +47,7 @@ def arrival_server():
     with FakeServer(files={"/data/a.root": b"hello world"}) as srv:
         srv.serves_arrivals = True
         yield srv
+
 
 # --------------------------------------------------------------------------
 # The default
@@ -208,9 +210,7 @@ def test_a_server_that_will_not_serve_it_is_asked_once_per_connection(server, mo
     def counting(self, request, *, path="", on_chunk=None, arrive_on_path=False):
         if arrive_on_path:
             asked.append(request)
-        return execute(
-            self, request, path=path, on_chunk=on_chunk, arrive_on_path=arrive_on_path
-        )
+        return execute(self, request, path=path, on_chunk=on_chunk, arrive_on_path=arrive_on_path)
 
     monkeypatch.setattr(Session, "execute", counting)
     config = _fast_multistream()

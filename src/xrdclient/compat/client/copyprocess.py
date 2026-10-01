@@ -261,16 +261,16 @@ def _job_failure(exc: Exception, job: _Job) -> XRootDStatus:
     if named is not None:
         return _named(*named)
     if not isinstance(exc, OSError) or isinstance(exc, errors.XRootDError):
-        return _server_failure(exc, job) if isinstance(exc, errors.ServerError) else (
-            from_exception(exc)
+        return (
+            _server_failure(exc, job)
+            if isinstance(exc, errors.ServerError)
+            else (from_exception(exc))
         )
     eno = exc.errno or 0
     detail = (exc.strerror or str(exc)).lower()
     source = parse(job.source)
     end = "source" if source.is_local and exc.filename == source.path else "destination"
-    return status(
-        errLocalError, errno=_LOCAL_ERRNOS.get(eno, eno), message=f"{detail}:  ({end})"
-    )
+    return status(errLocalError, errno=_LOCAL_ERRNOS.get(eno, eno), message=f"{detail}:  ({end})")
 
 
 def _server_failure(exc: errors.ServerError, job: _Job) -> XRootDStatus:
@@ -302,7 +302,9 @@ def _names_path(url: str, path: str) -> bool:
 #: their own elsewhere: code, XrdCl's words for it, and the job's detail.
 _ENGINE_CODES: dict[type, tuple[int, str, str]] = {
     RateThresholdError: (
-        208, "Threshold exceeded", "The transfer rate dropped below requested threshold!"
+        208,
+        "Threshold exceeded",
+        "The transfer rate dropped below requested threshold!",
     ),
     NoMoreReplicasError: (16, "No more replicas to try", " (source)"),
 }
