@@ -4,7 +4,7 @@ Notable user-visible changes are recorded here. This project follows
 [Semantic Versioning](https://semver.org/); compatibility fixes which make the
 client agree more closely with XrdCl are not considered breaking changes.
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-10-01
 
 ### Added
 
