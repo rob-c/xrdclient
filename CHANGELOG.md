@@ -4,7 +4,7 @@ Notable user-visible changes are recorded here. This project follows
 [Semantic Versioning](https://semver.org/); compatibility fixes which make the
 client agree more closely with XrdCl are not considered breaking changes.
 
-## [0.3.0] - Unreleased
+## [0.3.0] - 2026-10-05
 
 ### Added
 
@@ -111,10 +111,12 @@ client agree more closely with XrdCl are not considered breaking changes.
 
 ### Release readiness and limitations
 
-- Python 3.9.2 is the declared floor, but clean Python 3.9 installs are
-  currently blocked by the botocore/`urllib3>=2.2` dependency conflict. This
-  must be resolved before release; AlmaLinux 8/9 and Stream 9 tests use Python
-  3.12. Native Kerberos extras may require a compiler and headers on Linux.
+- Known limitation: Python 3.9 is the declared floor, but a clean Python 3.9
+  install does not resolve, because botocore pins `urllib3<1.27` there while
+  this release needs `urllib3>=2.2`. Use Python 3.10 or newer; the AlmaLinux
+  8/9 and Stream 9 packages use Python 3.12. The floor will be corrected in
+  a follow-up release. Native Kerberos extras may need a compiler and headers
+  on Linux.
 - VOMS verifies existing assertions; it does not issue them. CA-path checking
   is not full RFC 5280 constraint/CRL validation. pyhanko-certvalidator remains
   deferred to preserve Python 3.9 compatibility. Native-cache forwarding
