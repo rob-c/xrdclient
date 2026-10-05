@@ -6,7 +6,7 @@ plane than the client it replaces.
 
 ## Development setup
 
-Use an isolated environment; the project supports Python 3.9 through 3.14.
+Use an isolated environment; the project supports Python 3.10 through 3.14.
 
 ```console
 $ python3 -m venv .venv

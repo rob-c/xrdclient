@@ -4,12 +4,11 @@ This is the release checklist for maintainers. A tag is a publication request:
 the publish workflow rejects a tag which does not exactly match the runtime and
 wheel version.
 
-The current release is **0.3.0**, paired with xgfalclient 0.3.0. Keep a
-version's changelog entry `Unreleased` until its release is approved. Python
-3.9.2 is still the declared floor although a clean 3.9 install does not
-resolve (botocore pins `urllib3<1.27` there); 0.3.0 shipped with that as a
-documented limitation and the floor is to be corrected in the next release.
-See [Platforms](platforms.md) for the validation scope.
+The current release is **0.3.1**, paired with xgfalclient 0.3.1. Keep a
+version's changelog entry `Unreleased` until its release is approved. The
+declared Python floor is 3.10 (0.3.0 still declared 3.9.2, on which the
+dependencies could not be resolved). See [Platforms](platforms.md) for the
+validation scope.
 
 ## Prepare
 
@@ -24,11 +23,13 @@ See [Platforms](platforms.md) for the validation scope.
    strict docs build and the performance job. For retry, I/O or copy changes,
    also run both BRIX suites described in [Testing](testing.md).
 5. Run the [shared platform/package matrix](platforms.md) against matching
-   candidate refs from both repositories. Build fresh artifacts carrying 0.3.0;
+   candidate refs from both repositories. Build fresh artifacts carrying the
+   release version;
    old 0.2.0 working-tree packages are not final release artifacts. Check the
    paired native-package dependencies, runtime versions and installed commands.
-6. Publish xrdclient first, then xgfalclient with `xrdclient==0.3.0`. Do not
-   change the separate XrdCl/PyXRootD compatibility version to 0.3.0.
+6. Publish xrdclient first, then xgfalclient with its exact `xrdclient==`
+   pin updated to match. Do not change the separate XrdCl/PyXRootD
+   compatibility version to the release version.
 
 ## Validate the artifacts
 

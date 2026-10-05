@@ -153,10 +153,10 @@ that does not implement them says so rather than being guessed at; ordinary
 
 ## Python versions
 
-3.9 and newer, and the floor is 3.9 for one reason: it is what RHEL 9 and
-AlmaLinux 9 ship, which is what a grid login node hands you when you type
-`python3`. There is no `pip install` a user without root can be told to do
-first, so the library runs on the interpreter that is already there.
+3.10 and newer. The code is written to 3.9 syntax - what RHEL 9 and
+AlmaLinux 9 ship as `python3` - but the declared floor is 3.10, because on
+3.9 botocore pins `urllib3<1.27` and this client needs `urllib3>=2.2`; on
+those systems the AppStream `python3.12` package is the one to use.
 
 Nothing about newer syntax is banned in principle; what is banned is being
 unable to notice. A `match` statement, `zip(..., strict=True)` or
@@ -165,7 +165,7 @@ unable to notice. A `match` statement, `zip(..., strict=True)` or
 `tests/test_compat.py` parses every shipped module with the 3.9 grammar,
 reads every module for the handful of spellings that parse anywhere but only
 *run* on 3.10 or later, and - when a `python3.9` is on `PATH` - imports the
-whole package into it. CI runs the full suite on 3.9 through 3.13.
+whole package into it. CI runs the full suite on 3.10 through 3.14.
 
 The two or three things the floor lacks live in `xrdclient._compat`, and nothing
 else in the package names a version:

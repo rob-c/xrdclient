@@ -4,6 +4,20 @@ Notable user-visible changes are recorded here. This project follows
 [Semantic Versioning](https://semver.org/); compatibility fixes which make the
 client agree more closely with XrdCl are not considered breaking changes.
 
+## [0.3.1] - Unreleased
+
+### Changed
+
+- Raised the declared Python floor from 3.9.2 to 3.10. On Python 3.9 botocore
+  pins `urllib3<1.27`, which cannot be satisfied together with this client's
+  `urllib3>=2.2`, so a 3.9 install never resolved; the metadata now says so
+  up front instead of failing in the resolver. Every supported platform
+  package already uses a distribution-provided Python 3.10 or newer
+  (AppStream Python 3.12 on AlmaLinux 8/9 and CentOS Stream 9, the system
+  Python elsewhere), so no deployment target changes. The code is still kept
+  to 3.9 syntax, enforced by the compatibility test.
+- Paired with xgfalclient 0.3.1, which requires `xrdclient==0.3.1`.
+
 ## [0.3.0] - 2026-10-05
 
 ### Added
@@ -167,5 +181,6 @@ client agree more closely with XrdCl are not considered breaking changes.
 - Retry and cleanup paths preserve the primary transfer error and avoid
   leaking failed connections back into the pool.
 
+[0.3.1]: https://github.com/rob-c/xrdclient/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/rob-c/xrdclient/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rob-c/xrdclient/compare/v0.1.0...v0.2.0

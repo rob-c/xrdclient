@@ -359,7 +359,7 @@ $ python -m build && twine check --strict dist/*
 Ruff includes a focused set of high-confidence security checks. Wider generic
 security rules are reviewed rather than enabled blindly because protocol code
 legitimately contains specified hashes, XML parsing and subprocess transports.
-The CI test matrix covers Python 3.9 through 3.14.
+The CI test matrix covers Python 3.10 through 3.14.
 
 ## Maintainability regression test
 

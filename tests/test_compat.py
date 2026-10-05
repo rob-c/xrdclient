@@ -1,7 +1,8 @@
 """The oldest interpreter this package runs on, held to from any of them.
 
-RHEL 9 and AlmaLinux 9 ship Python 3.9, which is what most of the grid's
-login nodes offer, so 3.9 is the floor. Nothing about a newer interpreter
+RHEL 9 and AlmaLinux 9 ship Python 3.9 as ``python3``, so the code is kept
+to 3.9 syntax even though the declared floor is 3.10 (botocore and
+``urllib3>=2.2`` cannot be installed together on 3.9). Nothing about a newer interpreter
 makes code that breaks it fail there - the syntax parses, the ``|`` between
 two classes evaluates, ``zip`` takes its ``strict=`` - which is why the floor
 is checked here rather than trusted to whoever next runs the suite on a login

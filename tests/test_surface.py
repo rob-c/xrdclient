@@ -585,8 +585,8 @@ def _import_names(node: ast.AST) -> list[str]:
 
 
 #: Both purity checks below read the interpreter's own list of standard
-#: library module names, which is 3.10 and later. The package's floor is 3.9,
-#: where the list simply does not exist; every other version still runs them.
+#: library module names, which is 3.10 and later; the code is still kept
+#: 3.9-clean, where the list simply does not exist, so the checks skip there.
 needs_stdlib_names = pytest.mark.skipif(
     not hasattr(sys, "stdlib_module_names"),
     reason="sys.stdlib_module_names arrived in 3.10",

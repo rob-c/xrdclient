@@ -45,11 +45,10 @@ bindings.
 $ pip install xrdclient                 # includes the generic runtime dependencies
 ```
 
-Requires Python 3.9.2+. Runtime dependencies are `botocore`, `PyJWT[crypto]`,
-`urllib3`, `asn1crypto` and `cryptography`.
-The [0.3.0 release notes](CHANGELOG.md) describe the current unreleased
-candidate. Python 3.9 clean installation is currently blocked by the
-botocore/urllib3 dependency conflict; see [platform status](docs/platforms.md).
+Requires Python 3.10+. Runtime dependencies are `botocore`, `PyJWT[crypto]`,
+`urllib3`, `asn1crypto` and `cryptography`. (Python 3.9 cannot install
+botocore together with `urllib3>=2.2`, which is why the floor is 3.10; see
+the [release notes](CHANGELOG.md) and [platform status](docs/platforms.md).)
 XML parsing uses a local declaration-rejecting wrapper around Python's built-in
 parsers; no libxml2, lxml or XML build tools are required. Binary protocol
 records use local, bounds-checked readers and standard-library `struct`.
@@ -61,7 +60,7 @@ installs need a C compiler and Kerberos development headers. The default
 install keeps the portable Kerberos paths without requesting either binding.
 Set `XRD_KRB5_BACKEND=native` to use pykrb5 for credential-cache reads.
 
-CI checks wheel-only dependency resolution for Python 3.9 and 3.14 on
+CI checks wheel-only dependency resolution for Python 3.10 and 3.14 on
 macOS Intel/Apple Silicon, glibc Linux (2.28+) and musl Linux (1.2+), on x86-64
 and ARM64. Clean installs are exercised on Linux and macOS. These gates check
 current releases; they cannot guarantee future upstream wheel availability.

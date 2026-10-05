@@ -1,7 +1,8 @@
 """What the oldest Python this library runs on has not got.
 
-That is 3.9, because it is what RHEL 9 and AlmaLinux 9 ship, and a physicist
-on a login node at a site that runs one of those cannot choose otherwise. The
+The code is kept to 3.9 syntax, because that is what RHEL 9 and AlmaLinux 9
+ship as ``python3``, although the declared floor is 3.10 (the dependencies
+cannot be resolved on 3.9). The
 handful of things 3.10 added that this library would use anyway are written
 out here rather than scattered through it, and where the interpreter has the
 real thing, the real thing is what runs.

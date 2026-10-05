@@ -36,7 +36,7 @@ It is a Python library first and an XRootD binding second.
 $ pip install xrdclient                 # portable base install
 ```
 
-Requires Python 3.9.2+. Runtime dependencies are `botocore`, `PyJWT[crypto]`,
+Requires Python 3.10+. Runtime dependencies are `botocore`, `PyJWT[crypto]`,
 `urllib3`, `asn1crypto` and `cryptography`.
 XML and binary record parsing use local standard-library helpers.
 Native Kerberos bindings are optional:

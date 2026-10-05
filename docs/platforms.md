@@ -28,11 +28,12 @@ for the next Fedora, not a release blocker on its own.
 CentOS Stream 10's x86-64 image needs a v3-capable CPU; AlmaLinux 10 requires
 v2. An incompatible VM CPU is an infrastructure failure, not a client skip.
 
-Python 3.9 remains the declared compatibility floor, but currently cannot
-resolve `botocore` together with `urllib3>=2.2`. The existing Python 3.9 install
-gate deliberately remains red until this is resolved. Do not work around it
-with `--no-deps`, an old urllib3, or a source-only syntax test. Alma 8's default
-Python 3.6 is also unsupported; the distribution jobs select 3.12 explicitly.
+The declared Python floor is 3.10, because on 3.9 botocore pins `urllib3<1.27`
+and the clients need `urllib3>=2.2`. Every row above already uses a
+distribution-provided interpreter of 3.10 or newer, so the floor changes no
+deployment target: AlmaLinux 8/9 and CentOS Stream 9 use their AppStream
+Python 3.12 packages rather than the 3.6/3.9 system interpreters, and the
+other rows use the system Python.
 
 ## Run the Linux matrix
 
@@ -198,5 +199,4 @@ parity cases pass, while GSI *delegation* against a 6.2.0 server fails with
 `Secgsi: ErrSerialBuffer ... kXGC_certreq` for the published 0.2.0 as well as
 this candidate, so that is a pre-existing server-version incompatibility to
 investigate separately rather than a regression. The hosted-runner
-performance gate and the Python 3.9 dependency resolution blocker remain as
-described above.
+performance gate remains as described above.
