@@ -80,11 +80,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {arch: amd64, runner: ubuntu-latest, vm-options: ''}
+          - {arch: amd64, runner: ubuntu-latest, nix-config: ''}
           # The ARM64 hosted runners expose no /dev/kvm. Claiming the feature
-          # lets the test driver run the same VM under QEMU's software
-          # emulation: slower, but a real booted NixOS all the same.
-          - {arch: arm64, runner: ubuntu-24.04-arm, vm-options: --option system-features "nixos-test benchmark big-parallel kvm"}
+          # in the daemon's configuration (a client --option is not honoured
+          # by the multi-user daemon) lets the test driver run the same VM
+          # under QEMU's software emulation: slower, but a real booted NixOS.
+          - {arch: arm64, runner: ubuntu-24.04-arm, nix-config: 'system-features = nixos-test benchmark big-parallel kvm'}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -101,6 +102,7 @@ jobs:
       - uses: cachix/install-nix-action@v31
         with:
           nix_path: nixpkgs=channel:nixos-26.05
+          extra_nix_config: ${{ matrix.nix-config }}
       - name: Record the resolved package set
         run: nix-instantiate --eval -E '(import <nixpkgs> {}).lib.version' | tee nixpkgs-version.txt
       - name: Build both packages and run their full hermetic test suites
@@ -110,7 +112,7 @@ jobs:
       - name: Real NixOS VM installation and CLI tests
         run: >-
           nix-build clients/xrdclient/packaging/nix
-          --arg xgfalclientSrc ./clients/xgfalclient -A nixosTest ${{ matrix.vm-options }}
+          --arg xgfalclientSrc ./clients/xgfalclient -A nixosTest
       - if: always()
         uses: actions/upload-artifact@v4
         with:
