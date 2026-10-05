@@ -8,7 +8,8 @@
     {"name": "ubuntu26", "image": "docker.io/library/ubuntu:26.04", "family": "deb", "python": "python3", "packages": ["python3", "python3-venv", "python3-pip", "dpkg-dev", "passwd", "util-linux", "ca-certificates"]},
     {"name": "centos9-stream", "image": "quay.io/centos/centos:stream9", "family": "rpm", "python": "python3.12", "packages": ["python3.12", "python3.12-pip", "rpm-build", "shadow-utils", "util-linux", "tar"]},
     {"name": "centos10-stream", "image": "quay.io/centos/centos:stream10", "family": "rpm", "python": "python3", "packages": ["python3", "python3-pip", "rpm-build", "shadow-utils", "util-linux", "tar"]},
-    {"name": "fedora", "image": "quay.io/fedora/fedora:44", "family": "rpm", "python": "python3", "packages": ["python3", "python3-pip", "rpm-build", "shadow-utils", "util-linux", "tar"]}
+    {"name": "fedora", "image": "quay.io/fedora/fedora:44", "family": "rpm", "python": "python3", "packages": ["python3", "python3-pip", "rpm-build", "shadow-utils", "util-linux", "tar"]},
+    {"name": "fedora-rawhide", "image": "quay.io/fedora/fedora:rawhide", "family": "rpm", "python": "python3", "packages": ["python3", "python3-pip", "rpm-build", "shadow-utils", "util-linux", "tar"]}
   ],
   "native": ["nixos-26.05", "homebrew-macos-intel", "homebrew-macos-arm64"]
 }

@@ -94,8 +94,9 @@ client agree more closely with XrdCl are not considered breaking changes.
   coverage; existing coverage, maintainability, performance and interop gates
   remain required.
 - Added a shared rootless Podman/Docker runner and coordinated CI for AlmaLinux
-  8/9/10, CentOS Stream 9/10, Ubuntu 24.04/26.04, Fedora 44, NixOS 26.05 and
-  Homebrew on Intel/Apple Silicon. Tests check binary-only dependency resolution,
+  8/9/10, CentOS Stream 9/10, Ubuntu 24.04/26.04, Fedora 44 and Rawhide, NixOS
+  26.05 and Homebrew on Intel/Apple Silicon, on both x86-64 and ARM64. The
+  runner's `--arch` option selects an image architecture locally. Tests check binary-only dependency resolution,
   built-wheel installs, all installed commands, both hermetic suites as a
   non-root user, and native package installation/removal.
 - Added private RPM/DEB deployment bundles, Nix package/VM recipes and
@@ -116,10 +117,15 @@ client agree more closely with XrdCl are not considered breaking changes.
   is not full RFC 5280 constraint/CRL validation. pyhanko-certvalidator remains
   deferred to preserve Python 3.9 compatibility. Native-cache forwarding
   still requires a `FILE:` cache; real-KDC native-cache interop is not yet proven.
-- Pre-version-bump candidates passed all eight RPM/DEB targets, Nix package
-  builds and Intel Homebrew installation tests. Apple Silicon Homebrew and a
-  booted NixOS VM remain CI verification targets. See
+- The 0.3.0 candidates passed all nine RPM/DEB targets natively on ARM64,
+  including Fedora Rawhide on Python 3.15, plus native-VM installs on
+  AlmaLinux 9 and Ubuntu 24.04, the Nix package builds and a booted aarch64
+  NixOS VM test, and Apple Silicon Homebrew installation, `brew test` and
+  command checks. x86-64 artifacts come from the native hosted runners. See
   [the platform guide](docs/platforms.md) for validation scope and skipped tests.
+- GSI proxy delegation against an xrootd 6.2.0 server fails in the server's
+  `kXGC_certreq` handling for 0.2.0 as well as this release; non-delegating
+  GSI logins work. This is tracked as a server-version incompatibility.
 
 ## [0.2.0] - 2026-10-01
 

@@ -6,20 +6,25 @@ The package candidates retain their public APIs and exact
 
 ## Platform matrix
 
-| Platform | Tested interpreter | Deployment artifact |
-| --- | --- | --- |
-| AlmaLinux 8, 9 | AppStream Python 3.12 | Wheel, sdist, RPM |
-| AlmaLinux 10 | Distribution Python | Wheel, sdist, RPM |
-| CentOS Stream 9 | AppStream Python 3.12 | Wheel, sdist, RPM |
-| CentOS Stream 10 | Distribution Python | Wheel, sdist, RPM |
-| Ubuntu 24.04, 26.04 | Distribution Python | Wheel, sdist, DEB |
-| Fedora 44 | Distribution Python | Wheel, sdist, RPM |
-| NixOS 26.05 | Nixpkgs Python 3.12 | Nix derivations and VM test |
-| Homebrew macOS Intel/Apple Silicon | Brew Python 3.14 | Wheel bundles and tap formulae |
+| Platform | Architectures | Tested interpreter | Deployment artifact |
+| --- | --- | --- | --- |
+| AlmaLinux 8, 9 | x86-64, ARM64 | AppStream Python 3.12 | Wheel, sdist, RPM |
+| AlmaLinux 10 | x86-64, ARM64 | Distribution Python | Wheel, sdist, RPM |
+| CentOS Stream 9 | x86-64, ARM64 | AppStream Python 3.12 | Wheel, sdist, RPM |
+| CentOS Stream 10 | x86-64, ARM64 | Distribution Python | Wheel, sdist, RPM |
+| Ubuntu 24.04, 26.04 | x86-64, ARM64 | Distribution Python | Wheel, sdist, DEB |
+| Fedora 44, Rawhide | x86-64, ARM64 | Distribution Python | Wheel, sdist, RPM |
+| NixOS 26.05 | x86-64, ARM64 | Nixpkgs Python 3.12 | Nix derivations and VM test |
+| Homebrew macOS Intel/Apple Silicon | x86-64, ARM64 | Brew Python 3.14 | Wheel bundles and tap formulae |
 
 These are validation targets, not a claim that every row has passed before its
 CI job runs. Container testing checks distribution userspace on the host's
 kernel. The NixOS VM job separately checks an actual booted NixOS installation.
+Every Linux container runs natively on an x86-64 and on an ARM64 hosted
+runner; the RPM, DEB and wheel bundles are architecture-specific, so each
+architecture's artifacts come from its own job. Fedora Rawhide is a moving
+target included to see breakage early; a Rawhide-only failure is a warning
+for the next Fedora, not a release blocker on its own.
 CentOS Stream 10's x86-64 image needs a v3-capable CPU; AlmaLinux 10 requires
 v2. An incompatible VM CPU is an infrastructure failure, not a client skip.
 
@@ -36,10 +41,20 @@ Arrange the two candidate checkouts under one directory, then run:
 ```console
 python3 xrdclient/tools/platforms.py --workspace . --platform alma9 --output results
 python3 xrdclient/tools/platforms.py --workspace . --jobs 2 --output results
+python3 xrdclient/tools/platforms.py --workspace . --arch amd64 --output results-amd64
 ```
 
 Rootless Podman is preferred; `--engine docker` also works. Use a fresh output
-directory for each run. Only the disposable containers install OS packages.
+directory for each run. The default runs the host's own architecture;
+`--arch amd64` or `--arch arm64` selects that image variant and, on a host of
+the other architecture, runs it under the engine's emulation (Rosetta or
+QEMU). Emulated runs are slower and prove the packages, not the kernel; each
+`result.json` records the architecture that was run. Emulation can also stop
+short of the real thing: Ubuntu 26.04's `tar`, for example, uses a system
+call Rosetta does not implement, so its DEB build fails under Docker Desktop
+on Apple Silicon even though the wheels install and the suites pass. A
+failure of that shape is an emulator limit; the native runner in CI is the
+authority for that architecture. Only the disposable containers install OS packages.
 Only the two source checkouts are mounted, read-only; sibling directories are
 not exposed. CI checkouts don't retain GitHub tokens. Containers receive no
 SSH keys, host network or privileged access. Avoid placing secrets in the
@@ -139,28 +154,44 @@ release. No workflow in this matrix publishes packages automatically.
 
 ## Local validation: 2026-10-05
 
-The working-tree candidates passed all eight RPM/DEB targets on x86-64:
-AlmaLinux 8/9/10, Ubuntu 24.04/26.04, CentOS Stream 9/10 and Fedora 44.
-Each passed wheel/sdist checks, a clean binary-only dependency install,
-installed-command JSON/XML and byte-copy checks, both available hermetic
-suites as a non-root user, and native package installation/removal.
+The 0.3.0 candidates (xrdclient and xgfalclient at version 0.3.0, matching
+refs) were validated on an Apple Silicon host, so ARM64 is the natively tested
+architecture in this round and x86-64 ran under emulation.
 
-Those artifacts still carried version 0.2.0 before the development version
-was bumped to 0.3.0; they included the pending changes, not just the published
-0.2.0 tag. Rebuild and validate the final paired 0.3.0 artifacts before release.
+**ARM64, native.** All nine RPM/DEB containers passed: AlmaLinux 8/9/10,
+Ubuntu 24.04/26.04, CentOS Stream 9/10, Fedora 44 and Fedora Rawhide
+(Python 3.15.0rc2). Each passed wheel/sdist checks, a clean binary-only
+dependency install, the installed-command JSON/XML and byte-copy checks, both
+full hermetic suites as a non-root user, and native package installation and
+removal. The AlmaLinux 9 RPMs and Ubuntu 24.04 DEBs were additionally
+installed on real (non-container) AlmaLinux 9.8 and Ubuntu 24.04.4 ARM64
+virtual machines, where the installed-command checks passed and removal left
+no files behind. On Rawhide the development-only maintainability test is
+omitted because Complexipy has no wheel for Python 3.15 yet; every runtime
+test ran.
 
-Both Nix packages built and passed their suites using Nixpkgs
-`26.05.11216.0d9e9b832d03`. The NixOS VM recipe evaluated successfully, but
-no booted VM was verified locally: the Alma guest exposes no `/dev/kvm`.
-The hosted VM job remains unverified until CI runs it.
+**NixOS, ARM64.** Both packages built with Nixpkgs `26.05.11216.0d9e9b832d03`
+and passed their suites; the NixOS VM test booted an aarch64 NixOS and passed
+its installed CLI and copy checks under QEMU software emulation (no KVM in
+the container used to run Nix on macOS).
 
-Intel Homebrew formula installation, formula tests and installed-command
-checks passed. The macOS suites retained their configured 100% line/branch
-coverage gates. Apple Silicon Homebrew is a CI target, not locally verified.
+**Homebrew, Apple Silicon.** Wheel bundles were generated with Brew Python
+3.14, the tap formulae installed from source, `brew test` passed for both
+formulae, and every installed command passed the smoke checks. The full
+hermetic suites also pass on this host with Brew Python 3.13 and 3.14.
+
+**x86-64, emulated.** The same containers were run with `--arch amd64` under
+Docker Desktop's Rosetta emulation; see the note under *Run the Linux matrix*
+for what emulation cannot prove. The hosted x86-64 runners in CI remain the
+authority for x86-64 artifacts.
 
 Optional tests requiring external fault tools, native Kerberos bindings or
 independent oracle executables were skipped where unavailable; their reasons
-are retained in the logs/JUnit reports. Real-server interoperability and
-performance gates were not rerun here; this work changed packaging and test
-fixtures, not client runtime implementations. The Python 3.9 dependency
-resolution blocker above remains unresolved.
+are retained in the JUnit reports. The real-daemon interop suite was run on
+the host against xrootd 6.2.0: the non-delegating GSI, token, Kerberos and
+parity cases pass, while GSI *delegation* against a 6.2.0 server fails with
+`Secgsi: ErrSerialBuffer ... kXGC_certreq` for the published 0.2.0 as well as
+this candidate, so that is a pre-existing server-version incompatibility to
+investigate separately rather than a regression. The hosted-runner
+performance gate and the Python 3.9 dependency resolution blocker remain as
+described above.

@@ -638,6 +638,9 @@ def test_importing_the_package_uses_only_declared_runtime_dependencies():
         "typing_extensions",
         "packaging",
         "sitecustomize",
+        # Fedora's site hook for its split standard library (Python 3.15 on
+        # Rawhide); it is part of the distribution's interpreter, not a dependency.
+        "_missing_stdlib_info",
     }
     script = (
         "import sys; import xrdclient; "

@@ -12,16 +12,40 @@ from pathlib import Path
 MATRIX = Path(__file__).resolve().parents[1] / "packaging/platforms.json"
 
 
+#: Hosted runners for each architecture the CI matrix builds on.
+RUNNERS = {"amd64": "ubuntu-latest", "arm64": "ubuntu-24.04-arm"}
+
+
 def matrix() -> list[dict]:
     return json.loads(MATRIX.read_text(encoding="utf-8"))["containers"]
 
 
-def command(engine: str, workspace: Path, output: Path, target: dict) -> list[str]:
+def ci_matrix() -> dict:
+    """Every container on every architecture, each on its own native runner."""
+    return {
+        "include": [
+            {**target, "arch": arch, "runner": runner}
+            for target in matrix()
+            for arch, runner in RUNNERS.items()
+        ]
+    }
+
+
+ARCHITECTURES = ("amd64", "arm64")
+
+
+def command(
+    engine: str, workspace: Path, output: Path, target: dict, arch: str | None = None
+) -> list[str]:
+    # An explicit architecture selects that image variant and runs it under the
+    # engine's emulation when it differs from the host; the default is native.
+    platform = [f"--platform=linux/{arch}"] if arch else []
     return [
         engine,
         "run",
         "--rm",
         "--pull=always",
+        *platform,
         "--cpus=4",
         "--memory=2g",
         "--pids-limit=2048",
@@ -42,11 +66,11 @@ def command(engine: str, workspace: Path, output: Path, target: dict) -> list[st
     ]
 
 
-def run(engine: str, workspace: Path, output: Path, target: dict) -> dict:
+def run(engine: str, workspace: Path, output: Path, target: dict, arch: str | None = None) -> dict:
     output.mkdir(parents=True, exist_ok=True)
     with (output / "container.log").open("w", encoding="utf-8") as log:
         result = subprocess.run(
-            command(engine, workspace, output, target),
+            command(engine, workspace, output, target, arch),
             stdout=log,
             stderr=subprocess.STDOUT,
             check=False,
@@ -58,6 +82,7 @@ def run(engine: str, workspace: Path, output: Path, target: dict) -> dict:
     report = {
         "platform": target["name"],
         "image": target["image"],
+        "arch": arch or "native",
         "exit_code": result.returncode,
         "ok": result.returncode == 0,
     }
@@ -77,17 +102,22 @@ def main() -> int:
         help="directory containing xrdclient/ and xgfalclient/",
     )
     parser.add_argument("--output", type=Path, default=Path("platform-results"))
-    parser.add_argument("--jobs", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--jobs", type=int, choices=(1, 2, 3, 4), default=1)
+    parser.add_argument(
+        "--arch",
+        choices=ARCHITECTURES,
+        help="image architecture to run (default: the host's own; others need emulation)",
+    )
     parser.add_argument("--platform", action="append", choices=[t["name"] for t in matrix()])
     args = parser.parse_args()
     if args.list:
-        print(json.dumps({"include": matrix()}))
+        print(json.dumps(ci_matrix()))
         return 0
     validate_workspace(parser, args.workspace)
     selected = [t for t in matrix() if not args.platform or t["name"] in args.platform]
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         pending = [
-            pool.submit(run, args.engine, args.workspace, args.output / t["name"], t)
+            pool.submit(run, args.engine, args.workspace, args.output / t["name"], t, args.arch)
             for t in selected
         ]
         reports = [task.result() for task in pending]

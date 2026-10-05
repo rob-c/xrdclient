@@ -98,17 +98,27 @@ redirects are capped by `config.redirect_limit`, `kXR_wait` intervals by
 server cannot hold a client forever or make it buffer an unbounded amount by
 sending a header alone.
 
-**No dependencies and no dynamic execution.** The core imports nothing outside
-the standard library, so there is no third-party supply chain to audit. Nothing
-in the package calls `eval`, `exec`, `pickle`, or `subprocess`, and no code
-path constructs a shell command.
+**A small, vetted dependency set and no dynamic execution.** The runtime
+depends on five maintained, general-purpose libraries - `cryptography`,
+`asn1crypto`, `PyJWT`, `urllib3` and `botocore` - and nothing else outside the
+standard library. Each is pinned to a minimum release in `pyproject.toml`,
+resolved from wheels on every supported platform in CI, and recorded with its
+hash in the deployment bundles, so the supply chain to audit is those five
+projects and their own dependencies. The optional `krb5` extra adds
+`python-gssapi` and `pykrb5` only when asked for. Nothing in the package calls
+`eval`, `exec`, `pickle`, or `subprocess`, and no code path constructs a
+shell command.
 
 **The cryptography is used, not invented.** TLS is `ssl`. Digests are
-`hashlib` and `zlib`. The from-scratch primitives - Blowfish, AES-CBC, RSA,
-DER/X.509 parsing - exist only because the XRootD `sss` and `gsi` handshakes
-specify them on the wire, and they are pinned against test vectors and against
-the real daemon. They are not offered as a general-purpose crypto library and
-`__all__` does not export them for that use.
+`hashlib` and `zlib`. Ciphers, RSA, elliptic-curve and Ed25519 signatures and
+X.509 parsing come from `cryptography`; ASN.1 structures from `asn1crypto`;
+AWS SigV4 signing from `botocore`. What remains local is protocol policy
+rather than primitives: the XRootD `sss` and `gsi` handshake framing, RFC 3820
+proxy rules, VOMS attribute-certificate policy, and the legacy raw-RSA and
+512-bit-key compatibility paths those handshakes still specify on the wire.
+Those are pinned against test vectors and against the real daemon, and are not
+offered as a general-purpose crypto library; `__all__` does not export them
+for that use.
 
 ## Limits you should know about
 

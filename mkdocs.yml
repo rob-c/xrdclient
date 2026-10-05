@@ -1,5 +1,5 @@
 site_name: xrdclient
-site_description: A pure-Python, Pythonic client for XRootD and HEP WebDAV
+site_description: A Python 3, Pythonic client for XRootD (root://, roots://) and HEP WebDAV
 site_url: https://rob-c.github.io/xrdclient/
 repo_url: https://github.com/rob-c/xrdclient
 copyright: LGPL-3.0-or-later

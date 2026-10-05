@@ -1,7 +1,10 @@
-"""A pure-Python XRootD client.
+"""A Python 3 XRootD client.
 
 Speaks the native ``root://`` binary protocol and HTTP/WebDAV, with no
-compiled extension and no XRootD installation required.
+compiled extension of its own and no XRootD installation required. The
+cryptographic, ASN.1, JWT, HTTP-connection and AWS-signing primitives come
+from a small set of maintained libraries (``cryptography``, ``asn1crypto``,
+``PyJWT``, ``urllib3`` and ``botocore``) installed from wheels.
 
     >>> import xrdclient
     >>> with xrdclient.open("root://eos.example.org//store/data.root") as f:

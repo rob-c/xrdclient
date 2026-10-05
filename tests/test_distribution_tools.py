@@ -39,6 +39,7 @@ def test_matrix_covers_every_requested_container_and_native_platform():
         "centos9-stream",
         "centos10-stream",
         "fedora",
+        "fedora-rawhide",
     }
     assert config["native"] == ["nixos-26.05", "homebrew-macos-intel", "homebrew-macos-arm64"]
     assert len({t["name"] for t in config["containers"]}) == len(config["containers"])
@@ -59,6 +60,25 @@ def test_container_uses_readonly_sources_and_no_host_privileges(tmp_path, engine
     assert "--privileged" not in argv and "--network=host" not in argv
     assert "--security-opt=no-new-privileges" in argv
     assert "--pull=always" in argv
+    assert not any(a.startswith("--platform") for a in argv)
+
+
+def test_ci_matrix_runs_every_container_on_both_architectures():
+    include = platforms.ci_matrix()["include"]
+    assert len(include) == 2 * len(platforms.matrix())
+    assert {(e["name"], e["arch"]) for e in include} == {
+        (t["name"], arch) for t in platforms.matrix() for arch in platforms.ARCHITECTURES
+    }
+    for entry in include:
+        assert entry["runner"] == platforms.RUNNERS[entry["arch"]]
+        assert ("arm" in entry["runner"]) is (entry["arch"] == "arm64")
+
+
+@pytest.mark.parametrize("arch", platforms.ARCHITECTURES)
+def test_an_explicit_architecture_selects_that_image_variant(tmp_path, arch):
+    argv = platforms.command("docker", tmp_path, tmp_path / "out", platforms.matrix()[0], arch)
+    assert f"--platform=linux/{arch}" in argv
+    assert argv.index(f"--platform=linux/{arch}") < argv.index(platforms.matrix()[0]["image"])
 
 
 def test_workspace_error_is_actionable(tmp_path):
@@ -99,6 +119,7 @@ def test_runner_retains_failure_logs_and_image_identity(tmp_path, monkeypatch, c
     report = platforms.run("podman", tmp_path, tmp_path / "result", platforms.matrix()[0])
     assert report["ok"] is (code == 0)
     assert report["exit_code"] == code
+    assert report["arch"] == "native"
     assert json.loads((tmp_path / "result/result.json").read_text()) == report
     assert "sha256:test" in (tmp_path / "result/image.json").read_text()
     assert (tmp_path / "result/container.log").is_file()

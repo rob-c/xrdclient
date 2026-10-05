@@ -42,7 +42,8 @@ jobs:
 
   linux:
     needs: matrix
-    runs-on: ubuntu-latest
+    # Each container runs natively on an x86-64 and on an ARM64 hosted runner.
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     strategy:
       fail-fast: false
@@ -69,12 +70,18 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: packages-${{ matrix.name }}
+          name: packages-${{ matrix.name }}-${{ matrix.arch }}
           path: results/
 
   nixos:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: amd64, runner: ubuntu-latest}
+          - {arch: arm64, runner: ubuntu-24.04-arm}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -104,7 +111,7 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nixos
+          name: nixos-${{ matrix.arch }}
           path: |
             nixpkgs-version.txt
             result/test.html

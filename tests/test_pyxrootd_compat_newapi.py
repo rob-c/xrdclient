@@ -755,7 +755,13 @@ def official():
 def test_every_code_name_the_bindings_have_has_their_number(official):
     from XRootD.client.responses import XRootDStatus as Theirs
 
-    names = [n for n in vars(Theirs) if n[:3] in ("err", "suD", "suC", "suR", "suP", "suA", "suN")]
+    # The bindings also grew a ``error_name`` property beside the ``err*`` codes.
+    names = [
+        n
+        for n in vars(Theirs)
+        if n[:3] in ("err", "suD", "suC", "suR", "suP", "suA", "suN")
+        and isinstance(getattr(Theirs, n), int)
+    ]
     assert names and {n: getattr(XRootDStatus, n) for n in names} == {
         n: getattr(Theirs, n) for n in names
     }

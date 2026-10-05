@@ -317,7 +317,7 @@ def _native_ap_req(principal: str, ccache: str) -> bytes:
             creds=creds,
         )
         token = context.step() or b""
-    except (gssapi.exceptions.GSSError, NotImplementedError) as exc:  # type: ignore[attr-defined]
+    except (gssapi.exceptions.GSSError, NotImplementedError) as exc:  # type: ignore[attr-defined,unused-ignore]
         raise CredentialError(
             f"Kerberos authentication could not use {ccache}: {exc}. Run kinit and try again."
         ) from exc
