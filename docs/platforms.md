@@ -86,8 +86,11 @@ snapshot on an older system.
 `xgfalclient` adds its modules, compatibility packages, commands and manual
 pages to that runtime and requires **exactly** the matching Xrd package
 release. Commands run with isolated Python, without the user's `PYTHONPATH`
-or system site-packages. Neither package replaces system Python or writes
-credentials/trust directories.
+or system site-packages. Bytecode is compiled into the package payload and
+the commands run with `-B`, so nothing is written into the runtime after
+installation and package removal leaves no files or directories behind.
+Neither package replaces system Python or writes credentials/trust
+directories.
 
 These are private deployment bundles, **not** recipes ready for submission to
 Fedora/Debian archives. They snapshot dependencies, including native wheels;
@@ -115,7 +118,9 @@ omitted because this package set lacks Complexipy; its repository-wide CI
 gate still runs. The second boots a NixOS VM and tests installed CLI reports
 and transfers. Running Nix inside Podman is useful for the first command but
 does **not** substitute for the VM test. The resolved Nixpkgs version is
-recorded in CI. Binary cache availability depends on the chosen package set;
+recorded in CI. Hosted ARM64 runners have no KVM, so that job claims the
+`kvm` system feature and the VM boots under QEMU software emulation; the
+test is the same, only slower. Binary cache availability depends on the chosen package set;
 arbitrary Nix builds are not promised to be compiler-free.
 
 ## Homebrew

@@ -161,6 +161,18 @@ def test_brew_bundle_has_real_hash_and_only_its_runtime(wheel, tmp_path, name, r
     assert len(manifest) == (1 if name == "xrdclient" else 2)
 
 
+def test_installed_commands_never_write_into_the_packaged_runtime(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda argv, **k: calls.append(argv))
+    stage = tmp_path / "stage"
+    (stage / "opt/storage-clients/bin").mkdir(parents=True)  # what pip would have created
+    info = {"name": "xrdclient", "version": "0.2.0", "scripts": ["xrd-cp"]}
+    packages.stage_runtime(stage, [], info, Path("/usr/bin/python3.12"), "3.12")
+    assert "--compile" in calls[0] and "--no-compile" not in calls[0]
+    wrapper = (stage / "opt/storage-clients/bin/xrd-cp").read_text()
+    assert "exec /usr/bin/python3.12 -I -S -B /opt/storage-clients/launch.py" in wrapper
+
+
 def test_private_launcher_preserves_redhat_and_debian_library_locations():
     text = packages.LAUNCHER.format(minor="3.12")
     assert '("lib", "lib64")' in text
@@ -195,6 +207,22 @@ def test_gfal_reuses_exact_native_runtime_in_rpm_metadata(tmp_path, monkeypatch,
         Path("/usr/bin/python3.12"),
         "0.2.0",
     )
-    assert (
-        f"Requires: xrdclient = 0.2.0-{release}" in (tmp_path / "rpmbuild/package.spec").read_text()
+    spec = (tmp_path / "rpmbuild/package.spec").read_text()
+    assert f"Requires: xrdclient = 0.2.0-{release}" in spec
+    assert "\n/opt/storage-clients/*\n" in spec
+
+
+def test_runtime_rpm_owns_its_directory_so_removal_leaves_nothing(tmp_path, monkeypatch):
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: None)
+    packages.rpm(
+        stage,
+        tmp_path,
+        {"name": "xrdclient", "version": "0.2.0"},
+        Path("/usr/bin/python3.12"),
+        "0.2.0",
     )
+    spec = (tmp_path / "rpmbuild/package.spec").read_text()
+    assert "\n/opt/storage-clients\n" in spec
+    assert "/opt/storage-clients/*" not in spec

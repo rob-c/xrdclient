@@ -47,7 +47,7 @@ if [[ "$family" == rpm ]]; then
 else
     apt-get install -y /artifacts/packages/*.deb
 fi
-"$interpreter" -I -S /opt/storage-clients/launch.py --smoke /work/xrdclient/tools/installed_smoke.py --bin-dir /usr/bin
+"$interpreter" -I -S -B /opt/storage-clients/launch.py --smoke /work/xrdclient/tools/installed_smoke.py --bin-dir /usr/bin
 # Run all hermetic/fault/CLI/VOMS tests as an ordinary user: root would mask
 # permission failures. Real-server interoperability remains a separate CI gate.
 "$runtimepy" -m pip install --only-binary=:all: pytest pytest-cov pytest-timeout pytest-xdist fsspec
@@ -76,5 +76,5 @@ else
 fi
 test ! -e /usr/bin/xrd-cp
 test ! -e /usr/bin/gfal-copy
-test ! -e /opt/storage-clients/launch.py
+test ! -e /opt/storage-clients
 exit "$suite_status"

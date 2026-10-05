@@ -70,7 +70,9 @@ def stage_runtime(stage: Path, wheels: list[Path], info: dict, python: Path, min
             "install",
             "--no-index",
             "--no-deps",
-            "--no-compile",
+            # Bytecode is part of the package payload, so the package manager
+            # owns it and nothing is written into the runtime after install.
+            "--compile",
             "--ignore-installed",
             "--only-binary=:all:",
             "--prefix",
@@ -87,7 +89,7 @@ def stage_runtime(stage: Path, wheels: list[Path], info: dict, python: Path, min
     for script in info["scripts"]:
         wrapper = prefix / "bin" / script
         wrapper.write_text(
-            f'#!/bin/sh\nexec {python} -I -S {PREFIX}/launch.py "$0" "$@"\n', encoding="utf-8"
+            f'#!/bin/sh\nexec {python} -I -S -B {PREFIX}/launch.py "$0" "$@"\n', encoding="utf-8"
         )
         wrapper.chmod(0o755)
         (binary / script).symlink_to(PREFIX / "bin" / script)
@@ -113,6 +115,9 @@ def rpm(stage: Path, output: Path, info: dict, python: Path, native_version: str
         dependencies = f"xrdclient = {native_version}-{release}"
     spec = top / "package.spec"
     manuals = "/usr/share/man/man1/*" if info["name"] == "xgfalclient" else ""
+    # The runtime owner also owns the directory, so removal leaves nothing
+    # behind; the add-on package claims only the files it staged.
+    runtime = str(PREFIX) if info["name"] == "xrdclient" else f"{PREFIX}/*"
     spec.write_text(
         f'''%global __os_install_post %{{nil}}
 Name: {info["name"]}
@@ -129,7 +134,7 @@ Storage client. Dependencies are private wheel snapshots; rebuild for updates.
 mkdir -p "%{{buildroot}}"
 cp -a "{stage}/." "%{{buildroot}}/"
 %files
-/opt/storage-clients/*
+{runtime}
 /usr/bin/*
 /usr/share/doc/{info["name"]}
 {manuals}

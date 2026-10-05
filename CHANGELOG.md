@@ -100,7 +100,9 @@ client agree more closely with XrdCl are not considered breaking changes.
   built-wheel installs, all installed commands, both hermetic suites as a
   non-root user, and native package installation/removal.
 - Added private RPM/DEB deployment bundles, Nix package/VM recipes and
-  compiler-free Homebrew wheel-bundle formula generation. Exact paired package
+  compiler-free Homebrew wheel-bundle formula generation. The bundles ship
+  their bytecode and run with `-B`, and the runtime RPM owns its directory,
+  so removal leaves nothing behind. Exact paired package
   dependencies, dependency inventories/hashes and package release/revision
   increments support coordinated upgrades and dependency security rebuilds.
 - Corrected Linux/macOS test portability: deterministic replica scheduling,
