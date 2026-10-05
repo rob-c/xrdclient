@@ -1102,7 +1102,7 @@ def test_a_third_party_copy_that_does_not_match_fails(url, capsys):
         _answer_checksum(destination, "00000001")
         code = cp_cli.main(["--tpc", "--verify", url + "data/a.root", str(destination.url) + "p"])
     assert code == 1
-    assert "mismatch" in capsys.readouterr().err
+    assert "checksum does not match" in capsys.readouterr().err
 
 
 def test_naming_an_algorithm_for_a_third_party_copy_asks_for_verification(url, capsys):

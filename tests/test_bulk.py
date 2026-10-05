@@ -497,6 +497,16 @@ def test_non_regular_destination_may_refuse_preallocation(monkeypatch):
         os.close(write_fd)
 
 
+def test_preallocation_on_platform_without_enotsup(tmp_path, monkeypatch):
+    def unsupported(fd, size):
+        raise OSError(errno.EINVAL, "preallocation unavailable")
+
+    with open(tmp_path / "data", "wb") as handle:
+        monkeypatch.delattr(errno, "ENOTSUP", raising=False)
+        monkeypatch.setattr(bulk_module.os, "ftruncate", unsupported)
+        bulk_module._preallocate(handle.fileno(), 1024)
+
+
 def test_stream_write_retries_partial_progress_and_rejects_a_stall(monkeypatch):
     landed = bytearray()
 

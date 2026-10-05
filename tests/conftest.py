@@ -56,6 +56,12 @@ def stat_line(size: int = 1024, flags: int = 0, mtime: int = 1_700_000_000) -> b
 
 
 @pytest.fixture(autouse=True)
+def _no_native_cache_backend(monkeypatch):
+    """Use portable caches unless the test explicitly selects native handling."""
+    monkeypatch.delenv("XRD_KRB5_BACKEND", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _no_dotfile(tmp_path_factory, monkeypatch):
     """Keep whoever is running the tests out of them.
 

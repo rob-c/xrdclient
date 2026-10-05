@@ -594,15 +594,18 @@ needs_stdlib_names = pytest.mark.skipif(
 
 
 @needs_stdlib_names
-def test_the_package_needs_nothing_but_the_standard_library():
-    """Pure Python: an interpreter and this package are the whole install list.
-
-    Checked in the source rather than in :data:`sys.modules`, which by now
-    holds whatever every other test has imported. The optional extras -
-    ``fsspec``, ``google_crc32c`` - may be named, but only where a
-    missing one cannot stop the package from importing.
-    """
-    stdlib = set(sys.stdlib_module_names) | {"xrdclient", "_typeshed"}
+def test_the_package_uses_only_declared_runtime_dependencies():
+    """No unguarded imports outside stdlib and the approved generic libraries."""
+    stdlib = set(sys.stdlib_module_names) | {
+        "xrdclient",
+        "_typeshed",
+        "asn1crypto",
+        "botocore",
+        "cryptography",
+        "gssapi",
+        "jwt",
+        "urllib3",
+    }
     offenders = {
         f"{source.name}: {name}"
         for source in pathlib.Path(xrdclient.__file__).parent.rglob("*.py")
@@ -613,16 +616,38 @@ def test_the_package_needs_nothing_but_the_standard_library():
 
 
 @needs_stdlib_names
-def test_importing_the_package_pulls_in_no_third_party_module():
-    """The receipt for the test above, from an interpreter of its own."""
+def test_importing_the_package_uses_only_declared_runtime_dependencies():
+    """Inspect a fresh interpreter, including approved dependencies' imports."""
+    allowed = {
+        "xrdclient",
+        "__main__",
+        "_distutils_hack",
+        "asn1crypto",
+        "botocore",
+        "cryptography",
+        "gssapi",
+        "jwt",
+        "urllib3",
+        "dateutil",
+        "jmespath",
+        "six",
+        "cffi",
+        "_cffi_backend",
+        "_openssl",
+        "decorator",
+        "typing_extensions",
+        "packaging",
+        "sitecustomize",
+    }
     script = (
         "import sys; import xrdclient; "
         "print(sorted({n.split('.')[0] for n in sys.modules} "
-        "- set(sys.stdlib_module_names) - {'xrdclient', '__main__', '_distutils_hack'}))"
+        f"- set(sys.stdlib_module_names) - {allowed!r}))"
     )
-    env = {**os.environ, "PYTHONPATH": str(pathlib.Path(xrdclient.__file__).parent.parent)}
+    paths = (str(pathlib.Path(xrdclient.__file__).parent.parent), os.environ.get("PYTHONPATH"))
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, paths))}
     out = subprocess.run(
-        [sys.executable, "-S", "-c", script],
+        [sys.executable, "-c", script],
         capture_output=True,
         text=True,
         env=env,

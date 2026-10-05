@@ -5,9 +5,9 @@ the client is about to sign a credential for whoever is at the other end, so
 it must first know who that is. This is the check the stock client makes:
 
 * the server's certificate chains, signature by signature, to a CA in the
-  certificate directory (``$X509_CERT_DIR``, else
-  ``/etc/grid-security/certificates``) - the anchors are the ones on disk,
-  never ones that arrived over the wire;
+  certificate directory (``$X509_CERT_DIR``, then the conventional Linux or
+  Homebrew grid-security location) - the anchors are the ones on disk, never
+  ones that arrived over the wire;
 * every certificate on the way is inside its validity period;
 * the certificate names the host the client dialled: its ``CN`` is the host
   or ``<service>/<host>``, or a ``subjectAltName`` DNS name (``*.`` matching
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import sys
 import time
 
 from .der import parse
@@ -41,13 +42,28 @@ class TrustError(ValueError):
     """The server's certificate does not establish who the server is."""
 
 
+def _default_ca_path() -> str:
+    configured = os.environ.get("X509_CERT_DIR")
+    if configured:
+        return configured
+    candidates = [DEFAULT_CA_PATH]
+    if sys.platform == "darwin":
+        candidates.extend(
+            (
+                "/opt/homebrew/etc/grid-security/certificates",
+                "/usr/local/etc/grid-security/certificates",
+            )
+        )
+    return next((path for path in candidates if os.path.isdir(path)), DEFAULT_CA_PATH)
+
+
 def anchors(ca_path: str | None) -> list[Certificate]:
     """Every CA certificate in the directory, from its ``<hash>.<n>`` files.
 
     The same files OpenSSL and XrdCrypto look CAs up by; signing policies,
     CRLs and namespaces files beside them are passed over.
     """
-    directory = ca_path or os.environ.get("X509_CERT_DIR") or DEFAULT_CA_PATH
+    directory = ca_path or _default_ca_path()
     try:
         names = sorted(os.listdir(directory))
     except OSError as exc:

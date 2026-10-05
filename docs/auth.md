@@ -30,8 +30,67 @@ proxy = load_proxy("/tmp/x509up_u1000")
 print(proxy.identity, proxy.remaining() / 3600, "hours left")
 ```
 
-The whole path is pure Python - DER, X.509, RSA, AES - so there is no
-`openssl` to have the wrong version of.
+DER primitives and signature/cipher operations use asn1crypto and cryptography.
+Proxy and VOMS policy remain in the client.
+
+### VOMS attributes
+
+A VOMS proxy is an ordinary RFC 3820 proxy with signed attribute
+certificates in its certificate extensions. The complete proxy chain is
+already sent by `gsi` and by mutual TLS on `roots://`, `xroots://` and
+`davs://`; existing proxies use the same authentication flow.
+
+The attributes can also be inspected and verified locally:
+
+```python
+from xrdclient.crypto import load_proxy, validate_voms
+
+proxy = load_proxy("/tmp/x509up_u1000")
+voms = validate_voms(proxy.chain)
+if not voms.verified:
+    raise RuntimeError(voms.message)
+
+print(voms.vos)
+print(voms.fqans)
+```
+
+`validate_voms` checks the AC version, holder binding through delegated
+parents, validity, the embedded signer and signature, issuer, optional target
+host, signer CA path, unknown critical extensions and the VO's `.lsc` file.
+VOMS server signatures using RSA PKCS#1 with SHA-1 through SHA-512, RSA-PSS,
+ECDSA P-256 with SHA-256, or Ed25519 are accepted; MD5-class, unsupported
+curves and unknown algorithms fail closed.
+Multiple ACs are independent: one bad VO does not discard another verified
+one. `inspect_voms(proxy.chain)` decodes the same VO, FQAN and generic
+attribute data without treating it as trusted.
+
+The CA-chain check currently covers signatures, issuer names and dates,
+not full RFC 5280 extension constraints or certificate revocation lists
+(CRLs). It is not a complete replacement for an established path validator.
+
+`voms.message` explains failures in plain language. `voms.diagnostics`
+exposes stable `code`, `message`, `path` and `errno` fields for missing,
+unreadable or damaged CA files, expired CA/signing certificates, and
+missing, malformed or mismatched `.lsc` files. Expiry dates use UTC.
+Do not repair signer mismatches by trusting certificates copied from a proxy,
+or solve permissions errors by making private keys world-readable.
+
+`xrdclient.crypto.check_vomses(path)` separately checks a vomses file or
+directory: readable UTF-8, five endpoint fields and valid port numbers.
+Its diagnostic tuple reports file paths and malformed line numbers without
+contacting servers. It helps debug obtaining a proxy; using an existing
+proxy never requires vomses. It does not establish endpoint trust or reachability.
+
+Trust directories are found in this order:
+
+1. `$X509_CERT_DIR` and `$X509_VOMS_DIR`;
+2. `/etc/grid-security/certificates` and `/etc/grid-security/vomsdir`;
+3. on macOS, the Apple Silicon Homebrew prefix under `/opt/homebrew/etc`, then
+   the Intel prefix under `/usr/local/etc`.
+
+The CA and VOMS trust material must still be installed at one of those
+locations. This code consumes a proxy minted by a VOMS service; it does not
+request VO assertions, because only that service can sign them.
 
 Which Diffie-Hellman exchange is used is the server's call, as it is for the
 stock client: a server at GSI version 10400 or later (every current one) gets
@@ -57,7 +116,7 @@ variable turns it on. When it is on:
 - the client tells the server it will sign (`kOptsDlgPxy | kOptsSigReq`), so a
   server configured with `-exppxy` asks, whatever its `-dlgpxy` says;
 - it signs nothing until the server's certificate chains to a CA in
-  `ca_path` (`$X509_CERT_DIR`, else `/etc/grid-security/certificates`) and
+  `ca_path` (`$X509_CERT_DIR`, else the Linux/Homebrew grid-security path) and
   names the host dialled - by `CN`, `<service>/<host>` or `subjectAltName`.
   A server that fails either is still logged into, and told "Not allowed to
   sign proxy requests", exactly the stock client's answer;
@@ -167,7 +226,22 @@ client does not create keyrings, so a missing one is no cache; nor does it
 add keys, so a fetched ticket stays in memory, as for a file. Off Linux,
 `KEYRING:` is a `CredentialError` that says so and names the fix.
 
-### What was tested against what
+### Optional native cache handling
+
+Install `xrdclient[krb5]` and set `XRD_KRB5_BACKEND=native` to delegate cache
+selection and reading to pykrb5 (distribution `krb5`). It uses the installed
+MIT/Heimdal library's FILE, DIR, KCM, KEYRING and macOS API support, copies
+credential data into the existing model, preserves flags and clock offsets,
+and never rewrites the cache. Unset that variable to keep the portable reader.
+The XRootD AP-REQ/TGS and forwarding adapters remain; pykrb5 does not expose
+all the APIs needed to replace them. Native binding errors retain their
+numeric code and explain how to check the cache or run kinit.
+
+macOS wheels install without a compiler. Linux installs of this optional
+extra need a C compiler and Kerberos development headers when no compatible
+wheel is available. Normal installs do not request native bindings.
+
+### Portable implementation interoperability evidence
 
 | Claim | Tested against |
 | --- | --- |
@@ -197,7 +271,7 @@ Supported: the AES enctypes - `aes256-cts-hmac-sha1-96`,
 
 | Situation | What to do |
 | --- | --- |
-| a macOS `API:` cache, or `MEMORY:` | `KRB5CCNAME=FILE:/tmp/krb5cc_$(id -u) kinit` |
+| a macOS `API:` cache, or `MEMORY:` | uses python-gssapi for a non-forwarded AP-REQ; requires native-library support. For forwarding, use `KRB5CCNAME=FILE:/tmp/krb5cc_$(id -u) kinit -f` |
 | a `KEYRING:` cache anywhere but Linux | the same |
 | tickets that have expired | `kinit` - the error says how long ago |
 | a realm with no `kdc =` line (DNS SRV lookup is not done) | add `[realms] REALM = { kdc = host }` |

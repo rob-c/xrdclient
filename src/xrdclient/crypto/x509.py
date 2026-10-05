@@ -1,4 +1,4 @@
-"""X.509 certificates and RFC 3820 proxies, parsed in pure Python.
+"""Library-backed X.509 inspection and RFC 3820 proxy compatibility.
 
 GSI needs less of X.509 than it first appears: the handshake echoes the
 proxy chain to the server verbatim, and the *server* validates it. What the
@@ -16,26 +16,39 @@ it is talking to - see :mod:`xrdclient.crypto.trust`.
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+
+from cryptography import x509 as _x509
+from cryptography.exceptions import UnsupportedAlgorithm
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
 
 from .._compat import SLOTS
 from .der import (
     TAG_BIT_STRING,
     TAG_BOOLEAN,
-    TAG_GENERALIZED_TIME,
     TAG_INTEGER,
     TAG_OCTET_STRING,
     TAG_OID,
     TAG_SET,
-    TAG_UTC_TIME,
     DERError,
     Element,
     encode,
+    oid,
     oid_string,
     parse,
+    parse_one,
+    printable_string,
     raw_children,
     read_integer,
     sequence,
+    set_of,
+    tlv,
+    utf8_string,
+)
+from .der import (
+    decode_time as _decode_time,
 )
 from .rsa import RSAPublicKey, pem_blocks, public_key_from_bitstring
 
@@ -43,9 +56,13 @@ __all__ = [
     "Certificate",
     "Extension",
     "Name",
+    "encode_name",
+    "ATTRIBUTE_NAMES",
+    "ATTRIBUTE_OIDS",
     "certificate_fields",
     "decode_name",
     "extensions_of",
+    "parse_certificate",
     "parse_extension",
     "signature_digest",
     "verify_signed",
@@ -57,7 +74,7 @@ __all__ = [
 
 #: The short names OpenSSL prints for the attribute types that appear in
 #: grid subjects. Anything else is rendered by its OID, which is honest.
-_ATTRIBUTE_NAMES = {
+ATTRIBUTE_NAMES = {
     "2.5.4.3": "CN",
     "2.5.4.6": "C",
     "2.5.4.7": "L",
@@ -70,6 +87,8 @@ _ATTRIBUTE_NAMES = {
     "0.9.2342.19200300.100.1.1": "UID",
 }
 
+ATTRIBUTE_OIDS = {short: dotted for dotted, short in ATTRIBUTE_NAMES.items()}
+
 #: ``id-ppl-*`` — the presence of the proxyCertInfo extension is what makes
 #: a certificate an RFC 3820 proxy.
 PROXY_CERT_INFO_OID = "1.3.6.1.5.5.7.1.14"
@@ -79,26 +98,54 @@ LEGACY_PROXY_OID = "1.3.6.1.4.1.3536.1.222"
 
 @dataclass(frozen=True, **SLOTS)
 class Name:
-    """A distinguished name: ordered ``(type, value)`` pairs."""
+    """A distinguished name: ``(type, value)`` pairs plus the DER they came from."""
 
     rdns: tuple[tuple[str, str], ...] = ()
+    der: bytes = field(default=b"", compare=False, repr=False)
 
     @property
     def cn(self) -> str:
-        """The last ``CN``, which for a proxy is ``"proxy"`` or a digit."""
         common = [value for key, value in self.rdns if key == "CN"]
         return common[-1] if common else ""
 
     def get(self, key: str) -> list[str]:
-        """Every value for one attribute type, in order."""
         return [value for name, value in self.rdns if name == key]
 
     def __str__(self) -> str:
-        """OpenSSL's oneline form: ``/DC=org/DC=example/CN=Jane Doe``."""
+        """OpenSSL's one-line form: ``/DC=org/DC=example/CN=Jane Doe``."""
         return "".join(f"/{key}={value}" for key, value in self.rdns)
 
     def __bool__(self) -> bool:
         return bool(self.rdns)
+
+    def encoded(self) -> bytes:
+        return self.der or encode_name(self.rdns)
+
+
+def encode_name(rdns: Sequence[tuple[str, str]]) -> bytes:
+    """A ``Name`` from ``(type, value)`` pairs, one attribute per RDN."""
+    parts = []
+    for key, value in rdns:
+        kind = ATTRIBUTE_OIDS.get(key, key)
+        parts.append(set_of(sequence(oid(kind), _attribute_value(kind, value))))
+    return sequence(*parts)
+
+
+#: Attributes RFC 4519 types as IA5String: domainComponent and emailAddress.
+_IA5_ATTRIBUTES = ("0.9.2342.19200300.100.1.25", "1.2.840.113549.1.9.1")
+
+
+def _attribute_value(kind: str, value: str) -> bytes:
+    if kind in _IA5_ATTRIBUTES:
+        return tlv(0x16, value.encode("ascii"))
+    if _printable(value):
+        return printable_string(value)
+    return utf8_string(value)
+
+
+def _printable(value: str) -> bool:
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 '()+,-./:=?")
+    return bool(value) and all(char in allowed for char in value)
 
 
 def _decode_name(element: Element) -> Name:
@@ -109,8 +156,8 @@ def _decode_name(element: Element) -> Name:
             if len(parts) != 2:
                 continue
             key = oid_string(parts[0])
-            rdns.append((_ATTRIBUTE_NAMES.get(key, key), _decode_string(parts[1])))
-    return Name(tuple(rdns))
+            rdns.append((ATTRIBUTE_NAMES.get(key, key), _decode_string(parts[1])))
+    return Name(tuple(rdns), element.encoded)
 
 
 def _decode_string(element: Element) -> str:
@@ -118,23 +165,6 @@ def _decode_string(element: Element) -> str:
     if element.tag == 0x1E:  # BMPString: UTF-16BE
         return element.value.decode("utf-16-be", "replace")
     return element.value.decode("utf-8", "replace")
-
-
-def _decode_time(element: Element) -> float:
-    """``UTCTime``/``GeneralizedTime`` as a UNIX timestamp."""
-    text = element.value.decode("ascii", "replace").strip()
-    if text.endswith("Z"):
-        text = text[:-1]
-    if element.tag == TAG_UTC_TIME:
-        if len(text) < 10:
-            raise DERError(f"malformed UTCTime {text!r}")
-        year = int(text[:2])
-        text = f"{2000 + year if year < 50 else 1900 + year}{text[2:]}"
-    elif element.tag != TAG_GENERALIZED_TIME:
-        raise DERError(f"tag 0x{element.tag:02x} is not a certificate time")
-    text = (text + "000000")[:14]
-    parsed = time.strptime(text, "%Y%m%d%H%M%S")
-    return float(__import__("calendar").timegm(parsed))
 
 
 @dataclass(frozen=True, **SLOTS)
@@ -188,66 +218,146 @@ class Certificate:
         return str(self.subject)
 
 
-def _parse_certificate(der: bytes) -> Certificate:
-    certificate, _ = parse(der)
-    tbs = certificate.children()[0]
-    fields = tbs.children()
-    index = 1 if fields and fields[0].tag == 0xA0 else 0  # [0] EXPLICIT version
-    _require_certificate_fields(fields, index)
-    serial = read_integer(fields[index]) if fields[index].tag == TAG_INTEGER else 0
-    issuer = _decode_name(fields[index + 2])
-    validity = fields[index + 3].children()
-    _require_validity(validity)
-    subject = _decode_name(fields[index + 4])
-    key = _certificate_key(fields[index + 5])
-    extensions = _extension_oids(fields[index + 6 :])
+def parse_certificate(der: bytes) -> Certificate:
+    """Decode one DER certificate.
+
+    VOMS attribute certificates embed their signing chain as consecutive DER
+    certificates rather than PEM, so callers need the single-certificate
+    decoder as well as :func:`load_certificates`.
+    """
+    data = certificate_data(der)
     return Certificate(
-        subject=subject,
-        issuer=issuer,
-        serial=serial,
-        not_before=_decode_time(validity[0]),
-        not_after=_decode_time(validity[1]),
-        public_key=key,
-        extensions=tuple(extensions),
-        der=der,
+        data.subject,
+        data.issuer,
+        data.serial,
+        data.not_before,
+        data.not_after,
+        data.public_key,
+        data.extensions,
+        data.der,
     )
 
 
-def _require_certificate_fields(fields: list[Element], index: int) -> None:
+# Kept for callers which used the old private test seam.
+_parse_certificate = parse_certificate
+
+
+@dataclass(frozen=True, **SLOTS)
+class CertificateData(Certificate):
+    """One decoded view for both clients; compatibility facades keep their types."""
+
+    extension_values: dict[str, tuple[bool, bytes]] = field(default_factory=dict, repr=False)
+    tbs: bytes = field(default=b"", repr=False)
+    signature: bytes = field(default=b"", repr=False)
+    signature_oid: str = ""
+    spki: bytes = field(default=b"", repr=False)
+
+
+def _library_name(name: _x509.Name) -> Name:
+    return Name(
+        tuple(
+            (ATTRIBUTE_NAMES.get(a.oid.dotted_string, a.oid.dotted_string), str(a.value))
+            for a in name
+        ),
+        name.public_bytes(),
+    )
+
+
+def certificate_data(der: bytes) -> CertificateData:
+    """Decode normal certificates through cryptography, preserving original DER.
+
+    Legacy inspection APIs also accept incomplete names/keys that a strict
+    X.509 loader refuses. Their bounded compatibility decoder is shared here;
+    this function does not establish trust or validate a certificate path.
+    """
+    try:
+        cert = _x509.load_der_x509_certificate(der)
+        extensions = {
+            e.oid.dotted_string: (e.critical, e.value.public_bytes()) for e in cert.extensions
+        }
+    except ValueError:
+        return _legacy_certificate_data(der)
+    try:
+        public = cert.public_key()
+        numbers = public.public_numbers() if isinstance(public, _rsa.RSAPublicKey) else None
+        key = RSAPublicKey(numbers.n, numbers.e) if numbers is not None else None
+        spki = public.public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+    except (ValueError, UnsupportedAlgorithm):
+        return _legacy_certificate_data(der)
+    return CertificateData(
+        _library_name(cert.subject),
+        _library_name(cert.issuer),
+        cert.serial_number,
+        cert.not_valid_before_utc.timestamp(),
+        cert.not_valid_after_utc.timestamp(),
+        key,
+        tuple(extensions),
+        bytes(der),
+        extensions,
+        cert.tbs_certificate_bytes,
+        cert.signature,
+        cert.signature_algorithm_oid.dotted_string,
+        spki,
+    )
+
+
+def _extensions(fields: list[Element]) -> dict[str, tuple[bool, bytes]]:
+    found: dict[str, tuple[bool, bytes]] = {}
+    for extra in fields:
+        if extra.tag != 0xA3:
+            continue
+        for extension in extra.children()[0].children():
+            parts = extension.children()
+            if parts and parts[-1].tag == TAG_OCTET_STRING:
+                critical = (
+                    len(parts) == 3 and parts[1].tag == TAG_BOOLEAN and parts[1].value != b"\x00"
+                )
+                found[oid_string(parts[0])] = (critical, parts[-1].value)
+    return found
+
+
+def _legacy_certificate_data(der: bytes) -> CertificateData:
+    top = parse_one(der).children()
+    if len(top) != 3 or top[0].tag != 0x30 or top[2].tag != TAG_BIT_STRING:
+        raise DERError("not an X.509 certificate")
+    fields = top[0].children()
+    index = 1 if fields and fields[0].tag == 0xA0 else 0
     if len(fields) < index + 6:
         raise DERError("certificate body is missing required fields")
-
-
-def _require_validity(validity: list[Element]) -> None:
+    validity = fields[index + 3].children()
     if len(validity) != 2:
         raise DERError("certificate validity is not a pair of times")
+    spki = fields[index + 5]
+    key = _certificate_key(spki)
+    extensions = _extensions(fields[index + 6 :])
+    return CertificateData(
+        _decode_name(fields[index + 4]),
+        _decode_name(fields[index + 2]),
+        read_integer(fields[index]) if fields[index].tag == TAG_INTEGER else 0,
+        _decode_time(validity[0]),
+        _decode_time(validity[1]),
+        key,
+        tuple(extensions),
+        bytes(der),
+        extensions,
+        top[0].encoded,
+        top[2].value[1:],
+        oid_string(top[1].children()[0]),
+        spki.encoded,
+    )
 
 
-def _certificate_key(element: Element) -> RSAPublicKey | None:
-    spki = element.children()
-    if len(spki) != 2 or spki[1].tag != TAG_BIT_STRING:
-        return None
-    try:
-        return public_key_from_bitstring(spki[1])
-    except DERError:
-        return None  # an EC or DSA certificate: readable, just not RSA
-
-
-def _extension_oids(extras: list[Element]) -> list[str]:
-    extensions: list[str] = []
-    for extra in extras:
-        if extra.tag == 0xA3:  # [3] EXPLICIT extensions
-            extensions.extend(_extension_block(extra))
-    return extensions
-
-
-def _extension_block(extra: Element) -> list[str]:
-    result = []
-    for extension in extra.children()[0].children():
-        parts = extension.children()
-        if parts:
-            result.append(oid_string(parts[0]))
-    return result
+def _certificate_key(spki: Element) -> RSAPublicKey | None:
+    parts = spki.children()
+    key: RSAPublicKey | None = None
+    if len(parts) == 2 and parts[1].tag == TAG_BIT_STRING:
+        try:
+            key = public_key_from_bitstring(parts[1])
+        except DERError:
+            pass
+    return key
 
 
 def load_certificates(data: bytes | str) -> list[Certificate]:
@@ -262,7 +372,7 @@ def load_certificates(data: bytes | str) -> list[Certificate]:
         if label != "CERTIFICATE":
             continue
         try:
-            out.append(_parse_certificate(der))
+            out.append(parse_certificate(der))
         except (DERError, ValueError):
             continue
     return out
@@ -368,8 +478,7 @@ class Extension:
 
 def decode_name(der: bytes) -> Name:
     """A DER ``Name`` as a :class:`Name`."""
-    element, _ = parse(der)
-    return _decode_name(element)
+    return _decode_name(parse_one(der))
 
 
 # The string types OpenSSL folds to lower-case UTF-8 before hashing a name

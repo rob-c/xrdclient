@@ -1093,11 +1093,13 @@ def test_an_https_endpoint_gets_a_tls_connection():
     """Nothing is dialled here - only the kind of connection is at issue."""
     import http.client as stdlib
 
+    import xrdclient.http.client as client_module
+
     with HTTPClient(Config()) as client:
         secure = client._connect(parse("https://h.example/f.root"))
         plain = client._connect(parse("http://h.example/f.root"))
-    assert isinstance(secure, stdlib.HTTPSConnection)
-    assert isinstance(plain, stdlib.HTTPConnection)
+    assert isinstance(secure, client_module.HTTPSConnection)
+    assert isinstance(plain, client_module.HTTPConnection)
     assert not isinstance(plain, stdlib.HTTPSConnection)
 
 

@@ -69,11 +69,27 @@ except xrdclient.ServerError as exc:
     exc.message     # the server's own text
     exc.path        # what we asked about
     exc.errno       # errno.ENOENT
-    str(exc)        # 'kXR_NotFound: no such file or directory [/store/missing]'
+    str(exc)        # plain explanation, path, server detail and numeric XRootD code
 ```
 
-`str()` names the wire code, so a bug report says what the server actually
-said. The `errno` is there because `OSError` promises it.
+`str()` starts with a plain explanation and a safe next step, then includes
+the path, server detail and numeric XRootD code. The original server text
+remains in `message`; `code`, `errno`, exception types and pickling are unchanged.
+Use these fields in programs instead of parsing display wording.
+
+## Writing useful messages
+
+Messages should serve physicists and first-time administrators. Explain what
+failed, identify the affected file or service, and suggest a short, safe next
+step. Put protocol internals in detail fields rather than making the user decode
+an opcode. Never suggest disabling certificate checks or trusting a certificate
+copied from an untrusted proxy. Tests should check the cause, path, numeric code
+and action, not just that an exception was raised.
+
+VOMS diagnostics distinguish a missing `.lsc` file, a damaged or expired CA
+certificate, a permissions problem and missing endpoint configuration. An expiry
+message includes a UTC date. Missing `vomses` is a setup issue for obtaining a
+proxy, not a reason to reject an already-issued one. See [Authentication](auth.md).
 
 Exceptions pickle correctly, which matters when they cross a
 `concurrent.futures` or `multiprocessing` boundary and you want the code and
@@ -119,7 +135,7 @@ except xrdclient.NoMechanismError as exc:
     print(exc)
     exc.offered    # ['gsi', 'unix'] - what the server said it would take
     exc.tried      # {'gsi': 'there is no file at /tmp/x509up_u1000; try: ...'}
-# no usable authentication mechanism (server offered: gsi, unix)
+# Login failed. No available authentication method succeeded (server methods: gsi, unix)
 # [gsi: there is no file at /tmp/x509up_u1000; try: voms-proxy-init -voms
 #  <your VO>, or point $X509_USER_PROXY at one; unix: refused]
 ```

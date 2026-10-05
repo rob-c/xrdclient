@@ -25,6 +25,7 @@ import contextvars
 import difflib
 import getpass
 import os
+import sys
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import MISSING, Field, dataclass, field, fields, replace
@@ -50,6 +51,21 @@ DEFAULTS_SECTION = "defaults"
 #: INI, and a literal token in a dotfile is a secret in every backup of it -
 #: ``token_file`` says the same thing without copying the bearer around.
 _NOT_IN_FILES = {"prompter": "it is a callable", "token": "use token_file instead"}
+
+
+def _grid_ca_path() -> str | None:
+    configured = os.environ.get("X509_CERT_DIR")
+    if configured:
+        return configured
+    candidates = ["/etc/grid-security/certificates"]
+    if sys.platform == "darwin":
+        candidates.extend(
+            (
+                "/opt/homebrew/etc/grid-security/certificates",
+                "/usr/local/etc/grid-security/certificates",
+            )
+        )
+    return next((path for path in candidates if os.path.isdir(path)), None)
 
 
 def _env_flag(name: str) -> bool | None:
@@ -357,7 +373,7 @@ class Config:
         default_factory=lambda: os.environ.get("XrdSecSSSKT") or os.environ.get("XrdSecsssKT")
     )
     proxy: str | None = field(default_factory=lambda: os.environ.get("X509_USER_PROXY"))
-    ca_path: str | None = field(default_factory=lambda: os.environ.get("X509_CERT_DIR"))
+    ca_path: str | None = field(default_factory=_grid_ca_path)
     ca_file: str | None = field(default_factory=lambda: os.environ.get("SSL_CERT_FILE"))
     auth_order: Sequence[str] = ("gsi", "ztn", "krb5", "sss", "unix", "host")
     verify_tls: bool = True

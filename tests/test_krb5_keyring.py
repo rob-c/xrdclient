@@ -510,7 +510,23 @@ def test_a_cache_laid_out_by_keyutils_is_read_through_the_real_syscall():
         done = subprocess.run(["keyctl", *argv], input=stdin, capture_output=True, check=True)
         return done.stdout.decode().strip()
 
-    collection = run("newring", f"_krb_{tag}", "@s")
+    probe = subprocess.run(
+        ["keyctl", "newring", f"_krb_{tag}", "@s"],
+        env={**os.environ, "LC_ALL": "C"},
+        capture_output=True,
+    )
+    denied = any(
+        message in probe.stderr
+        for message in (
+            b"Operation not permitted",
+            b"Permission denied",
+            b"Function not implemented",
+        )
+    )
+    if probe.returncode and denied:
+        pytest.skip("This container or kernel cannot create session keyrings")
+    probe.check_returncode()
+    collection = probe.stdout.decode().strip()
     try:
         cache = run("newring", tag, collection)
         run("padd", "user", "__krb5_princ__", cache, stdin=marshal_principal(JANE))

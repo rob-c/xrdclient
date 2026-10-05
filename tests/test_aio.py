@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 
 import pytest
@@ -41,7 +42,10 @@ def test_the_sync_package_does_not_import_asyncio():
     import subprocess
 
     done = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, env={"PYTHONPATH": "src"}
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env={"PYTHONPATH": os.pathsep.join(filter(None, ("src", os.environ.get("PYTHONPATH"))))},
     )
     assert done.returncode == 0, done.stderr
 

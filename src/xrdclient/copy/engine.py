@@ -12,13 +12,12 @@ from __future__ import annotations
 import errno
 import io
 import os
-import queue
 import stat as stat_module
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, replace
 from fnmatch import fnmatch
 from typing import IO, Any, Literal, cast
@@ -41,6 +40,8 @@ from ..session.bulk import BulkUnsupported
 from ..types import ChecksumInfo
 from ..url import XRootDURL, parse
 from . import replicas
+from ._pipeline import fill as _fill
+from ._pipeline import pump as _pump
 from .limits import Limits, Pace, _Stop
 
 __all__ = ["copy", "copy_tree", "CopyResult", "SyncMode"]
@@ -750,118 +751,6 @@ def _bulk_to_stream(
 # ---------------------------------------------------------------------------
 # The pump
 # ---------------------------------------------------------------------------
-
-
-def _fill(reader: IO[bytes], buffer: bytearray) -> int:
-    """One chunk of the source into ``buffer``; how many bytes arrived."""
-    readinto = getattr(reader, "readinto", None)
-    if readinto is not None:
-        return cast("int", readinto(buffer) or 0)
-    data = reader.read(len(buffer))  # a stream that only implements read()
-    buffer[: len(data)] = data
-    return len(data)
-
-
-def _chunks(reader: IO[bytes], chunk_size: int) -> Iterator[memoryview]:
-    """The source, one chunk at a time, into a buffer the loop reuses.
-
-    Each piece is only valid until the next one is asked for, which is all the
-    pump needs and is what lets one buffer serve the whole transfer.
-    """
-    buffer = bytearray(chunk_size)
-    view = memoryview(buffer)
-    while count := _fill(reader, buffer):
-        yield view[:count]
-
-
-class _Ahead:
-    """A thread that reads the next chunks while the last one is written.
-
-    A read and a write are both round trips, and doing them strictly in turn
-    means each waits out the other: over a long link that halves the rate for
-    no reason but the shape of the loop. A window ``depth`` chunks deep lets
-    them overlap, so a transfer goes at the slower of its two ends rather than
-    at their sum. It costs ``depth`` buffers of memory and one thread, which is
-    why it is worth turning off (``config.in_flight = 1``) for a copy between
-    two local files, where there is no latency to hide.
-
-    The chunks come out in the order they were read - one thread reads, and the
-    queue is a queue - so the digest the pump computes is still the file's.
-    """
-
-    def __init__(self, reader: IO[bytes], chunk_size: int, depth: int) -> None:
-        self._reader = reader
-        self._chunk_size = chunk_size
-        self._ready: queue.Queue[memoryview | BaseException | None] = queue.Queue(depth)
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._read, name="xrd-readahead", daemon=True)
-
-    def __enter__(self) -> Iterator[memoryview]:
-        self._thread.start()
-        return self._drain()
-
-    def __exit__(self, *exc: object) -> None:
-        """Stop reading. The thread may be blocked on a full queue, so empty it."""
-        self._stop.set()
-        while self._thread.is_alive():
-            with suppress(queue.Empty):
-                self._ready.get(timeout=0.05)
-        self._thread.join()
-
-    def _read(self) -> None:
-        try:
-            while True:
-                buffer = bytearray(self._chunk_size)  # a fresh one: the last is in flight
-                count = _fill(self._reader, buffer)
-                # Nothing left to read, or nobody left to read it for.
-                if not count or not self._offer(memoryview(buffer)[:count]):
-                    break
-        except BaseException as exc:
-            self._offer(exc)
-        finally:
-            self._offer(None)
-
-    def _offer(self, item: memoryview | BaseException | None) -> bool:
-        """Hand one item over, unless the consumer has stopped wanting them."""
-        while not self._stop.is_set():
-            with suppress(queue.Full):
-                self._ready.put(item, timeout=0.05)
-                return True
-        return False
-
-    def _drain(self) -> Iterator[memoryview]:
-        while True:
-            item = self._ready.get()
-            if item is None:
-                return
-            if isinstance(item, BaseException):
-                raise item
-            yield item
-
-
-def _pump(
-    reader: IO[bytes],
-    writer: IO[bytes],
-    total: int | None,
-    chunk_size: int,
-    progress: Progress | None,
-    digest: Any,
-    depth: int = 1,
-) -> int:
-    """Move every byte, digesting and reporting as it goes."""
-    source: AbstractContextManager[Iterator[memoryview]] = (
-        _Ahead(reader, chunk_size, depth) if depth > 1 else nullcontext(_chunks(reader, chunk_size))
-    )
-    done = 0
-    with source as pieces:
-        for piece in pieces:
-            writer.write(piece)
-            if digest is not None:
-                digest.update(piece)
-            done += len(piece)
-            if progress is not None:
-                progress(done, total)
-    return done
 
 
 class _Dynamic:

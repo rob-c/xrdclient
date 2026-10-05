@@ -1,8 +1,8 @@
 # xrdclient
 
-A pure-Python client for XRootD. `root://`, `roots://`, `https://`, HEP
-WebDAV and `s3://`, spoken by the same objects, with no compiled extension, no
-`libXrdCl`, and no third-party import in the core.
+A Python 3 client for XRootD. `root://`, `roots://`, `https://`, HEP
+WebDAV and `s3://`, spoken by the same objects. General-purpose libraries own parsing and
+cryptographic primitives.
 
 ```python
 import xrdclient
@@ -33,18 +33,25 @@ It is a Python library first and an XRootD binding second.
 ## Install
 
 ```console
-$ pip install xrdclient                 # the whole library, Kerberos included
+$ pip install xrdclient                 # portable base install
 ```
 
-Python 3.9 or newer - the version RHEL 9 and AlmaLinux 9 ship, so a grid
-login node needs nothing installed but this. Almost nothing needs an extra:
-`http://`, `https://` and WebDAV are `http.client`, and GSI / X.509 proxies
-are pure Python down to the AES and the RSA. Kerberos is the single
-exception, because a Kerberos token can only honestly be tested against a
-live KDC.
+Requires Python 3.9.2+. Runtime dependencies are `botocore`, `PyJWT[crypto]`,
+`urllib3`, `asn1crypto` and `cryptography`.
+XML and binary record parsing use local standard-library helpers.
+Native Kerberos bindings are optional:
+`pip install 'xrdclient[krb5]'` installs python-gssapi and pykrb5. macOS has
+wheels; Linux source installs need Kerberos development headers and a compiler.
+CI checks base dependency wheels for Intel/ARM64 macOS, glibc and musl Linux.
+
+The maintained libraries own AWS signing, JWT claim decoding, DER primitives,
+cipher/curve operations and connection setup/TLS. Protocol-specific GSI,
+RFC 3820/VOMS policy, redirects and upload handshakes remain thin client adapters.
 
 ## Where to go next
 
+- **[JSON/XML command output](output.md)** - typed reports for every command,
+  including errors, staging states, progress and binary stdout.
 - **[Easy mode](easy.md)** - fifteen one-line verbs on a URL, for when there
   is one question to ask and no reason to learn a class first.
 - **[Quickstart](quickstart.md)** - the ten things you will actually do.

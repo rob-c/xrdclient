@@ -87,7 +87,10 @@ class NoMechanismError(AuthenticationError):
         self.offered = offered
         self.tried = tried or {}
         detail = "; ".join(f"{k}: {v}" for k, v in self.tried.items())
-        msg = f"no usable authentication mechanism (server offered: {', '.join(offered) or 'none'})"
+        msg = (
+            "Login failed. No available authentication method succeeded "
+            f"(server methods: {', '.join(offered) or 'none'})"
+        )
         super().__init__(f"{msg} [{detail}]" if detail else msg)
 
     def __reduce__(self) -> tuple:  # type: ignore[type-arg]
@@ -119,7 +122,10 @@ class ChecksumMismatchError(XRootDError):
     """A computed checksum did not match the expected one."""
 
     def __init__(self, algorithm: str, expected: str, actual: str) -> None:
-        super().__init__(f"{algorithm} mismatch: expected {expected}, got {actual}")
+        super().__init__(
+            f"The {algorithm} checksum does not match: expected {expected}, got {actual}. "
+            "Check the source file before copying it again."
+        )
         self.algorithm = algorithm
         self.expected = expected
         self.actual = actual
@@ -201,10 +207,11 @@ class ServerError(XRootDError):
             self.args = (self._describe(),)
 
     def _describe(self) -> str:
-        name = _CODE_NAMES.get(self.code, f"kXR_unknown({self.code})")
+        summary = _USER_ERRORS.get(self.code, "The server could not complete the request.")
         where = f" [{self.path}]" if self.path else ""
         note = f" ({self.hint})" if self.hint else ""
-        return f"{name}: {self.message}{where}{note}"
+        detail = f" Server: {self.message}" if self.message else ""
+        return f"{summary}{where}{detail} (XRootD error {self.code}){note}"
 
     def __reduce__(self) -> tuple:  # type: ignore[type-arg]
         # ``OSError.__reduce__`` would round-trip through ``(errno, strerror)``
@@ -332,6 +339,52 @@ kXR_ReqTimedOut = 3034
 kXR_TimerExpired = 3035
 
 _CODE_NAMES = {v: k for k, v in list(globals().items()) if k.startswith("kXR_")}
+
+# Plain-language summaries; the exact server response remains in ``message``.
+_USER_ERRORS: dict[int, str] = {
+    kXR_ArgInvalid: "A setting is invalid. Check the command and configuration.",
+    kXR_ArgMissing: "A required setting is missing. Check the command and configuration.",
+    kXR_ArgTooLong: "A setting or path is too long. Use a shorter value.",
+    kXR_FileLocked: "The file is locked. Try again later or contact the storage administrator.",
+    kXR_FileNotOpen: "The file is no longer open. Reopen it before continuing.",
+    kXR_FSError: "The storage reported a failure. Check its status or contact the administrator.",
+    kXR_InvalidRequest: "The server could not accept this request. Check the command and settings.",
+    kXR_IOError: "The server could not read or write the file. Check the storage status.",
+    kXR_NoMemory: "The server is short of memory. Try again later or contact its administrator.",
+    kXR_NoSpace: "Storage is full. Free space or choose another destination.",
+    kXR_NotAuthorized: "Access denied. Check your credentials and permission to use this path.",
+    kXR_NotFound: "File or folder not found. Check the path.",
+    kXR_ServerError: (
+        "The server reported a failure. Check its status or contact its administrator."
+    ),
+    kXR_Unsupported: "This operation is not supported by the server. Check its available features.",
+    kXR_noserver: "No storage server is available. Check the endpoint or try again later.",
+    kXR_NotFile: "This path is not the required file type. Check the path.",
+    kXR_isDirectory: "This path names a folder, not a file. Choose a file path.",
+    kXR_Cancelled: "The operation was canceled.",
+    kXR_ItExists: (
+        "The destination already exists. Choose another path or explicitly enable overwrite."
+    ),
+    kXR_ChkSumErr: "The file's checksum does not match. Check the source before copying it again.",
+    kXR_inProgress: "The operation is still running. Wait before checking again.",
+    kXR_overQuota: "Your storage quota is full. Free space or ask for a larger quota.",
+    kXR_SigVerErr: "The server could not verify the request signature. Check your credentials.",
+    kXR_DecryptErr: "The server could not read the encrypted request. Check your credentials.",
+    kXR_Overloaded: "The server is busy. Try again later.",
+    kXR_fsReadOnly: "This storage is read-only. Choose a writable destination.",
+    kXR_BadPayload: "The server could not read the request data. Check client and server versions.",
+    kXR_AttrNotFound: "The requested file metadata is missing. Check the attribute name.",
+    kXR_TLSRequired: "The server requires an encrypted connection.",
+    kXR_noReplicas: "No accessible copy of this file was found. Contact the storage administrator.",
+    kXR_AuthFailed: "Login failed. Check that your proxy or token is valid for this service.",
+    kXR_Impossible: "The server cannot perform this request. Check the command and settings.",
+    kXR_Conflict: "The request conflicts with another operation. Check the file before retrying.",
+    kXR_TooManyErrs: (
+        "The server stopped after repeated failures. Contact the storage administrator."
+    ),
+    kXR_ReqTimedOut: "The server request timed out. Check its availability or try again later.",
+    kXR_TimerExpired: "The server request timed out. Check its availability or try again later.",
+}
 
 _CODE_CLASSES: dict[int, type[ServerError]] = {
     kXR_ArgInvalid: InvalidArgumentError,

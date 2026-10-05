@@ -557,8 +557,19 @@ def test_the_ca_directory_falls_back_to_the_environment_then_the_grid_default(mo
     monkeypatch.setenv("X509_CERT_DIR", str(ca_dir))
     assert len(anchors(None)) == 1
     monkeypatch.delenv("X509_CERT_DIR")
+    monkeypatch.setattr("xrdclient.crypto.trust.sys.platform", "linux")
+    monkeypatch.setattr(os.path, "isdir", lambda _path: False)
     monkeypatch.setattr(os, "listdir", _refuse)
     with pytest.raises(TrustError, match=DEFAULT_CA_PATH):
+        anchors(None)
+
+
+def test_the_ca_directory_discovers_homebrew(monkeypatch):
+    monkeypatch.delenv("X509_CERT_DIR", raising=False)
+    monkeypatch.setattr("xrdclient.crypto.trust.sys.platform", "darwin")
+    monkeypatch.setattr(os.path, "isdir", lambda path: path.startswith("/opt/homebrew"))
+    monkeypatch.setattr(os, "listdir", _refuse)
+    with pytest.raises(TrustError, match="/opt/homebrew/etc/grid-security/certificates"):
         anchors(None)
 
 

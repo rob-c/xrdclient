@@ -28,6 +28,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Callable, Sequence
 from typing import IO, Any, Literal, overload
 
+from .._xml import UnsafeXML
 from ..config import Config
 from ..errors import (
     BusyError,
@@ -47,6 +48,7 @@ from ..http.file import HTTPRawIO, open_http
 from ..io.raw import OpenBinaryMode, OpenTextMode
 from ..types import ChecksumInfo, DirEntry, PrepareStatus, StatInfo
 from ..url import XRootDURL, parse
+from ._codec import decode, listing_items, manifest, modified
 from .sigv4 import DEFAULT_REGION, Credentials, hash_payload, sign
 
 __all__ = ["S3FileSystem", "S3RawIO", "open_s3", "MIN_PART_SIZE"]
@@ -87,54 +89,23 @@ def _list_params(prefix: str, token: str) -> dict[str, str]:
     return params
 
 
-def _directory_entries(listing: ET.Element, prefix: str, parent: str) -> list[DirEntry]:
-    entries = []
-    for common in _elements(listing, "CommonPrefixes"):
-        name = _text(common, "Prefix")[len(prefix) :].rstrip("/")
-        if name:
-            entries.append(_directory_entry(name, parent))
-    return entries
-
-
-def _directory_entry(name: str, parent: str) -> DirEntry:
-    return DirEntry(
-        name=name,
-        parent=parent,
-        stat=StatInfo(
-            flags=StatInfoFlags.IS_DIR | StatInfoFlags.IS_READABLE,
-            path=f"{parent.rstrip('/')}/{name}",
-        ),
+def _entry(name: str, item: dict[str, Any] | None, parent: str, algorithm: str) -> DirEntry:
+    info = item or {}
+    tag = _etag(info.get("ETag", ""))
+    flags = StatInfoFlags.IS_READABLE | (
+        StatInfoFlags.IS_DIR if item is None else StatInfoFlags.IS_WRITABLE
     )
-
-
-def _object_entries(
-    listing: ET.Element, prefix: str, parent: str, algorithm: str
-) -> list[DirEntry]:
-    entries = []
-    for content in _elements(listing, "Contents"):
-        key = _text(content, "Key")
-        name = key[len(prefix) :]
-        if name and "/" not in name:  # omit the prefix's own marker
-            entries.append(_object_entry(content, key, name, parent, algorithm))
-    return entries
-
-
-def _object_entry(
-    content: ET.Element, key: str, name: str, parent: str, algorithm: str
-) -> DirEntry:
-    tag = _etag(_text(content, "ETag"))
-    checksum = ChecksumInfo("md5", tag) if algorithm and _is_md5(tag) else None
     return DirEntry(
         name=name,
         parent=parent,
         stat=StatInfo(
             id=tag,
-            st_size=int(_text(content, "Size") or 0),
-            flags=StatInfoFlags.IS_READABLE | StatInfoFlags.IS_WRITABLE,
-            st_mtime=_iso8601(_text(content, "LastModified")),
-            path=f"/{key}",
+            st_size=info.get("Size", 0),
+            flags=flags,
+            st_mtime=modified(info),
+            path=f"/{info['Key']}" if item is not None else f"{parent.rstrip('/')}/{name}",
         ),
-        checksum=checksum,
+        checksum=ChecksumInfo("md5", tag) if algorithm and _is_md5(tag) else None,
     )
 
 
@@ -274,13 +245,13 @@ class S3FileSystem(HTTPFileSystem):
     def _has_children(self, key: str) -> bool:
         """Does anything live under this prefix? One key is enough to know."""
         listing = self._list({"prefix": f"{key}/", "max-keys": "1"})
-        return bool(_elements(listing, "Contents") or _elements(listing, "CommonPrefixes"))
+        return bool(listing.get("Contents", []) or listing.get("CommonPrefixes", []))
 
-    def _list(self, params: dict[str, str]) -> ET.Element:
+    def _list(self, params: dict[str, str]) -> dict[str, Any]:
         """One ``ListObjectsV2`` page."""
         query = {"list-type": "2", **params}
         response = self.client.request("GET", self._bucket_url(query), expect=(200,))
-        return _xml(response, self.bucket)
+        return _answer(response, self.bucket, "ListObjectsV2")
 
     def scandir(
         self,
@@ -309,11 +280,12 @@ class S3FileSystem(HTTPFileSystem):
         token = ""
         while True:
             listing = self._list(_list_params(prefix, token))
-            entries.extend(_directory_entries(listing, prefix, here))
-            entries.extend(_object_entries(listing, prefix, here, algorithm))
-            if _text(listing, "IsTruncated") != "true":
+            entries.extend(
+                _entry(name, item, here, algorithm) for name, item in listing_items(listing, prefix)
+            )
+            if not listing.get("IsTruncated"):
                 return entries
-            token = _text(listing, "NextContinuationToken")
+            token = listing.get("NextContinuationToken", "")
 
     def checksum(self, path: str, algorithm: str | None = None) -> ChecksumInfo:
         """The object's ``ETag``, which is its MD5 - if it has one.
@@ -430,7 +402,7 @@ class S3FileSystem(HTTPFileSystem):
         # A copy, like a completion, can answer 200 and report its failure in
         # the body - and the source is the only copy until this one is known
         # to have worked.
-        if b"<Error" in response.body:
+        if "Error" in _answer(response, self.bucket, "CopyObject"):
             raise ProtocolError(f"{self.url.host} failed to copy {src} to {dst}")
         self.remove(src)
 
@@ -560,7 +532,9 @@ class S3RawIO(HTTPRawIO):
             headers={"Content-Length": "0"},
             expect=(200,),
         )
-        self._upload_id = _text(_xml(response, self.url.path), "UploadId")
+        self._upload_id = _answer(response, self.url.path, "CreateMultipartUpload").get(
+            "UploadId", ""
+        )
         if not self._upload_id:
             raise ProtocolError(f"{self.url.host} began an upload without naming it")
         self._pending += self._buffer
@@ -616,7 +590,7 @@ class S3RawIO(HTTPRawIO):
         self._check_intact()
         try:
             self._drain(final=True)
-            body = _manifest(self._parts)
+            body = manifest([f'"{tag}"' for tag in self._parts])
             response = self.client.request(
                 "POST",
                 self._with({"uploadId": self._upload_id}),
@@ -626,7 +600,7 @@ class S3RawIO(HTTPRawIO):
             )
             # S3 answers 200 and *then* reports a failure in the body, so that
             # it can keep the connection alive while it assembles the object.
-            if b"<Error" in response.body:
+            if "Error" in _answer(response, self.url.path, "CompleteMultipartUpload"):
                 raise ProtocolError(f"{self.url.host} failed to complete a multipart upload")
         except BaseException as exc:
             self._fail(exc)
@@ -778,23 +752,16 @@ def _close_with(stream: Any, done: Callable[[], None]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _xml(response: Response, what: str) -> ET.Element:
+def _answer(response: Response, what: str, operation: str) -> dict[str, Any]:
     """Parse an S3 answer, which is XML in a namespace nobody needs."""
     try:
-        return ET.fromstring(response.body)
+        return decode(operation, response.body, headers=dict(response.headers.items()))
+    except UnsafeXML as exc:
+        raise ProtocolError(
+            f"{what}: S3 response contains a forbidden document type or entity"
+        ) from exc
     except ET.ParseError as exc:
         raise ProtocolError(f"{what}: unparsable S3 answer: {exc}") from exc
-
-
-def _elements(parent: ET.Element, name: str) -> list[ET.Element]:
-    """Every child with this local name, whatever namespace it is in."""
-    return [child for child in parent if child.tag.rpartition("}")[2] == name]
-
-
-def _text(parent: ET.Element, name: str) -> str:
-    """The text of the first such child, or ``""``."""
-    found = _elements(parent, name)
-    return (found[0].text or "").strip() if found else ""
 
 
 def _etag(value: str) -> str:
@@ -807,28 +774,9 @@ def _is_md5(value: str) -> bool:
     return len(value) == 32 and all(c in "0123456789abcdef" for c in value.lower())
 
 
-def _iso8601(stamp: str) -> int:
-    """``2024-01-02T03:04:05.000Z`` as seconds since the epoch, or 0."""
-    from datetime import datetime
-
-    try:
-        return int(datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp())
-    except ValueError:
-        return 0
-
-
 def _part_size(sent: int) -> int:
     """How much the next part holds, once ``sent`` parts have gone up."""
     return min(MIN_PART_SIZE << (sent // _PARTS_PER_DOUBLING), MAX_PART_SIZE)
-
-
-def _manifest(etags: list[str]) -> bytes:
-    """The XML that names the parts, in order, to finish an upload."""
-    parts = "".join(
-        f"<Part><PartNumber>{n}</PartNumber><ETag>&quot;{tag}&quot;</ETag></Part>"
-        for n, tag in enumerate(etags, start=1)
-    )
-    return f"<CompleteMultipartUpload>{parts}</CompleteMultipartUpload>".encode()
 
 
 def _host_header(url: XRootDURL) -> str:

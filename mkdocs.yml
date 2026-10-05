@@ -41,6 +41,7 @@ nav:
       - S3 object storage: s3.md
       - fsspec: fsspec.md
       - Command line: cli.md
+      - JSON and XML output: output.md
       - Safety: safety.md
   - Coming from pyxrootd:
       - Compatibility layer: compat.md
@@ -57,6 +58,7 @@ nav:
   - Under the hood:
       - Performance: performance.md
       - Testing and fault injection: testing.md
+      - Platforms and packages: platforms.md
       - Maintainability metrics: maintainability.md
       - Interoperability and parity: interop.md
       - Security: security.md

@@ -3,12 +3,13 @@
 The server advertises what it accepts in the ``kXR_login`` security trailer;
 :func:`select` intersects that with what this machine can actually produce,
 ordered by :attr:`~xrdclient.config.Config.auth_order`. Every mechanism registers
-unconditionally, because a zero-dependency install can genuinely attempt
-``gsi``, ``ztn``, ``sss``, ``unix`` and ``host`` — all five are pure Python.
+unconditionally: the default installation can attempt ``gsi``, ``ztn``,
+``sss``, ``unix`` and ``host`` without an authentication-specific extra.
 
-``krb5`` is pure Python too: it reads the credential cache, asks the KDC for a
-service ticket when the cache holds only a TGT, and builds the AP-REQ itself
-(:mod:`xrdclient.auth.kerberos`). With no ticket it stays quiet and the ladder
+Portable ``krb5`` reads the credential cache, asks the KDC for a service ticket
+when the cache holds only a TGT, and builds the AP-REQ itself
+(:mod:`xrdclient.auth.kerberos`). Optional native bindings support additional
+cache handling. With no ticket it stays quiet and the ladder
 moves on; with one that has expired it raises, so that :func:`select` records
 *why* rather than falling through to ``unix`` and leaving the cause unsaid.
 

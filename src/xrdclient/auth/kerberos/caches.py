@@ -10,12 +10,14 @@ a KCM cache takes, as MIT's library does; for the others it stays in this
 process's memory.
 
 macOS's own ``API:`` caches are held by Heimdal's credential service behind
-XPC, and ``MEMORY:`` and ``MSLSA:`` caches by another process or Windows;
-naming one is an error that says how to get a FILE cache instead.
+XPC, and ``MEMORY:`` and ``MSLSA:`` caches by another process or Windows.
+The portable reader explains how to get a FILE cache instead. Selecting
+``XRD_KRB5_BACKEND=native`` delegates supported cache types to optional pykrb5.
 """
 
 from __future__ import annotations
 
+import os
 from typing import Protocol
 
 from ...errors import CredentialError
@@ -68,8 +70,9 @@ class FileCache:
 def _refuse_api(name: str) -> CredentialError:
     return CredentialError(
         f"Kerberos credential cache {name!r} is a macOS API: cache, held by the system's "
-        "Heimdal credential service over XPC, which this pure-Python client cannot reach. "
-        f"Get a ticket into a file with: {_TO_A_FILE}"
+        "Heimdal credential service, which the portable cache reader cannot reach. "
+        "Install 'xrdclient[krb5]' and set XRD_KRB5_BACKEND=native, "
+        f"or get a ticket into a file with: {_TO_A_FILE}"
     )
 
 
@@ -82,6 +85,22 @@ def open_ccache(
     Raises :class:`~xrdclient.errors.CredentialError` for a cache type that
     cannot be read here, naming the fix.
     """
+    choice = os.environ.get("XRD_KRB5_BACKEND", "portable")
+    if choice == "native":
+        from .native import NativeCache
+
+        return NativeCache(name or os.environ.get("KRB5CCNAME") or None)
+    if choice != "portable":
+        raise CredentialError(
+            f"Unknown Kerberos cache backend {choice!r}. "
+            "Set XRD_KRB5_BACKEND to 'native' or 'portable'."
+        )
+    return _portable_ccache(name, profile, keyctl)
+
+
+def _portable_ccache(
+    name: str | None, profile: Profile | None, keyctl: Keyctl | None
+) -> CredentialCache:
     name = name if name is not None else ccache_name(profile)
     kind, sep, rest = name.partition(":")
     if sep and kind == "KCM":

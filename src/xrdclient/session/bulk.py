@@ -29,9 +29,11 @@ when it cannot.
 
 from __future__ import annotations
 
+import sys
 import time
 from collections import deque
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from typing import NoReturn
 
@@ -315,29 +317,110 @@ class BulkReader:
         been answered, so a failure anywhere in the window is never lost
         behind a success that happened to come back later.
         """
-        total = len(view)
-        if total <= 0:
+        if not view:
             return 0
-        free_sids = self._begin()
-        pending: dict[int, int] = {}
+        return self.write_chunks(
+            (view[at : at + self._chunk] for at in range(0, len(view), self._chunk)), start
+        )
+
+    def write_chunks(
+        self,
+        pieces: Iterable[memoryview],
+        start: int = 0,
+        *,
+        acknowledged: Callable[[int, int], None] | None = None,
+        waited: Callable[[int, int], None] | None = None,
+        check: Callable[[], None] | None = None,
+        strict_replies: bool = False,
+    ) -> int:
+        """Stream bounded pieces, reporting only acknowledged byte ranges.
+
+        A ``waited`` callback records ranges declined with ``kXR_wait``. It
+        must not use this borrowed session: replay belongs to the caller,
+        after this exchange settles. Without it, WAIT retains the ordinary
+        :meth:`write_from` fallback. No write is silently retried here.
+        """
+        pending: dict[int, tuple[int, int]] = {}
         header = memoryview(bytearray(_HEADER))
-        cursor = acked = 0
+        source = iter(pieces)
+        offset, acked = start, 0
+        exhausted = False
+        failure: XRootDError | None = None
+        free_sids = self._begin()
         try:
             while True:
-                while free_sids and cursor < total:
-                    size = min(self._chunk, total - cursor)
-                    sid = free_sids.pop()
-                    self._issue_write(sid, start + cursor, view[cursor : cursor + size])
-                    pending[sid] = size
-                    cursor += size
+                if not exhausted and failure is None:
+                    offset, exhausted = self._write_batch(source, free_sids, pending, offset, check)
                 if not pending:
+                    if failure is not None:
+                        raise failure
                     return acked
-                answered = self._acknowledged(header)
-                if answered is not None:
-                    acked += pending.pop(answered)
-                    free_sids.append(answered)
+                reply = self._next_reply(header)
+                body = self._body(reply.dlen)
+                if reply.status == c.kXR_oksofar:
+                    continue
+                self._owed.discard(reply.streamid)
+                span = pending.pop(reply.streamid)
+                free_sids.append(reply.streamid)
+                count, error = self._write_answer(
+                    reply, body, span, acknowledged, waited, strict_replies
+                )
+                acked += count
+                failure = failure or error
         finally:
-            self.settle()
+            with suppress(Exception) if sys.exc_info()[0] is not None else nullcontext():
+                self.settle()
+
+    def _write_batch(
+        self,
+        source: Iterator[memoryview],
+        free: list[int],
+        pending: dict[int, tuple[int, int]],
+        offset: int,
+        check: Callable[[], None] | None,
+    ) -> tuple[int, bool]:
+        while free:
+            try:
+                piece = next(source)
+            except StopIteration:
+                return offset, True
+            if not piece:
+                continue
+            if len(piece) > self._chunk:
+                raise ValueError("write chunk exceeds the configured chunk size")
+            sid = free.pop()
+            self._issue_write(sid, offset, piece)
+            pending[sid] = (offset, len(piece))
+            offset += len(piece)
+            if check is not None:
+                check()
+        return offset, False
+
+    def _write_answer(
+        self,
+        reply: ResponseHeader,
+        body: bytearray,
+        span: tuple[int, int],
+        acknowledged: Callable[[int, int], None] | None,
+        waited: Callable[[int, int], None] | None,
+        strict: bool,
+    ) -> tuple[int, XRootDError | None]:
+        if reply.status == c.kXR_ok:
+            if acknowledged is not None:
+                acknowledged(*span)
+            return span[1], None
+        if reply.status == c.kXR_wait and waited is not None:
+            waited(*span)
+            return 0, None
+        if strict and reply.status != c.kXR_error:
+            self._torn = True
+            raise ProtocolError(
+                f"unexpected reply to a write: stream {reply.streamid}, status {reply.status}"
+            )
+        try:
+            _refuse(reply.status, body)
+        except XRootDError as exc:
+            return 0, exc
 
     def settle(self) -> None:
         """Make the connection safe for its next request, or mark it broken.
@@ -465,22 +548,6 @@ class BulkReader:
         body = self._body(reply.dlen)
         self._owed.discard(reply.streamid)
         _refuse(reply.status, body)
-
-    def _acknowledged(self, header: memoryview) -> int | None:
-        """Take one reply to a write off the wire; the stream id it settles.
-
-        ``None`` for a ``kXR_oksofar`` instalment, which a write is not meant
-        to get but which is harmless if it does. A refusal raises once its
-        frame is off the wire, like a failed read.
-        """
-        reply = self._next_reply(header)
-        body = self._body(reply.dlen)
-        if reply.status == c.kXR_oksofar:
-            return None
-        self._owed.discard(reply.streamid)
-        if reply.status != c.kXR_ok:
-            _refuse(reply.status, body)
-        return reply.streamid
 
     def _next_reply(self, header: memoryview) -> ResponseHeader:
         """The next reply header, which must answer a request still owed.

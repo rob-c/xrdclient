@@ -22,6 +22,7 @@ from dataclasses import replace
 from typing import IO, Any
 
 from .._log import get_logger
+from .._xml import UnsafeXML, fromstring
 from ..client.filesystem import FileSystem
 from ..config import Config
 from ..errors import (
@@ -101,10 +102,10 @@ _HEX_WIDTHS = {"crc64": 16, "crc64nvme": 16}
 
 def _parse(payload: bytes) -> ET.Element:
     """Parse a multistatus body, refusing anything that carries a DTD."""
-    if b"<!DOCTYPE" in payload[:1024] or b"<!ENTITY" in payload[:4096]:
-        raise ProtocolError("refusing a WebDAV response with a document type declaration")
     try:
-        return ET.fromstring(payload)
+        return fromstring(payload)
+    except UnsafeXML as exc:
+        raise ProtocolError("refusing a WebDAV response with a document type declaration") from exc
     except ET.ParseError as exc:
         raise ProtocolError(f"malformed WebDAV response: {exc}") from exc
 

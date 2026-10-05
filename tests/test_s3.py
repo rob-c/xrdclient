@@ -839,8 +839,8 @@ def test_a_manifest_that_is_not_xml_names_no_parts_at_all(public):
 
 def test_an_answer_that_is_not_xml_is_a_protocol_error(bucket, fs):
     with pytest.raises(ProtocolError, match="unparsable"):
-        s3fs._xml(_response(b"<not xml at all"), "the bucket")
-    assert s3fs._text(s3fs._xml(_response(b"<a><b>x</b></a>"), "x"), "missing") == ""
+        s3fs._answer(_response(b"<not xml at all"), "the bucket", "ListObjectsV2")
+    assert "Contents" not in s3fs._answer(_response(b"<a><b>x</b></a>"), "x", "ListObjectsV2")
 
 
 def _response(body):
@@ -856,7 +856,13 @@ def _response(body):
     [("2024-01-02T03:04:05.000Z", 1704164645), ("last tuesday", 0), ("", 0)],
 )
 def test_a_timestamp_that_is_not_one_is_simply_unknown(stamp, seconds):
-    assert s3fs._iso8601(stamp) == seconds
+    from xrdclient.s3._codec import decode
+
+    body = (
+        f"<ListBucketResult><Contents><LastModified>{stamp}</LastModified>"
+        "</Contents></ListBucketResult>"
+    ).encode()
+    assert int(decode("ListObjectsV2", body)["Contents"][0]["LastModified"].timestamp()) == seconds
 
 
 def test_a_key_with_a_space_in_it_survives_the_round_trip(bucket, fs):

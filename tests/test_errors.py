@@ -129,7 +129,9 @@ def test_a_server_timeout_is_caught_by_the_same_except_as_a_client_one():
     assert info.value.filename == "/a"
     # And it names the code, as every other server error does, rather than
     # falling back to OSError's "[Errno 110] took too long".
-    assert str(info.value) == "kXR_ReqTimedOut: took too long [/a]"
+    assert str(info.value).startswith("The server request timed out.")
+    assert "XRootD error 3034" in str(info.value)
+    assert info.value.message == "took too long"
 
 
 def test_tls_required_names_the_fix():
@@ -140,14 +142,16 @@ def test_tls_required_names_the_fix():
     assert isinstance(info.value, e.TLSRequiredError)
     assert info.value.errno == errno.EACCES
     assert "roots://" in str(info.value)
-    assert str(info.value).startswith("kXR_TLSRequired: TLS required [/store/f]")
+    assert str(info.value).startswith("The server requires an encrypted connection.")
+    assert info.value.message == "TLS required"
+    assert info.value.path == "/store/f"
 
 
 def test_tls_required_survives_pickling():
     back = pickle.loads(pickle.dumps(e.TLSRequiredError(e.kXR_TLSRequired, "TLS", path="/p")))
     assert isinstance(back, PermissionError)
     assert (back.code, back.path, back.errno) == (e.kXR_TLSRequired, "/p", errno.EACCES)
-    assert str(back).startswith("kXR_TLSRequired")
+    assert str(back).startswith("The server requires an encrypted connection.")
 
 
 def test_every_error_code_the_protocol_defines_has_a_name():

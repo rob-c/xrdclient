@@ -4,6 +4,12 @@ This is the release checklist for maintainers. A tag is a publication request:
 the publish workflow rejects a tag which does not exactly match the runtime and
 wheel version.
 
+The current candidate is **0.3.0**, paired with xgfalclient 0.3.0. Keep its
+changelog entry `Unreleased` until the release is approved. Python 3.9.2 remains
+the declared floor, but the botocore/urllib3 clean-install conflict is a release
+blocker, not a permitted skip. See [Platforms](platforms.md) for outstanding
+native-platform checks and the scope of pre-version-bump validation.
+
 ## Prepare
 
 1. Work from a clean checkout of the release commit. Review every untracked
@@ -16,6 +22,12 @@ wheel version.
 4. Run the supported-version CI matrix, the real-daemon interop/parity job,
    strict docs build and the performance job. For retry, I/O or copy changes,
    also run both BRIX suites described in [Testing](testing.md).
+5. Run the [shared platform/package matrix](platforms.md) against matching
+   candidate refs from both repositories. Build fresh artifacts carrying 0.3.0;
+   old 0.2.0 working-tree packages are not final release artifacts. Check the
+   paired native-package dependencies, runtime versions and installed commands.
+6. Publish xrdclient first, then xgfalclient with `xrdclient==0.3.0`. Do not
+   change the separate XrdCl/PyXRootD compatibility version to 0.3.0.
 
 ## Validate the artifacts
 

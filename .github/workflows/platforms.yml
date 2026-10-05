@@ -1,0 +1,167 @@
+name: Distribution packages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      xrdclient-ref:
+        description: Xrd candidate ref (blank uses the selected workflow ref)
+        type: string
+        default: ''
+      xgfalclient-ref:
+        description: Matching GFAL candidate ref
+        type: string
+        default: main
+  workflow_call:
+    inputs:
+      xrdclient-ref:
+        type: string
+        default: ''
+      xgfalclient-ref:
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      platforms: ${{ steps.matrix.outputs.platforms }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: rob-c/xrdclient
+          persist-credentials: false
+          ref: ${{ inputs.xrdclient-ref || github.sha }}
+      - id: matrix
+        run: echo "platforms=$(python3 tools/platforms.py --list)" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.platforms) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: rob-c/xrdclient
+          persist-credentials: false
+          ref: ${{ inputs.xrdclient-ref || github.sha }}
+          path: clients/xrdclient
+      - uses: actions/checkout@v4
+        with:
+          repository: rob-c/xgfalclient
+          persist-credentials: false
+          ref: ${{ inputs.xgfalclient-ref || 'main' }}
+          path: clients/xgfalclient
+      - name: Rootless container prerequisites
+        run: sudo apt-get update && sudo apt-get install -y podman uidmap slirp4netns
+      - name: Wheel-only install, native package lifecycle and complete hermetic suites
+        run: >-
+          python3 clients/xrdclient/tools/platforms.py --engine podman
+          --workspace clients --platform '${{ matrix.name }}' --output results
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.name }}
+          path: results/
+
+  nixos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: rob-c/xrdclient
+          persist-credentials: false
+          ref: ${{ inputs.xrdclient-ref || github.sha }}
+          path: clients/xrdclient
+      - uses: actions/checkout@v4
+        with:
+          repository: rob-c/xgfalclient
+          persist-credentials: false
+          ref: ${{ inputs.xgfalclient-ref || 'main' }}
+          path: clients/xgfalclient
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-26.05
+      - name: Record the resolved package set
+        run: nix-instantiate --eval -E '(import <nixpkgs> {}).lib.version' | tee nixpkgs-version.txt
+      - name: Build both packages and run their full hermetic test suites
+        run: >-
+          nix-build clients/xrdclient/packaging/nix
+          --arg xgfalclientSrc ./clients/xgfalclient -A xgfalclient
+      - name: Real NixOS VM installation and CLI tests
+        run: >-
+          nix-build clients/xrdclient/packaging/nix
+          --arg xgfalclientSrc ./clients/xgfalclient -A nixosTest
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nixos
+          path: |
+            nixpkgs-version.txt
+            result/test.html
+
+  homebrew:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15-intel, macos-15]
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: rob-c/xrdclient
+          persist-credentials: false
+          ref: ${{ inputs.xrdclient-ref || github.sha }}
+          path: clients/xrdclient
+      - uses: actions/checkout@v4
+        with:
+          repository: rob-c/xgfalclient
+          persist-credentials: false
+          ref: ${{ inputs.xgfalclient-ref || 'main' }}
+          path: clients/xgfalclient
+      - run: brew install python@3.14
+      - name: Build platform-specific, compiler-free wheel bundles
+        run: |
+          brewed_python="$(brew --prefix python@3.14)/bin/python3.14"
+          "$brewed_python" -m venv build-env
+          build-env/bin/python -m pip install --only-binary=:all: build
+          build-env/bin/python -m build --wheel --outdir wheels clients/xrdclient
+          build-env/bin/python -m build --wheel --outdir wheels clients/xgfalclient
+          build-env/bin/python -m pip download --only-binary=:all: --dest wheelhouse wheels/*.whl
+          cd clients/xrdclient
+          ../../build-env/bin/python -m tools.homebrew_package --wheelhouse ../../wheelhouse --output ../../brew-packages
+      - name: Install and test the generated tap formulae
+        run: |
+          brew tap-new --no-git storage-ci/clients
+          cp brew-packages/*.rb "$(brew --repository storage-ci/clients)/Formula/"
+          brew install --build-from-source storage-ci/clients/xrdclient storage-ci/clients/xgfalclient
+          brew test storage-ci/clients/xrdclient
+          brew test storage-ci/clients/xgfalclient
+      - name: Exercise every installed command
+        run: >-
+          "$(brew --prefix xgfalclient)/libexec/bin/python"
+          clients/xrdclient/tools/installed_smoke.py --bin-dir "$(brew --prefix xgfalclient)/bin"
+          --xrd-bin-dir "$(brew --prefix xrdclient)/bin"
+      - name: Full hermetic suites using Brew Python
+        run: |
+          build-env/bin/python -m pip install --only-binary=:all: wheels/*.whl pytest pytest-cov pytest-timeout pytest-xdist fsspec 'complexipy>=6,<7' 'radon>=6,<7'
+          for client in xrdclient xgfalclient; do
+            (cd "clients/$client" && ../../build-env/bin/python -m pytest -q -n 4 -m 'not interop and not parity' --timeout=300 --cov --cov-fail-under=0 --junitxml="../../brew-packages/$client-tests.xml")
+          done
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-${{ matrix.os }}
+          path: brew-packages/

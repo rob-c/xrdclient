@@ -18,6 +18,7 @@ from typing import IO, Any, cast
 from .._version import __version__
 from ..config import Config
 from ..url import XRootDURL, parse
+from . import _output
 
 __all__ = [
     "OK",
@@ -70,6 +71,7 @@ def stdout_bytes() -> IO[bytes]:
 
 def fail(program: str, exc: BaseException) -> int:
     """Report ``exc`` the way a Unix tool does, and give back the exit code."""
+    _output.error(exc)
     print(f"{program}: {exc}", file=sys.stderr)
     return ERROR
 
@@ -117,7 +119,7 @@ def size_arg(text: str) -> int:
 
 def common_flags(parser: argparse.ArgumentParser) -> None:
     """The options every command in both tools understands."""
-    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    _output.flags(parser, legacy_json=True)
     parser.add_argument("-q", "--quiet", action="store_true", help="say nothing on success")
     parser.add_argument("-v", "--verbose", action="count", default=0, help="log more (repeatable)")
     parser.add_argument("--token", metavar="TOKEN", help="bearer token to present")
@@ -144,7 +146,16 @@ def common_flags(parser: argparse.ArgumentParser) -> None:
 
 def version_flag(parser: argparse.ArgumentParser) -> None:
     """Add the distribution version without importing the client machinery."""
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument(
+        "--version", action=_Version, nargs=0, help="show program's version and exit"
+    )
+
+
+class _Version(argparse.Action):
+    def __call__(self, parser: argparse.ArgumentParser, *args: Any, **kwargs: Any) -> None:
+        _output.record("version", version=__version__)
+        parser._print_message(f"{parser.prog} {__version__}\n", sys.stdout)
+        parser.exit()
 
 
 def configure_logging(verbosity: int) -> None:
@@ -201,6 +212,9 @@ class Endpoints:
         from ..client import FileSystem
 
         target = parse(url)
+        report = _output.current()
+        if report is not None:
+            report.identity["url"] = str(url)
         if target.is_local:
             raise ValueError(f"{url} is a local path, not a remote endpoint")
         key = (target.scheme, target.host, target.port)

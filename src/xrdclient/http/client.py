@@ -47,6 +47,9 @@ from ..errors import (
 )
 from ..transport.base import tls_context
 from ..url import XRootDURL, parse, quote_path
+from ._connection import HTTPConnection, HTTPSConnection
+from ._engine import REDIRECTS as _REDIRECTS
+from ._engine import Request, attempt, redirects
 from .expect import InterimAnswer, await_continue, wants_expect
 
 __all__ = [
@@ -75,7 +78,6 @@ _RETRYABLE = frozenset(
     {"GET", "HEAD", "PUT", "DELETE", "OPTIONS", "PROPFIND", "MKCOL", "MOVE", "COPY"}
 )
 
-_REDIRECTS = frozenset({301, 302, 303, 307, 308})
 
 #: HTTP status to the ``kXR_*`` code that means the same thing, so one status
 #: table feeds the one exception table the whole package already has.
@@ -258,10 +260,8 @@ class HTTPClient:
         scheme, host, port = _key(url)
         timeout = self.config.connect_timeout
         if scheme == "https":
-            return http.client.HTTPSConnection(
-                host, port, timeout=timeout, context=_context(self.config)
-            )
-        return http.client.HTTPConnection(host, port, timeout=timeout)
+            return HTTPSConnection(host, port, timeout=timeout, ssl_context=_context(self.config))
+        return HTTPConnection(host, port, timeout=timeout)
 
     def _discard(self, url: XRootDURL) -> None:
         conn = self._pool.pop(_key(url), None)
@@ -350,38 +350,51 @@ class HTTPClient:
         ``timeout`` is the longest any one read of it may wait, in place of
         :attr:`Config.request_timeout` (see :meth:`ready`).
         """
-        target = url
+        origin = final = url
         asked = False
-        # Credentials stay with the origin they were meant for. Once a hop
-        # leaves it they stay behind for the rest of the chain, even if a
-        # later hop comes back: the server that sent it there is not one
-        # the caller vouched for.
-        trusted = relay = True
-        for _ in range(self.config.redirect_limit + 1):
-            response = self._once(
-                method, target, body, headers, credentials=trusted, relay=relay, timeout=timeout
+
+        def send(request: Request[XRootDURL, bytes]) -> http.client.HTTPResponse:
+            nonlocal final
+            final = request.url
+            return self._once(
+                request.method,
+                request.url,
+                request.body,
+                headers,
+                credentials=request.credentials,
+                relay=request.relay,
+                timeout=timeout,
             )
+
+        def advance(
+            request: Request[XRootDURL, bytes], response: http.client.HTTPResponse
+        ) -> XRootDURL | None:
+            nonlocal asked, origin
             if response.status == 401 and not asked:
-                # One shot at asking, and only ever the first time: a second
-                # 401 with the credential in hand means it was refused, not
-                # absent, and no amount of typing fixes that.
                 asked = True
-                if self._ask_for_credentials(target, response):
-                    # The user was asked for this host by name, so what they
-                    # typed is theirs to send to it.
-                    url, trusted = target, True
+                if self._ask_for_credentials(request.url, response):
+                    origin, request.credentials = request.url, True
                     response.read(MAX_BODY)
                     response.close()
-                    continue
+                    return request.url
             if response.status in _REDIRECTS and response.getheader("Location"):
-                hop = self._next_hop(response, url, target, trusted, relay)
-                target, trusted, relay = hop
-                if response.status == 303:
-                    method, body = "GET", None
-                _log.debug("%s redirected to %s", method, target)
-                continue
-            return _checked(response, target, expect, errors)
-        raise RedirectLimitError(f"more than {self.config.redirect_limit} redirects for {url}")
+                target, request.credentials, request.relay = self._next_hop(
+                    response, origin, request.url, request.credentials, request.relay
+                )
+                _log.debug("%s redirected to %s", request.method, target)
+                return target
+            return None
+
+        response = redirects(
+            Request(method, url, body),
+            send,
+            advance,
+            self.config.redirect_limit,
+            lambda: RedirectLimitError(
+                f"more than {self.config.redirect_limit} redirects for {url}"
+            ),
+        )
+        return _checked(response, final, expect, errors)
 
     def _next_hop(
         self,
@@ -568,23 +581,24 @@ class HTTPClient:
         # A conditional request is not safe to repeat: the first attempt may
         # have been applied, which makes the second one fail its condition.
         repeatable = method in _RETRYABLE and not any(k.lower().startswith("if-") for k in sent)
-        for attempt in (0, 1):
-            try:
-                conn = self.ready(url, timeout)
-                if body is not None and wants_expect(method, len(body)):
-                    response = self._send_expecting(conn, method, target, body, sent)
-                else:
-                    conn.request(method, target, body=body, headers=sent)
-                    response = conn.getresponse()
-                self._serving[response] = conn
-                return response
-            except (http.client.HTTPException, OSError) as exc:
-                self._discard(url)
-                if attempt == 0 and repeatable and not isinstance(exc, TIMEOUTS):
-                    _log.debug("retrying %s %s after %s", method, url, exc)
-                    continue
-                raise _wrap(exc, method, url) from exc
-        raise AssertionError("unreachable")  # pragma: no cover
+
+        def send(unused: None) -> http.client.HTTPResponse:
+            conn = self.ready(url, timeout)
+            if body is not None and wants_expect(method, len(body)):
+                response = self._send_expecting(conn, method, target, body, sent)
+            else:
+                conn.request(method, target, body=body, headers=sent)
+                response = conn.getresponse()
+            self._serving[response] = conn
+            return response
+
+        return attempt(
+            lambda: None,
+            send,
+            lambda unused: self._discard(url),
+            lambda unused, error: repeatable and not isinstance(error, TIMEOUTS),
+            lambda error: _wrap(error, method, url),
+        )
 
 
 def _key(url: XRootDURL) -> tuple[str, str, int]:

@@ -107,6 +107,7 @@ def make_certificate(
     not_before: float | None = None,
     not_after: float | None = None,
     extensions: tuple[tuple[str, bytes], ...] = (),
+    subject_spki: bytes | None = None,
 ) -> bytes:
     """A signed X.509 v3 certificate, as DER."""
     now = time.time()
@@ -124,7 +125,7 @@ def make_certificate(
             utctime(now + 43200 if not_after is None else not_after),
         ),
         subject,
-        public_key_info(subject_key),
+        subject_spki if subject_spki is not None else public_key_info(subject_key),
         *(encoded if extensions else []),
     )
     return sequence(tbs, algorithm, bitstring(signer.sign(tbs, digest="sha256")))

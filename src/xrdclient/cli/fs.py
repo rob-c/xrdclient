@@ -22,7 +22,7 @@ from typing import Any
 from .._compat import zip_strict
 from ..doctor import diagnose
 from ..errors import XRootDError
-from ..types import DirEntry, StatInfo
+from ..types import DirEntry, PrepareStatus, StatInfo
 from . import (
     ERROR,
     OK,
@@ -30,13 +30,13 @@ from . import (
     common_flags,
     config_from,
     confirm,
-    dumps,
     fail,
     interactive,
     size_arg,
     stdout_bytes,
     version_flag,
 )
+from . import _output as output
 
 __all__ = ["main"]
 
@@ -83,14 +83,9 @@ def _stat_lines(info: StatInfo) -> list[str]:
 
 def _ls(args: argparse.Namespace, endpoints: Endpoints) -> int:
     listings = _listings(args, endpoints)
-    if args.json:
-        print(
-            dumps(
-                {
-                    root: [_entry_record(entry) for entry in items]
-                    for root, items in listings.items()
-                }
-            )
+    if args.json or output.current() is not None:
+        output.payload(
+            {root: [_entry_record(entry) for entry in items] for root, items in listings.items()}
         )
     else:
         _print_listings(listings, args.long)
@@ -104,9 +99,22 @@ def _listings(args: argparse.Namespace, endpoints: Endpoints) -> dict[str, list[
         if args.recursive:
             for root, _dirs, _files in filesystem.walk(path):
                 listings[root] = filesystem.scandir(root)
+                _listing_record(url, root, listings[root])
         else:
             listings[path] = filesystem.scandir(path)
+            _listing_record(url, path, listings[path])
     return listings
+
+
+def _listing_record(url: str, path: str, entries: list[DirEntry]) -> None:
+    if output.current() is not None:
+        output.record(
+            operation="ls",
+            url=url,
+            path=path,
+            status="succeeded",
+            entries=[_entry_record(entry) for entry in entries],
+        )
 
 
 def _print_listings(listings: dict[str, list[DirEntry]], long: bool) -> None:
@@ -134,8 +142,9 @@ def _stat_cmd(args: argparse.Namespace, endpoints: Endpoints) -> int:
     for url in args.url:
         filesystem, path = endpoints.at(url)
         found.append(filesystem.stat(path))
-    if args.json:
-        print(dumps(found))
+        output.record(operation="stat", url=url, status="succeeded", value=found[-1])
+    if args.json or output.current() is not None:
+        output.payload(found)
         return OK
     for url, info in zip_strict(args.url, found):
         print(url)
@@ -150,6 +159,7 @@ def _cat(args: argparse.Namespace, endpoints: Endpoints) -> int:
         with filesystem.open(path, "rb") as handle:
             while chunk := handle.read(1 << 20):
                 out.write(chunk)
+        output.record(operation="cat", url=url, status="succeeded")
     return OK
 
 
@@ -167,6 +177,7 @@ def _tail(args: argparse.Namespace, endpoints: Endpoints) -> int:
     lines = tail.splitlines(keepends=True)
     out.write(b"".join(lines[max(0, len(lines) - args.lines) :]))
     out.flush()
+    output.record(operation="tail", url=args.url, status="succeeded", follow=args.follow)
     if not args.follow:
         return OK
     try:
@@ -233,8 +244,11 @@ def _du(args: argparse.Namespace, endpoints: Endpoints) -> int:
         totals[url] = (
             _du_tree(filesystem, path) if filesystem.isdir(path) else (filesystem.getsize(path), 1)
         )
-    if args.json:
-        print(dumps({url: {"bytes": s, "files": n} for url, (s, n) in totals.items()}))
+        output.record(
+            operation="du", url=url, status="succeeded", bytes=totals[url][0], files=totals[url][1]
+        )
+    if args.json or output.current() is not None:
+        output.payload({url: {"bytes": s, "files": n} for url, (s, n) in totals.items()})
         return OK
     for url, (size, count) in totals.items():
         print(f"{size:>15} {count:>9} {url}")
@@ -245,6 +259,7 @@ def _chmod(args: argparse.Namespace, endpoints: Endpoints) -> int:
     for url in args.url:
         filesystem, path = endpoints.at(url)
         filesystem.chmod(path, args.mode)
+        output.record(operation="chmod", url=url, mode=args.mode, status="succeeded")
     return OK
 
 
@@ -252,6 +267,7 @@ def _truncate(args: argparse.Namespace, endpoints: Endpoints) -> int:
     for url in args.url:
         filesystem, path = endpoints.at(url)
         filesystem.truncate(path, args.size)
+        output.record(operation="truncate", url=url, size=args.size, status="succeeded")
     return OK
 
 
@@ -271,26 +287,57 @@ def _prepare(args: argparse.Namespace, endpoints: Endpoints) -> int:
         return _prepare_status(args, work)
     handles = []
     for filesystem, paths in work:
+        output.identify(
+            "evict" if args.evict else "prepare",
+            endpoint=getattr(filesystem, "endpoint", None),
+            paths=paths,
+        )
         if args.evict:
             filesystem.evict(paths)
         else:
             handles.append(filesystem.prepare(paths, priority=args.priority))
-    if args.json:
-        print(dumps(handles))
+        _prepare_record(filesystem, paths, handles, args.evict)
+    if args.json or output.current() is not None:
+        output.payload(handles)
     elif handles and not args.quiet:
         print("\n".join(handles))
     return OK
 
 
+def _prepare_record(filesystem: Any, paths: list[str], handles: list[str], evict: bool) -> None:
+    if evict:
+        output.record(
+            operation="evict",
+            endpoint=getattr(filesystem, "endpoint", None),
+            paths=paths,
+            handle=None,
+            status="succeeded",
+        )
+    else:
+        output.record(
+            operation="prepare",
+            endpoint=getattr(filesystem, "endpoint", None),
+            paths=paths,
+            handle=handles[-1],
+            status="queued",
+        )
+
+
 def _prepare_status(args: argparse.Namespace, work: Iterable[tuple[Any, list[str]]]) -> int:
     """Report how the staging request ``--status`` names is going."""
-    reports = [
-        status
-        for filesystem, paths in work
-        for status in filesystem.query_prepare(args.status, paths)
-    ]
-    if args.json:
-        print(dumps(reports))
+    reports = []
+    for filesystem, paths in work:
+        output.identify(
+            "prepare_status",
+            endpoint=getattr(filesystem, "endpoint", None),
+            request_id=args.status,
+            paths=paths,
+        )
+        for status in filesystem.query_prepare(args.status, paths):
+            reports.append(status)
+            _stage_record(status, "prepare_status")
+    if args.json or output.current() is not None:
+        output.payload(reports)
     elif not args.quiet:
         for status in reports:
             print(status)
@@ -299,28 +346,53 @@ def _prepare_status(args: argparse.Namespace, work: Iterable[tuple[Any, list[str
 
 def _locality(args: argparse.Namespace, endpoints: Endpoints) -> int:
     """Say where each file is now, without asking for any of it to move."""
-    reports = [
-        report
-        for filesystem, paths in _grouped(args.url, endpoints)
-        for report in filesystem.archive_info(paths)
-    ]
-    if args.json:
-        print(dumps(reports))
+    reports = []
+    for filesystem, paths in _grouped(args.url, endpoints):
+        output.identify("locality", endpoint=getattr(filesystem, "endpoint", None), paths=paths)
+        for report in filesystem.archive_info(paths):
+            reports.append(report)
+            _stage_record(report, "locality")
+    if args.json or output.current() is not None:
+        output.payload(reports)
     elif not args.quiet:
         for report in reports:
             print(report)
     return OK
 
 
+def _stage_record(status: PrepareStatus, operation: str) -> None:
+    if output.current() is None:
+        return
+    state = "ready" if status.online else ("offline" if operation == "locality" else "queued")
+    if status.error:
+        state = "failed"
+        output.error(
+            RuntimeError(
+                "The server could not report this file's storage state. "
+                "Check its path and service. Server: " + status.error
+            ),
+            path=status.path,
+        )
+    output.record(operation=operation, path=status.path, status=state, value=status)
+
+
 def _ln(args: argparse.Namespace, endpoints: Endpoints) -> int:
     filesystem, target = endpoints.at(args.target)
     other, link = endpoints.at(args.link)
+    output.identify("ln", source=args.target, target=args.link, symbolic=args.symbolic)
     if other is not filesystem:
         raise ValueError("a link and its target live on one endpoint")
     if args.symbolic:
         filesystem.symlink(target, link)
     else:
         filesystem.link(target, link)
+    output.record(
+        operation="ln",
+        source=args.target,
+        target=args.link,
+        symbolic=args.symbolic,
+        status="succeeded",
+    )
     return OK
 
 
@@ -329,8 +401,9 @@ def _readlink(args: argparse.Namespace, endpoints: Endpoints) -> int:
     for url in args.url:
         filesystem, path = endpoints.at(url)
         targets[url] = filesystem.readlink(path)
-    if args.json:
-        print(dumps(targets))
+        output.record(operation="readlink", url=url, status="succeeded", value=targets[url])
+    if args.json or output.current() is not None:
+        output.payload(targets)
         return OK
     for target in targets.values():
         print(target)
@@ -342,8 +415,9 @@ def _checksum(args: argparse.Namespace, endpoints: Endpoints) -> int:
     for url in args.url:
         filesystem, path = endpoints.at(url)
         results.append((url, filesystem.checksum(path, args.algorithm)))
-    if args.json:
-        print(dumps(dict(results)))
+        output.record(operation="checksum", url=url, status="succeeded", value=results[-1][1])
+    if args.json or output.current() is not None:
+        output.payload(dict(results))
         return OK
     for url, info in results:
         print(f"{info.value}  {url}" if len(results) > 1 else f"{info.algorithm} {info.value}")
@@ -354,6 +428,7 @@ def _mkdir(args: argparse.Namespace, endpoints: Endpoints) -> int:
     for url in args.url:
         filesystem, path = endpoints.at(url)
         filesystem.mkdir(path, parents=args.parents, exist_ok=args.parents)
+        output.record(operation="mkdir", url=url, status="succeeded")
     return OK
 
 
@@ -385,6 +460,8 @@ def _rm(args: argparse.Namespace, endpoints: Endpoints) -> int:
         filesystem, path = endpoints.at(url)
         if not _remove_one(args, filesystem, url, path):
             code = ERROR
+        else:
+            output.record(operation="rm", url=url, status="succeeded")
     return code
 
 
@@ -415,15 +492,18 @@ def _rmdir(args: argparse.Namespace, endpoints: Endpoints) -> int:
     for url in args.url:
         filesystem, path = endpoints.at(url)
         filesystem.rmdir(path)
+        output.record(operation="rmdir", url=url, status="succeeded")
     return OK
 
 
 def _mv(args: argparse.Namespace, endpoints: Endpoints) -> int:
     filesystem, source = endpoints.at(args.source)
     other, target = endpoints.at(args.dest)
+    output.identify("mv", source=args.source, target=args.dest)
     if other is not filesystem:
         raise ValueError("mv works within one endpoint; use xrd-cp between servers")
     filesystem.rename(source, target)
+    output.record(operation="mv", source=args.source, target=args.dest, status="succeeded")
     return OK
 
 
@@ -433,6 +513,7 @@ def _touch(args: argparse.Namespace, endpoints: Endpoints) -> int:
         filesystem.touch(path)
         if args.time is not None:
             filesystem.utime(path, None if args.time == "now" else (args.time, args.time))
+        output.record(operation="touch", url=url, status="succeeded")
     return OK
 
 
@@ -454,14 +535,15 @@ def _chown(args: argparse.Namespace, endpoints: Endpoints) -> int:
     for url in args.url:
         filesystem, path = endpoints.at(url)
         filesystem.chown(path, uid, gid)
+        output.record(operation="chown", url=url, uid=uid, gid=gid, status="succeeded")
     return OK
 
 
 def _df(args: argparse.Namespace, endpoints: Endpoints) -> int:
     filesystem, path = endpoints.at(args.url)
     info = filesystem.statvfs(path)
-    if args.json:
-        print(dumps(info))
+    if args.json or output.current() is not None:
+        output.payload(info)
         return OK
     print(f"  Read/write nodes: {info.nodes_rw}")
     print(f"  Read/write free:  {info.free_rw} MB ({info.utilization_rw}% used)")
@@ -477,8 +559,8 @@ def _locate(args: argparse.Namespace, endpoints: Endpoints) -> int:
         if args.deep
         else filesystem.locate(path, create=args.create)
     )
-    if args.json:
-        print(dumps(places))
+    if args.json or output.current() is not None:
+        output.payload(places)
         return OK
     for place in places:
         print(f"{place.address} {place.type} {place.access}")
@@ -490,8 +572,8 @@ def _ping(args: argparse.Namespace, endpoints: Endpoints) -> int:
     started = time.monotonic()
     filesystem.ping()
     elapsed = (time.monotonic() - started) * 1e3
-    if args.json:
-        print(dumps({"endpoint": filesystem.endpoint, "ms": round(elapsed, 3)}))
+    if args.json or output.current() is not None:
+        output.payload({"endpoint": filesystem.endpoint, "ms": round(elapsed, 3)})
     elif not args.quiet:
         print(f"{filesystem.endpoint} responded in {elapsed:.1f} ms")
     return OK
@@ -505,8 +587,8 @@ def _doctor(args: argparse.Namespace, endpoints: Endpoints) -> int:
     of here.
     """
     report = diagnose(args.url or "", config=config_from(args))
-    if args.json:
-        print(dumps({"url": report.url, "ok": report.ok, "checks": report.to_dict()}))
+    if args.json or output.current() is not None:
+        output.payload({"url": report.url, "ok": report.ok, "checks": report.to_dict()})
     elif not args.quiet:
         print(report)
     return OK if report.ok else ERROR
@@ -515,8 +597,8 @@ def _doctor(args: argparse.Namespace, endpoints: Endpoints) -> int:
 def _query(args: argparse.Namespace, endpoints: Endpoints) -> int:
     filesystem, _path = endpoints.at(args.url)
     values = filesystem.query_config(*args.name)
-    if args.json:
-        print(dumps(values))
+    if args.json or output.current() is not None:
+        output.payload(values)
         return OK
     for name in args.name:
         print(f"{name} {values.get(name, '')}")
@@ -528,9 +610,11 @@ def _xattr(args: argparse.Namespace, endpoints: Endpoints) -> int:
     if args.set is not None:
         name, _, value = args.set.partition("=")
         filesystem.setxattr(path, name, value.encode())
+        output.record(operation="xattr_set", url=args.url, name=name, status="succeeded")
         return OK
     if args.remove is not None:
         filesystem.removexattr(path, args.remove)
+        output.record(operation="xattr_remove", url=args.url, name=args.remove, status="succeeded")
         return OK
     if args.recursive:
         return _xattr_tree(args, filesystem, path)
@@ -539,8 +623,8 @@ def _xattr(args: argparse.Namespace, endpoints: Endpoints) -> int:
 
 def _xattr_tree(args: argparse.Namespace, filesystem: Any, path: str) -> int:
     tree = filesystem.listxattr_tree(path)
-    if args.json:
-        print(dumps(tree))
+    if args.json or output.current() is not None:
+        output.payload(tree)
         return OK
     for name, names in tree.items():
         for attribute in names:
@@ -550,8 +634,8 @@ def _xattr_tree(args: argparse.Namespace, filesystem: Any, path: str) -> int:
 
 def _xattr_show(args: argparse.Namespace, filesystem: Any, path: str) -> int:
     attributes = filesystem.xattrs(path)
-    if args.json:
-        print(dumps(attributes))
+    if args.json or output.current() is not None:
+        output.payload(attributes)
         return OK
     for name, value in attributes.items():
         print(f"{name}={value.decode('utf-8', 'replace')}")
@@ -564,10 +648,9 @@ def _xattr_show(args: argparse.Namespace, filesystem: Any, path: str) -> int:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog=PROGRAM, description="Inspect and change a remote namespace."
-    )
+    parser = output.Parser(prog=PROGRAM, description="Inspect and change a remote namespace.")
     version_flag(parser)
+    output.flags(parser, legacy_json=True)
     subs = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     def command(name: str, handler: Callable[..., int], help_text: str) -> argparse.ArgumentParser:
@@ -710,7 +793,15 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    return output.run_cli(PROGRAM, argv, lambda: _main(argv), legacy_json=True)
+
+
+def _main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    report = output.current()
+    if report is not None:
+        report.command = args.command
+    output.identify(args.command)
     config = config_from(args)
     try:
         with Endpoints(config) as endpoints:

@@ -67,6 +67,14 @@ def daemon(short_dir):
         yield server
 
 
+def test_the_fake_kcm_stops_its_accept_thread_on_every_platform(short_dir):
+    server = _kcmd.FakeKcm(short_dir / "shutdown.sock").start()
+    thread = server._thread
+    server.stop()
+    assert thread is not None and not thread.is_alive()
+    server.stop()  # teardown is idempotent too
+
+
 @pytest.fixture(autouse=True)
 def _fresh_memory():
     krb5._FETCHED.clear()
@@ -351,8 +359,13 @@ def test_file_and_dir_names_still_open_as_files(tmp_path):
 
 @pytest.mark.parametrize("name", ["API:", "API:ABCD-1234"])
 def test_a_macos_api_cache_is_refused_with_the_fix(name):
-    with pytest.raises(CredentialError, match=r"XPC.*KRB5CCNAME=FILE:/tmp/krb5cc_\$\(id -u\)"):
+    with pytest.raises(CredentialError) as error:
         open_ccache(name, Profile.parse(""))
+    message = str(error.value)
+    assert name in message
+    assert "Install 'xrdclient[krb5]'" in message
+    assert "XRD_KRB5_BACKEND=native" in message
+    assert "KRB5CCNAME=FILE:/tmp/krb5cc_$(id -u) kinit" in message
 
 
 # -- the krb5 credential, from a KCM cache --------------------------------------

@@ -206,7 +206,7 @@ Things the bindings do not offer at all:
 - `fsspec`: `pd.read_parquet("root://host//store/t.parquet")`
 - WebDAV and HTTP behind the same three entry points
 - servers to test against: `xrdclient.testing`
-- no compiled dependency, so `pip install` works in any wheelhouse
+- no XRootD client build; supported platforms install runtime dependencies from wheels
 
 ## What you give up
 

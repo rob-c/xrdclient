@@ -43,12 +43,20 @@ def test_params_must_be_exactly_16_bytes():
 
 
 def test_oversized_payloads_are_refused():
+    class Oversized(bytes):
+        __slots__ = ()
+
+        def __len__(self) -> int:
+            # Test the actual 31-bit boundary without allocating 2 GiB in
+            # each OS job. encode must reject this before using its contents.
+            return c.MAX_FRAME_PAYLOAD + 1
+
     class Huge(Request):
         __slots__ = ()
         opcode = 3001
 
         def payload(self) -> bytes:
-            return b"\x00" * (c.MAX_FRAME_PAYLOAD + 1)
+            return Oversized()
 
     with pytest.raises(ProtocolError, match="exceeds the protocol maximum"):
         encode(Huge(), 1)

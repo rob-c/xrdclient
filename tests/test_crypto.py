@@ -12,7 +12,7 @@ import zlib
 import pytest
 
 from xrdclient.crypto.aes import BLOCK_SIZE, cbc_encrypt
-from xrdclient.crypto.blowfish import Blowfish, _pi_fraction_words
+from xrdclient.crypto.blowfish import Blowfish
 from xrdclient.crypto.checksum import algorithms, checksum_bytes, checksum_file, new
 from xrdclient.crypto.crc32c import (
     PAGE_SIZE,
@@ -121,10 +121,6 @@ def test_accelerated_and_pure_python_agree():
 # --------------------------------------------------------------------------
 # Blowfish - Schneier's published test vectors
 # --------------------------------------------------------------------------
-
-
-def test_the_pi_derivation_matches_the_published_p_array():
-    assert _pi_fraction_words(4) == [0x243F6A88, 0x85A308D3, 0x13198A2E, 0x03707344]
 
 
 @pytest.mark.parametrize(

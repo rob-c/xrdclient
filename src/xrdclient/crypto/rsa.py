@@ -41,6 +41,9 @@ __all__ = [
     "load_private_key",
     "load_public_key",
     "pem_blocks",
+    "public_key_from_bitstring",
+    "private_key_der",
+    "private_key_pem",
     "RSA_OID",
 ]
 
@@ -410,3 +413,31 @@ def public_key_from_bitstring(element: Element) -> RSAPublicKey:
     if len(fields) != 2:
         raise DERError(f"RSAPublicKey has {len(fields)} fields, expected 2")
     return RSAPublicKey(read_integer(fields[0]), read_integer(fields[1]))
+
+
+def private_key_der(key: RSAPrivateKey) -> bytes:
+    """PKCS#1 ``RSAPrivateKey`` DER, with the CRT fields OpenSSL expects."""
+    from .der import integer, sequence
+
+    if not (key.p and key.q):
+        raise ValueError("encoding a private key needs its primes")
+    return sequence(
+        integer(0),
+        integer(key.n),
+        integer(key.e),
+        integer(key.d),
+        integer(key.p),
+        integer(key.q),
+        integer(key.d % (key.p - 1)),
+        integer(key.d % (key.q - 1)),
+        integer(pow(key.q, -1, key.p)),
+    )
+
+
+def private_key_pem(key: RSAPrivateKey) -> bytes:
+    """``-----BEGIN RSA PRIVATE KEY-----``: the unencrypted form proxies use."""
+    import base64
+    import textwrap
+
+    body = "\n".join(textwrap.wrap(base64.b64encode(private_key_der(key)).decode("ascii"), 64))
+    return f"-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----\n".encode()

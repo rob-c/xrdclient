@@ -1,4 +1,4 @@
-"""``krb5`` — Kerberos 5, in pure Python.
+"""``krb5`` — XRootD Kerberos authentication with maintained crypto/GSSAPI.
 
 The credential XRootD's ``krb5`` security plugin expects is ``"krb5\\0"``
 followed by a raw AP-REQ (RFC 4120 section 3.2) for the service principal
@@ -18,24 +18,28 @@ copy, as MIT's library gives it one, while a file or a keyring is never
 written. When the server runs with ``-exptkn`` (its offer ends ``,fwd``) it
 then asks for the TGT itself, and gets a forwarded one in a KRB-CRED.
 
-This is all done here rather than through a system GSS-API library, which
-is what makes the package installable with no compiler and no extra - and
-it is proven the only way a security exchange can be: by RFC test vectors
-for the cryptography, and by a real MIT KDC and a real ``xrootd`` accepting
-what it builds (``tests/test_krb5_interop.py``).
+The legacy cache/TGS and forwarding paths remain protocol adapters, using
+``cryptography`` for their ciphers. macOS ``API:`` and ``MEMORY:`` caches use
+python-gssapi to obtain the native Kerberos token; its GSS envelope is removed
+so XRootD still receives the raw AP-REQ it requires. Unit tests check that
+framing; native-cache real-KDC interoperability still needs verification.
+The legacy path has RFC vectors and MIT KDC/XRootD interoperability tests
+(``tests/test_krb5_interop.py``).
 
 What is not supported, each with an error that says so: ``kinit`` itself
 (the AS exchange), cross-realm service tickets, KDC discovery through DNS,
-macOS ``API:`` credential caches and ``MEMORY:`` ones, and single-DES,
+native-cache TGT forwarding (use a ``FILE:`` cache), and single-DES,
 triple-DES and RC4 keys.
 """
 
 from __future__ import annotations
 
+import os
 import threading
 
 from .._log import get_logger
 from ..config import Config
+from ..crypto.der import oid_string, parse
 from ..errors import CredentialError
 from .base import Credential, Offer
 from .kerberos.caches import CredentialCache, FileCache, open_ccache
@@ -213,7 +217,7 @@ def _forwarded_tgt(path: str, client: Principal, live: list[Ticket], profile: Pr
 class KerberosCredential(Credential):
     """``krb5`` — a raw AP-REQ for the server's principal, and a forwarded TGT if asked."""
 
-    __slots__ = ("principal", "_ticket", "_forward", "_forwarded")
+    __slots__ = ("principal", "_ticket", "_forward", "_forwarded", "_native_request")
     name = "krb5"
 
     def __init__(
@@ -223,8 +227,11 @@ class KerberosCredential(Credential):
         self._ticket = ticket
         self._forward = forward
         self._forwarded = False
+        self._native_request = b""
 
     def initial(self) -> bytes:
+        if self._native_request:
+            return PROTOCOL + self._native_request
         if self._ticket is None:
             raise CredentialError(f"no service ticket for {self.principal}")
         return PROTOCOL + build_ap_req(self._ticket)
@@ -246,6 +253,9 @@ class KerberosCredential(Credential):
     def available(
         cls, offer: Offer, config: Config, *, username: str, host: str
     ) -> KerberosCredential | None:
+        cache_name = os.environ.get("KRB5CCNAME", "")
+        if cache_name.startswith(("API:", "MEMORY:")):
+            return cls._from_native_cache(offer, host, cache_name)
         profile = Profile.load()
         cache = open_ccache(profile=profile)
         try:
@@ -268,5 +278,69 @@ class KerberosCredential(Credential):
         forward = _forwarded_tgt(cache.name, client, live, profile) if forwarding else None
         return cls(str(target), ticket, forward=forward)
 
+    @classmethod
+    def _from_native_cache(cls, offer: Offer, host: str, cache_name: str) -> KerberosCredential:
+        if wants_forwarding(offer):
+            raise CredentialError(
+                "XRootD ticket forwarding from API/MEMORY caches is not supported yet. "
+                "Run kinit -f with a FILE: cache for this server."
+            )
+        principal = service_principal(offer, host)
+        result = cls(principal)
+        result._native_request = _native_ap_req(principal, cache_name)
+        return result
+
     def __repr__(self) -> str:
         return f"KerberosCredential(principal={self.principal!r})"
+
+
+def _native_ap_req(principal: str, ccache: str) -> bytes:
+    """Use the platform cache/KDC via python-gssapi; retain XRootD's raw AP-REQ."""
+    try:
+        import gssapi  # type: ignore[import-not-found,unused-ignore]
+    except (ImportError, OSError) as exc:
+        raise CredentialError(
+            "Native Kerberos authentication is not installed. "
+            "Install it with python -m pip install 'xrdclient[krb5]', "
+            "or run kinit with a FILE: cache."
+        ) from exc
+
+    try:
+        # KRB5CCNAME already names this cache. Using the default acquisition
+        # also works on Heimdal builds without the credential-store extension.
+        creds = gssapi.Credentials(usage="initiate", mechs=[gssapi.MechType.kerberos])
+        context = gssapi.SecurityContext(
+            name=gssapi.Name(principal, name_type=gssapi.NameType.kerberos_principal),
+            mech=gssapi.MechType.kerberos,
+            flags=0,
+            usage="initiate",
+            creds=creds,
+        )
+        token = context.step() or b""
+    except (gssapi.exceptions.GSSError, NotImplementedError) as exc:  # type: ignore[attr-defined]
+        raise CredentialError(
+            f"Kerberos authentication could not use {ccache}: {exc}. Run kinit and try again."
+        ) from exc
+    return _unwrap_ap_req(token)
+
+
+def _unwrap_ap_req(token: bytes) -> bytes:
+    """RFC 2743 mechanism header and RFC 4121 TOK_ID, not GSS message protection."""
+    try:
+        wrapper, end = parse(token)
+        mechanism, pos = parse(wrapper.value)
+        payload = wrapper.value[pos:]
+        request, request_end = parse(payload[2:])
+        valid = (
+            wrapper.tag == 0x60
+            and end == len(token)
+            and oid_string(mechanism) == "1.2.840.113554.1.2.2"
+            and payload[:2] == b"\x01\x00"
+            and request.tag == 0x6E
+            and request_end == len(payload) - 2
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise CredentialError("The system Kerberos library returned a malformed AP-REQ token.")
+    return payload[2:]

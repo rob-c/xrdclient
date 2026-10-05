@@ -3,7 +3,7 @@
 XrdCl treats a local or remote ``.meta4``/``.metalink`` file as a virtual
 redirector.  The document must describe exactly one file; its URLs are tried
 in priority order and its checksums describe the bytes every replica must
-contain.  This module is the deliberately small, dependency-free parser for
+contain.  This module parses
 that metadata.  Moving the bytes remains the copy engine's job.
 
 Parsing is bounded before :mod:`xml.etree` sees the input.  Metalink files are
@@ -14,12 +14,12 @@ declarations would turn replica discovery into a memory-exhaustion surface.
 from __future__ import annotations
 
 import posixpath
-import re
 import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
 from ._compat import SLOTS
+from ._xml import UnsafeXML, fromstring
 from .crypto import algorithms
 from .crypto import new as new_checksum
 from .errors import MetalinkError
@@ -42,7 +42,6 @@ MAX_DESCRIPTOR_SIZE = 8 << 20
 MAX_URL_SIZE = 4096
 MAX_REPLICAS = 10_000
 
-_FORBIDDEN_XML = re.compile(rb"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
 _HEX = frozenset("0123456789abcdefABCDEF")
 _ALIASES = {"a32": "adler32", "sha": "sha1"}
 _SUPPORTED = frozenset(algorithms())
@@ -101,10 +100,12 @@ def _parse_document(data: bytes) -> ET.Element:
         raise MetalinkError(
             f"Metalink descriptor is {len(data)} bytes; limit is {MAX_DESCRIPTOR_SIZE}"
         )
-    if _FORBIDDEN_XML.search(data):
-        raise MetalinkError("Metalink descriptors may not declare a DOCTYPE or XML entities")
     try:
-        root = ET.fromstring(data)
+        root = fromstring(data)
+    except UnsafeXML as exc:
+        raise MetalinkError(
+            "Metalink descriptors may not declare a DOCTYPE or XML entities"
+        ) from exc
     except ET.ParseError as exc:
         raise MetalinkError(f"Malformed or corrupted Metalink file: {exc}") from None
     if _local_name(root.tag) != "metalink":

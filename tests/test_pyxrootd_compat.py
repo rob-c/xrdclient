@@ -1379,9 +1379,14 @@ def test_setting_an_xattr_the_system_refuses_raises_its_errno(tmp_path):
 
     from xrdclient.compat.client import xattr
 
+    expected = errno.ENOENT
+    if hasattr(os, "setxattr"):
+        with pytest.raises(OSError) as system_error:
+            os.setxattr(str(tmp_path / "missing"), "user.XrdCks.adler32", b"v")
+        expected = system_error.value.errno
     with pytest.raises(OSError) as caught:
         xattr._setxattr(str(tmp_path / "missing"), "XrdCks.adler32", b"v")
-    assert caught.value.errno == errno.ENOENT
+    assert caught.value.errno == expected
 
 
 def test_linux_keeps_the_attribute_in_the_user_namespace(monkeypatch):

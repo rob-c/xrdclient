@@ -35,11 +35,11 @@ this client, which in addition checks the server's certificate against the
 CA directory and the host name (:mod:`xrdclient.crypto.trust`) before it signs
 anything for it.
 
-Everything it needs is here or in :mod:`xrdclient.crypto`: DH is
-``pow(g, x, p)`` on Python integers, AES-CBC and RSA are
-:mod:`xrdclient.crypto.aes` and :mod:`xrdclient.crypto.rsa`, and the proxy is read by
-:mod:`xrdclient.crypto.x509`. There is no ``cryptography`` dependency and no
-extra to install.
+Protocol adapters are here or in :mod:`xrdclient.crypto`: DH is
+``pow(g, x, p)`` on Python integers, AES-CBC uses ``cryptography`` through
+:mod:`xrdclient.crypto.aes`, and legacy raw-RSA operations remain in
+:mod:`xrdclient.crypto.rsa`. Proxy parsing uses :mod:`xrdclient.crypto.x509`.
+These are included in the default installation; no GSI extra is needed.
 
 Translated from go-hep ``xrootd/xrdproto/auth/gsi`` and ``XrdSecgsi``.
 """

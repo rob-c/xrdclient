@@ -35,6 +35,18 @@ def test_bearer_token_file_is_picked_up(monkeypatch):
     assert Config().token_file == "/run/tok"
 
 
+def test_grid_ca_directory_discovers_homebrew(monkeypatch):
+    monkeypatch.delenv("X509_CERT_DIR", raising=False)
+    monkeypatch.setattr(cfgmod.sys, "platform", "linux")
+    monkeypatch.setattr(cfgmod.os.path, "isdir", lambda _path: False)
+    assert Config().ca_path is None
+    monkeypatch.setattr(cfgmod.sys, "platform", "darwin")
+    monkeypatch.setattr(cfgmod.os.path, "isdir", lambda path: path.startswith("/opt/homebrew"))
+    assert Config().ca_path == "/opt/homebrew/etc/grid-security/certificates"
+    monkeypatch.setenv("X509_CERT_DIR", "/grid/cas")
+    assert Config().ca_path == "/grid/cas"
+
+
 def test_evolve_is_a_copy():
     base = Config(username="a")
     other = base.evolve(username="b")

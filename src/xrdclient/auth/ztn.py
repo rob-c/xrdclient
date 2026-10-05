@@ -8,11 +8,11 @@ also what the C client uses: an explicit token, then ``$BEARER_TOKEN``, then
 
 from __future__ import annotations
 
-import base64
-import json
 import os
 import struct
 import time
+
+import jwt
 
 from .._log import get_logger
 from ..config import Config
@@ -63,14 +63,12 @@ def token_claims(token: str) -> dict[str, object]:
     Signature verification is the server's job; the client only reads the
     expiry so it can fail fast with a useful message instead of a 3010.
     """
-    parts = token.split(".")
-    if len(parts) < 2:
-        return {}
-    payload = parts[1]
-    payload += "=" * (-len(payload) % 4)
     try:
-        return dict(json.loads(base64.urlsafe_b64decode(payload)))
-    except (ValueError, TypeError):
+        # Expiry inspection must not depend on signature base64 validity.
+        # This is deliberately not an authentication or signature check.
+        header, payload, _signature = token.split(".")
+        return dict(jwt.decode(f"{header}.{payload}.", options={"verify_signature": False}))
+    except (jwt.PyJWTError, ValueError):
         return {}
 
 

@@ -1,10 +1,9 @@
 """Cryptographic primitives the protocol needs that the stdlib does not have.
 
 Blowfish (SSS), CRC-32C (paged I/O), CRC-64 (checksums), AES (the GSI session cipher), RSA and
-just enough DER to read X.509 proxies — all pure Python, so ``pip install``
-never needs a compiler. Everything the stdlib already has — HMAC-SHA256,
-MD5, Adler-32, CRC-32, and TLS itself — comes from ``hmac``, ``hashlib``,
-``zlib`` and ``ssl``.
+X.509 proxy adapters. cryptography and asn1crypto own the reusable primitives;
+platform/protocol policy stays here. Standard hashes, checksums and TLS use
+``hmac``, ``hashlib``, ``zlib`` and ``ssl``.
 
 None of this is a data path. AES here encrypts a few hundred bytes once per
 connection during the GSI handshake; bulk confidentiality is TLS's job, and
@@ -30,6 +29,16 @@ if TYPE_CHECKING:  # the names, for a type checker, at no cost at run time
         pem_blocks,
     )
     from .sigver import Signer, is_signed, sigver_hash, sigver_sign, sigver_verify
+    from .voms import (
+        VOMSAttribute,
+        VOMSDiagnostic,
+        VOMSEntry,
+        VOMSResult,
+        VOMSStatus,
+        check_vomses,
+        inspect_voms,
+        validate_voms,
+    )
     from .x509 import Certificate, Name, ProxyCredential, load_certificates, load_proxy
 
 #: Which module each public name lives in. Nothing here is imported until it is
@@ -64,6 +73,14 @@ _MODULES = {
     "sigver_hash": "sigver",
     "sigver_sign": "sigver",
     "sigver_verify": "sigver",
+    "VOMSAttribute": "voms",
+    "VOMSDiagnostic": "voms",
+    "VOMSEntry": "voms",
+    "VOMSResult": "voms",
+    "VOMSStatus": "voms",
+    "inspect_voms": "voms",
+    "validate_voms": "voms",
+    "check_vomses": "voms",
     "Certificate": "x509",
     "Name": "x509",
     "ProxyCredential": "x509",
@@ -100,6 +117,11 @@ __all__ = [
     "RSAPrivateKey",
     "RSAPublicKey",
     "Signer",
+    "VOMSAttribute",
+    "VOMSDiagnostic",
+    "VOMSEntry",
+    "VOMSResult",
+    "VOMSStatus",
     "algorithms",
     "cbc_decrypt",
     "cbc_encrypt",
@@ -109,6 +131,7 @@ __all__ = [
     "crc64",
     "crc64nvme",
     "is_signed",
+    "inspect_voms",
     "load_certificates",
     "load_private_key",
     "load_proxy",
@@ -121,4 +144,6 @@ __all__ = [
     "sigver_sign",
     "sigver_verify",
     "unpack_pages",
+    "validate_voms",
+    "check_vomses",
 ]

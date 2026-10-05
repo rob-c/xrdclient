@@ -1,5 +1,8 @@
 # Command line
 
+Every command supports [JSON/XML reports](output.md), including errors,
+help/version, progress and binary stdout: use `--output-format json|xml`.
+
 Two commands, `xrd-fs` and `xrd-cp`, both taking whole URLs. Both understand
 `--json`, and both use the same three exit codes: `0` success, `1` a runtime
 failure, `2` a usage error. A third, `xrd-datasets`, is installed by a package

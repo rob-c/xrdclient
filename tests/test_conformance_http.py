@@ -311,7 +311,7 @@ def test_a_document_type_hidden_past_the_first_kilobyte_is_still_refused(dav, fs
 
 
 def test_an_entity_declared_past_the_guard_still_fetches_nothing(dav, fs):
-    """Belt and braces: :mod:`xml.etree` resolves no external entity either."""
+    """The parser rejects declarations regardless of their position in the body."""
     padding = "<!--" + "x" * 5000 + "-->"
     body = (
         f'{XML}{padding}<!DOCTYPE D:multistatus [<!ENTITY xxe SYSTEM "{_bait(dav)}">]>'
@@ -319,7 +319,7 @@ def test_an_entity_declared_past_the_guard_still_fetches_nothing(dav, fs):
         "</D:response></D:multistatus>"
     ).encode()
     dav.handlers["PROPFIND"] = canned(body)
-    with pytest.raises(ProtocolError, match="malformed"):
+    with pytest.raises(ProtocolError, match="document type"):
         fs.stat("/d/a.root")
     assert ("GET", "/secret") not in dav.seen
 

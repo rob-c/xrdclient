@@ -476,7 +476,7 @@ def test_an_unparseable_keytab_is_skipped_not_raised(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_registry_holds_the_zero_dependency_mechanisms():
+def test_registry_holds_the_default_install_mechanisms():
     assert {"unix", "host", "sss", "ztn"} <= set(auth.registry())
 
 

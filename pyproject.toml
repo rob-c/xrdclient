@@ -7,9 +7,9 @@ build-backend = "hatchling.build"
 [project]
 name = "xrdclient"
 dynamic = ["version"]
-description = "A pure-Python, Pythonic client for XRootD (root://, roots://) and HEP WebDAV"
+description = "A Python 3, Pythonic client for XRootD (root://, roots://) and HEP WebDAV"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.9.2"
 license = { text = "LGPL-3.0-or-later" }
 authors = [{ name = "Robert Currie", email = "robert.andrew.currie@gmail.com" }]
 keywords = ["xrootd", "hep", "webdav", "storage", "root"]
@@ -25,7 +25,14 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
   "Topic :: System :: Filesystems",
 ]
-dependencies = []
+# Maintained libraries provide reusable parsing, transport and security primitives.
+dependencies = [
+  "asn1crypto>=1.5.1",
+  "botocore>=1.35",
+  "cryptography>=45",
+  "PyJWT[crypto]>=2.10",
+  "urllib3>=2.2",
+]
 
 [project.urls]
 Homepage = "https://github.com/rob-c/xrdclient"
@@ -35,6 +42,8 @@ Issues = "https://github.com/rob-c/xrdclient/issues"
 Changelog = "https://github.com/rob-c/xrdclient/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
+# Native Kerberos bindings need system headers when no wheel is available.
+krb5 = ["gssapi>=1.12,<2", "krb5>=0.10,<0.11"]
 dev = [
   "build>=1,<2",
   "complexipy>=6,<7",
@@ -103,7 +112,13 @@ exclude_also = [
 # gated at the full line-and-branch mark; the optional adapters (fsspec,
 # asyncio, CLI) are not, because their coverage depends on which extras are
 # installed - the suite covers those too, but only when they are there.
-include = ["*/xrdclient/proto/*", "*/xrdclient/crypto/*", "*/xrdclient/client/*", "*/xrdclient/s3/*"]
+include = [
+  "*/xrdclient/proto/*", "*/xrdclient/crypto/*", "*/xrdclient/client/*", "*/xrdclient/s3/*",
+  "*/xrdclient/http/_engine.py", "*/xrdclient/http/_connection.py",
+  "*/xrdclient/http/expect.py", "*/xrdclient/copy/_pipeline.py",
+  "*/xrdclient/session/bulk.py",
+  "*/xrdclient/cli/_output.py",
+]
 fail_under = 100
 show_missing = true
 skip_covered = true

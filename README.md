@@ -1,8 +1,8 @@
 # xrdclient
 
-A pure-Python client for XRootD. `root://`, `roots://`, `https://`, HEP
-WebDAV and `s3://`, spoken by the same objects, with no compiled extension, no
-`libXrdCl`, and no third-party import in the core.
+A Python 3 client for XRootD. `root://`, `roots://`, `https://`, HEP
+WebDAV and `s3://`, spoken by the same objects. Parsing, signing and cryptographic primitives use
+maintained, general-purpose dependencies.
 
 ```python
 import xrdclient
@@ -42,16 +42,51 @@ bindings.
 ## Install
 
 ```console
-$ pip install xrdclient                 # the whole library, and nothing else
+$ pip install xrdclient                 # includes the generic runtime dependencies
 ```
 
-Requires Python 3.9+, which is what RHEL 9 and AlmaLinux 9 ship, so the
-system interpreter on a grid login node is enough. Almost nothing needs an
-extra: `http://`, `https://` and WebDAV are `http.client`, S3 is that plus
-`hmac`, and GSI/X.509 proxies and Kerberos are pure Python down to the AES
-and RSA.
+Requires Python 3.9.2+. Runtime dependencies are `botocore`, `PyJWT[crypto]`,
+`urllib3`, `asn1crypto` and `cryptography`.
+The [0.3.0 release notes](CHANGELOG.md) describe the current unreleased
+candidate. Python 3.9 clean installation is currently blocked by the
+botocore/urllib3 dependency conflict; see [platform status](docs/platforms.md).
+XML parsing uses a local declaration-rejecting wrapper around Python's built-in
+parsers; no libxml2, lxml or XML build tools are required. Binary protocol
+records use local, bounds-checked readers and standard-library `struct`.
+Cryptography supplies native wheels for supported mainstream platforms.
+
+Native Kerberos is optional: `pip install 'xrdclient[krb5]'` adds python-gssapi
+and pykrb5 (distribution name `krb5`). Both have macOS wheels; Linux source
+installs need a C compiler and Kerberos development headers. The default
+install keeps the portable Kerberos paths without requesting either binding.
+Set `XRD_KRB5_BACKEND=native` to use pykrb5 for credential-cache reads.
+
+CI checks wheel-only dependency resolution for Python 3.9 and 3.14 on
+macOS Intel/Apple Silicon, glibc Linux (2.28+) and musl Linux (1.2+), on x86-64
+and ARM64. Clean installs are exercised on Linux and macOS. These gates check
+current releases; they cannot guarantee future upstream wheel availability.
+
+Python's built-in XML parser must be kept up to date through Python or
+operating-system updates. Parser regression tests cover declaration rejection,
+encoded input, malformed records and existing protocol error codes.
+
+The maintained libraries own AWS signing, JWT claim decoding, DER primitives,
+cipher/curve operations and connection setup/TLS. Protocol-specific GSI,
+RFC 3820/VOMS policy, redirects and upload handshakes remain client adapters.
+Legacy raw-RSA GSI operations, 512-bit compatibility key generation and
+XRootD ticket forwarding still retain local implementations.
+
+xrdclient also owns the small security/parsing core shared with xgfalclient:
+VOMS policy and diagnostics, DER and RSA helpers, AES/signature adapters,
+X.509 names and declaration-rejecting XML loading. It remains independently
+installable and does not import or depend on xgfalclient.
 
 ## What it does
+
+**Structured CLI reports.** Every `xrd-fs` subcommand and `xrd-cp` supports
+`--output-format json|xml` (or `--xml`), including errors, help/version,
+progress, staging and binary stdout. Existing successful `--json` payloads
+remain compatible. See [the report contract](docs/output.md).
 
 **One-liners.** `xrdclient.ls`, `xrdclient.glob`, `xrdclient.stat`, `xrdclient.exists`, `xrdclient.size`,
 `xrdclient.checksum`, `xrdclient.read_text`, `xrdclient.read_bytes`, `xrdclient.write_text`,
@@ -157,9 +192,10 @@ protocol efficiency and not a network — on a link with real latency the
 pipelining matters more, not less, but the numbers would be that link's.
 
 **Objects.** A bucket is one more endpoint: `s3://bucket/key` reads, writes,
-lists and copies through the same `xrdclient.open`, `xrdclient.FileSystem` and `xrdclient.copy`,
-signed with AWS SigV4 out of `hmac` and `hashlib` — no `boto3`, in the
-dependency tree or the import graph. Credentials come from the environment or
+lists and copies through the same `xrdclient.open`, `xrdclient.FileSystem` and `xrdclient.copy`.
+Botocore supplies AWS SigV4 signing, S3 response parsing and multipart XML
+serialization; the client retains its HTTP transport and transfer policies.
+Credentials come from the environment or
 `~/.aws/credentials`, or are left out entirely for a public bucket; an object
 too long to hold goes up as a multipart upload, and a failed one is aborted
 rather than left in the bucket. Ceph RGW, MinIO and anything else with an
@@ -211,11 +247,18 @@ checked *before* the round trip, so an expired proxy is a sentence and not a
 timeout an hour into a job) and WLCG / SciTokens / macaroons. TLS on
 `roots://`, `xroots://` and `davs://` — all three present the same proxy as
 the client certificate, so mutual TLS costs no argument.
+VOMS attribute certificates in that proxy are preserved across authentication
+and delegation, and `xrdclient.crypto.validate_voms()` verifies and exposes
+their VOs, FQANs and generic attributes, including on macOS. Homebrew grid trust directories are discovered automatically.
 
 `krb5` needs nothing but `kinit`: it reads your credential cache, fetches
 the service ticket from the KDC itself when the cache holds only your TGT,
-and will tell you when your ticket expired. It is pure Python too, and
-tested against a real MIT KDC and a real `xrootd`.
+and will tell you when your ticket expired. Existing FILE/DIR/KCM/KEYRING
+and forwarded-TGT behavior is retained. Explicit `API:`/`MEMORY:` caches use
+python-gssapi and unwrap its initial token to the raw AP-REQ XRootD expects;
+forwarding from those caches still requires a FILE cache. This new native-cache
+adapter has hermetic framing/error tests; real-KDC interoperability is still
+required before claiming full native-cache support.
 
 At a terminal, a login with no proxy and no token asks for one — naming what
 is missing, where it looked, and the command that produces it — instead of

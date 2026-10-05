@@ -26,6 +26,7 @@ import socket
 import struct
 import threading
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -159,6 +160,9 @@ class FakeKcm:
     def stop(self) -> None:
         listener, self._listener = self._listener, None
         if listener is not None:
+            # On Linux close() alone doesn't wake another thread's accept().
+            with suppress(OSError):
+                listener.shutdown(socket.SHUT_RDWR)
             listener.close()
         if self._thread is not None:
             self._thread.join(5)
@@ -172,9 +176,12 @@ class FakeKcm:
         self.stop()
 
     def _accept(self) -> None:
+        listener = self._listener
+        if listener is None:
+            return
         while self._listener is not None:
             try:
-                conn, _ = self._listener.accept()
+                conn, _ = listener.accept()
             except OSError:
                 return
             threading.Thread(target=self._serve, args=(conn,), daemon=True).start()

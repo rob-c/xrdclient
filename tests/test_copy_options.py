@@ -384,8 +384,26 @@ def _reads(server: FakeServer) -> int:
     return sum(op in (c.kXR_read, c.kXR_pgread, c.kXR_readv) for op in server.seen)
 
 
+def _meet_first_reads(server: FakeServer, barrier: threading.Barrier) -> None:
+    first = True
+
+    def read(conn, sid, params, body):
+        nonlocal first
+        if first:
+            first = False
+            barrier.wait(timeout=10)
+        yield from fake._h_read(conn, sid, params, body)
+
+    server.handlers[c.kXR_read] = read
+
+
 def test_several_replicas_each_send_part_of_the_file(tmp_path):
     with FakeServer(files={"/f": PAYLOAD}) as a, FakeServer(files={"/f": PAYLOAD}) as b:
+        # Both workers must be scheduled before a fast replica drains the
+        # tiny fixture. Keep the actual multi-source and progress assertions.
+        barrier = threading.Barrier(2)
+        _meet_first_reads(a, barrier)
+        _meet_first_reads(b, barrier)
         with _locator(_where(a), _where(b)) as red:
             seen: list[tuple[int, int | None]] = []
             result = xrdclient.copy(

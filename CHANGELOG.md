@@ -4,7 +4,124 @@ Notable user-visible changes are recorded here. This project follows
 [Semantic Versioning](https://semver.org/); compatibility fixes which make the
 client agree more closely with XrdCl are not considered breaking changes.
 
-## [0.2.0] - Unreleased
+## [0.3.0] - Unreleased
+
+### Added
+
+- Portable VOMS attribute-certificate inspection and verification via
+  `inspect_voms` and `validate_voms`, exposing VOs, ordered FQANs, generic
+  attributes and independent verdicts for each assertion. Validation checks
+  holder binding through proxy parents, validity, signer/issuer, signatures,
+  target restrictions, critical extensions, CA chains and `vomsdir` LSC bindings.
+- VOMS signatures using RSA PKCS#1/PSS, P-256 ECDSA and Ed25519, with malformed
+  assertions and unsupported algorithms rejected. Existing VOMS proxy chains
+  remain intact during authentication and delegation.
+- Automatic macOS trust discovery under Intel and Apple Silicon Homebrew
+  prefixes, alongside explicit `X509_CERT_DIR`/`X509_VOMS_DIR` overrides and
+  standard Linux grid-security directories.
+- Plain-language VOMS diagnostics with stable codes, exact paths and filesystem
+  error numbers for missing, empty, corrupt, unreadable, expired or not-yet-valid
+  trust material. CA expiry, signer expiry and missing/malformed/mismatched
+  `.lsc` files are distinguished, with a safe next step for the user.
+- Separate `check_vomses` endpoint preflight for missing folders, permissions,
+  invalid UTF-8, malformed fields and invalid ports. Using an existing proxy
+  does not require vomses configuration or contact a VOMS service.
+- Versioned JSON/XML reports for every `xrd-fs` subcommand and `xrd-cp`,
+  including help/version, usage/runtime errors, partial batches, staging
+  identifiers/states, progress and base64 binary stdout. The shared
+  `storage-client-report` schema retains numeric codes and typed per-file
+  results; `--output-format json|xml` selects it, while text remains the default.
+  Existing successful Xrd `--json` payloads remain compatible.
+- Optional pykrb5 cache reads selected by `XRD_KRB5_BACKEND=native`, retaining
+  native error codes and never rewriting the cache. Explicit macOS `API:` and
+  `MEMORY:` caches can obtain raw XRootD AP-REQ tokens through python-gssapi.
+
+### Changed
+
+- Updated the declared Python minimum from 3.9 to 3.9.2, retaining the Python
+  3.9 minor-version floor. Clean-install readiness is documented below.
+- Added `asn1crypto`, `botocore`, `cryptography`, `PyJWT[crypto]` and `urllib3`
+  as runtime dependencies. Library adapters replace local cipher arithmetic,
+  signature primitives, DER primitives, JWT claim decoding, AWS HMAC signing
+  and HTTP connection/TLS setup while retaining client-specific policies.
+  JWT expiry inspection is diagnostic, not signature verification.
+- Made xrdclient the canonical shared implementation for xgfalclient's VOMS,
+  DER/RSA/AES/signature helpers, X.509 names and inspection, XML declaration
+  checks, HTTP connection/request lifecycle, streamed copy/read-ahead pipeline,
+  bulk upload framing and S3 codecs. xrdclient remains independently installable
+  with no import of or dependency on xgfalclient.
+- Both certificate facades now use cryptography's X.509 APIs for ordinary
+  certificates. One bounded fallback preserves legacy inspection behaviour;
+  protocol-specific proxy policy and raw-RSA GSI compatibility remain local.
+- Consolidated bounded HTTP redirects, retry/replay decisions and failed
+  exchange cleanup behind adapters. Shared transfer orchestration retains
+  client-specific credentials, upload modes, buffers, cancellation, checksum,
+  durability, recovery and error policies.
+- Extended bulk writes with acknowledged-range progress, cancellation checks,
+  strict reply handling and caller-owned WAIT policy. GFAL can replay settled
+  WAIT ranges without maintaining a second framing implementation.
+- S3 signing, modeled response/error parsing, namespaces, timestamps, listings
+  and multipart-manifest serialization now use botocore over the existing HTTP
+  transport, without adopting SDK credential discovery or retry policy.
+- XML loading rejects declarations through shared standard-library helpers.
+  Binary records retain bounded local readers; neither XML libraries needing
+  compilation nor Construct are required.
+- Native `gssapi` and `krb5` bindings are confined to the optional `krb5`
+  extra. Default installations retain portable Kerberos paths and use binary
+  dependency wheels on the tested mainstream platforms.
+
+### Fixed
+
+- Partial stream writes complete before a chunk is acknowledged or progress
+  advances; zero, negative and oversized write counts fail rather than losing
+  or duplicating bytes. Reader workers stop cleanly on errors/cancellation.
+- S3 copy and multipart completion reject embedded error replies even when
+  HTTP reports success.
+- Common server failures now provide clear display summaries and next steps
+  without changing exception classes, numeric codes or raw server details.
+  Credential diagnostics retain redaction and distinguish connection refusal
+  from timeout.
+- Malformed VOMS/LSC data, invalid encoding, incomplete subject/issuer pairs
+  and filesystem permission failures produce typed diagnostics instead of
+  parser exceptions or misleading trust failures.
+
+### Testing and packaging
+
+- Added extensive VOMS, trust/permission, malformed-input, clock-boundary,
+  signature and policy tests, including independent OpenSSL checks when
+  available. Shared engines, dependency adapters, old API surfaces, transport
+  faults, durability, WAIT/acknowledgements and JSON/XML reports have regression
+  coverage; existing coverage, maintainability, performance and interop gates
+  remain required.
+- Added a shared rootless Podman/Docker runner and coordinated CI for AlmaLinux
+  8/9/10, CentOS Stream 9/10, Ubuntu 24.04/26.04, Fedora 44, NixOS 26.05 and
+  Homebrew on Intel/Apple Silicon. Tests check binary-only dependency resolution,
+  built-wheel installs, all installed commands, both hermetic suites as a
+  non-root user, and native package installation/removal.
+- Added private RPM/DEB deployment bundles, Nix package/VM recipes and
+  compiler-free Homebrew wheel-bundle formula generation. Exact paired package
+  dependencies, dependency inventories/hashes and package release/revision
+  increments support coordinated upgrades and dependency security rebuilds.
+- Corrected Linux/macOS test portability: deterministic replica scheduling,
+  KCM listener shutdown, bounded oversized-frame fixtures, inherited Nix
+  dependency paths and real filesystem/kernel capability checks.
+
+### Release readiness and limitations
+
+- Python 3.9.2 is the declared floor, but clean Python 3.9 installs are
+  currently blocked by the botocore/`urllib3>=2.2` dependency conflict. This
+  must be resolved before release; AlmaLinux 8/9 and Stream 9 tests use Python
+  3.12. Native Kerberos extras may require a compiler and headers on Linux.
+- VOMS verifies existing assertions; it does not issue them. CA-path checking
+  is not full RFC 5280 constraint/CRL validation. pyhanko-certvalidator remains
+  deferred to preserve Python 3.9 compatibility. Native-cache forwarding
+  still requires a `FILE:` cache; real-KDC native-cache interop is not yet proven.
+- Pre-version-bump candidates passed all eight RPM/DEB targets, Nix package
+  builds and Intel Homebrew installation tests. Apple Silicon Homebrew and a
+  booted NixOS VM remain CI verification targets. See
+  [the platform guide](docs/platforms.md) for validation scope and skipped tests.
+
+## [0.2.0] - 2026-10-01
 
 ### Added
 
@@ -40,4 +157,5 @@ client agree more closely with XrdCl are not considered breaking changes.
 - Retry and cleanup paths preserve the primary transfer error and avoid
   leaking failed connections back into the pool.
 
+[0.3.0]: https://github.com/rob-c/xrdclient/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rob-c/xrdclient/compare/v0.1.0...v0.2.0

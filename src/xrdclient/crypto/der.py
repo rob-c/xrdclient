@@ -1,37 +1,49 @@
-"""A minimal DER reader — enough for PKCS#1, PKCS#8 and X.509.
+"""DER compatibility helpers backed by asn1crypto.
 
-DER is the encoding every X.509 structure this client meets is written in:
-a tag byte, a length, and that many content bytes, nested. Only the handful
-of universal types the certificates and keys actually use are decoded here;
-anything else comes back as a raw :class:`Element` for the caller to look at
-or ignore.
-
-This exists so that GSI needs no third-party parser. The reader is
-deliberately strict, because a lenient parser of attacker-supplied structures
-is a liability. The small writer at the end (:func:`encode`, :func:`sequence`
-and friends) exists for one job: X.509 delegation, where the client signs a
-proxy certificate for the server and so has to produce DER, not only read it.
+The public Element API is retained for protocol-specific structures. The
+library owns TLV parsing/encoding and ASN.1 primitive decoding; this adapter
+keeps the clients\' definite-length, single-byte-tag input policy.
 """
 
 from __future__ import annotations
 
+import calendar
+import time
 from dataclasses import dataclass
+
+from asn1crypto import core, parser  # type: ignore[import-untyped]
 
 from .._compat import SLOTS
 
 __all__ = [
-    "DERError",
-    "Element",
-    "parse",
-    "parse_all",
-    "read_integer",
-    "oid_string",
     "raw_children",
     "encode",
     "encode_integer",
     "encode_oid",
     "encode_time",
+    "decode_time",
+    "DERError",
+    "Element",
+    "parse",
+    "parse_one",
+    "parse_all",
+    "read_integer",
+    "oid_string",
+    "tlv",
+    "integer",
+    "oid",
     "sequence",
+    "set_of",
+    "octet_string",
+    "bit_string",
+    "boolean",
+    "null",
+    "utf8_string",
+    "printable_string",
+    "utc_time",
+    "generalized_time",
+    "validity_time",
+    "explicit",
     "TAG_BOOLEAN",
     "TAG_INTEGER",
     "TAG_BIT_STRING",
@@ -68,18 +80,20 @@ class DERError(ValueError):
 
 @dataclass(frozen=True, **SLOTS)
 class Element:
-    """One tag-length-value triple."""
+    """One tag-length-value triple; ``encoded`` re-emits it byte for byte."""
 
     tag: int
     value: bytes
 
     @property
     def constructed(self) -> bool:
-        """True for SEQUENCE, SET, and the explicit context-specific tags."""
         return bool(self.tag & 0x20)
 
+    @property
+    def encoded(self) -> bytes:
+        return tlv(self.tag, self.value)
+
     def children(self) -> list[Element]:
-        """Parse the content as a sequence of elements."""
         if not self.constructed:
             raise DERError(f"tag 0x{self.tag:02x} is primitive and has no children")
         return parse_all(self.value)
@@ -91,39 +105,50 @@ class Element:
         return f"Element(tag=0x{self.tag:02x}, len={len(self.value)})"
 
 
-def _read_length(data: bytes, pos: int) -> tuple[int, int]:
-    if pos >= len(data):
+# ---------------------------------------------------------------------------
+# Reading
+# ---------------------------------------------------------------------------
+
+
+def _check_header(data: bytes, pos: int) -> None:
+    if pos < 0 or pos >= len(data):
+        raise DERError("truncated: no tag byte")
+    if data[pos] & 0x1F == 0x1F:
+        raise DERError("multi-byte tags are not supported")
+    if pos + 1 >= len(data):
         raise DERError("truncated: no length byte")
-    first = data[pos]
-    pos += 1
-    if first < 0x80:
-        return first, pos
-    count = first & 0x7F
-    if count == 0:
+    count = data[pos + 1]
+    if count == 0x80:
         raise DERError("indefinite lengths are not valid DER")
+    if count > 0x80:
+        _check_long_length(data, pos, count & 0x7F)
+
+
+def _check_long_length(data: bytes, pos: int, count: int) -> None:
     if count > 4:
         raise DERError(f"length of length {count} is implausible")
-    if pos + count > len(data):
+    if pos + 2 + count > len(data):
         raise DERError("truncated: long-form length runs past the end")
-    return int.from_bytes(data[pos : pos + count], "big"), pos + count
 
 
 def parse(data: bytes, pos: int = 0) -> tuple[Element, int]:
-    """Read one element starting at ``pos``; returns it and the next offset."""
-    if pos >= len(data):
-        raise DERError("truncated: no tag byte")
-    tag = data[pos]
-    if tag & 0x1F == 0x1F:
-        raise DERError("multi-byte tags are not supported")
-    length, pos = _read_length(data, pos + 1)
-    end = pos + length
-    if end > len(data):
-        raise DERError(f"truncated: element claims {length} bytes, {len(data) - pos} available")
-    return Element(tag, data[pos:end]), end
+    """Read one definite-length element, preserving the existing API."""
+    _check_header(data, pos)
+    try:
+        class_, method, tag, header, content, _ = parser.parse(bytes(data[pos:]))
+    except ValueError as exc:
+        raise DERError(f"truncated DER element: {exc}") from exc
+    return Element((class_ << 6) | (method << 5) | tag, content), pos + len(header) + len(content)
+
+
+def parse_one(data: bytes) -> Element:
+    element, end = parse(data)
+    if end != len(data):
+        raise DERError(f"{len(data) - end} trailing bytes after the element")
+    return element
 
 
 def parse_all(data: bytes) -> list[Element]:
-    """Read every element in ``data``, which must be consumed exactly."""
     out: list[Element] = []
     pos = 0
     while pos < len(data):
@@ -133,7 +158,6 @@ def parse_all(data: bytes) -> list[Element]:
 
 
 def read_integer(element: Element) -> int:
-    """A DER INTEGER as a Python ``int`` (two's complement, any width)."""
     if element.tag != TAG_INTEGER:
         raise DERError(f"expected INTEGER, got tag 0x{element.tag:02x}")
     if not element.value:
@@ -142,23 +166,102 @@ def read_integer(element: Element) -> int:
 
 
 def oid_string(element: Element) -> str:
-    """An OBJECT IDENTIFIER in dotted form, e.g. ``"1.2.840.113549.1.1.1"``."""
     if element.tag != TAG_OID:
         raise DERError(f"expected OBJECT IDENTIFIER, got tag 0x{element.tag:02x}")
-    data = element.value
-    if not data:
+    if not element.value:
         raise DERError("OBJECT IDENTIFIER with no content")
-    first = data[0]
-    parts = [str(min(first // 40, 2)), str(first - 40 * min(first // 40, 2))]
-    value = 0
-    for index, byte in enumerate(data[1:], start=1):
-        value = (value << 7) | (byte & 0x7F)
-        if not byte & 0x80:
-            parts.append(str(value))
-            value = 0
-        elif index == len(data) - 1:
-            raise DERError("OBJECT IDENTIFIER ends mid-arc")
-    return ".".join(parts)
+    if element.value[-1] & 0x80:
+        raise DERError("OBJECT IDENTIFIER ends mid-arc")
+    return str(core.ObjectIdentifier.load(parser.emit(0, 0, TAG_OID, element.value)).dotted)
+
+
+# ---------------------------------------------------------------------------
+# Writing
+# ---------------------------------------------------------------------------
+
+
+def tlv(tag: int, value: bytes) -> bytes:
+    return bytes(parser.emit(tag >> 6, (tag >> 5) & 1, tag & 0x1F, value))
+
+
+def integer(value: int) -> bytes:
+    return bytes(core.Integer(value).dump())
+
+
+def oid(dotted: str) -> bytes:
+    return bytes(core.ObjectIdentifier(dotted).dump())
+
+
+def sequence(*parts: bytes) -> bytes:
+    return tlv(TAG_SEQUENCE, b"".join(parts))
+
+
+def set_of(*parts: bytes) -> bytes:
+    """A SET OF, members sorted as DER requires."""
+    return tlv(TAG_SET, b"".join(sorted(parts)))
+
+
+def octet_string(data: bytes) -> bytes:
+    return tlv(TAG_OCTET_STRING, data)
+
+
+def bit_string(data: bytes) -> bytes:
+    return tlv(TAG_BIT_STRING, b"\x00" + data)
+
+
+def boolean(value: bool) -> bytes:
+    return tlv(TAG_BOOLEAN, b"\xff" if value else b"\x00")
+
+
+def null() -> bytes:
+    return tlv(TAG_NULL, b"")
+
+
+def utf8_string(text: str) -> bytes:
+    return tlv(TAG_UTF8_STRING, text.encode("utf-8"))
+
+
+def printable_string(text: str) -> bytes:
+    return tlv(TAG_PRINTABLE_STRING, text.encode("ascii"))
+
+
+def utc_time(when: float) -> bytes:
+    return tlv(TAG_UTC_TIME, time.strftime("%y%m%d%H%M%SZ", time.gmtime(when)).encode())
+
+
+def generalized_time(when: float) -> bytes:
+    return tlv(TAG_GENERALIZED_TIME, time.strftime("%Y%m%d%H%M%SZ", time.gmtime(when)).encode())
+
+
+def validity_time(when: float) -> bytes:
+    """RFC 5280: UTCTime through 2049, GeneralizedTime from 2050."""
+    year = time.gmtime(when).tm_year
+    return utc_time(when) if year < 2050 else generalized_time(when)
+
+
+def explicit(number: int, inner: bytes) -> bytes:
+    """A context-specific constructed tag ``[number] EXPLICIT``."""
+    return tlv(0xA0 | number, inner)
+
+
+def decode_time(element: Element) -> float:
+    """``UTCTime``/``GeneralizedTime`` as a UNIX timestamp."""
+    text = element.value.decode("ascii", "replace").strip()
+    if text.endswith("Z"):
+        text = text[:-1]
+    if element.tag == TAG_UTC_TIME:
+        if len(text) < 10:
+            raise DERError(f"malformed UTCTime {text!r}")
+        year = int(text[:2])
+        text = f"{2000 + year if year < 50 else 1900 + year}{text[2:]}"
+    elif element.tag != TAG_GENERALIZED_TIME:
+        raise DERError(f"tag 0x{element.tag:02x} is not a certificate time")
+    text = (text + "000000")[:14]
+    try:
+        parsed = time.strptime(text, "%Y%m%d%H%M%S")
+    except ValueError as exc:
+        raise DERError(f"malformed time {text!r}") from exc
+    return float(calendar.timegm(parsed))
 
 
 def raw_children(data: bytes) -> list[bytes]:
@@ -180,48 +283,17 @@ def raw_children(data: bytes) -> list[bytes]:
     return out
 
 
-# ---------------------------------------------------------------------------
-# The writer: definite, minimal lengths, which is all DER allows
-# ---------------------------------------------------------------------------
-
-
-def _encode_length(count: int) -> bytes:
-    if count < 0x80:
-        return bytes([count])
-    body = count.to_bytes((count.bit_length() + 7) // 8, "big")
-    return bytes([0x80 | len(body)]) + body
-
-
-def encode(tag: int, value: bytes) -> bytes:
-    """One tag-length-value triple."""
-    return bytes([tag]) + _encode_length(len(value)) + value
-
-
-def sequence(*parts: bytes) -> bytes:
-    """A SEQUENCE of already-encoded elements."""
-    return encode(TAG_SEQUENCE, b"".join(parts))
-
-
-def encode_integer(value: int) -> bytes:
-    """An INTEGER in the fewest two's-complement bytes."""
-    width = (value.bit_length() + 8) // 8
-    return encode(TAG_INTEGER, value.to_bytes(width, "big", signed=True))
+encode = tlv
+encode_integer = integer
 
 
 def encode_oid(dotted: str) -> bytes:
-    """An OBJECT IDENTIFIER from its dotted form."""
-    arcs = [int(part) for part in dotted.split(".")]
-    if len(arcs) < 2:
-        raise DERError(f"OBJECT IDENTIFIER {dotted!r} needs at least two arcs")
-    body = bytearray()
-    for arc in [40 * arcs[0] + arcs[1], *arcs[2:]]:
-        chunk = [arc & 0x7F]
-        arc >>= 7
-        while arc:
-            chunk.append(0x80 | (arc & 0x7F))
-            arc >>= 7
-        body += bytes(reversed(chunk))
-    return encode(TAG_OID, bytes(body))
+    if len(dotted.split(".")) < 2:
+        raise DERError("OBJECT IDENTIFIER needs at least two arcs")
+    try:
+        return bytes(core.ObjectIdentifier(dotted).dump())
+    except ValueError as exc:
+        raise DERError(f"invalid OBJECT IDENTIFIER {dotted!r}: {exc}") from exc
 
 
 def encode_time(when: float) -> bytes:

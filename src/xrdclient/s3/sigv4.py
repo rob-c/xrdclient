@@ -17,12 +17,15 @@ from __future__ import annotations
 
 import configparser
 import hashlib
-import hmac
 import os
 import urllib.parse
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+
+from botocore.auth import S3SigV4Auth, S3SigV4QueryAuth  # type: ignore[import-untyped]
+from botocore.awsrequest import AWSRequest  # type: ignore[import-untyped]
+from botocore.credentials import Credentials as _AWSCredentials  # type: ignore[import-untyped]
 
 from .._compat import SLOTS
 
@@ -146,40 +149,70 @@ def sign(
     as S3 requires; the rest (``Range``, ``Content-Length``, ``User-Agent``)
     travel unsigned, so a proxy that adds one does not break the request.
     """
-    stamp = (when or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
-    scope = f"{stamp[:8]}/{region}/{service}/aws4_request"
+    path, separator, query = target.partition("?")
+    # Encode literal spaces without decoding escaped slashes/object names.
+    path = urllib.parse.quote(path or "/", safe="/%")
+    return _signed_request(
+        method,
+        f"https://{host}{path}{separator}{query}",
+        host,
+        headers,
+        payload_hash,
+        credentials=_AWSCredentials(
+            credentials.access_key, credentials.secret_key, credentials.session_token or None
+        ),
+        region=region,
+        service=service,
+        when=when,
+    )
 
-    signed = {k: v for k, v in headers.items() if _is_signed(k)}
+
+def _signed_request(
+    method: str,
+    url: str,
+    host: str,
+    headers: Mapping[str, str],
+    payload_hash: str,
+    *,
+    credentials: _AWSCredentials,
+    region: str,
+    service: str = "s3",
+    when: datetime | None = None,
+) -> dict[str, str]:
+    """Sign an already encoded wire URL without changing its spelling."""
+    signed = _selected_headers(headers)
     signed["host"] = host
-    signed["x-amz-date"] = stamp
     signed["x-amz-content-sha256"] = payload_hash
-    if credentials.session_token:
-        signed["x-amz-security-token"] = credentials.session_token
+    request = AWSRequest(method=method.upper(), url=url, headers=signed)
+    request.params = urllib.parse.parse_qsl(url.partition("?")[2], keep_blank_values=True)
+    _authorize(_PayloadSigner(credentials, service, region, payload_hash), request, when)
+    return {
+        k.lower() if k.lower().startswith("x-amz-") else k: v for k, v in request.headers.items()
+    }
 
-    lowered = sorted((k.lower(), " ".join(v.split())) for k, v in signed.items())
-    names = ";".join(name for name, _ in lowered)
-    path, _, query = target.partition("?")
-    canonical = "\n".join(
-        [
-            method.upper(),
-            _canonical_uri(path),
-            _canonical_query(query),
-            "".join(f"{name}:{value}\n" for name, value in lowered),
-            names,
-            payload_hash,
-        ]
+
+def _authorize(
+    auth: S3SigV4Auth | S3SigV4QueryAuth, request: AWSRequest, when: datetime | None
+) -> None:
+    request.context["timestamp"] = (when or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+    auth._modify_request_before_signing(request)
+    canonical = auth.canonical_request(request)
+    auth._inject_signature_to_request(
+        request, auth.signature(auth.string_to_sign(request, canonical), request)
     )
-    to_sign = "\n".join([ALGORITHM, stamp, scope, hashlib.sha256(canonical.encode()).hexdigest()])
-    signature = hmac.new(
-        _signing_key(credentials.secret_key, stamp[:8], region, service),
-        to_sign.encode(),
-        hashlib.sha256,
-    ).hexdigest()
-    signed["Authorization"] = (
-        f"{ALGORITHM} Credential={credentials.access_key}/{scope}, "
-        f"SignedHeaders={names}, Signature={signature}"
-    )
-    return signed
+
+
+class _PayloadSigner(S3SigV4Auth):  # type: ignore[misc]
+    """Use the caller's precomputed hash without reading a streamed body."""
+
+    def __init__(
+        self, credentials: _AWSCredentials, service: str, region: str, digest: str
+    ) -> None:
+        super().__init__(credentials, service, region)
+        self._digest = digest
+
+    def payload(self, request: AWSRequest) -> str:
+        return self._digest
 
 
 def _is_signed(name: str) -> bool:
@@ -187,31 +220,6 @@ def _is_signed(name: str) -> bool:
     return lowered == "host" or lowered.startswith("x-amz-")
 
 
-def _canonical_uri(path: str) -> str:
-    """The path as S3 canonicalises it: decoded, then re-encoded its way.
-
-    The server does the same to what it receives, so a target this client
-    percent-encoded slightly differently still signs to the same string.
-    """
-    return urllib.parse.quote(urllib.parse.unquote(path or "/"), safe="/")
-
-
-def _canonical_query(query: str) -> str:
-    """The query sorted and re-encoded, with a value for every name."""
-    pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
-    return "&".join(
-        f"{urllib.parse.quote(name, safe='')}={urllib.parse.quote(value, safe='')}"
-        for name, value in sorted(pairs)
-    )
-
-
-def _signing_key(secret: str, date: str, region: str, service: str) -> bytes:
-    """The four-step derivation: date, region, service, and the terminator.
-
-    Each step keys the next, so the key that signs a request is good for one
-    day, one region and one service - which is the point of deriving it at all.
-    """
-    key = f"AWS4{secret}".encode()
-    for step in (date, region, service, "aws4_request"):
-        key = hmac.new(key, step.encode(), hashlib.sha256).digest()
-    return key
+def _selected_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    reserved = {"host", "x-amz-date", "x-amz-content-sha256", "x-amz-security-token"}
+    return {k: v for k, v in headers.items() if _is_signed(k) and k.lower() not in reserved}

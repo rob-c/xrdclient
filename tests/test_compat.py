@@ -143,13 +143,20 @@ def test_the_alias_assignments_that_have_to_be_evaluated_are_evaluated():
 def test_a_real_3_9_can_import_every_module():
     """And last, the interpreter itself, when the machine has one.
 
-    Nothing about this package needs installing to be imported - the core is
-    the standard library and a ``PYTHONPATH`` - so a system Python is enough,
-    and a module that needs an extra says so by name rather than failing.
+    The selected interpreter needs the base dependencies installed. Optional
+    adapters still identify their missing extras with a pip-install hint.
     """
     python = shutil.which("python3.9")
     if python is None:
         pytest.skip("no python3.9 on PATH to check the floor against")
+    required = subprocess.run(
+        [python, "-c", "import cryptography, botocore, asn1crypto, jwt, urllib3"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if required.returncode:
+        pytest.skip("the Python 3.9 interpreter lacks usable base dependencies: " + required.stderr)
     src = str(pathlib.Path(xrdclient.__file__).parent.parent)
     probe = """
 import importlib, pkgutil, xrdclient

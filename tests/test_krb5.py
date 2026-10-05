@@ -461,12 +461,12 @@ def test_an_unreadable_cache_is_an_error_not_a_silence(monkeypatch, tmp_path, co
         KerberosCredential.available(OFFER, Config(), username="jane", host="srv")
 
 
-def test_a_macos_api_cache_is_an_error_not_a_silence(monkeypatch):
-    # KCM: and KEYRING: caches are read now (tests/test_krb5_kcm.py,
-    # tests/test_krb5_keyring.py); macOS's XPC-held API: caches are not.
+def test_a_macos_api_cache_uses_the_native_library(monkeypatch):
     monkeypatch.setenv("KRB5CCNAME", "API:")
-    with pytest.raises(CredentialError, match=r"API:.*KRB5CCNAME=FILE:"):
-        KerberosCredential.available(OFFER, Config(), username="jane", host="srv")
+    monkeypatch.setattr(krb5, "_native_ap_req", lambda principal, cache: b"native-ap-req")
+    credential = KerberosCredential.available(OFFER, Config(), username="jane", host="srv")
+    assert credential is not None
+    assert credential.initial() == b"krb5\0native-ap-req"
 
 
 def test_a_cached_service_ticket_is_used_without_asking_the_kdc(monkeypatch, cache, kdc):

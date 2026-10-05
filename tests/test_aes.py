@@ -7,7 +7,7 @@ tested only against itself is tested against nothing.
 import pytest
 
 from xrdclient.crypto import AES, cbc_decrypt, cbc_encrypt
-from xrdclient.crypto.aes import BLOCK_SIZE, SBOX, pkcs7_pad, pkcs7_unpad
+from xrdclient.crypto.aes import BLOCK_SIZE, pkcs7_pad, pkcs7_unpad
 
 #: FIPS-197 appendix C: one plaintext, the three key sizes.
 FIPS_197 = [
@@ -49,13 +49,6 @@ def test_sp_800_38a_cbc_vector():
     """The mode, not just the block function — chaining is where CBC goes wrong."""
     assert cbc_encrypt(SP800_38A_KEY, SP800_38A_PLAIN, SP800_38A_IV, pad=False) == SP800_38A_CIPHER
     assert cbc_decrypt(SP800_38A_KEY, SP800_38A_CIPHER, SP800_38A_IV, pad=False) == SP800_38A_PLAIN
-
-
-def test_the_sbox_is_the_published_one():
-    """The tables are generated at import, so pin their first and last rows."""
-    assert SBOX[:16].hex() == "637c777bf26b6fc53001672bfed7ab76"
-    assert SBOX[-16:].hex() == "8ca1890dbfe6426841992d0fb054bb16"
-    assert len(set(SBOX)) == 256  # a permutation, not just 256 bytes
 
 
 @pytest.mark.parametrize("size", [16, 24, 32])

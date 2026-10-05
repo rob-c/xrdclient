@@ -27,7 +27,8 @@ from ..copy import CopyResult, append_zip, copy, copy_tree, third_party
 from ..errors import XRootDError
 from ..types import human_bytes as _human
 from ..url import XRootDURL, parse
-from . import OK, USAGE, Endpoints, common_flags, config_from, dumps, fail, size_arg, version_flag
+from . import OK, USAGE, Endpoints, common_flags, config_from, fail, size_arg, version_flag
+from . import _output as output
 
 __all__ = ["main"]
 
@@ -35,7 +36,7 @@ PROGRAM = "xrd-cp"
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = output.Parser(
         prog=PROGRAM,
         description="Copy files between root://, https://, and the local filesystem.",
         epilog=(
@@ -234,8 +235,14 @@ class Bar:
         self.label = label
         self.stream = stream or sys.stderr
         self._last = -1
+        self.report = output.current()
 
     def __call__(self, done: int, total: int | None) -> None:
+        if self.report is not None:
+            self.report.record(
+                "progress", bytes_transferred=done, total=total, **self.report.identity
+            )
+            return
         if total:
             percent = int(100 * done / total)
             if percent == self._last:
@@ -247,6 +254,8 @@ class Bar:
         print(f"\r{text}", end="", file=self.stream, flush=True)
 
     def finish(self) -> None:
+        if self.report is not None:
+            return
         if self._last >= 0 or self.stream is not sys.stderr:
             print(file=self.stream)
 
@@ -468,7 +477,12 @@ def _tpc_misuse(args: argparse.Namespace) -> str | None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    return output.run_cli(PROGRAM, argv, lambda: _main(argv), legacy_json=True)
+
+
+def _main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    output.identify("copy", sources=args.source, target=args.dest)
     complaint = _misuse(args)
     if complaint is not None:
         print(f"{PROGRAM}: {complaint}", file=sys.stderr)
@@ -546,8 +560,8 @@ def _show_results(results: Sequence[CopyResult], args: argparse.Namespace) -> No
     which is a corrupt download that looks like a successful one.
     """
     where = sys.stderr if _writes_to_stdout(results) else sys.stdout
-    if args.json:
-        print(dumps([_record(r) for r in results]), file=where)
+    if args.json or output.current() is not None:
+        output.payload([_record(r) for r in results], where=where)
     elif not args.quiet:
         for result in results:
             print(result, file=where)
@@ -571,13 +585,30 @@ def _run(
             if into and args.zip
             else _destination(source, dest, into=into)
         )
-        bar = Bar(posixpath.basename(source.path.rstrip("/")) or str(source)) if show else None
+        bar = _progress_for(source, args, show)
+        output.identify("copy", source=str(source), target=str(target))
         try:
-            results.extend(_copy_one(source, target, args, config, bar, options))
+            completed = _copy_one(source, target, args, config, bar, options)
+            for result in completed:
+                output.record(
+                    operation="copy",
+                    status="planned" if args.dry_run else "succeeded",
+                    source=result.source,
+                    target=result.target,
+                    value=_record(result),
+                )
+            results.extend(completed)
         finally:
             if bar is not None:
                 bar.finish()
     return results
+
+
+def _progress_for(source: XRootDURL, args: argparse.Namespace, show: bool) -> Bar | None:
+    reporting = output.current() is not None and args.progress is not False
+    if show or reporting:
+        return Bar(posixpath.basename(source.path.rstrip("/")) or str(source))
+    return None
 
 
 #: Flags passed on to :func:`~xrdclient.copy` when given: attribute, keyword.
