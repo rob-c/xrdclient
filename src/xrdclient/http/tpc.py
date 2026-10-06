@@ -164,8 +164,21 @@ WRITE_ACTIVITIES = ("LIST", "DOWNLOAD", "MANAGE", "UPLOAD", "DELETE")
 def _minted(
     far: XRootDURL, config: Config, client: HTTPClient, *, write: bool, timeout: float | None
 ) -> str | None:
-    """A macaroon for ``far``, when nothing else will authorise it; else ``None``."""
-    if not far.use_tls or _remote_token(far, None, config):
+    """A macaroon for ``far``, when nothing else will authorise it; else ``None``.
+
+    A far-end token written at the call site - its URL's ``authz``, or an
+    explicit ``remote_token`` the caller passed (which, when given, means this
+    is never reached) - is the far end's to accept, so it is used as given and
+    no macaroon is minted. But the *ambient* token, the user's own, is not: it
+    authorises the control request to the near side, while the far leg is a
+    server-to-server transfer the active SE makes with whatever
+    ``TransferHeaderAuthorization`` carries, and an identity-mapped token
+    (a DiracX token, say - accepted for a direct read or write, and to mint a
+    macaroon, but not for the delegated leg) is refused there. So a macaroon
+    scoped to this one file is minted with it, exactly as the proxy path does;
+    if the far end cannot mint one, the ambient token is forwarded after all.
+    """
+    if not far.use_tls or any(far.query.get(key) for key in _TOKEN_KEYS):
         return None
     from .dav import macaroon
 

@@ -819,12 +819,21 @@ def test_a_minted_token_is_scoped_to_what_the_copy_does(monkeypatch):
     assert tpc._minted(far, config, None, write=True, timeout=300) == "m"
     assert requests[0][1:] == (["activity:LIST,DOWNLOAD"], "PT30M")
     assert requests[1][1:] == (["activity:LIST,DOWNLOAD,MANAGE,UPLOAD,DELETE"], "PT20M")
-    # Nothing to mint: plain http, a token already in hand, or a far end that cannot.
+    # Nothing to mint: plain http, a far-end token in the URL, or a far end that cannot.
     assert (
         tpc._minted(xrdclient.url.parse("http://se/f"), config, None, write=False, timeout=None)
         is None
     )
-    assert tpc._minted(far, xrdclient.Config(token="t"), None, write=False, timeout=None) is None
+    # A token written into the far URL is the far end's to accept, so it stands.
+    assert (
+        tpc._minted(
+            xrdclient.url.parse("https://se/f?authz=X"), config, None, write=False, timeout=None
+        )
+        is None
+    )
+    # But an *ambient* token no longer suppresses the mint: it is refused on the
+    # delegated leg, so a macaroon is minted with it instead and used there.
+    assert tpc._minted(far, xrdclient.Config(token="t"), None, write=False, timeout=None) == "m"
 
     def refuse(*args, **kwargs):
         raise PermissionError("no macaroons here")
