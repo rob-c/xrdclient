@@ -149,9 +149,21 @@ def glob(pattern: Location, *, config: Config | None = None) -> list[XRootDPath]
     A local pattern is :meth:`pathlib.Path.glob`'s job.
     """
     _refuse_local(pattern, "glob", "use pathlib.Path.glob")
-    with XRootDPath(pattern, config) as here:
-        found = list(here.fs.glob(here.url.path))
-    return [XRootDPath(here.url.with_path(path), config) for path in found]
+    from .client import FileSystem
+
+    url = pattern.url if isinstance(pattern, XRootDPath) else parse(pattern)
+    target = url.glob_pattern()
+    # A pattern ending in '?' parses to an empty query, so glob_pattern cannot
+    # tell it from a path with no '?' at all; restore that one '?'.
+    if isinstance(pattern, str) and pattern.endswith("?") and not target.endswith("?"):
+        target += "?"
+    # Glob from a query-clean base: a '?' wildcard also lands in the URL's query,
+    # which would otherwise ride along on every listing the glob makes and be
+    # rejected as stray opaque data by a strict server (dCache).
+    base = url.without_query()
+    with FileSystem(base, config) as fs:
+        found = list(fs.glob(target))
+    return [XRootDPath(base.with_path(path), config) for path in found]
 
 
 def stat(url: Location, *, config: Config | None = None) -> StatInfo:

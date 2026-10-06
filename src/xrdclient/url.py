@@ -132,6 +132,18 @@ class XRootDURL:
     def without_query(self) -> XRootDURL:
         return replace(self, query={}, _raw_query="")
 
+    def glob_pattern(self) -> str:
+        """This path read as a glob pattern, ``?`` wildcards and all.
+
+        A ``?`` in a pattern like ``.../f??.dat`` is also the URL's
+        query-string delimiter, so parsing moved the tail into the query and
+        left ``path`` ending at the first ``?``. Globbing the path alone would
+        match the literal name ``f``; joining the raw query back on restores
+        the wildcards. A pattern with no ``?`` has an empty query and is
+        returned unchanged.
+        """
+        return f"{self.path}?{self._raw_query}" if self._raw_query else self.path
+
     # -- formatting ----------------------------------------------------
 
     @property
