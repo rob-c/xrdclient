@@ -220,8 +220,19 @@ def _add_token(headers: dict[str, str], token: str | None) -> None:
 
 
 def _add_verification(headers: dict[str, str], verify: bool | None) -> None:
-    if verify is not None:
-        headers["RequireChecksumVerification"] = "true" if verify else "false"
+    """Set ``RequireChecksumVerification``, defaulting it *off* as gfal2 does.
+
+    ``true`` asks the destination to verify the source's checksum in band,
+    which it does with a ``HEAD`` carrying ``Want-Digest``. Some sources
+    answer a checksum *query* but put no digest in that ``HEAD`` - CNAF's
+    StoRM is one - and the destination then fails the whole copy with "no
+    checksum in HEAD response". So, like gfal2 (which never sends ``true``),
+    the default is ``false``: the copy is verified end to end afterwards by
+    :func:`xrdclient.third_party`, which compares each side's checksum query.
+    ``verify=True`` still forces server-side verification for a caller who
+    wants it and knows both ends can answer a HEAD digest.
+    """
+    headers["RequireChecksumVerification"] = "true" if verify else "false"
 
 
 def _add_streams(headers: dict[str, str], streams: int | None) -> None:

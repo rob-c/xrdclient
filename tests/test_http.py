@@ -940,9 +940,42 @@ def test_the_optional_knobs_reach_the_wire(dav, elsewhere):
     assert headers["TransferHeaderX-Rucio-Id"] == "abc"
 
 
-def test_saying_nothing_about_checksums_leaves_the_server_policy_alone(dav, elsewhere):
+def test_the_copy_turns_off_the_servers_own_checksum_verification_by_default(dav, elsewhere):
+    """``RequireChecksumVerification: false`` by default, as gfal2 sends.
+
+    Left absent, the destination defaults to verifying the source's checksum
+    in band with a ``HEAD``; a source that answers a checksum query but puts
+    no digest in that ``HEAD`` (CNAF's StoRM) then fails the whole copy. So
+    the server-side check is turned off and the copy is verified end to end
+    afterwards instead (test_a_pull_is_verified_against_both_servers_by_default).
+    """
     xrdclient.third_party(dav.url / "d/a.root", elsewhere.url / "d/copy.root")
-    assert "RequireChecksumVerification" not in elsewhere.copies[-1]
+    assert elsewhere.copies[-1]["RequireChecksumVerification"] == "false"
+
+
+def test_a_pull_from_a_checksumless_head_source_still_succeeds(dav, elsewhere):
+    """The CNAF-StoRM case: no digest in the source HEAD must not fail the copy.
+
+    The destination here refuses any COPY that asks it to verify the source
+    checksum (as dCache does when the source HEAD carries none); the client's
+    default of ``RequireChecksumVerification: false`` is what lets it through.
+    """
+    def refuse_server_verification(method, path, headers):
+        if method == "COPY" and headers.get("RequireChecksumVerification") == "true":
+            return (500, b"failure: no checksum in HEAD response\n", {})
+        return None
+
+    elsewhere.handlers["COPY"] = refuse_server_verification
+    xrdclient.third_party(dav.url / "d/a.root", elsewhere.url / "d/copy.root", verify=False)
+    assert elsewhere.contents("/d/copy.root") == BODY
+
+
+def test_verify_true_still_forces_server_side_verification(dav, elsewhere):
+    """A caller who knows both ends can answer a HEAD digest can still ask for it."""
+    from xrdclient.http import third_party
+
+    third_party(dav.url / "d/a.root", elsewhere.url / "d/copy.root", verify=True)
+    assert elsewhere.copies[-1]["RequireChecksumVerification"] == "true"
 
 
 def test_an_endpoint_without_third_party_copy_says_so(dav, elsewhere):
