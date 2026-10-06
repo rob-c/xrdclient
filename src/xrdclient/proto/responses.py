@@ -12,7 +12,7 @@ import re
 from dataclasses import dataclass, field
 
 from .._compat import SLOTS
-from ..errors import ProtocolError
+from ..errors import ProtocolError, UnsupportedError
 from ..flags import StatInfoFlags
 from ..types import (
     CheckpointInfo,
@@ -367,6 +367,13 @@ def parse_stat(data: bytes, path: str = "") -> StatInfo:
 def parse_statvfs(data: bytes) -> VFSInfo:
     """``kXR_stat`` with ``kXR_vfs``."""
     parts = data.split(b"\x00", 1)[0].decode("utf-8", "replace").split()
+    if len(parts) == 4:
+        # A server that does not do the vfs stat answers the request as a plain
+        # ``kXR_stat`` - the four-field ``id size flags modtime`` line of the
+        # directory itself. dCache does exactly this. That is the server saying
+        # it has no vfs figures, not a garbled vfs reply, so it reads as
+        # unsupported rather than as a protocol fault.
+        raise UnsupportedError(3013, "server answered kXR_stat vfs with a plain stat")
     if len(parts) < 6:
         raise ProtocolError(f"kXR_stat vfs returned {len(parts)} fields, expected 6")
     return VFSInfo(

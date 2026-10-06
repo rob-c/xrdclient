@@ -220,3 +220,59 @@ def test_a_real_rmtree_never_deletes_through_a_link(real_server, sandbox):
     # What is left is the links, and the directory that holds one.
     assert sorted(os.listdir(f"{sandbox}/tree")) == ["link", "sub"]
     assert os.listdir(f"{sandbox}/tree/sub") == ["cycle"]
+
+
+# -- dCache has no inodes and no kXR_notempty: the backend the guards were for --
+
+
+def test_walk_recurses_when_every_directory_reports_the_same_id(monkeypatch, config):
+    """dCache answers ``kXR_stat`` for a directory with id ``0`` - the same for
+    all of them. The walk's link-cycle guard, keyed on that id, took the first
+    child it entered for every later directory and stopped one level in; a
+    placeholder id identifies nothing and must not be a cycle key."""
+    from xrdclient.testing import server as _server
+
+    real = _server._Connection._stat_line
+
+    def zeroed(self, path: str, *, follow: bool = True) -> bytes:
+        line = real(self, path, follow=follow)
+        if path in self.s.dirs:  # dCache's constant directory id
+            return b"0 " + line.split(b" ", 1)[1]
+        return line
+
+    monkeypatch.setattr(_server._Connection, "_stat_line", zeroed)
+    files = {"/t/a/b/deep": b"x", "/t/a/sibling": b"y", "/t/top": b"z"}
+    with FakeServer(files=dict(files)) as srv, FileSystem(srv.url, config) as fs:
+        found = sorted(root for root, _dirs, _files in fs.walk("/t"))
+    assert found == ["/t", "/t/a", "/t/a/b"]
+
+
+def test_descent_does_not_collapse_directories_that_share_a_placeholder_id():
+    from xrdclient.client.filesystem import _Descent
+
+    descent = _Descent(lambda _path: None, followlinks=False)
+    # A real device+inode repeats only on a genuine cycle: entered once.
+    assert descent.enters("/x", "1234") is True
+    assert descent.enters("/y", "1234") is False
+    # A placeholder (dCache's 0, an empty S3 id) names nothing: never a repeat.
+    assert descent.enters("/a", "0") is True
+    assert descent.enters("/b", "0") is True
+    assert descent.enters("/c", "") is True
+    assert descent.enters("/d", "0:0") is True
+
+
+def test_not_empty_reads_a_servers_message_when_the_errno_does_not_say():
+    import errno
+
+    from xrdclient.client.filesystem import _not_empty
+
+    # Stock xrootd: kXR_ItExists -> EEXIST (and POSIX ENOTEMPTY).
+    assert _not_empty(OSError(errno.EEXIST, "exists")) is True
+    assert _not_empty(OSError(errno.ENOTEMPTY, "not empty")) is True
+    # dCache: a generic server error carrying EIO, reason in the text alone.
+    dcache = OSError(
+        errno.EIO, "Failed to delete directory (Directory is not empty: /pnfs/x [666])."
+    )
+    assert _not_empty(dcache) is True
+    # A real failure that is not about emptiness stays a failure.
+    assert _not_empty(OSError(errno.EIO, "The server reported a failure.")) is False

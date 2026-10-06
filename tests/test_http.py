@@ -676,6 +676,32 @@ def test_a_copy_into_webdav_verifies_itself(dav, tmp_path):
         xrdclient.copy(source, dav.url / "d/up.bin", overwrite=False)
 
 
+def test_a_copy_into_a_missing_collection_makes_the_parents(dav, tmp_path):
+    """A ``root://`` write carries ``kXR_mkpath``; WebDAV ``PUT`` makes no
+    parents and answers 409. The copy makes them first, from a clean namespace
+    (a failed ``PUT`` leaves EOS unable to), so the write lands."""
+    source = tmp_path / "deep.bin"
+    source.write_bytes(b"payload")
+    result = xrdclient.copy(source, dav.url / "fresh/sub/deep.bin", verify=False)
+    assert result.size == len(b"payload")
+    assert {"/fresh", "/fresh/sub"} <= dav.dirs
+    assert dav.contents("/fresh/sub/deep.bin") == b"payload"
+
+
+def test_copy_tree_into_webdav_makes_its_directories_up_front(dav, tmp_path):
+    (tmp_path / "a" / "b").mkdir(parents=True)
+    (tmp_path / "top.txt").write_text("t")
+    (tmp_path / "a" / "x.txt").write_text("x")
+    (tmp_path / "a" / "b" / "y.txt").write_text("y")
+    results = xrdclient.copy_tree(str(tmp_path), dav.url / "tree", verify=False)
+    assert len(results) == 3
+    assert {"/tree", "/tree/a", "/tree/a/b"} <= dav.dirs
+    assert dav.contents("/tree/a/b/y.txt") == b"y"
+    # The directories are made once, before any file - not an MKCOL per PUT.
+    mkcols = [path for method, path in dav.seen if method == "MKCOL"]
+    assert mkcols and all(not path.endswith(".txt") for path in mkcols)
+
+
 # ---------------------------------------------------------------------------
 # Macaroons
 # ---------------------------------------------------------------------------

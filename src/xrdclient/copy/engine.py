@@ -1141,6 +1141,7 @@ def copy(
     min_rate: float | None = None,
     timeout: float | None = None,
     coerce: bool = False,
+    _make_parents: bool = True,
 ) -> CopyResult:
     """Copy ``source`` to ``target`` and report what happened.
 
@@ -1250,7 +1251,67 @@ def copy(
         min_rate=min_rate,
         timeout=timeout,
         coerce=coerce,
+        make_parents=_make_parents,
     )
+
+
+def _ensure_parent_collection(dst: XRootDURL | None, config: Config) -> None:
+    """Make a WebDAV target's parent directory before the first byte goes out.
+
+    A write to ``root://`` carries ``kXR_mkpath`` and a local copy calls
+    ``os.makedirs``, so a copy into a directory that is not there succeeds at
+    both ends; WebDAV makes no parents on ``PUT``. Worse, a grid storage
+    element (EOS) is left unable to create any of the path once a ``PUT`` into
+    it has failed, so this cannot be done in reaction to the 404 - the parent
+    is made up front, from a clean namespace. Only an ``http``/``dav``
+    destination needs it: ``root://`` and local make their own parents and S3
+    has no directories to make. ``MKCOL`` on a directory already there is
+    ``exist_ok``, so the common copy into an existing directory costs one
+    round trip and no error.
+    """
+    if dst is None or not dst.is_http:
+        return
+    parent = os.path.dirname(dst.path.rstrip("/"))
+    if parent in ("", "/"):
+        return
+    from ..http.dav import HTTPFileSystem
+
+    fs = HTTPFileSystem(dst, config)
+    try:
+        fs.mkdir(parent, parents=True, exist_ok=True)
+    finally:
+        fs.client.close()
+
+
+def _precreate_tree_dirs(
+    dst: XRootDURL, wanted: Sequence[str], config: Config, *, dry_run: bool
+) -> None:
+    """Make every directory a WebDAV tree copy will write into, up front.
+
+    :func:`copy_tree` could leave each file's :func:`copy` make its own parent,
+    but that is a fresh connection and an ``MKCOL`` per file; the directories
+    are few and shared, so they are made once here over one reused client, and
+    the per-file :func:`_ensure_parent_collection` is then switched off. Only a
+    WebDAV destination needs it - ``root://`` and local make their own parents
+    (see :func:`_ensure_parent_collection`), so for those this does nothing.
+    """
+    if dry_run or not dst.is_http or not wanted:
+        return
+    base = dst.path.rstrip("/")
+    directories = {""}
+    for rel in wanted:
+        current = os.path.dirname(rel.strip("/"))
+        while current:
+            directories.add(current)
+            current = os.path.dirname(current)
+    from ..http.dav import HTTPFileSystem
+
+    fs = HTTPFileSystem(dst, config)
+    try:
+        for relative in sorted(directories, key=lambda d: d.count("/")):
+            fs.mkdir(base + ("/" + relative if relative else ""), parents=True, exist_ok=True)
+    finally:
+        fs.client.close()
 
 
 def _copy_one(
@@ -1273,6 +1334,7 @@ def _copy_one(
     timeout: float | None,
     coerce: bool,
     declared: ChecksumInfo | None = None,
+    make_parents: bool = True,
 ) -> CopyResult:
     """Copy one concrete source; Metalink dispatch has already happened."""
     cfg = config
@@ -1291,6 +1353,8 @@ def _copy_one(
     )
     if dry_run:
         return _dry_run(job)
+    if make_parents:
+        _ensure_parent_collection(job.dst_url, cfg)
     algo = algorithm or cfg.preferred_checksum
     started = time.monotonic()
     with _cleaned_on_failure(job, resume=resume):
@@ -1759,8 +1823,10 @@ def copy_tree(
 ) -> list[CopyResult]:
     """Copy a directory recursively, returning one result per file copied.
 
-    Local target directories are created as needed; remote ones are, too,
-    because a remote write asks the server for ``kXR_mkpath``. Options other
+    Target directories are created as needed, wherever the target is: a local
+    copy calls ``os.makedirs``, a ``root://`` write asks the server for
+    ``kXR_mkpath``, and a WebDAV tree has its directories made up front, since
+    ``PUT`` makes none (see :func:`_ensure_parent_collection`). Options other
     than the ones named here - ``dry_run`` and ``verify`` among them - are
     passed through to :func:`copy`.
 
@@ -1789,6 +1855,9 @@ def copy_tree(
     count = cfg.parallel_files if workers is None else workers
     total = _tree_total(progress, count)
     options = _sync_options(options, sync)
+    # A WebDAV tree's directories are made once, here, rather than one
+    # connection and MKCOL per file inside every copy() below.
+    _precreate_tree_dirs(dst_url, wanted, cfg, dry_run=bool(options.get("dry_run")))
 
     def move(rel: str) -> CopyResult | None:
         destination = dst_url / rel
@@ -1797,7 +1866,9 @@ def copy_tree(
         if destination.is_local and not options.get("dry_run"):
             os.makedirs(os.path.dirname(destination.path), exist_ok=True)
         report = progress if total is None else total.worker()
-        return copy(src_url / rel, destination, config=cfg, progress=report, **options)
+        return copy(
+            src_url / rel, destination, config=cfg, progress=report, _make_parents=False, **options
+        )
 
     results = _each(wanted, count, move)
     if delete:

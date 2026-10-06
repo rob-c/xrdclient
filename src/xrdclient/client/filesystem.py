@@ -140,9 +140,17 @@ def _not_empty(exc: OSError) -> bool:
     """Whether a refused ``rmdir`` said "that directory has something in it".
 
     Stock xrootd reports ``ENOTEMPTY`` as ``kXR_ItExists``, which arrives as
-    an ``EEXIST``; the POSIX spelling is accepted as well.
+    an ``EEXIST``; the POSIX spelling is accepted as well. dCache sends
+    neither: ``kXR_rmdir`` on a full directory comes back as a generic server
+    error carrying ``EIO``, with the reason in its text alone ("Failed to
+    delete directory (Directory is not empty: ...)"). Read that text where the
+    errno does not carry the meaning, so a tree on dCache is cleared instead of
+    taken for a server fault and abandoned half-removed.
     """
-    return exc.errno in (errno.EEXIST, errno.ENOTEMPTY)
+    if exc.errno in (errno.EEXIST, errno.ENOTEMPTY):
+        return True
+    text = getattr(exc, "message", None) or exc.strerror or ""
+    return "not empty" in text.lower()
 
 
 class _Links:
@@ -191,11 +199,27 @@ class _Descent:
     def enters(self, path: str, ident: str) -> bool:
         if not self._follow and self._links(path):
             return False
-        if ident in self._seen:
-            return False
-        if ident:  # an entry with no id (an S3 prefix) is never a repeat
+        if self._identifies(ident):
+            if ident in self._seen:
+                return False
             self._seen.add(ident)
         return True
+
+    @staticmethod
+    def _identifies(ident: str) -> bool:
+        """Whether a stat id truly names one directory, for the cycle guard.
+
+        The id is the server's device and inode, so a link that comes round to
+        an ancestor is seen the second time its id turns up. That only holds
+        when the id identifies: a server that carries no inodes must not have
+        its placeholder taken as one identity shared by every directory.
+        dCache answers every directory with id ``0`` and S3 with none at all -
+        trust either as an id and the walk, having entered the first child,
+        takes every later sibling for that same child and stops. Such an id
+        guards nothing, and without ``followlinks`` the tree it walks has no
+        cycle to guard against; an all-zero (or empty) id is treated as absent.
+        """
+        return bool(ident.strip("0:"))
 
 
 class _Batches:

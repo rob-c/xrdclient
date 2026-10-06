@@ -4,7 +4,7 @@ import struct
 
 import pytest
 
-from xrdclient.errors import ProtocolError
+from xrdclient.errors import ProtocolError, UnsupportedError
 from xrdclient.flags import StatInfoFlags
 from xrdclient.proto import constants as c
 from xrdclient.proto import responses as rp
@@ -249,6 +249,14 @@ def test_parse_statvfs():
 def test_parse_statvfs_rejects_a_short_line():
     with pytest.raises(ProtocolError, match="expected 6"):
         rp.parse_statvfs(b"1 2 3\x00")
+
+
+def test_parse_statvfs_reads_a_plain_stat_as_unsupported():
+    # dCache does not do the vfs stat and answers the request as an ordinary
+    # four-field ``kXR_stat`` (``id size flags modtime``). That is the server
+    # saying it has no vfs figures, which is unsupported, not a garbled reply.
+    with pytest.raises(UnsupportedError):
+        rp.parse_statvfs(b"0 512 51 1791287802\x00")
 
 
 def test_parse_statx_is_one_byte_per_path():
