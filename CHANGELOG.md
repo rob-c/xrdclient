@@ -4,6 +4,45 @@ Notable user-visible changes are recorded here. This project follows
 [Semantic Versioning](https://semver.org/); compatibility fixes which make the
 client agree more closely with XrdCl are not considered breaking changes.
 
+## Unreleased
+
+<!-- At release, rename this heading to "## [0.3.2] - <date>", bump
+     src/xrdclient/_version.py to 0.3.2, and add the compare link below. -->
+
+### Fixed
+
+- `walk` descends fully, and `rmtree` with it, against a server that gives
+  every directory the same placeholder stat id. The link-cycle guard took that
+  id (dCache answers every directory with `0`) for one node shared by all of
+  them and stopped one level in; a placeholder id now identifies nothing, so a
+  tree on dCache is walked and removed instead of left half-cleared. `rmtree`
+  also recognises dCache's "directory not empty" as the generic server error
+  it arrives as, rather than abandoning the tree on it.
+- `statvfs` against a server that answers the vfs request with an ordinary
+  `kXR_stat` line (dCache) reports it as unsupported, not a protocol error.
+- `copy` and `copy_tree` into WebDAV make the destination's parent collections
+  first. A `PUT` makes none, and on EOS a failed one leaves the path unusable,
+  so the parents are created up front from a clean namespace; a tree makes all
+  of its directories once over one connection.
+- `glob` keeps a `?` wildcard in a pattern given as a URL. It is also the
+  URL's query delimiter, so the pattern's tail was parsed away as a query,
+  matching the literal prefix and finding nothing; the wildcard is now kept,
+  and the listing is made through a query-clean base so a strict server
+  (dCache) does not reject the stray opaque data.
+- A token-authorised third-party copy mints a short-lived macaroon at the far
+  end for the delegated leg instead of forwarding a bare ambient token. An
+  identity-mapped token (a DiracX token) is taken for a direct read or write,
+  and to mint a macaroon, but refused on the server-to-server leg; a far-end
+  token written into the URL is still used as given.
+
+### Changed
+
+- A third-party copy no longer asks the destination to verify the source's
+  checksum in band (`RequireChecksumVerification` defaults off) and compares
+  the digest end to end here instead, so a pull from a source that puts no
+  checksum in its `HEAD` (CNAF's StoRM) to a strict destination (dCache)
+  succeeds.
+
 ## [0.3.1] - 2026-10-06
 
 ### Changed
