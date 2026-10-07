@@ -59,13 +59,20 @@ def test_glob_question_mark_survives_url_parsing(config):
     # the literal prefix to match nothing. It is a single-character wildcard.
     import fnmatch
 
-    files = {f"/data/{n}": b"x"
-             for n in ("f00.dat", "f01.dat", "f40.dat", "ab.dat", "abc.dat")}
+    files = {f"/data/{n}": b"x" for n in ("f00.dat", "f01.dat", "f40.dat", "ab.dat", "abc.dat")}
     names = sorted(n.rsplit("/", 1)[-1] for n in files)
     with FakeServer(files=files) as srv:
         base = str(srv.url.with_path("/data"))
-        for pat in ("f??.dat", "f?.dat", "??.dat", "???.dat", "f0?.dat",
-                    "f00.da?", "f[0-1]?.dat", "*.dat"):
+        for pat in (
+            "f??.dat",
+            "f?.dat",
+            "??.dat",
+            "???.dat",
+            "f0?.dat",
+            "f00.da?",
+            "f[0-1]?.dat",
+            "*.dat",
+        ):
             got = sorted(p.name for p in xrdclient.glob(f"{base}/{pat}", config=config))
             assert got == sorted(n for n in names if fnmatch.fnmatch(n, pat)), pat
 

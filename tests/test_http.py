@@ -995,6 +995,7 @@ def test_a_pull_from_a_checksumless_head_source_still_succeeds(dav, elsewhere):
     checksum (as dCache does when the source HEAD carries none); the client's
     default of ``RequireChecksumVerification: false`` is what lets it through.
     """
+
     def refuse_server_verification(method, path, headers):
         if method == "COPY" and headers.get("RequireChecksumVerification") == "true":
             return (500, b"failure: no checksum in HEAD response\n", {})

@@ -4,10 +4,7 @@ Notable user-visible changes are recorded here. This project follows
 [Semantic Versioning](https://semver.org/); compatibility fixes which make the
 client agree more closely with XrdCl are not considered breaking changes.
 
-## Unreleased
-
-<!-- At release, rename this heading to "## [0.3.2] - <date>", bump
-     src/xrdclient/_version.py to 0.3.2, and add the compare link below. -->
+## [0.3.2] - 2026-10-07
 
 ### Fixed
 
@@ -220,6 +217,7 @@ client agree more closely with XrdCl are not considered breaking changes.
 - Retry and cleanup paths preserve the primary transfer error and avoid
   leaking failed connections back into the pool.
 
+[0.3.2]: https://github.com/rob-c/xrdclient/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/rob-c/xrdclient/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/rob-c/xrdclient/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rob-c/xrdclient/compare/v0.1.0...v0.2.0
