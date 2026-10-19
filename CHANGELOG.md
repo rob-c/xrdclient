@@ -45,6 +45,9 @@ client agree more closely with XrdCl are not considered breaking changes.
 
 ### Added
 
+- The `fsspec` extra (`pip install 'xrdclient[fsspec]'`) brings in fsspec
+  for `xrdclient.fsspec_impl`; fsspec was only a development dependency, so
+  nothing declared what the adapter needs.
 - `xrdclient.crypto.proxies`: one X.509 proxy issuer with named profiles
   (`rfc3820`, `arc`, `xrootd`, `globus-legacy`): `issue_proxy`, `create_proxy`
   (in memory, RSA or EC, VOMS ACs embedded), `write_proxy` (atomic, `0600`,

@@ -59,6 +59,9 @@ fast = ["xrdcore[fast]>=0.4.0,<0.5"]
 # xrdsec's since 0.4.0, so this is xrdsec's extra. Native bindings need
 # Kerberos development headers when no wheel is available.
 krb5 = ["xrdsec[krb5]>=0.4.0,<0.5"]
+# The fsspec filesystems (xrdclient.fsspec_impl: root://, dav(s)://), which
+# subclass fsspec's; the fsspec.specs entry points name them.
+fsspec = ["fsspec>=2024.2.0"]
 dev = [
   "build>=1,<2",
   "complexipy>=6,<7",

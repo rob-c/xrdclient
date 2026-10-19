@@ -27,6 +27,9 @@ jobs:
         with:
           package: xrdclient
           preflight: true
+          # Every public module is imported from the installed wheel, and
+          # xrdclient.fsspec_impl subclasses fsspec's filesystems.
+          extras: fsspec
 
   # Trusted publishing ties PyPI's trust to this job of this workflow, so the
   # upload stays here, in a job that only downloads what the build staged.

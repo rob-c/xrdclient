@@ -1,7 +1,7 @@
 # fsspec
 
 ```console
-$ pip install xrdclient fsspec
+$ pip install 'xrdclient[fsspec]'
 ```
 
 That is the whole setup, and pandas, dask and pyarrow already bring `fsspec`
