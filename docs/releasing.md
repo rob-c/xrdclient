@@ -74,7 +74,7 @@ next changelog section before development resumes.
 
 ## Releasing the 0.4.0 chain
 
-0.4.0 is six packages released together, lowest layer first, because each
+0.4.0 is seven packages released together, lowest layer first, because each
 publish job installs its wheel from what the previous steps put on PyPI:
 
 | Step | Package | Repository | Requires (on PyPI) | Published to |
@@ -84,6 +84,7 @@ publish job installs its wheel from what the previous steps put on PyPI:
 | 3 | xrdclient | `rob-c/xrdclient` | the three libraries, `>=0.4.0,<0.5` | PyPI + GitHub |
 | 4 | xgfalclient | `rob-c/xgfalclient` | `xrdclient==0.4.0` and the libraries | PyPI + GitHub |
 | 5 | xrdarc | `rob-c/xrdarc` | xrdcore, xrdsec and xrdhttp (never a client) | PyPI + GitHub |
+| 6 | xrdwms | `rob-c/xrdwms` (new) | every package above (xrdarc through its `arc` extra) | PyPI |
 
 PyPI never forgets a version: an upload in the wrong order cannot be undone,
 only yanked and superseded by a new version of every package above it. Do not
@@ -119,7 +120,7 @@ run or release of the chain can start. It gets no PyPI project: it is used
 from a checkout only (its `pyproject.toml` carries `Private :: Do Not
 Upload`).
 
-Each new PyPI project (xrdcore, xrdsec, xrdhttp, xrdarc) is created by its
+Each new PyPI project (xrdcore, xrdsec, xrdhttp, xrdarc, xrdwms) is created by its
 first trusted upload. Before tagging, on
 <https://pypi.org/manage/account/publishing/> add a **pending publisher** per
 project: owner `rob-c`, repository `<name>`, workflow `publish.yml` (for
@@ -130,7 +131,7 @@ have trusted publishers; check they still name `publish.yml` and `pypi`.
 
 ### Pre-flight for the whole chain
 
-From the workspace holding all six checkouts and xrd-devtools, with `build`,
+From the workspace holding all seven checkouts and xrd-devtools, with `build`,
 `hatchling` and `twine` in the interpreter and xrd-devtools installed
 (`pip install -e xrd-devtools`):
 
@@ -142,7 +143,7 @@ $ xrddevtools conformance --workspace .   # every pyproject.toml is the one stan
 $ xrddevtools release check xrdclient     # one version source, changelog, metadata (each repo)
 ```
 
-The pre-flight (`xrddevtools.chain_preflight`) checks that all six versions are the chain's
+The pre-flight (`xrddevtools.chain_preflight`) checks that all seven versions are the chain's
 (xrdcore's, or `--version`); that every package's requirements on the others
 follow the layering with the agreed specifiers (`>=0.4.0,<0.5` for each
 library, `==0.4.0` for xgfalclient's xrdclient, nothing upward: xrdarc never
@@ -238,6 +239,17 @@ once they are on PyPI it can install them from there instead. Date the changelog
 A failed tag uploads nothing; delete it, fix, and tag again, as for the
 others. A user installs it with `pip install xrdarc`; pip fetches xrdcore,
 xrdsec and xrdhttp from PyPI.
+
+### Step 6: xrdwms
+
+xrdwms sits on every package above - the three libraries, xrdclient and
+xgfalclient, and xrdarc through its `arc` extra - so it goes last, once
+xrdarc 0.4.0 is installable from PyPI. Date the changelog, commit, wait for
+CI, then tag and push `v0.4.0`. Its `.github/workflows/publish.yml` builds
+with the shared `publish` action (build, `twine check --strict`, the
+pre-flight against PyPI, a clean install whose tag, version and dated
+changelog agree) and uploads with trusted publishing (owner `rob-c`,
+repository `xrdwms`, workflow `publish.yml`, environment `pypi`).
 
 ### After the chain
 
