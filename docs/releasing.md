@@ -83,7 +83,7 @@ publish job installs its wheel from what the previous steps put on PyPI:
 | 2 | xrdsec, xrdhttp | `rob-c/xrdsec`, `rob-c/xrdhttp` (new) | `xrdcore>=0.4.0,<0.5` | PyPI + GitHub |
 | 3 | xrdclient | `rob-c/xrdclient` | the three libraries, `>=0.4.0,<0.5` | PyPI + GitHub |
 | 4 | xgfalclient | `rob-c/xgfalclient` | `xrdclient==0.4.0` and the libraries | PyPI + GitHub |
-| 5 | xrdarc | `rob-c/xrdarc` | xrdcore and xrdsec (never a client) | GitHub release |
+| 5 | xrdarc | `rob-c/xrdarc` | xrdcore, xrdsec and xrdhttp (never a client) | PyPI + GitHub |
 
 PyPI never forgets a version: an upload in the wrong order cannot be undone,
 only yanked and superseded by a new version of every package above it. Do not
@@ -91,8 +91,9 @@ start a step until the previous one is installable from PyPI.
 
 ### Once: create the new repositories and PyPI projects
 
-xrdcore, xrdsec and xrdhttp are not git repositories yet. For each `<name>`
-of the three, from the workspace (review `git status` before the first
+This was done for 0.4.0 (xrdcore, xrdsec, xrdhttp, xrdwms and xrd-devtools
+are on `rob-c`); it is kept as the recipe for a new repository of the chain.
+For each new `<name>`, from the workspace (review `git status` before the first
 commit: build output, caches and `.coverage` files are ignored, nothing else
 should be untracked):
 
@@ -118,12 +119,11 @@ run or release of the chain can start. It gets no PyPI project: it is used
 from a checkout only (its `pyproject.toml` carries `Private :: Do Not
 Upload`).
 
-Each PyPI project (xrdcore, xrdsec, xrdhttp) is created by its first trusted
-upload. Before tagging, on
+Each new PyPI project (xrdcore, xrdsec, xrdhttp, xrdarc) is created by its
+first trusted upload. Before tagging, on
 <https://pypi.org/manage/account/publishing/> add a **pending publisher** per
-project: owner `rob-c`, repository `<name>`, workflow `publish.yml`,
-environment `pypi`. (xrdarc is not on PyPI; if it ever is, its publisher
-names workflow `release.yml` - see step 5.) In each GitHub repository create the `pypi` environment
+project: owner `rob-c`, repository `<name>`, workflow `publish.yml` (for
+xrdarc, `release.yml` - see step 5), environment `pypi`. In each GitHub repository create the `pypi` environment
 (Settings, Environments), restricted to `v*` tags, with a required reviewer if
 you want a manual approval before upload. xrdclient and xgfalclient already
 have trusted publishers; check they still name `publish.yml` and `pypi`.
@@ -218,9 +218,8 @@ check` and the tag, changelog and gfal2-version checks, and only then uploads.
 
 ### Step 5: xrdarc
 
-xrdarc is released on GitHub only; nothing is uploaded to PyPI. Its CI
-checks out the libraries; once they are on PyPI it can install them from
-there instead. Date the changelog, commit, wait for CI, then tag and push
+xrdarc is released on GitHub and PyPI. Its CI checks out the libraries;
+once they are on PyPI it can install them from there instead. Date the changelog, commit, wait for CI, then tag and push
 `v0.4.0`. Its `.github/workflows/release.yml`:
 
 1. builds the sdist and wheel and runs `twine check --strict`;
@@ -232,16 +231,13 @@ there instead. Date the changelog, commit, wait for CI, then tag and push
    client was installed, and runs the checkout's suite against the installed
    wheel;
 4. creates the GitHub release `v0.4.0` ("xrdarc 0.4.0", notes from the
-   changelog's `[0.4.0]` section) with the wheel and sdist attached.
+   changelog's `[0.4.0]` section) with the wheel and sdist attached;
+5. uploads the same wheel and sdist to PyPI with trusted publishing (owner
+   `rob-c`, repository `xrdarc`, workflow `release.yml`, environment `pypi`).
 
 A failed tag uploads nothing; delete it, fix, and tag again, as for the
-others. A user installs it with `pip install xrdarc-0.4.0-py3-none-any.whl`
-(or the release asset's URL); pip fetches xrdcore and xrdsec from PyPI.
-
-To put xrdarc on PyPI later: add a pending trusted publisher (owner `rob-c`,
-repository `xrdarc`, workflow `release.yml`, environment `pypi`), create the
-`pypi` environment in the repository, and uncomment the `publish` job at the
-end of `release.yml`; the table above then gains "PyPI +" for step 5.
+others. A user installs it with `pip install xrdarc`; pip fetches xrdcore,
+xrdsec and xrdhttp from PyPI.
 
 ### After the chain
 
