@@ -123,8 +123,8 @@ Upload`).
 Each new PyPI project (xrdcore, xrdsec, xrdhttp, xrdarc, xrdwms) is created by its
 first trusted upload. Before tagging, on
 <https://pypi.org/manage/account/publishing/> add a **pending publisher** per
-project: owner `rob-c`, repository `<name>`, workflow `publish.yml` (for
-xrdarc, `release.yml` - see step 5), environment `pypi`. In each GitHub repository create the `pypi` environment
+project: owner `rob-c`, repository `<name>`, workflow `publish.yml`,
+environment `pypi`. In each GitHub repository create the `pypi` environment
 (Settings, Environments), restricted to `v*` tags, with a required reviewer if
 you want a manual approval before upload. xrdclient and xgfalclient already
 have trusted publishers; check they still name `publish.yml` and `pypi`.
@@ -221,7 +221,7 @@ check` and the tag, changelog and gfal2-version checks, and only then uploads.
 
 xrdarc is released on GitHub and PyPI. Its CI checks out the libraries;
 once they are on PyPI it can install them from there instead. Date the changelog, commit, wait for CI, then tag and push
-`v0.4.0`. Its `.github/workflows/release.yml`:
+`v0.4.0`. Its `.github/workflows/publish.yml`:
 
 1. builds the sdist and wheel and runs `twine check --strict`;
 2. runs xrd-devtools' `chain_preflight.py pypi dist/*.whl` (steps 1-3 are
@@ -234,7 +234,7 @@ once they are on PyPI it can install them from there instead. Date the changelog
 4. creates the GitHub release `v0.4.0` ("xrdarc 0.4.0", notes from the
    changelog's `[0.4.0]` section) with the wheel and sdist attached;
 5. uploads the same wheel and sdist to PyPI with trusted publishing (owner
-   `rob-c`, repository `xrdarc`, workflow `release.yml`, environment `pypi`).
+   `rob-c`, repository `xrdarc`, workflow `publish.yml`, environment `pypi`).
 
 A failed tag uploads nothing; delete it, fix, and tag again, as for the
 others. A user installs it with `pip install xrdarc`; pip fetches xrdcore,
