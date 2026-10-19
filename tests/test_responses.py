@@ -4,7 +4,7 @@ import struct
 
 import pytest
 
-from xrdclient.errors import ProtocolError
+from xrdclient.errors import ProtocolError, UnsupportedError
 from xrdclient.flags import StatInfoFlags
 from xrdclient.proto import constants as c
 from xrdclient.proto import responses as rp
@@ -246,9 +246,27 @@ def test_parse_statvfs():
     assert (info.nodes_staging, info.free_staging, info.utilization_staging) == (1, 500, 20)
 
 
+def test_parse_statvfs_rejects_a_field_that_is_not_a_number():
+    with pytest.raises(ProtocolError, match="non-numeric"):
+        rp.parse_statvfs(b"1 2 three 4 5 6\x00")
+
+
 def test_parse_statvfs_rejects_a_short_line():
     with pytest.raises(ProtocolError, match="expected 6"):
         rp.parse_statvfs(b"1 2 3\x00")
+
+
+def test_parse_statvfs_reads_a_plain_stat_as_unsupported():
+    # dCache does not do the vfs stat and answers the request as an ordinary
+    # four-field ``kXR_stat`` (``id size flags modtime``). That is the server
+    # saying it has no vfs figures, which is unsupported, not a garbled reply.
+    with pytest.raises(UnsupportedError):
+        rp.parse_statvfs(b"0 512 51 1791287802\x00")
+
+
+def test_parse_statvfs_still_refuses_four_words_that_are_not_a_stat_line():
+    with pytest.raises(ProtocolError, match="expected 6"):
+        rp.parse_statvfs(b"0 big 51 1791287802\x00")
 
 
 def test_parse_statx_is_one_byte_per_path():
@@ -267,6 +285,7 @@ def test_parse_dirlist_with_stat_drops_the_dot_entry():
     body = b".\nid 0 19 0\nfile.root\nid 42 0 1700000000\nsub\nid 0 2 0\x00"
     entries = rp.parse_dirlist(body, "/d")
     assert [e.name for e in entries] == ["file.root", "sub"]
+    assert entries[0].stat is not None
     assert entries[0].stat.st_size == 42
     assert entries[0].path == "/d/file.root"
 
@@ -285,6 +304,7 @@ def test_parse_dirlist_reads_the_digest_appended_to_each_stat_line():
     )
     entries = rp.parse_dirlist(body, "/d")
     assert entries[0].checksum == ChecksumInfo("adler32", "1a0b045d")
+    assert entries[0].stat is not None
     assert entries[0].stat.st_size == 42  # the token does not disturb the stat
     assert entries[1].checksum is None  # "none" is no digest, not a digest of none
 
@@ -301,6 +321,7 @@ def test_parse_dirlist_reads_the_digest_appended_to_each_stat_line():
 def test_a_stat_line_without_a_usable_token_keeps_its_fields(line):
     entries = rp.parse_dirlist(f".\nid 0 19 0\nf\n{line}\n".encode(), "/d")
     assert entries[0].checksum is None
+    assert entries[0].stat is not None
     assert entries[0].stat.st_size == 42
 
 
@@ -636,3 +657,10 @@ def test_a_readlink_answer_naming_nothing_is_a_protocol_error():
 
     with pytest.raises(ProtocolError, match="named no target"):
         rp.parse_readlink(b"   \x00")
+
+
+@pytest.mark.parametrize("line", [b"\x01\t\x01\t\x01\t\x01", b"id x 0 0", b"id 1 0 0 c a 644 u g"])
+def test_a_non_numeric_stat_field_is_a_protocol_error(line):
+    """Found by the framing property tests: ``int()`` must not leak ValueError."""
+    with pytest.raises(ProtocolError, match="non-numeric"):
+        rp.parse_stat(line)

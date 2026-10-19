@@ -15,19 +15,23 @@ from __future__ import annotations
 
 import ast
 import importlib
+import inspect
 import io
 import os
 import pathlib
 import subprocess
 import sys
 import zipfile
+from collections.abc import Callable
 
 import pytest
 
 import xrdclient
+from xrdclient.aio import AsyncFileSystem
 from xrdclient.client.file import File
-from xrdclient.client.filesystem import FileSystem
+from xrdclient.client.filesystem import BaseFileSystem, FileSystem
 from xrdclient.config import Config
+from xrdclient.copy import CopyResult
 from xrdclient.errors import UnsupportedError
 from xrdclient.flags import (
     Access,
@@ -41,7 +45,8 @@ from xrdclient.flags import (
 )
 from xrdclient.path import XRootDPath
 from xrdclient.testing import FakeServer
-from xrdclient.types import ReadRange, WriteChunk
+from xrdclient.types import ReadRange, StatInfo, WriteChunk
+from xrdclient.url import XRootDURL
 
 CONFIG = Config(username="tester", auth_order=("host",), require_tls=False)
 
@@ -121,7 +126,14 @@ def _fs_list_archive(fs):
     assert [entry.name for entry in fs.list_archive("a.zip")] == ["member"]
 
 
-FILESYSTEM = {
+def _fs_abort(fs):
+    fs.abort()
+    with pytest.raises(xrdclient.AbortedError):
+        fs.stat("f.root")
+
+
+FILESYSTEM: dict[str, Callable[[FileSystem], object]] = {
+    "abort": _fs_abort,
     "appid": lambda fs: fs.appid("surface-test"),
     "cancel_prepare": lambda fs: fs.cancel_prepare(fs.prepare(["f.root"])),
     "checksum": lambda fs: fs.checksum("f.root"),
@@ -130,6 +142,7 @@ FILESYSTEM = {
     "chown": lambda fs: fs.chown("f.root", 1000, 1000),
     "close": lambda fs: fs.close(),
     "deep_locate": lambda fs: fs.deep_locate("f.root"),
+    "dirlist": lambda fs: fs.dirlist("."),
     "endpoint": lambda fs: fs.endpoint,
     "evict": lambda fs: fs.evict(["f.root"]),
     "exists": lambda fs: fs.exists("f.root"),
@@ -194,7 +207,8 @@ def test_this_filesystem_method_works_against_a_server(fs, name):
 
 
 def test_every_public_filesystem_method_is_exercised():
-    assert set(FILESYSTEM) == public(FileSystem)
+    # The shared helpers live on the base class every scheme inherits them from.
+    assert set(FILESYSTEM) == public(FileSystem) | public(BaseFileSystem)
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +242,7 @@ def _file_removexattr(fh):
     return fh.removexattr("user.k")
 
 
-FILE = {
+FILE: dict[str, Callable[[File], object]] = {
     "bind_data_path": lambda fh: fh.bind_data_path(),
     "checkpoint": _file_checkpoint,
     "checksum": lambda fh: fh.checksum(),
@@ -263,6 +277,8 @@ FILE = {
     "write": lambda fh: fh.write(b"W", 0),
     "writev": lambda fh: fh.writev([WriteChunk(0, b"a"), (2, b"b")]),
     "clone": lambda fh: fh.clone(fh, [(0, 2, 4)]),
+    "write_pieces": lambda fh: fh.write_pieces([b"ab", b"cd"], 0),
+    "abort": lambda fh: fh.abort(),
 }
 
 
@@ -272,7 +288,8 @@ def test_this_file_method_works_against_a_server(fh, name):
 
 
 def test_every_public_file_method_is_exercised():
-    assert set(FILE) == public(File)
+    # The read and write halves live in private base classes of File's own.
+    assert set(FILE) == set().union(*(public(k) for k in File.__mro__[:-1]))
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +302,7 @@ def _path_open(p):
         return fh.read()
 
 
-PATH = {
+PATH: dict[str, Callable[[XRootDPath], object]] = {
     "anchor": lambda p: p.anchor,
     "checksum": lambda p: p.checksum(),
     "chmod": lambda p: p.chmod(0o640),
@@ -369,7 +386,7 @@ def _use_config(srv):
     return xrdclient.current()
 
 
-def _use_copy(srv, tmp_path):
+def _use_copy(srv: FakeServer, tmp_path: pathlib.Path) -> CopyResult:
     return xrdclient.copy(srv.url.with_path("/store/f.root"), tmp_path / "out.root", config=CONFIG)
 
 
@@ -385,6 +402,20 @@ def _use_third_party(srv, tmp_path):
             config=CONFIG,
             verify=False,
         )
+
+
+def _use_failed_end(srv, tmp_path):
+    with FakeServer() as destination:
+        try:
+            xrdclient.third_party(
+                srv.url.with_path("/store/none.root"),
+                destination.url.with_path("/x"),
+                config=CONFIG,
+                verify=False,
+            )
+        except FileNotFoundError as exc:
+            return xrdclient.failed_end(exc) or "no end"  # a placement names none
+    raise AssertionError("a missing source copied")
 
 
 def _use_file(srv, tmp_path):
@@ -406,14 +437,14 @@ def _use_checkpoint(srv, tmp_path):
 def _use_aio(srv, tmp_path):
     import asyncio
 
-    async def go():
-        async with xrdclient.aio.FileSystem(srv.url.with_path("/store"), CONFIG) as fs:
+    async def go() -> list[str]:
+        async with AsyncFileSystem(srv.url.with_path("/store"), CONFIG) as fs:
             return await fs.listdir(".")
 
     return asyncio.run(go())
 
 
-def _one_file(srv):
+def _one_file(srv: FakeServer) -> XRootDURL:
     """The URL the one-line verbs below ask their questions about."""
     return srv.url.with_path("/store/f.root")
 
@@ -449,7 +480,7 @@ def _use_parse_metalink(srv, tmp):
     return xrdclient.parse_metalink(document).replicas
 
 
-NAMES = {
+NAMES: dict[str, Callable[..., object]] = {
     "Access": lambda srv, tmp: int(Access.OWNER_READ | Access.OWNER_WRITE) > 0,
     "Checkpoint": _use_checkpoint,
     "CheckpointInfo": lambda srv, tmp: xrdclient.CheckpointInfo(capacity=8, used=2).free,
@@ -463,6 +494,7 @@ NAMES = {
     "DirListFlags": lambda srv, tmp: DirListFlags.STAT | DirListFlags.NONE,
     "File": _use_file,
     "FileSystem": lambda srv, tmp: xrdclient.FileSystem(srv.url, CONFIG).close(),
+    "BaseFileSystem": lambda srv, tmp: issubclass(xrdclient.FileSystem, xrdclient.BaseFileSystem),
     "LocationInfo": lambda srv, tmp: xrdclient.LocationInfo(address="a:1094").address,
     "MetalinkFile": lambda srv, tmp: xrdclient.MetalinkFile("f", ("file:///f",)).name,
     "LocateFlags": lambda srv, tmp: LocateFlags.FOR_DIRLIST | LocateFlags.NONE,
@@ -499,6 +531,7 @@ NAMES = {
     "parse": lambda srv, tmp: xrdclient.parse("root://host:1094//store/f.root").path,
     "parse_metalink": _use_parse_metalink,
     "third_party": _use_third_party,
+    "failed_end": _use_failed_end,
     # the one-line verbs
     "ls": lambda srv, tmp: xrdclient.ls(srv.url.with_path("/store"), config=CONFIG),
     "glob": lambda srv, tmp: xrdclient.glob(srv.url.with_path("/store/*.root"), config=CONFIG),
@@ -520,7 +553,7 @@ NAMES = {
 }
 
 
-def _within_a_deadline(srv):
+def _within_a_deadline(srv: FakeServer) -> StatInfo:
     with xrdclient.deadline(30):
         return xrdclient.stat(_one_file(srv), config=CONFIG)
 
@@ -528,7 +561,7 @@ def _within_a_deadline(srv):
 @pytest.mark.parametrize("name", sorted(NAMES))
 def test_this_public_name_is_usable(srv, tmp_path, name):
     call = NAMES[name]
-    result = call(srv, tmp_path) if call.__code__.co_argcount == 2 else call(srv)
+    result = call(srv, tmp_path) if len(inspect.signature(call).parameters) == 2 else call(srv)
     assert result is not None or name in {"FileSystem", "Path"}
 
 
@@ -560,7 +593,7 @@ def _imports(source: pathlib.Path) -> list[tuple[str, bool]]:
     """
     tree = ast.parse(source.read_text(encoding="utf-8"))
     guarded = _guarded_nodes(tree)
-    found = []
+    found: list[tuple[str, bool]] = []
     for node in ast.walk(tree):
         found.extend((name, node in guarded) for name in _import_names(node))
     return found
@@ -584,38 +617,33 @@ def _import_names(node: ast.AST) -> list[str]:
     return []
 
 
-#: Both purity checks below read the interpreter's own list of standard
-#: library module names, which is 3.10 and later. The package's floor is 3.9,
-#: where the list simply does not exist; every other version still runs them.
-needs_stdlib_names = pytest.mark.skipif(
-    not hasattr(sys, "stdlib_module_names"),
-    reason="sys.stdlib_module_names arrived in 3.10",
-)
-
-
-@needs_stdlib_names
 def test_the_package_uses_only_declared_runtime_dependencies():
     """No unguarded imports outside stdlib and the approved generic libraries."""
     stdlib = set(sys.stdlib_module_names) | {
         "xrdclient",
         "_typeshed",
         "asn1crypto",
-        "botocore",
         "cryptography",
         "gssapi",
-        "jwt",
-        "urllib3",
+        "xrdcore",
+        # The HTTP protocol pieces; botocore is xrdhttp's to import, not ours.
+        "xrdhttp",
+        # The grid security code (X.509, proxies, VOMS, tokens, TLS contexts).
+        "xrdsec",
     }
+    # fsspec loads the adapter itself, through its entry point, so the adapter
+    # may import fsspec; nothing else in the package imports the adapter
+    # (test_importing_the_package_uses_only_declared_runtime_dependencies).
+    loaded_by = {"fsspec_impl.py": "fsspec"}
     offenders = {
         f"{source.name}: {name}"
         for source in pathlib.Path(xrdclient.__file__).parent.rglob("*.py")
         for name, guarded in _imports(source)
-        if name not in stdlib and not guarded
+        if name not in stdlib and not guarded and loaded_by.get(source.name) != name
     }
     assert not offenders
 
 
-@needs_stdlib_names
 def test_importing_the_package_uses_only_declared_runtime_dependencies():
     """Inspect a fresh interpreter, including approved dependencies' imports."""
     allowed = {
@@ -626,7 +654,11 @@ def test_importing_the_package_uses_only_declared_runtime_dependencies():
         "botocore",
         "cryptography",
         "gssapi",
-        "jwt",
+        "xrdcore",
+        "xrdhttp",
+        "xrdsec",
+        # botocore (xrdhttp's, for S3) and its own dependencies; this package
+        # no longer imports urllib3.
         "urllib3",
         "dateutil",
         "jmespath",
@@ -638,6 +670,9 @@ def test_importing_the_package_uses_only_declared_runtime_dependencies():
         "typing_extensions",
         "packaging",
         "sitecustomize",
+        # Fedora's site hook for its split standard library (Python 3.15 on
+        # Rawhide); it is part of the distribution's interpreter, not a dependency.
+        "_missing_stdlib_info",
     }
     script = (
         "import sys; import xrdclient; "
@@ -669,7 +704,9 @@ def test_the_working_directory_is_not_needed_to_use_the_package(srv, tmp_path):
 
 def test_the_async_facade_is_one_attribute_away(monkeypatch):
     """``xrdclient.aio`` resolves lazily, and nothing else does."""
-    monkeypatch.delattr(xrdclient, "aio", raising=False)  # as it is before anyone asks
+    # As it is before anyone asks. ``delattr`` would ask: ``hasattr`` is true
+    # of every lazy name, so it is the namespace itself that is edited.
+    monkeypatch.delitem(vars(xrdclient), "aio", raising=False)
     assert xrdclient.aio is importlib.import_module("xrdclient.aio")
     with pytest.raises(AttributeError, match="has no attribute 'nonesuch'"):
         _ = xrdclient.nonesuch

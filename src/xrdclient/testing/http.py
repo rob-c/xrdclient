@@ -3,74 +3,96 @@
 :class:`FakeDAVServer` is to :mod:`xrdclient.http` what
 :class:`~xrdclient.testing.FakeServer` is to the binary protocol: enough of a real
 storage element - ranged ``GET``, chunked ``PUT``, ``PROPFIND``, ``MKCOL``,
-``MOVE``, ``DELETE``, RFC 3230 digests, macaroon minting, third-party
-``COPY`` - to test a client against, with knobs for the awkward cases (a
-server that redirects, one that demands a token, one that has no WebDAV at
-all, one that ignores ranges, one whose third-party copy fails after
-answering ``202``).
+``MOVE``, ``DELETE``, RFC 3230 and RFC 9530 digests, macaroon minting,
+third-party ``COPY``, the WLCG tape REST API - to test a client against, with
+knobs for the awkward cases (a server that redirects, one that demands a
+token, one that has no WebDAV at all, one that ignores ranges, one whose
+third-party copy fails after answering ``202``).
 
     >>> with FakeDAVServer(files={"/d/a.root": b"hello"}) as srv:
     ...     xrdclient.FileSystem(srv.url).listdir("/d")
     ['a.root']
+
+Since 0.4.0 the server itself is xrdhttp's shared fake storage element,
+:class:`xrdhttp.testing.StorageServer`, in its XrdCl style - the same one
+xgfalclient's suite runs against - and every switch documented there
+(faults, ``tokens``, ``redirect_prefixes``, S3, ...) works here.
+:class:`FakeDAVServer` is the thin preset that keeps this package's
+vocabulary, the one :class:`~xrdclient.testing.FakeServer` shares: a
+namespace held in :attr:`~FakeDAVServer.files` and
+:attr:`~FakeDAVServer.dirs`, :attr:`~FakeDAVServer.url` as an
+:class:`~xrdclient.url.XRootDURL`, the request log as
+:attr:`~FakeDAVServer.seen` (and ``targets``, ``headers``, ``bodies``),
+:attr:`~FakeDAVServer.handlers` keyed by method, and the tape state under
+its flat names (``nearline``, ``staged``, ``cancelled``, ``released``,
+``no_tape``, ``sitename``). :data:`Handler` and :data:`Reply` are
+xrdhttp's.
+
+This module also re-exports, under their pre-0.4.0 names, xrdsec's generic
+test HTTPS server (:class:`FakeHTTPSServer`, its :class:`Request`,
+:class:`Response` and :class:`Fault`, which the storage element is built on
+too) and xrdhttp's reply helpers (:func:`ranged_reply`,
+:func:`propfind_reply`, :func:`multistatus`, :func:`dav_entries`,
+:class:`DAVEntry`, :data:`BOUNDARY`), for a fake of some other HTTP service.
 """
 
 from __future__ import annotations
 
-import json
 import posixpath
-import socketserver
-import threading
-import time
-import urllib.parse
-from collections.abc import Callable
-from email.utils import formatdate
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Optional, cast
+import ssl
 
-from ..crypto import checksum_bytes
+from xrdhttp.testing import BOUNDARY as BOUNDARY
+from xrdhttp.testing import DAVEntry as DAVEntry
+from xrdhttp.testing import Handler as Handler
+from xrdhttp.testing import MemoryStore, StorageServer, Tape
+from xrdhttp.testing import Reply as Reply
+from xrdhttp.testing import dav_entries as dav_entries
+from xrdhttp.testing import multistatus as multistatus
+from xrdhttp.testing import propfind_reply as propfind_reply
+from xrdhttp.testing import ranged_reply as ranged_reply
+from xrdsec.testing.https import FakeHTTPSServer as FakeHTTPSServer
+from xrdsec.testing.https import Fault as Fault
+from xrdsec.testing.https import PeerIdentity as PeerIdentity
+from xrdsec.testing.https import Request as Request
+from xrdsec.testing.https import Response as Response
+from xrdsec.testing.https import Route as Route
+from xrdsec.testing.https import TLSServer as TLSServer
+from xrdsec.testing.https import peer_identity as peer_identity
+from xrdsec.testing.https import read_body as read_body
+
 from ..url import XRootDURL, parse
 
-__all__ = ["FakeDAVServer", "Handler", "Reply"]
+__all__ = [
+    "BOUNDARY",
+    "DAVEntry",
+    "FakeDAVServer",
+    "FakeHTTPSServer",
+    "Fault",
+    "Handler",
+    "PeerIdentity",
+    "Reply",
+    "Request",
+    "Response",
+    "Route",
+    "TLSServer",
+    "dav_entries",
+    "multistatus",
+    "peer_identity",
+    "propfind_reply",
+    "ranged_reply",
+    "read_body",
+]
 
-#: One canned answer: ``(status, body, headers)``.
-Reply = tuple[int, bytes, dict[str, str]]
 
-#: What :attr:`FakeDAVServer.handlers` holds. It is handed ``(method, path,
-#: headers)`` and either answers the request itself or returns ``None`` to let
-#: the real implementation have it.
-Handler = Callable[[str, str, dict[str, str]], Optional[Reply]]
+class FakeDAVServer(StorageServer):
+    """An HTTP/WebDAV endpoint on loopback, populated from a dict.
 
-_DIGESTS = ("adler32", "md5", "sha256", "crc32c", "crc64")
-
-
-def _clean(path: str) -> str:
-    """The stored form of a plain path: absolute, no trailing slash.
-
-    A plain path is a name, as a test or a tape request writes it, so a
-    ``%`` or a ``#`` in it is part of the name and is not decoded here.
+    Every knob is a plain public attribute set after construction and read
+    per request, so a test can change the server's behaviour between two
+    calls of the client - the first attempt redirected, the second served.
+    The port is bound on first use and released by :meth:`stop`; serving
+    threads are daemons, so a leaked server cannot hang interpreter exit.
     """
-    return posixpath.normpath("/" + path.strip("/")) if path.strip("/") else "/"
-
-
-def _decoded(target: str) -> str:
-    """The plain path a request target or an absolute URL names.
-
-    Its escapes are decoded exactly once, which is the other half of the
-    client encoding a name exactly once.
-    """
-    return _clean(urllib.parse.unquote(urllib.parse.urlsplit(target).path))
-
-
-def _endpoint(server: socketserver.BaseServer) -> tuple[str, int]:
-    """The bound ``(host, port)``. These servers are always AF_INET, which is
-    narrower than the address family ``socketserver`` is typed for.
-    """
-    host, port = cast("tuple[str, int]", server.server_address)
-    return host, port
-
-
-class FakeDAVServer:
-    """An HTTP/WebDAV endpoint on loopback, populated from a dict."""
 
     def __init__(
         self,
@@ -79,669 +101,124 @@ class FakeDAVServer:
         dirs: list[str] | None = None,
         host: str = "127.0.0.1",
         port: int = 0,
+        tls: ssl.SSLContext | None = None,
     ) -> None:
-        #: Path to contents. Mutated by the client, readable by the test.
-        self.files: dict[str, bytes] = {}
-        #: Collections that exist, including every parent of every file.
-        self.dirs: set[str] = {"/"}
-        #: ``(method, path)`` for every request served, in order.
-        self.seen: list[tuple[str, str]] = []
-        #: Method to :data:`Handler`, for serving an answer this server would
-        #: never produce on its own - a hostile multistatus, a short body, a
-        #: digest in a shape nobody sensible would send.
-        self.handlers: dict[str, Handler] = {}
-        #: The body of every request served, in order.
-        self.bodies: list[bytes] = []
-        #: The raw request target of every request served, query and all.
-        self.targets: list[str] = []
-        #: Bearer token to demand; ``None`` accepts anything.
-        self.require_token: str | None = None
-        #: ``path -> location`` sent as a 307 before the real answer.
-        self.redirects: dict[str, str] = {}
-        #: Answer a redirect as soon as the headers are in and hang up
-        #: without reading the body, as EOS's head node does with a ``PUT``.
-        #: A client that did not ask ``Expect: 100-continue`` first is left
-        #: writing into a closed connection.
-        self.early_redirects = False
-        #: Honour ``Expect: 100-continue``. ``False`` is a server that ignores
-        #: the expectation, which HTTP allows: it just reads the body.
-        self.expect_continue = True
-        #: The headers of every request served, in order.
-        self.headers: list[dict[str, str]] = []
-        #: Refuse ``PROPFIND``, the way a plain HTTP server would.
-        self.no_dav = False
-        #: Answer a ranged ``GET`` with the whole body, as some caches do.
-        self.ignore_ranges = False
-        #: Promise the full ``Content-Length`` on a ``GET`` but send only
-        #: this many bytes and drop the connection - a server dying mid-reply.
-        self.truncate_at: int | None = None
-        #: Answer ``Want-Digest`` at all.
-        self.digests = True
-        #: What a macaroon request mints.
+        """Hold ``files`` (and the empty collections ``dirs``); nothing is bound yet.
+
+        Parents of every file and directory are created, as a real
+        namespace has them. ``port=0`` lets the kernel choose, so the suite's
+        parallel workers never collide on a port. The macaroon minted is the
+        fixed ``macaroon-abc123``, and the tape API is on.
+        """
+        self._memory = MemoryStore(files, dirs or ())
+        super().__init__(self._memory, tls=tls, host=host, port=port, name="xrdclient-fake-dav")
         self.macaroon = "macaroon-abc123"
-        #: Refuse ``COPY``, the way an endpoint without third-party copy would.
-        self.no_tpc = False
-        #: Report this in the ``failure:`` line instead of doing the transfer.
-        self.tpc_failure: str | None = None
-        #: How many performance markers a ``COPY`` sends before the outcome.
-        self.tpc_markers = 2
-        #: Seconds to wait before each marker and the outcome of a ``COPY``:
-        #: a transfer that is slow but alive, the way a long one looks.
-        self.tpc_marker_gap = 0.0
-        #: The headers of every ``COPY`` served, in order.
-        self.copies: list[dict[str, str]] = []
-        #: Files that live on tape rather than on disk. A staging request for
-        #: one of them stays ``SUBMITTED`` until the test discards it here,
-        #: which is how a test watches a file come online.
-        self.nearline: set[str] = set()
-        #: Request id to the paths it named, for the WLCG tape API.
-        self.staged: dict[str, list[str]] = {}
-        #: Answer ``/api/v1`` at all - ``False`` is a site with no tape.
-        self.no_tape = False
-        #: ``(request id, path)`` for each file withdrawn from a request.
-        self.cancelled: set[tuple[str, str]] = set()
-        #: ``(request id, path)`` for each file released from a request.
-        self.released: set[tuple[str, str]] = set()
-        #: The name the well-known discovery document gives the site.
-        self.sitename = "fake-site"
+        self.tape = Tape()
 
-        for path, data in (files or {}).items():
-            self.add_file(path, data)
-        for path in dirs or []:
-            self.add_dir(path)
-
-        self._wanted = (host, port)
-        self._last: tuple[str, int] | None = None
-        self._bound: ThreadingHTTPServer | None = None
-        self._thread: threading.Thread | None = None
-
-    # -- contents ------------------------------------------------------
-
-    def add_dir(self, path: str) -> None:
-        target = _clean(path)
-        while target not in self.dirs:
-            self.dirs.add(target)
-            target = posixpath.dirname(target) or "/"
-
-    def add_file(self, path: str, data: bytes = b"") -> None:
-        target = _clean(path)
-        self.files[target] = bytes(data)
-        self.add_dir(posixpath.dirname(target))
-
-    def contents(self, path: str) -> bytes:
-        return self.files[_clean(path)]
-
-    # -- lifecycle -----------------------------------------------------
+    # -- the namespace -------------------------------------------------------------------
 
     @property
-    def _server(self) -> ThreadingHTTPServer:
-        if self._bound is None:
-            self._bound = _Server(self._wanted, _Handler)
-            self._bound.fake = self
-        return self._bound
+    def files(self) -> dict[str, bytes]:
+        """Path to contents. Mutated by the client, readable (and writable) by the test."""
+        return self._memory.files
 
     @property
-    def address(self) -> tuple[str, int]:
-        """Where the server listens; reading it before ``start`` binds a port."""
-        if self._bound is None and self._last is not None:
-            return self._last
-        return _endpoint(self._server)
+    def dirs(self) -> set[str]:
+        """Collections that exist, including every parent of every file."""
+        return self._memory.dirs
 
     @property
     def url(self) -> XRootDURL:
-        """``http://host:port/`` - what a client connects to."""
-        host, port = self.address
-        return parse(f"http://{host}:{port}/")
+        """``http://host:port/`` - or ``https://`` with TLS - what a client connects to."""
+        return parse(f"{self.base}/")
 
-    def start(self) -> FakeDAVServer:
-        """Serve in a background thread. Idempotent."""
-        if self._thread is None:
-            self._thread = threading.Thread(
-                target=self._server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
-            )
-            self._thread.start()
-        return self
+    # -- the request log -----------------------------------------------------------------
 
-    def stop(self) -> None:
-        """Stop serving and release the port. Idempotent."""
-        if self._bound is None:
-            return
-        self._last = _endpoint(self._bound)
-        if self._thread is not None:
-            self._bound.shutdown()
-            self._thread = None
-        self._bound.server_close()
-        self._bound = None
+    @property
+    def seen(self) -> list[tuple[str, str]]:
+        """``(method, path)`` for every request served, in order; paths decoded and normalised."""
+        # The namespace key: no trailing slash, ``//`` and ``.`` folded, as stored.
+        return [
+            (request.method, posixpath.normpath("/" + request.path.strip("/")))
+            for request in list(self.requests)
+        ]
 
-    def __enter__(self) -> FakeDAVServer:
-        return self.start()
+    @property
+    def targets(self) -> list[str]:
+        """The raw request target of every request served, query and all."""
+        return [request.target for request in list(self.requests)]
 
-    def __exit__(self, *exc: object) -> None:
-        self.stop()
+    @property
+    def headers(self) -> list[dict[str, str]]:
+        """The headers of every request served, in order."""
+        return [request.headers for request in list(self.requests)]
+
+    @property
+    def bodies(self) -> list[bytes]:
+        """The body of every request served, in order (``b""`` for none)."""
+        return [request.body for request in list(self.requests)]
+
+    # -- authorisation -------------------------------------------------------------------
+
+    @property
+    def require_token(self) -> str | None:
+        """The bearer token to demand; ``None`` accepts anything."""
+        return next(iter(self.tokens), None)
+
+    @require_token.setter
+    def require_token(self, token: str | None) -> None:
+        """Demand ``token`` (and only it); ``None`` stops demanding one."""
+        self.tokens = {token} if token else set()
+
+    # -- the WLCG tape API ---------------------------------------------------------------
+
+    @property
+    def _tape(self) -> Tape:
+        """The tape state, made afresh if a test turned the API off and on again."""
+        if self.tape is None:
+            self.tape = Tape()
+        return self.tape
+
+    @property
+    def no_tape(self) -> bool:
+        """Answer ``/api/v1`` at all - ``True`` is a site with no tape."""
+        return self.tape is None
+
+    @no_tape.setter
+    def no_tape(self, absent: bool) -> None:
+        """Take the tape away, or put a fresh one back."""
+        self.tape = None if absent else Tape()
+
+    @property
+    def nearline(self) -> set[str]:
+        """Files on tape only: staging one stays ``SUBMITTED`` until the test discards it here."""
+        return self._tape.nearline
+
+    @property
+    def staged(self) -> dict[str, list[str]]:
+        """Request id to the paths it named, for the requests not yet withdrawn."""
+        return self._tape.staged()
+
+    @property
+    def cancelled(self) -> set[tuple[str, str]]:
+        """``(request id, path)`` for each file withdrawn from a request."""
+        return {(handle, path) for handle, paths in self._tape.cancelled for path in paths}
+
+    @property
+    def released(self) -> set[tuple[str, str]]:
+        """``(request id, path)`` for each file released from a request."""
+        return {(handle, path) for handle, paths in self._tape.released for path in paths}
+
+    @property
+    def sitename(self) -> str:
+        """The name the well-known discovery document gives the site."""
+        return self._tape.sitename
+
+    @sitename.setter
+    def sitename(self, name: str) -> None:
+        """Rename the site."""
+        self._tape.sitename = name
 
     def __repr__(self) -> str:
-        bound = _endpoint(self._bound) if self._bound else self._last
-        where = f"{bound[0]}:{bound[1]}" if bound else "unbound"
-        return f"FakeDAVServer({where}, files={len(self.files)}, dirs={len(self.dirs)})"
-
-
-class _Server(ThreadingHTTPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-    fake: FakeDAVServer
-
-    def handle_error(self, request: object, address: object) -> None:
-        """A client that hangs up mid-request is normal here, not a failure."""
-
-
-class _Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-    server: _Server
-
-    # -- plumbing ------------------------------------------------------
-
-    def log_message(self, fmt: str, *args: object) -> None:
-        """Quiet: a test's output is the test's own."""
-
-    @property
-    def fake(self) -> FakeDAVServer:
-        return self.server.fake
-
-    @property
-    def target(self) -> str:
-        return _decoded(self.path)
-
-    def _body(self) -> bytes:
-        """Read the request body, chunked or not, recording it as we go."""
-        payload = self._read_body()
-        self.fake.bodies.append(payload)
-        return payload
-
-    def _read_body(self) -> bytes:
-        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
-            chunks: list[bytes] = []
-            while True:
-                size = int(self.rfile.readline().split(b";")[0] or b"0", 16)
-                if not size:
-                    self.rfile.readline()  # the trailing CRLF of the last chunk
-                    return b"".join(chunks)
-                chunks.append(self.rfile.read(size))
-                self.rfile.readline()
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        return self.rfile.read(length)
-
-    def _send(self, status: int, body: bytes = b"", **headers: str) -> None:
-        self._reply(status, body, {n.replace("_", "-"): v for n, v in headers.items()})
-
-    def _reply(self, status: int, body: bytes, headers: dict[str, str]) -> None:
-        """Send one response, with the header names exactly as given."""
-        self.send_response(status)
-        for name, value in headers.items():
-            self.send_header(name, value)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        cut = self.fake.truncate_at if self.command == "GET" else None
-        if cut is not None and cut < len(body):
-            self.wfile.write(body[:cut])
-            self.wfile.flush()
-            self.close_connection = True
-            return
-        if body and self.command != "HEAD":
-            self.wfile.write(body)
-
-    def handle_expect_100(self) -> bool:
-        """Say ``100 Continue`` - unless a knob says this server would not."""
-        if self.fake.early_redirects and self.fake.redirects.get(self.target):
-            return True  # :meth:`_gate` answers before the body is read
-        if not self.fake.expect_continue:
-            return True
-        return super().handle_expect_100()
-
-    def _gate(self) -> bool:
-        """Record the request; answer it here if a knob says to."""
-        self.fake.seen.append((self.command, self.target))
-        self.fake.targets.append(self.path)
-        self.fake.headers.append(dict(self.headers.items()))
-        handler = self.fake.handlers.get(self.command)
-        if handler is not None:
-            canned = handler(self.command, self.target, dict(self.headers.items()))
-            if canned is not None:
-                self._body()  # drain it, or the next request reads this one's tail
-                self._reply(*canned)
-                return False
-        wanted = self.fake.require_token
-        if wanted and self.headers.get("Authorization") != f"Bearer {wanted}":
-            self._body()  # drain it, or the next request reads this one's tail
-            self._send(401, b"no token")
-            return False
-        location = self.fake.redirects.pop(self.target, None)
-        if location and self.fake.early_redirects:
-            self.close_connection = True
-            self._send(307, b"", Location=location, Connection="close")
-            return False
-        if location:
-            self._body()
-            self._send(307, b"", Location=location)
-            return False
-        return True
-
-    # -- verbs ---------------------------------------------------------
-
-    def do_OPTIONS(self) -> None:
-        if not self._gate():
-            return
-        self._send(
-            200,
-            b"",
-            DAV="1,2",
-            Allow="GET,HEAD,PUT,DELETE,PROPFIND,MKCOL,MOVE,COPY,OPTIONS",
-        )
-
-    def do_HEAD(self) -> None:
-        self.do_GET()
-
-    def do_GET(self) -> None:
-        if not self._gate():
-            return
-        if self.target == "/.well-known/wlcg-tape-rest-api":
-            self._discovery()
-            return
-        rest = self._api
-        if rest is not None:
-            self._tape(rest)
-            return
-        path = self.target
-        if path in self.fake.dirs:
-            self._send(200, b"", Content_Type="text/html")
-            return
-        self._get_file(path)
-
-    def _get_file(self, path: str) -> None:
-        """Serve one file, including digest and byte-range response headers."""
-        data = self.fake.files.get(path)
-        if data is None:
-            self._send(404, b"not found")
-            return
-        extra = self._get_headers(data)
-        span = self.headers.get("Range")
-        if span and not self.fake.ignore_ranges:
-            self._send_range(span, data, extra)
-            return
-        self._send(200, data, **extra)
-
-    def _get_headers(self, data: bytes) -> dict[str, str]:
-        """Metadata headers for a successful file response."""
-        extra = {"Last-Modified": formatdate(0, usegmt=True), "Accept-Ranges": "bytes"}
-        wanted = self.headers.get("Want-Digest")
-        if wanted and self.fake.digests:
-            offered = _digest_header(wanted, data)
-            if offered:
-                extra["Digest"] = offered
-        return extra
-
-    def _send_range(self, span: str, data: bytes, extra: dict[str, str]) -> None:
-        """Serve the requested inclusive HTTP byte range."""
-        start, end = _range(span, len(data))
-        if start >= len(data):
-            # RFC 9110: a range that starts at or past the end cannot be
-            # satisfied, and says how long the representation really is.
-            self._send(416, b"", Content_Range=f"bytes */{len(data)}")
-            return
-        piece = data[start:end]
-        extra["Content-Range"] = f"bytes {start}-{start + len(piece) - 1}/{len(data)}"
-        self._send(206, piece, **extra)
-
-    def do_PUT(self) -> None:
-        if not self._gate():
-            return
-        path = self.target
-        body = self._body()
-        if self.headers.get("If-None-Match") == "*" and path in self.fake.files:
-            self._send(412, b"exists")
-            return
-        if posixpath.dirname(path) not in self.fake.dirs:
-            self._send(409, b"no parent collection")
-            return
-        created = path not in self.fake.files
-        self.fake.add_file(path, body)
-        self._send(201 if created else 204)
-
-    def do_DELETE(self) -> None:
-        if not self._gate():
-            return
-        rest = self._api
-        if rest is not None:
-            self._tape(rest)
-            return
-        path = self.target
-        if self.fake.files.pop(path, None) is not None:
-            self._send(204)
-        elif path in self.fake.dirs:
-            self.fake.dirs.discard(path)
-            for name in [f for f in self.fake.files if f.startswith(path + "/")]:
-                del self.fake.files[name]
-            self._send(204)
-        else:
-            self._send(404, b"not found")
-
-    def do_MKCOL(self) -> None:
-        if not self._gate():
-            return
-        path = self.target
-        if path in self.fake.dirs or path in self.fake.files:
-            self._send(405, b"already exists")
-        elif posixpath.dirname(path) not in self.fake.dirs:
-            self._send(409, b"no parent collection")
-        else:
-            self.fake.dirs.add(path)
-            self._send(201)
-
-    def do_MOVE(self) -> None:
-        if not self._gate():
-            return
-        source = self.target
-        destination = _decoded(self.headers.get("Destination", ""))
-        if source in self.fake.files:
-            existed = destination in self.fake.files
-            self.fake.add_file(destination, self.fake.files.pop(source))
-            self._send(204 if existed else 201)
-        elif source in self.fake.dirs:
-            self.fake.dirs.discard(source)
-            self.fake.add_dir(destination)
-            for name in [f for f in self.fake.files if f.startswith(source + "/")]:
-                self.fake.add_file(destination + name[len(source) :], self.fake.files.pop(name))
-            self._send(201)
-        else:
-            self._send(404, b"not found")
-
-    def do_COPY(self) -> None:
-        """Third-party copy: fetch from ``Source`` or push to ``Destination``.
-
-        The transfer really happens - over HTTP, against whichever server the
-        header names, which may well be this one - because the point of the
-        exercise is that the client never sees the bytes.
-        """
-        if not self._gate():
-            return
-        self.fake.copies.append(dict(self.headers.items()))
-        if self.fake.no_tpc:
-            self._send(501, b"no third-party copy here")
-            return
-        source = self.headers.get("Source")
-        destination = self.headers.get("Destination")
-        if bool(source) == bool(destination):
-            self._send(400, b"exactly one of Source and Destination is required")
-            return
-        if self.headers.get("Overwrite", "T") == "F" and self.target in self.fake.files:
-            self._send(412, b"exists")
-            return
-
-        # The outcome goes in the body, so everything from here answers 202.
-        try:
-            size = self._transfer(source, destination)
-        except _TPCFailure as exc:
-            self._markers(0, failure=str(exc))
-        else:
-            self._markers(size, failure=self.fake.tpc_failure)
-
-    def _transfer(self, source: str | None, destination: str | None) -> int:
-        """Move the bytes, and return how many there were."""
-        if self.fake.tpc_failure:
-            return 0
-        token = self.headers.get("TransferHeaderAuthorization")
-        headers = {"Authorization": token} if token else {}
-        if source:
-            pulled = _fetch("GET", source, headers)
-            self.fake.add_file(self.target, pulled)
-            return len(pulled)
-        stored = self.fake.files.get(self.target)
-        if stored is None:
-            raise _TPCFailure(f"HTTP 404 {self.target} is not here to push")
-        _fetch("PUT", destination or "", headers, stored)
-        return len(stored)
-
-    def _markers(self, size: int, *, failure: str | None) -> None:
-        """A chunked stream of performance markers, then the outcome line."""
-        self.send_response(202)
-        self.send_header("Content-Type", "text/perf-marker")
-        self.send_header("Transfer-Encoding", "chunked")
-        self.end_headers()
-        count = max(self.fake.tpc_markers, 0)
-        for step in range(1, count + 1):
-            done = size * step // count if count else size
-            time.sleep(self.fake.tpc_marker_gap)
-            self._chunk(
-                f"Perf Marker\nTimestamp: {step}\nStripe Index: 0\n"
-                f"Stripe Bytes Transferred: {done}\nTotal Stripe Count: 1\nEnd\n"
-            )
-        time.sleep(self.fake.tpc_marker_gap)
-        self._chunk(f"failure: {failure}\n" if failure else "success: Created\n")
-        self.wfile.write(b"0\r\n\r\n")
-
-    def _chunk(self, text: str) -> None:
-        payload = text.encode()
-        self.wfile.write(b"%x\r\n%s\r\n" % (len(payload), payload))
-        self.wfile.flush()
-
-    def do_POST(self) -> None:
-        if not self._gate():
-            return
-        rest = self._api
-        if rest is not None:
-            self._tape(rest)
-            return
-        self._body()
-        if self.headers.get("Content-Type") == "application/macaroon-request":
-            body = b'{"macaroon": "%s", "uri": {}}' % self.fake.macaroon.encode()
-            self._send(200, body, Content_Type="application/json")
-            return
-        self._send(405, b"not allowed")
-
-    def do_PROPFIND(self) -> None:
-        if not self._gate():
-            return
-        self._body()
-        if self.fake.no_dav:
-            self._send(405, b"no webdav here")
-            return
-        path = self.target
-        depth = self.headers.get("Depth", "1")
-        if path in self.fake.dirs:
-            children = self._children(path) if depth != "0" else []
-            entries = [(path, True, 0), *children]
-        elif path in self.fake.files:
-            entries = [(path, False, len(self.fake.files[path]))]
-        else:
-            self._send(404, b"not found")
-            return
-        self._send(207, _multistatus(entries), Content_Type='text/xml; charset="utf-8"')
-
-    def _children(self, path: str) -> list[tuple[str, bool, int]]:
-        prefix = path.rstrip("/") + "/"
-        seen: dict[str, tuple[str, bool, int]] = {}
-        for name, data in self.fake.files.items():
-            if name.startswith(prefix) and "/" not in name[len(prefix) :]:
-                seen[name] = (name, False, len(data))
-        for name in self.fake.dirs:
-            if name.startswith(prefix) and "/" not in name[len(prefix) :]:
-                seen[name] = (name, True, 0)
-        return [seen[key] for key in sorted(seen)]
-
-    # -- the WLCG tape API ---------------------------------------------
-
-    @property
-    def _api(self) -> list[str] | None:
-        """What follows ``/api/v1`` in the target, or ``None`` if it is a file."""
-        parts = self.target.strip("/").split("/")
-        return parts[2:] if parts[:2] == ["api", "v1"] else None
-
-    def _tape(self, rest: list[str]) -> None:
-        """Serve one request to the API, whichever verb it arrived as."""
-        body = self._body() if self.command == "POST" else b""
-        if self.fake.no_tape:
-            self._json(404, {"message": "there is no tape behind this endpoint"})
-        elif self.command == "POST":
-            self._tape_post(rest, body)
-        elif self.command == "DELETE":
-            self._tape_delete(rest)
-        else:
-            self._tape_get(rest)
-
-    def _discovery(self) -> None:
-        """The well-known document naming the site's tape endpoints."""
-        if self.fake.no_tape:
-            self._json(404, {"message": "there is no tape behind this endpoint"})
-            return
-        endpoint = {"uri": str(self.fake.url.with_path("/api/v1")), "version": "v1", "metadata": {}}
-        self._json(200, {"sitename": self.fake.sitename, "endpoints": [endpoint]})
-
-    def _tape_post(self, rest: list[str], body: bytes) -> None:
-        try:
-            document = json.loads(body or b"{}")
-        except ValueError:
-            self._json(400, {"message": "that is not a JSON document"})
-            return
-        subset = self._subset_log(rest)
-        if subset is not None:
-            self._tape_subset(rest[1], document, subset.update)
-        elif rest == ["stage"]:
-            self._tape_stage(document)
-        elif rest == ["archiveinfo"]:
-            given = [str(path) for path in document.get("paths", [])]
-            self._json(200, [self._locality(path) for path in given])
-        else:
-            self._json(404, {"message": "no such endpoint"})
-
-    def _subset_log(self, rest: list[str]) -> set[tuple[str, str]] | None:
-        """Where ``stage/<id>/cancel`` or ``release/<id>`` is recorded; ``None`` for others."""
-        if len(rest) == 3 and rest[0] == "stage" and rest[2] == "cancel":
-            return self.fake.cancelled
-        if len(rest) == 2 and rest[0] == "release":
-            return self.fake.released
-        return None
-
-    def _tape_stage(self, document: Any) -> None:
-        paths = [str(entry.get("path", "")) for entry in document.get("files", [])]
-        if not paths:
-            self._json(400, {"message": "a staging request names at least one file"})
-            return
-        handle = f"stage-{len(self.fake.staged) + 1:04d}"
-        self.fake.staged[handle] = paths
-        self._json(201, {"requestId": handle}, Location=f"/api/v1/stage/{handle}")
-
-    def _tape_subset(
-        self, handle: str, document: Any, record: Callable[[set[tuple[str, str]]], None]
-    ) -> None:
-        """Cancel or release some of request ``handle``'s files."""
-        paths = [str(path) for path in document.get("paths", [])]
-        if handle not in self.fake.staged:
-            self._json(404, {"message": "no such staging request"})
-            return
-        record({(handle, path) for path in paths})
-        self._send(200)
-
-    def _tape_get(self, rest: list[str]) -> None:
-        paths = self.fake.staged.get(rest[1]) if rest[:1] == ["stage"] and len(rest) == 2 else None
-        if paths is None:
-            self._json(404, {"message": "no such staging request"})
-            return
-        files = [self._staging(rest[1], path) for path in paths]
-        self._json(200, {"id": rest[1], "createdAt": 1, "startedAt": 1, "files": files})
-
-    def _tape_delete(self, rest: list[str]) -> None:
-        known = rest[:1] == ["stage"] and len(rest) == 2
-        if known and self.fake.staged.pop(rest[1], None) is not None:
-            self._send(204)
-        else:
-            self._json(404, {"message": "no such staging request"})
-
-    def _staging(self, handle: str, given: str) -> dict[str, object]:
-        """One file of a staging request, as its poll reply describes it."""
-        if (handle, given) in self.fake.cancelled:
-            return {"path": given, "state": "CANCELLED", "onDisk": False}
-        path = _clean(given)
-        if path not in self.fake.files:
-            return {"path": given, "state": "FAILED", "onDisk": False, "error": "no such file"}
-        if path in self.fake.nearline:
-            return {"path": given, "state": "SUBMITTED", "onDisk": False, "startedAt": 1}
-        return {"path": given, "state": "COMPLETED", "onDisk": True, "startedAt": 1}
-
-    def _locality(self, given: str) -> dict[str, str]:
-        """One file of an ``archiveinfo`` reply, in the specification's words."""
-        path = _clean(given)
-        if path not in self.fake.files:
-            return {"path": given, "locality": "LOST", "error": "no such file"}
-        return {"path": given, "locality": "TAPE" if path in self.fake.nearline else "DISK"}
-
-    def _json(self, status: int, document: object, **headers: str) -> None:
-        body = json.dumps(document).encode()
-        self._send(status, body, Content_Type="application/json", **headers)
-
-
-class _TPCFailure(Exception):
-    """What the ``failure:`` line will say. Never reaches the status line."""
-
-
-def _fetch(method: str, url: str, headers: dict[str, str], body: bytes | None = None) -> bytes:
-    """One request to the other endpoint of a third-party copy."""
-    import http.client
-
-    parts = urllib.parse.urlsplit(url)
-    if parts.scheme not in ("http", "https"):
-        raise _TPCFailure(f"HTTP 400 cannot speak {parts.scheme or '<none>'} to the far side")
-    conn = http.client.HTTPConnection(parts.hostname or "", parts.port or 80, timeout=10)
-    target = parts.path + (f"?{parts.query}" if parts.query else "")
-    try:
-        conn.request(method, target, body=body, headers=headers)
-        response = conn.getresponse()
-        payload = response.read()
-        if response.status >= 400:
-            raise _TPCFailure(f"HTTP {response.status} {response.reason} from {parts.netloc}")
-        return payload
-    except OSError as exc:
-        raise _TPCFailure(f"HTTP 500 cannot reach {parts.netloc}: {exc}") from exc
-    finally:
-        conn.close()
-
-
-def _range(header: str, size: int) -> tuple[int, int]:
-    """``bytes=start-`` or ``bytes=start-end``, resolved against ``size``."""
-    span = header.split("=", 1)[1]
-    start_s, _, end_s = span.partition("-")
-    start = int(start_s or 0)
-    end = int(end_s) + 1 if end_s else size
-    return start, min(end, size)
-
-
-def _digest_header(wanted: str, data: bytes) -> str:
-    """An RFC 3230 ``Digest`` value for the first algorithm we both know."""
-    import base64
-
-    for token in wanted.split(","):
-        name = token.split(";")[0].strip().lower()
-        algorithm = {"sha-256": "sha256", "sha-512": "sha512", "sha": "sha1"}.get(name, name)
-        if algorithm not in _DIGESTS:
-            continue
-        value = checksum_bytes(algorithm, data)
-        if algorithm in ("adler32", "crc32c"):
-            return f"{name}={value}"
-        return f"{name}=" + base64.b64encode(bytes.fromhex(value)).decode()
-    return ""
-
-
-def _multistatus(entries: list[tuple[str, bool, int]]) -> bytes:
-    """A ``<D:multistatus>`` body for ``(path, is_collection, size)`` triples."""
-    parts = ['<?xml version="1.0" encoding="utf-8"?>', '<D:multistatus xmlns:D="DAV:">']
-    for path, is_dir, size in entries:
-        href = urllib.parse.quote(path) + ("/" if is_dir and path != "/" else "")
-        kind = "<D:collection/>" if is_dir else ""
-        length = "" if is_dir else f"<D:getcontentlength>{size}</D:getcontentlength>"
-        parts.append(
-            f"<D:response><D:href>{href}</D:href><D:propstat>"
-            f"<D:prop><D:resourcetype>{kind}</D:resourcetype>{length}"
-            f"<D:getlastmodified>{formatdate(0, usegmt=True)}</D:getlastmodified>"
-            f"<D:displayname>{posixpath.basename(path) or '/'}</D:displayname>"
-            "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
-        )
-    parts.append("</D:multistatus>")
-    return "".join(parts).encode()
+        """Where it listens and how much it holds; never binds a port to say so."""
+        return f"FakeDAVServer({self._where()}, files={len(self.files)}, dirs={len(self.dirs)})"

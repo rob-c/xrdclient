@@ -16,17 +16,19 @@ analysis, which is why none of them is allowed to be a warning.
 from __future__ import annotations
 
 import struct
+from collections.abc import Iterator
 
 import pytest
 
-from conftest import handshake_reply, login_body, ok, protocol_body
+from tests.conftest import handshake_reply, login_body, ok, protocol_body
 from xrdclient.config import Config
-from xrdclient.errors import ProtocolError
+from xrdclient.errors import ProtocolError, ServerError
 from xrdclient.proto import constants as c
 from xrdclient.proto import machine as m
 from xrdclient.proto import requests as r
 from xrdclient.proto.frames import decode_header
 from xrdclient.testing import error, frame
+from xrdclient.testing.server import Handler
 
 SID = 4  # the first streamid the machine hands out
 
@@ -58,6 +60,14 @@ def submitted() -> m.SessionMachine:
 
 def events(machine: m.SessionMachine) -> list[m.Event]:
     return list(machine.events())
+
+
+def completed(machine: m.SessionMachine) -> list[m.Completed]:
+    """The events, every one of which the test expects to be a reply."""
+    found = events(machine)
+    done = [e for e in found if isinstance(e, m.Completed)]
+    assert done == found, found
+    return done
 
 
 # ---------------------------------------------------------------------------
@@ -98,9 +108,9 @@ def test_a_reply_shorter_than_its_own_dlen_waits_for_the_rest():
     machine.receive_data(_HDR.pack(SID, c.kXR_ok, 10) + b"abcd")
     assert events(machine) == []
     machine.receive_data(b"efghij")
-    completed = events(machine)
-    assert [type(e).__name__ for e in completed] == ["Completed"]
-    assert completed[0].data == b"abcdefghij"
+    assert [(type(e).__name__, e.data) for e in completed(machine)] == [
+        ("Completed", b"abcdefghij")
+    ]
 
 
 def test_the_split_may_land_inside_the_header():
@@ -109,7 +119,7 @@ def test_the_split_may_land_inside_the_header():
     machine.receive_data(payload[:3])
     assert events(machine) == []
     machine.receive_data(payload[3:])
-    assert events(machine)[0].data == b"hello"
+    assert completed(machine)[0].data == b"hello"
 
 
 @pytest.mark.parametrize("size", [1, 2, 3, 7])
@@ -118,7 +128,7 @@ def test_a_reply_delivered_in_pieces_of_this_size_still_parses(size):
     payload = frame(SID, c.kXR_ok, bytes(range(200)))
     for at in range(0, len(payload), size):
         machine.receive_data(payload[at : at + size])
-    assert events(machine)[0].data == bytes(range(200))
+    assert completed(machine)[0].data == bytes(range(200))
 
 
 def test_the_streamid_is_two_bytes_and_the_second_one_matters():
@@ -148,14 +158,14 @@ def test_two_replies_in_one_receive_are_both_dispatched():
     second = machine.submit(r.Stat("/b"), path="/b")
     machine.data_to_send()
     machine.receive_data(frame(second, c.kXR_ok, b"b") + frame(first, c.kXR_ok, b"a"))
-    assert [(e.streamid, e.data) for e in events(machine)] == [(second, b"b"), (first, b"a")]
+    assert [(e.streamid, e.data) for e in completed(machine)] == [(second, b"b"), (first, b"a")]
 
 
 def test_an_error_body_with_no_message_still_carries_its_code():
     machine = submitted()
     machine.receive_data(frame(SID, c.kXR_error, struct.pack(">i", 3011)))
     failure = events(machine)[0]
-    assert isinstance(failure, m.Failed)
+    assert isinstance(failure, m.Failed) and isinstance(failure.error, ServerError)
     assert failure.error.code == 3011
 
 
@@ -163,7 +173,7 @@ def test_an_error_code_the_client_does_not_know_is_still_an_error():
     machine = submitted()
     machine.receive_data(error(SID, 31337, "something went wrong"))
     failure = events(machine)[0]
-    assert isinstance(failure, m.Failed)
+    assert isinstance(failure, m.Failed) and isinstance(failure.error, ServerError)
     assert failure.error.code == 31337
     assert "something went wrong" in str(failure.error)
 
@@ -180,10 +190,10 @@ def test_a_status_the_client_does_not_know_is_refused_not_guessed_at():
 # ---------------------------------------------------------------------------
 
 
-def answer(payload, status=c.kXR_ok):
+def answer(payload: bytes, status: int = c.kXR_ok) -> Handler:
     """A handler that replies with one canned frame, whatever was asked."""
 
-    def handler(conn, sid, params, body):
+    def handler(conn: object, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
         yield frame(sid, status, payload)
 
     return handler
@@ -301,13 +311,22 @@ def test_a_stat_line_missing_fields_is_refused(hostile, line):
 
 def test_a_stat_line_whose_size_is_not_a_number_is_refused(hostile):
     client = hostile(c.kXR_stat, answer(b"id0 huge 0 1700000000\x00"))
-    with pytest.raises(ValueError):
+    with pytest.raises(ProtocolError, match="non-numeric"):
         client.stat("/data/a.root")
 
 
 def test_a_statvfs_line_missing_fields_is_refused(hostile):
     client = hostile(c.kXR_stat, answer(b"1 2 3\x00"))
     with pytest.raises(ProtocolError, match="vfs returned"):
+        client.statvfs("/data")
+
+
+def test_a_statvfs_answered_with_a_plain_stat_line_is_unsupported(hostile):
+    """dCache answers ``kXR_stat`` + ``kXR_vfs`` with the directory's own stat."""
+    from xrdclient.errors import UnsupportedError
+
+    client = hostile(c.kXR_stat, answer(b"0 512 51 1791287802\x00"))
+    with pytest.raises(UnsupportedError):
         client.statvfs("/data")
 
 

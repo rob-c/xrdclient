@@ -11,6 +11,18 @@ it means "the contents of this directory", which land in DEST itself rather
 than in ``DEST/<name>`` - the only spelling a repeated ``-r --sync`` can use,
 since from the second run on DEST exists and ``cp`` would nest the copy into
 it. Everything it does is one call into :func:`xrdclient.copy`.
+
+Reading order: :func:`_parser` (every flag, including the ``xrdcp`` ones
+under their ``xrdcp`` names in :func:`_xrdcp_flags`), then :func:`_misuse`
+(flag combinations refused up front with exit code ``2``, so a contradictory
+command never half-runs), then :func:`_main` -> :func:`_transfers` ->
+:func:`_run` -> :func:`_copy_one`, which picks one of the four library calls:
+:func:`~xrdclient.copy.append_zip`, :func:`~xrdclient.copy.third_party`,
+:func:`~xrdclient.copy.copy_tree` or :func:`~xrdclient.copy.copy`.
+
+An existing DEST is an error without ``-f``, and checksum verification
+follows the library default unless ``--verify`` or ``--no-verify`` says
+otherwise.
 """
 
 from __future__ import annotations
@@ -20,15 +32,16 @@ import os
 import posixpath
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any, TextIO, TypedDict, cast
 
+from .. import report as output
 from ..config import Config
 from ..copy import CopyResult, append_zip, copy, copy_tree, third_party
 from ..errors import XRootDError
 from ..types import human_bytes as _human
 from ..url import XRootDURL, parse
 from . import OK, USAGE, Endpoints, common_flags, config_from, fail, size_arg, version_flag
-from . import _output as output
 
 __all__ = ["main"]
 
@@ -36,6 +49,13 @@ PROGRAM = "xrd-cp"
 
 
 def _parser() -> argparse.ArgumentParser:
+    """Every ``xrd-cp`` flag, with ``--json``/``--xml`` and the shared credential flags.
+
+    ``--verify``/``--no-verify`` and ``--progress``/``--no-progress`` default
+    to ``None``, not ``False``: "not said" must stay distinguishable from
+    "said no", because the library default (and, for progress, whether stderr
+    is a terminal) decides the unsaid case.
+    """
     parser = output.Parser(
         prog=PROGRAM,
         description="Copy files between root://, https://, and the local filesystem.",
@@ -154,7 +174,15 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _xrdcp_flags(parser: argparse.ArgumentParser) -> None:
-    """The transfer controls ``xrdcp`` has, under ``xrdcp``'s names."""
+    """The transfer controls ``xrdcp`` has, under ``xrdcp``'s names.
+
+    Same short and long spellings and the same ranges (checked in
+    :data:`_LIMITS`), so an ``xrdcp`` command line can be retargeted by
+    changing the program name. ``-Z`` and ``-F`` default to ``None`` so that
+    an unsaid flag leaves the library default alone rather than forcing
+    ``False``. ``-f`` is not here: it is defined in :func:`_parser` and means
+    overwrite, as it does for ``xrdcp`` too.
+    """
     parser.add_argument(
         "-z",
         "--zip",
@@ -232,12 +260,25 @@ class Bar:
     """
 
     def __init__(self, label: str, stream: TextIO | None = None) -> None:
+        """A bar headed ``label``, drawn on ``stream`` (standard error by default)."""
         self.label = label
         self.stream = stream or sys.stderr
+        # The last whole percentage drawn: -1 until the first, so that
+        # :meth:`finish` knows whether there is a line to end.
         self._last = -1
+        # Captured at construction rather than looked up per call: progress
+        # callbacks can arrive on a transfer worker thread, where the
+        # context variable :func:`~xrdcore.report.current` reads is not set.
         self.report = output.current()
 
     def __call__(self, done: int, total: int | None) -> None:
+        """Show ``done`` of ``total`` bytes; ``total`` is ``None`` when unknown.
+
+        Under a structured report every call becomes a ``progress`` record
+        instead. On a terminal the line is redrawn only when the whole
+        percentage changes: a callback per chunk would otherwise spend more
+        time writing to the tty than a fast LAN copy spends copying.
+        """
         if self.report is not None:
             self.report.record(
                 "progress", bytes_transferred=done, total=total, **self.report.identity
@@ -254,6 +295,7 @@ class Bar:
         print(f"\r{text}", end="", file=self.stream, flush=True)
 
     def finish(self) -> None:
+        """End the bar's line, so the next output does not overwrite it."""
         if self.report is not None:
             return
         if self._last >= 0 or self.stream is not sys.stderr:
@@ -284,7 +326,14 @@ class _CopyOptions(TypedDict, total=False):
 
 
 def _is_dir(url: XRootDURL, endpoints: Endpoints) -> bool:
-    """Does ``url`` name a directory that already exists?"""
+    """Does ``url`` name a directory that already exists?
+
+    A trailing ``/`` is taken at its word without asking the server, as
+    ``cp`` does. A remote stat that fails - DEST does not exist yet, or the
+    server will not say - counts as "not a directory", so ``xrd-cp f new``
+    writes ``new``; any real problem with DEST surfaces from the copy
+    itself, with the copy's error message.
+    """
     if url.path.endswith("/"):
         return True
     if url.is_local:
@@ -382,24 +431,34 @@ def _transfer_misuse(args: argparse.Namespace) -> str | None:
 
 
 def _tpc_local_misuse(args: argparse.Namespace) -> str | None:
+    """``--tpc`` with a flag that needs the bytes to pass through this client."""
     if args.tpc and (args.dry_run or args.remove_source):
         return "--tpc hands the transfer to the servers; --dry-run and --remove-source cannot"
     return None
 
 
 def _resume_misuse(args: argparse.Namespace) -> str | None:
+    """``--continue`` with a flag that rules out a partial DEST to continue."""
     if args.resume and (args.tpc or args.no_clobber):
         return "--continue needs a partial DEST to carry on from; --tpc and -n forbid one"
     return None
 
 
 def _overwrite_misuse(args: argparse.Namespace) -> str | None:
+    """``-f`` and ``-n`` together: one of them was a mistake."""
     if args.force and args.no_clobber:
         return "-f overwrites DEST and -n refuses to; they cannot both be what you meant"
     return None
 
 
 def _zip_misuse(args: argparse.Namespace) -> str | None:
+    """The ZIP flags against each other and against transfer modes they cannot use.
+
+    ``--zip`` is unpacked by this client (the ``xrdcl.unzip`` CGI is XrdCl's
+    client-side convention, not a server feature), so it needs the bytes;
+    ``--zip-append`` writes a fresh member and has no partial or existing
+    member to continue, overwrite or protect.
+    """
     if args.zip and args.tpc:
         return "--zip is expanded by this client and cannot be combined with --tpc"
     if args.zip and args.zip_append:
@@ -477,25 +536,41 @@ def _tpc_misuse(args: argparse.Namespace) -> str | None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """The ``xrd-cp`` entry point: run with ``argv`` (default ``sys.argv[1:]``).
+
+    Returns the exit code rather than exiting, so tests and embedding
+    programs can call it; the console script wrapper does the exit.
+    """
     return output.run_cli(PROGRAM, argv, lambda: _main(argv), legacy_json=True)
 
 
 def _main(argv: Sequence[str] | None = None) -> int:
+    """Parse, refuse contradictions, resolve DEST, copy, and report.
+
+    Exit codes: ``0`` when every transfer succeeded, ``1`` on the first
+    failure (the sources after it are not attempted), ``2`` for a usage
+    error, including several sources aimed at a DEST that is not a
+    directory.
+    """
     args = _parser().parse_args(argv)
     output.identify("copy", sources=args.source, target=args.dest)
     complaint = _misuse(args)
     if complaint is not None:
         print(f"{PROGRAM}: {complaint}", file=sys.stderr)
         return USAGE
-    config = _copy_config(args)
     sources = [_source(s) for s in args.source]
     if args.zip:
+        # XrdCl's spelling: ``?xrdcl.unzip=MEMBER`` on the archive URL is what
+        # ``xrdcp --zip`` sends through, and :func:`~xrdclient.copy` reads it.
         sources = [source.with_query(**{"xrdcl.unzip": args.zip}) for source in sources]
     dest = parse(args.dest)
+    # Progress by default only for a person watching: not in a pipeline or a
+    # batch log, and not when -q asked for silence.
     show = args.progress if args.progress is not None else (sys.stderr.isatty() and not args.quiet)
+    job = _Job(args, _copy_config(args), show, _copy_options(args))
 
     try:
-        results = _transfers(sources, dest, args, config, show=show)
+        results = _transfers(job, sources, dest)
     except (XRootDError, OSError, ValueError) as exc:
         return fail(PROGRAM, exc)
     if results is None:
@@ -506,7 +581,12 @@ def _main(argv: Sequence[str] | None = None) -> int:
 
 
 def _copy_config(args: argparse.Namespace) -> Config:
-    """The common client configuration with copy-specific tuning applied."""
+    """The common client configuration with copy-specific tuning applied.
+
+    In the library these are :class:`~xrdclient.Config` fields, not
+    :func:`~xrdclient.copy` keywords, so they are applied here, each only
+    when given, and the settings file still decides the rest.
+    """
     config = config_from(args)
     if args.in_flight is not None:
         config = config.evolve(in_flight=args.in_flight)
@@ -521,22 +601,40 @@ def _copy_config(args: argparse.Namespace) -> Config:
     return config
 
 
-def _transfers(
-    sources: list[XRootDURL],
-    dest: XRootDURL,
-    args: argparse.Namespace,
-    config: Config,
-    *,
-    show: bool,
-) -> list[CopyResult] | None:
-    """Run a valid single-target invocation, or report an ambiguous target."""
-    if args.zip_append:
-        return _run(sources, dest, args, config, into=False, show=show)
-    with Endpoints(config) as endpoints:
+@dataclass(frozen=True, slots=True)
+class _Job:
+    """What every transfer of one invocation shares, decided once in :func:`_main`.
+
+    Grouped so the per-source helpers take the job plus what differs per
+    source, rather than the same four values threaded through each call.
+    """
+
+    #: The parsed command line; the helpers read the mode flags from it.
+    args: argparse.Namespace
+    #: The client configuration, with the copy tuning flags applied.
+    config: Config
+    #: Whether to draw a progress bar on a terminal.
+    show: bool
+    #: The keyword options both :func:`~xrdclient.copy` and ``copy_tree`` take.
+    options: _CopyOptions
+
+
+def _transfers(job: _Job, sources: list[XRootDURL], dest: XRootDURL) -> list[CopyResult] | None:
+    """Run a valid single-target invocation, or report an ambiguous target.
+
+    ``None`` means several sources were aimed at a DEST that is neither an
+    existing directory nor spelled with a trailing ``/`` - ``cp``'s "target
+    is not a directory", which :func:`_main` reports as a usage error.
+    """
+    if job.args.zip_append:
+        # DEST is the archive itself, never a directory to copy into, so
+        # there is nothing to look up first.
+        return _run(job, sources, dest, into=False)
+    with Endpoints(job.config) as endpoints:
         into = _is_dir(dest, endpoints)
         if len(sources) > 1 and not into:
             return None
-        return _run(sources, dest, args, config, into=into, show=show)
+        return _run(job, sources, dest, into=into)
 
 
 #: Destinations that mean "the bytes come out of this command", where a
@@ -567,28 +665,27 @@ def _show_results(results: Sequence[CopyResult], args: argparse.Namespace) -> No
             print(result, file=where)
 
 
-def _run(
-    sources: list[XRootDURL],
-    dest: XRootDURL,
-    args: argparse.Namespace,
-    config: Config,
-    *,
-    into: bool,
-    show: bool,
-) -> list[CopyResult]:
-    """Do the transfers the parsed command line asks for."""
-    options = _copy_options(args)
+def _run(job: _Job, sources: list[XRootDURL], dest: XRootDURL, *, into: bool) -> list[CopyResult]:
+    """Copy each source in turn to where it belongs under ``dest``.
+
+    ``into`` is whether ``dest`` is a directory the sources go inside. Each
+    completed transfer becomes a ``result`` record as soon as it finishes,
+    so a report from a run that fails part-way still lists what succeeded.
+    """
+    args = job.args
     results: list[CopyResult] = []
     for source in sources:
+        # A ``--zip`` copy into a directory is named after the member, not
+        # after the archive it came out of.
         target = (
             dest / posixpath.basename(args.zip.rstrip("/"))
             if into and args.zip
             else _destination(source, dest, into=into)
         )
-        bar = _progress_for(source, args, show)
+        bar = _progress_for(source, args, job.show)
         output.identify("copy", source=str(source), target=str(target))
         try:
-            completed = _copy_one(source, target, args, config, bar, options)
+            completed = _copy_one(job, source, target, bar)
             for result in completed:
                 output.record(
                     operation="copy",
@@ -605,6 +702,12 @@ def _run(
 
 
 def _progress_for(source: XRootDURL, args: argparse.Namespace, show: bool) -> Bar | None:
+    """A progress bar for ``source``, or ``None`` when nobody would see one.
+
+    Under ``--json`` progress becomes records unless ``--no-progress`` was
+    given explicitly; ``-p`` alone is not needed there, since the records do
+    not disturb anyone's terminal.
+    """
     reporting = output.current() is not None and args.progress is not False
     if show or reporting:
         return Bar(posixpath.basename(source.path.rstrip("/")) or str(source))
@@ -628,7 +731,13 @@ _PASSED = (
 
 
 def _copy_options(args: argparse.Namespace) -> _CopyOptions:
-    """Keyword options shared by ordinary and recursive copies."""
+    """Keyword options shared by ordinary and recursive copies.
+
+    Only flags actually given are passed, so the library's defaults stay the
+    single source of truth for everything else.
+    """
+    # ``--continue`` writes into an existing DEST by definition, so it implies
+    # the permission ``-f`` would otherwise have to give.
     options: dict[str, Any] = {"overwrite": args.force or args.resume}
     if args.verify is not None:
         options["verify"] = args.verify  # where ``False`` is an answer too
@@ -639,16 +748,18 @@ def _copy_options(args: argparse.Namespace) -> _CopyOptions:
     return cast("_CopyOptions", options)
 
 
-def _copy_one(
-    source: XRootDURL,
-    target: XRootDURL,
-    args: argparse.Namespace,
-    config: Config,
-    bar: Bar | None,
-    options: _CopyOptions,
-) -> list[CopyResult]:
-    """Copy one resolved source using the selected transfer strategy."""
+def _copy_one(job: _Job, source: XRootDURL, target: XRootDURL, bar: Bar | None) -> list[CopyResult]:
+    """Copy one resolved source using the selected transfer strategy.
+
+    The strategies are exclusive (:func:`_misuse` has already refused the
+    combinations), checked in the order that makes the dispatch unambiguous.
+    A recursive copy returns one result per file; the others return one.
+    """
+    args, config, options = job.args, job.config, job.options
     if args.zip_append:
+        # The copy options do not apply: :func:`~xrdclient.copy.append_zip`
+        # takes only the chunk size, and refuses a member already present
+        # rather than overwriting or resuming one.
         return [
             append_zip(
                 source,
@@ -699,7 +810,12 @@ def _third_party(
 
 
 def _record(result: CopyResult) -> dict[str, object]:
-    """One transfer as JSON: the dataclass plus what it computes."""
+    """One transfer as JSON: the dataclass plus what it computes.
+
+    Scripts parse these keys from ``--json``, so renaming one breaks them.
+    ``rate`` is ``None`` for a copy that took no measurable time rather than
+    a division by zero.
+    """
     return {
         "source": result.source,
         "target": result.target,
@@ -712,5 +828,5 @@ def _record(result: CopyResult) -> dict[str, object]:
     }
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     raise SystemExit(main())

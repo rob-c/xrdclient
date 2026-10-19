@@ -12,8 +12,10 @@ marks the connection broken so that nothing ever uses it again.
 
 from __future__ import annotations
 
+import dataclasses
 import struct
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
+from typing import Any
 
 import pytest
 
@@ -33,17 +35,16 @@ PAYLOAD = bytes((i * 7 + i // 251) % 256 for i in range(2 << 20))
 CHUNK = 256 << 10
 
 
-def _config(**overrides: object) -> Config:
-    settings: dict[str, object] = {
-        "username": "tester",
-        "auth_order": ("host",),
-        "require_tls": False,
-        "data_streams": 0,
-        "bulk_chunk": CHUNK,
-        "bulk_depth": 4,
-    }
-    settings.update(overrides)
-    return Config(**settings)  # type: ignore[arg-type]
+def _config(**overrides: Any) -> Config:
+    base = Config(
+        username="tester",
+        auth_order=("host",),
+        require_tls=False,
+        data_streams=0,
+        bulk_chunk=CHUNK,
+        bulk_depth=4,
+    )
+    return dataclasses.replace(base, **overrides)
 
 
 Answer = Callable[[int], Iterator[bytes]]
@@ -79,8 +80,7 @@ def _io_error(sid: int) -> Iterator[bytes]:
 
 def _silence(sid: int) -> Iterator[bytes]:
     """Never answer at all, so whoever is waiting for this reply stalls."""
-    return
-    yield  # pragma: no cover - makes this a generator
+    yield from ()
 
 
 def _elsewhere(sid: int) -> Iterator[bytes]:
@@ -99,7 +99,7 @@ def server():
         yield srv
 
 
-def _open(server, path: str = "/f", **overrides: object) -> File:
+def _open(server: FakeServer, path: str = "/f", **overrides: Any) -> File:
     handle = File(server.url.with_path(path), _config(**overrides))
     handle.open("r")
     return handle
@@ -138,6 +138,7 @@ def test_an_abandoned_stream_drains_what_it_asked_for(server):
     with _open(server) as handle:
         with handle.session.bulk(handle.handle, chunk=CHUNK, depth=4) as reader:
             pieces = reader.stream(0, len(PAYLOAD))
+            assert isinstance(pieces, Generator)
             offset, view = next(pieces)
             assert bytes(view) == PAYLOAD[offset : offset + len(view)]
             pieces.close()
@@ -149,19 +150,22 @@ def test_a_consumer_that_raises_is_settled_by_the_session(server):
     """Leaving the lending block settles the reader even if its iterator lives on."""
     with _open(server) as handle:
         pieces = None
-        with pytest.raises(RuntimeError):
-            with handle.session.bulk(handle.handle, chunk=CHUNK, depth=4) as reader:
-                pieces = reader.stream(0, len(PAYLOAD))
-                next(pieces)
-                raise RuntimeError("the consumer gave up")
+        with (
+            pytest.raises(RuntimeError),
+            handle.session.bulk(handle.handle, chunk=CHUNK, depth=4) as reader,
+        ):
+            pieces = reader.stream(0, len(PAYLOAD))
+            next(pieces)
+            raise RuntimeError("the consumer gave up")
         _still_answers_correctly(handle)
         assert not handle.session.broken
         # Closing the orphaned iterator afterwards finds nothing left to do.
+        assert isinstance(pieces, Generator)
         pieces.close()
         _still_answers_correctly(handle)
 
 
-def _read_breaks(server, expected: type[Exception], **overrides: object) -> File:
+def _read_breaks(server: FakeServer, expected: type[Exception], **overrides: Any) -> File:
     """Read the whole file, expect ``expected``, and hand back the handle.
 
     The handle is deliberately not closed: its connection is broken, and a
@@ -224,10 +228,12 @@ def test_a_wait_in_a_stream_drains_before_raising(server):
 
     server.handlers[c.kXR_read] = _misbehave_on(3, _wait)
     with _open(server) as handle:
-        with pytest.raises(BulkUnsupported):
-            with handle.session.bulk(handle.handle, chunk=CHUNK, depth=4) as reader:
-                for _ in reader.stream(0, len(PAYLOAD)):
-                    pass
+        with (
+            pytest.raises(BulkUnsupported),
+            handle.session.bulk(handle.handle, chunk=CHUNK, depth=4) as reader,
+        ):
+            for _ in reader.stream(0, len(PAYLOAD)):
+                pass
         _still_answers_correctly(handle)
         assert not handle.session.broken
 

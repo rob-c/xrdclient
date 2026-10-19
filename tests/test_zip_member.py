@@ -14,6 +14,7 @@ import xrdclient
 from xrdclient.cli import cp
 from xrdclient.client import _zip
 from xrdclient.client._zip import ZipArchiveError
+from xrdclient.io.zip import ZipMemberIO
 from xrdclient.testing import FakeServer
 
 
@@ -141,6 +142,7 @@ def test_query_reads_one_remote_member_and_keeps_other_cgi(remote_archive):
         authz="Bearer secret", **{"xrdcl.unzip": "folder/data.txt"}
     )
     with xrdclient.open(url, "rb", buffering=17, config=config) as member:
+        assert isinstance(member, io.BufferedReader)
         assert "secret" not in member.raw.name
         assert member.read(11) == payload[:11]
         assert member.seek(-8, io.SEEK_END) == len(payload) - 8
@@ -179,6 +181,7 @@ def test_unbuffered_stored_member_has_normal_raw_io_semantics(config):
             member="plain.bin",
             config=config,
         )
+        assert isinstance(raw, ZipMemberIO)
         assert (raw.readable(), raw.writable(), raw.seekable(), raw.mode) == (
             True,
             False,
@@ -211,23 +214,27 @@ def test_local_member_and_empty_member(tmp_path):
 
 def test_zip64_sizes_and_offset_are_used_for_member_reads(config):
     archive = _zip64_member(b"wide.bin", b"zip64 data")
-    with FakeServer(files={"/wide.zip": archive}) as server:
-        with xrdclient.open(
+    with (
+        FakeServer(files={"/wide.zip": archive}) as server,
+        xrdclient.open(
             server.url.with_path("/wide.zip"), "rb", member="wide.bin", config=config
-        ) as member:
-            assert member.read() == b"zip64 data"
+        ) as member,
+    ):
+        assert member.read() == b"zip64 data"
 
 
 def test_small_forced_zip64_and_legacy_cp437_names_are_read(config):
     archive = _small_zip64_archive("café.bin".encode("cp437"), b"legacy name")
-    with FakeServer(files={"/small-wide.zip": archive}) as server:
-        with xrdclient.open(
+    with (
+        FakeServer(files={"/small-wide.zip": archive}) as server,
+        xrdclient.open(
             server.url.with_path("/small-wide.zip"),
             "rb",
             member="café.bin",
             config=config,
-        ) as member:
-            assert member.read() == b"legacy name"
+        ) as member,
+    ):
+        assert member.read() == b"legacy name"
 
 
 def test_missing_member_and_broken_local_header_close_cleanly(config):
@@ -271,14 +278,14 @@ def test_full_reads_verify_the_member_crc(method, config):
     archive = _archive({"bad": b"payload" * 100}, method=method)
     crc = _field(archive, b"PK\x01\x02", 16, 4)
     archive = _replace_field(archive, b"PK\x01\x02", 16, 4, crc ^ 1)
-    with FakeServer(files={"/bad.zip": archive}) as server:
-        with (
-            xrdclient.open(
-                server.url.with_path("/bad.zip"), "rb", member="bad", config=config
-            ) as member,
-            pytest.raises(ZipArchiveError, match="CRC32 mismatch"),
-        ):
-            member.read()
+    with (
+        FakeServer(files={"/bad.zip": archive}) as server,
+        xrdclient.open(
+            server.url.with_path("/bad.zip"), "rb", member="bad", config=config
+        ) as member,
+        pytest.raises(ZipArchiveError, match="CRC32 mismatch"),
+    ):
+        member.read()
 
 
 def test_deflate_metadata_cannot_hide_trailing_or_expanding_data(config):
@@ -385,6 +392,7 @@ def test_finishing_an_inflated_member_twice_is_idempotent(config):
             member="bad",
             config=config,
         )
+        assert isinstance(raw, ZipMemberIO)
         assert raw.read() == b"done"
         raw._finish_inflate()
         raw.close()

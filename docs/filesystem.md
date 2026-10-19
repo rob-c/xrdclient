@@ -10,6 +10,32 @@ with xrdclient.FileSystem("root://eos.example.org") as fs:
 
 Paths may be absolute or relative to the URL's own path.
 
+## One name, three implementations
+
+`FileSystem(url)` picks the implementation by scheme: `root://` is
+`FileSystem` itself, `http(s)://`, `dav(s)://` and `webdav://` are
+`xrdclient.http.HTTPFileSystem`, and `s3://` is `xrdclient.s3.S3FileSystem`.
+All three share one abstract base, `xrdclient.BaseFileSystem`:
+
+```
+BaseFileSystem            walk, glob, rmtree, list_archive, read/write_bytes/text,
+├── FileSystem            exists/isdir/isfile/getsize, listdir, iterdir, ...
+└── HTTPFileSystem        + an abstract method for every protocol operation
+    └── S3FileSystem
+```
+
+The protocol operations - `stat`, `scandir`, `mkdir`, `prepare`, `open`, ... -
+are abstract on the base and implemented by each scheme its own way; what is
+built on top of them lives on the base once, so it behaves identically
+everywhere. WebDAV and S3 are siblings of the `root://` class, not subclasses:
+neither inherits binary-protocol code it cannot use.
+
+`isinstance(fs, xrdclient.FileSystem)` is still true of all three - the two
+HTTP classes are registered as virtual subclasses of `FileSystem` - and
+`type(fs) is FileSystem` only for `root://`, as before. Annotate with
+`BaseFileSystem` to mean "any filesystem", or subclass it to add a scheme of
+your own: implement the abstract methods and the helpers come for free.
+
 ## Reading the namespace
 
 | Method | Notes |
@@ -20,6 +46,7 @@ Paths may be absolute or relative to the URL's own path.
 | `exists`, `isdir`, `isfile`, `getsize` | the `os.path` spellings |
 | `listdir(path)` | names only |
 | `scandir(path)` | `DirEntry` objects with `stat` attached |
+| `dirlist(path)` | the raw `kXR_dirlist` answer, as bytes (`root://` only) |
 | `iterdir(path)` | the same, as an iterator |
 | `walk(top)` | `os.walk`'s `(root, dirs, files)` triples |
 | `glob(pattern, root="")` | `pathlib` semantics, absolute paths out |
@@ -53,6 +80,24 @@ for entry in fs.scandir("/store", algorithm="adler32"):
 directory, or a file it could not read. An algorithm the server does not
 compute fails the whole listing rather than some of its entries, so ask for
 one `checksum()` names.
+
+Parsing is most of what a long listing costs - every entry becomes a
+`StatInfo`. A caller that needs a field or two of each can have the answer
+unparsed and pay only for what it reads:
+
+```python
+raw = fs.dirlist("/store", stat=True)    # same request scandir sends
+lines = [line for line in raw.rstrip(b"\0").decode().split("\n") if line]
+if lines[:1] == ["."]:                   # the server honoured kXR_dstat
+    for name, stat in zip(lines[2::2], lines[3::2]):
+        ident, size, flags, mtime = stat.split()[:4]
+```
+
+With `stat`, a server that honours `kXR_dstat` starts with a `.` line and the
+directory's own stat line, then sends each name and its stat line in turn; one
+that ignores the flag sends names alone, so the leading `.` - not the flag you
+sent - says which arrived. WebDAV answers in XML, not this format, and refuses
+`dirlist` with `UnsupportedError`: use `scandir` there.
 
 ### glob
 
@@ -222,8 +267,10 @@ schemes.
 
 `statvfs()` and `query_space()` answer different questions. `statvfs()`
 describes the whole storage element the way `df` would, in megabytes and
-percentages; `query_space()` describes the one space token - the pool an
-`oss.cgroup` write lands in - in bytes, and reports its quota:
+percentages (a server with no such figures - dCache answers the request
+with an ordinary stat line - raises `UnsupportedError`); `query_space()`
+describes the one space token - the pool an `oss.cgroup` write lands in - in
+bytes, and reports its quota:
 
 ```python
 space = fs.query_space("/store")
@@ -249,11 +296,20 @@ file is online - so `all(fs.query_prepare(handle, paths))` is "the stage has
 finished". A handle the server never issued is an error rather than a list of
 files it says nothing about.
 
-A request that has not run yet can be withdrawn by the same handle:
+A request that has not run yet can be withdrawn by the same handle - all of
+it, or some of its files:
 
 ```python
 fs.cancel_prepare(handle)
+fs.cancel_prepare(handle, ["/store/b.root"])
+fs.prepare(["/store/b.root"], cancel=True, reqid=handle)   # the same request
 ```
+
+Over `root://` that is `kXR_prepare` with `kXR_cancel`, the request id leading
+the path list as XrdCl sends it; over `davs://` it is the tape API's
+`DELETE /stage/<id>` or `POST /stage/<id>/cancel`. A `reqid` without
+`cancel=True`, or a cancel without a `reqid`, is a `ValueError`, raised before
+anything is sent.
 
 Where a file is *now* is a separate question, and asking it stages nothing:
 
@@ -267,9 +323,9 @@ That is one `statx` over `root://` - the protocol's offline flag is the whole
 answer - and `POST /api/v1/archiveinfo` over `davs://`, which is why the
 `state` word is the tape API's (`ONLINE`, `NEARLINE`, `DISK`, `TAPE`) on both.
 
-Cancelling names the request, not the files, which is why it is a separate
-method rather than a flag: passing paths here would ask the server to cancel
-whatever requests have handles that look like filenames.
+Cancelling names the request first and the files second, which is why the
+request id is its own argument rather than one more path: as a path it would
+be resolved against the filesystem's directory and stop naming the request.
 
 A checksum the server is still computing can be called off the same way, this
 one by path:
@@ -353,6 +409,30 @@ put them.
     is not something to branch on. The server also caps its reply and drops
     the remainder of a large tree without saying so. Where either matters,
     `fs.walk()` and a `listxattr` per file is the answer you can trust.
+
+## Aborting
+
+`abort()` stops every call on a filesystem now, from any thread, and refuses
+every call after it - for a watchdog or a cancelled job, where a timeout would
+come too late:
+
+```python
+threading.Timer(30, fs.abort).start()
+try:
+    fs.stat("/store/slow.root")
+except xrdclient.AbortedError as exc:        # an OSError, errno ECANCELED
+    ...
+```
+
+It is thread-safe, idempotent and never blocks on the network: the
+connections the filesystem's requests are out on are shut down, which wakes a
+blocked call at once, and nothing is retried, reconnected or pooled again. An
+aborted filesystem is spent; close it and make another. The connection is what
+an abort reaches, so a file opened from the filesystem that shares its
+connection sees it dropped - abort the `File` itself to stop only that file.
+Over WebDAV and S3 every connection the filesystem's HTTP client holds is shut
+down the same way. `xrdclient.aio`'s `AsyncFileSystem.abort()` is the same
+call, made straight from the event loop.
 
 ## Sharing a connection
 

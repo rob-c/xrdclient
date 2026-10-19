@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 import xrdclient
-from conftest import _REAL_CONFIG
+from tests.conftest import _REAL_CONFIG
 from xrdclient.cli import cp as cli_cp
 from xrdclient.cli import fs as cli_fs
 from xrdclient.client.file import File
@@ -130,14 +130,15 @@ def test_directories_are_made_listed_walked_and_removed(rfs, sandbox):
     assert not rfs.exists(sandbox)
 
 
-def _assert_listing(rfs, sandbox):
+def _assert_listing(rfs: xrdclient.FileSystem, sandbox: str) -> None:
     assert sorted(rfs.listdir(sandbox)) == ["a.root", "b.dat", "x"]
     entries = {e.name: e for e in rfs.scandir(sandbox)}
     assert entries["x"].is_dir() and entries["a.root"].is_file()
-    assert entries["a.root"].stat.st_size == 1
+    stat = entries["a.root"].stat
+    assert stat is not None and stat.st_size == 1
 
 
-def _assert_walk(rfs, sandbox):
+def _assert_walk(rfs: xrdclient.FileSystem, sandbox: str) -> None:
     found = {root: sorted(files) for root, _dirs, files in rfs.walk(sandbox)}
     assert found[sandbox] == ["a.root", "b.dat"]
     assert found[f"{sandbox}/x/y/z"] == ["deep.root"]
@@ -290,7 +291,7 @@ def test_extended_attributes_round_trip(rfs, blob):
     try:
         rfs.setxattr(blob, "user.experiment", b"cms")
     except (UnsupportedError, NotFoundError) as exc:  # tmpfs without user xattrs
-        pytest.skip(f"the export does not support xattrs: {exc}")
+        pytest.skip(f"environment: the exported filesystem has no user xattrs: {exc}")
     assert rfs.getxattr(blob, "user.experiment") == b"cms"
     # Names come back mangled - the daemon's attribute plugin strips its own
     # namespace prefix on the way out and takes four characters of the name
@@ -330,9 +331,8 @@ def test_visa_is_a_server_limitation_not_a_client_bug(rfs, blob):
     Asserting it keeps the mapping honest: the client must report the server's
     "unsupported" rather than dressing it up as something else.
     """
-    with File(rfs.url.with_path(blob), _REAL_CONFIG) as handle:
-        with pytest.raises(UnsupportedError):
-            handle.visa()
+    with File(rfs.url.with_path(blob), _REAL_CONFIG) as handle, pytest.raises(UnsupportedError):
+        handle.visa()
 
 
 # ---------------------------------------------------------------------------
@@ -344,8 +344,8 @@ def _tool(name: str) -> str:
     import shutil
 
     found = shutil.which(name)
-    if found is None:  # pragma: no cover - depends on the installation
-        pytest.skip(f"no {name} on PATH")
+    if found is None:
+        pytest.skip(f"environment: no {name} on PATH")
     return found
 
 
@@ -515,11 +515,11 @@ def tpc_pair(tmp_path, monkeypatch):
     """
     import shutil
 
-    import _xrootd
+    from tests import _xrootd
 
     xrdcp = shutil.which("xrdcp")
     if not _xrootd.available() or xrdcp is None:
-        pytest.skip("needs the xrootd and xrdcp binaries")
+        pytest.skip("environment: needs the xrootd and xrdcp binaries on PATH")
     tpc = f"ofs.tpc autorm pgm {xrdcp} --server\n"
     monkeypatch.setattr(_xrootd, "CONFIG", _xrootd.CONFIG + tpc)
     roots = [Path(os.path.realpath(tmp_path / name)) for name in ("src", "dst")]
@@ -544,7 +544,8 @@ def test_a_stock_destination_pulls_a_verified_third_party_copy(tpc_pair):
         verify=True,
     )
     assert (dst_root / "g.bin").read_bytes() == BLOB
-    assert result.verified and result.checksum.value == f"{zlib.adler32(BLOB):08x}"
+    assert result.verified and result.checksum is not None
+    assert result.checksum.value == f"{zlib.adler32(BLOB):08x}"
 
 
 # ---------------------------------------------------------------------------

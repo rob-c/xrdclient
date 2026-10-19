@@ -7,6 +7,7 @@ Usage: python glob_files.py [root://host:port] [/working/dir]
 from __future__ import annotations
 
 import sys
+from collections.abc import Iterable
 
 from xrdclient.compat import client  # was: from XRootD import client
 from xrdclient.compat.client.flags import MkDirFlags, OpenFlags
@@ -25,7 +26,7 @@ for name in NAMES:
 base = f"{URL}/{WORK}"
 
 
-def short(urls):
+def short(urls: Iterable[str]) -> list[str]:
     """The part of each URL below the working directory, sorted."""
     return sorted(u.split(WORK, 1)[1] for u in urls)
 

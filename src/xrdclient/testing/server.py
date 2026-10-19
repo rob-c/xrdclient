@@ -17,12 +17,31 @@ awkward paths get exercised too.
 
 TLS is not implemented; point a client at it with ``root://``, not
 ``roots://``.
+
+This module is the server's state, socket and dispatcher; the per-opcode
+handlers are in :mod:`xrdclient.testing._server`, one module per area of the
+protocol, and are re-exported here. Names a test patches on this module -
+``_checksum``, ``CHECKPOINT_CAPACITY``, the ``_HANDLERS`` table - are defined
+here and read through it at call time, so such a patch still takes effect.
+
+Threading and lifetime: :class:`socketserver.ThreadingTCPServer` gives every
+accepted connection its own thread, which runs one :class:`_Connection` for
+the life of the socket. All connections share the one :class:`FakeServer`'s
+dicts; handlers mutate them without locking, which the GIL makes safe for the
+single-operation updates they do. The registries that must be consistent
+across threads - live sockets, logged-in sessions, parked data paths - are
+guarded by ``_live_lock``. Every thread is a daemon, so a test that forgets
+:meth:`FakeServer.stop` cannot hang interpreter exit.
+
+Where to start reading: :meth:`_Connection._serve_request` (one request,
+including where its data and reply travel for a bound data path), then
+:meth:`_Connection._dispatch` (the fault knobs, in the order they apply),
+then the handler module for the opcode in question.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import pathlib
 import posixpath
@@ -30,27 +49,91 @@ import socket
 import socketserver
 import struct
 import threading
-import time
 import zlib
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import dataclass, field
-from typing import cast
-from urllib.parse import parse_qs
+from typing import Self, cast
 
-from .._compat import zip_strict
-from ..errors import (
-    kXR_ArgInvalid,
-    kXR_AttrNotFound,
-    kXR_FileNotOpen,
-    kXR_ItExists,
-    kXR_NoSpace,
-    kXR_Unsupported,
-)
 from ..proto import constants as c
-from ..proto.buffer import Reader, Writer
 from ..url import XRootDURL, parse
 
-__all__ = ["FakeServer", "frame", "error", "pgwrite_cse", "from_directory", "main"]
+# The request handlers live in ``_server``, one module per area of the
+# protocol (see its package docstring for the map). They are re-exported here
+# under their old names - ``as`` marks each one as a deliberate re-export -
+# because tests reach for them as ``xrdclient.testing.server._h_open`` and so
+# on, and because the ``_HANDLERS`` table below is built from them.
+from ._server.files import _Checkpoint as _Checkpoint
+from ._server.files import _checkpoint_exec as _checkpoint_exec
+from ._server.files import _colocate as _colocate
+from ._server.files import _h_chkpoint as _h_chkpoint
+from ._server.files import _h_clone as _h_clone
+from ._server.files import _h_close as _h_close
+from ._server.files import _h_open as _h_open
+from ._server.files import _h_pgread as _h_pgread
+from ._server.files import _h_pgwrite as _h_pgwrite
+from ._server.files import _h_read as _h_read
+from ._server.files import _h_readv as _h_readv
+from ._server.files import _h_sync as _h_sync
+from ._server.files import _h_write as _h_write
+from ._server.files import _h_writev as _h_writev
+from ._server.files import _splice as _splice
+from ._server.files import _target_refusal as _target_refusal
+from ._server.files import _template_refusal as _template_refusal
+from ._server.namespace import _h_chmod as _h_chmod
+from ._server.namespace import _h_dirlist as _h_dirlist
+from ._server.namespace import _h_link as _h_link
+from ._server.namespace import _h_mkdir as _h_mkdir
+from ._server.namespace import _h_mv as _h_mv
+from ._server.namespace import _h_readlink as _h_readlink
+from ._server.namespace import _h_rm as _h_rm
+from ._server.namespace import _h_rmdir as _h_rmdir
+from ._server.namespace import _h_setattr as _h_setattr
+from ._server.namespace import _h_stat as _h_stat
+from ._server.namespace import _h_statx as _h_statx
+from ._server.namespace import _h_symlink as _h_symlink
+from ._server.namespace import _h_truncate as _h_truncate
+from ._server.namespace import _two_paths as _two_paths
+from ._server.queries import _QUERIES as _QUERIES
+from ._server.queries import _config_value as _config_value
+from ._server.queries import _h_locate as _h_locate
+from ._server.queries import _h_prepare as _h_prepare
+from ._server.queries import _h_query as _h_query
+from ._server.queries import _h_query_fctl as _h_query_fctl
+from ._server.queries import _q_ckscan as _q_ckscan
+from ._server.queries import _q_cksum as _q_cksum
+from ._server.queries import _q_config as _q_config
+from ._server.queries import _q_prep as _q_prep
+from ._server.queries import _q_space as _q_space
+from ._server.queries import _q_stats as _q_stats
+from ._server.queries import _q_visa as _q_visa
+from ._server.session import _h_auth as _h_auth
+from ._server.session import _h_bind as _h_bind
+from ._server.session import _h_endsess as _h_endsess
+from ._server.session import _h_login as _h_login
+from ._server.session import _h_ping as _h_ping
+from ._server.session import _h_protocol as _h_protocol
+from ._server.session import _h_set as _h_set
+from ._server.wire import _NULL_HANDLE as _NULL_HANDLE
+from ._server.wire import _REQ as _REQ
+from ._server.wire import _RESP as _RESP
+from ._server.wire import _clean as _clean
+from ._server.wire import _error as _error
+from ._server.wire import _frame as _frame
+from ._server.wire import _NotFound as _NotFound
+from ._server.wire import error as error
+from ._server.wire import frame as frame
+from ._server.wire import pgwrite_cse as pgwrite_cse
+from ._server.xattrs import _FATTR_EDITS as _FATTR_EDITS
+from ._server.xattrs import _fattr_del as _fattr_del
+from ._server.xattrs import _fattr_edit as _fattr_edit
+from ._server.xattrs import _fattr_get as _fattr_get
+from ._server.xattrs import _fattr_list as _fattr_list
+from ._server.xattrs import _fattr_path as _fattr_path
+from ._server.xattrs import _fattr_reply as _fattr_reply
+from ._server.xattrs import _fattr_set as _fattr_set
+from ._server.xattrs import _fattr_walk as _fattr_walk
+from ._server.xattrs import _h_fattr as _h_fattr
+
+__all__ = ["FakeServer", "error", "frame", "from_directory", "main", "pgwrite_cse"]
 
 #: Requests whose body is payload rather than a path, so nothing about them
 #: belongs in :attr:`FakeServer.arguments`. The read side is here for the same
@@ -74,57 +157,6 @@ _DATA_REQUESTS = frozenset(
 #: What :attr:`FakeServer.handlers` entries look like.
 Handler = Callable[["_Connection", int, bytes, bytes], Iterator[bytes]]
 
-_REQ = struct.Struct(">HH16sI")
-_RESP = struct.Struct(">HHI")
-_NULL_HANDLE = b"\x00\x00\x00\x00"
-
-
-def frame(streamid: int, status: int, body: bytes = b"") -> bytes:
-    """One complete response frame: the 8-byte header and its body.
-
-    Public because :attr:`FakeServer.handlers` is: answering badly means
-    building the frame yourself.
-    """
-    return _RESP.pack(streamid, status, len(body)) + body
-
-
-def error(streamid: int, code: int, message: str) -> bytes:
-    """A ``kXR_error`` frame carrying a server error code and its text."""
-    return frame(streamid, c.kXR_error, struct.pack(">i", code) + message.encode() + b"\x00")
-
-
-def pgwrite_cse(streamid: int, corrupt: Sequence[int]) -> bytes:
-    """A ``kXR_pgwrite`` reply naming the pages that arrived corrupt.
-
-    A ``kXR_status`` frame whose trailer is ``cseCRC[4] dlFirst[2] dlLast[2]``
-    and then one big-endian ``int64`` file offset per bad page.
-    ``dlFirst``/``dlLast`` say how much of the first and last page the request
-    covered - a whole page each here, which is what a write of whole pages
-    means. Public for the same reason :func:`frame` is.
-    """
-    trailer = struct.pack(">IHH", 0, c.kXR_pgPageSZ, c.kXR_pgPageSZ) + b"".join(
-        struct.pack(">q", off) for off in corrupt
-    )
-    status = (
-        struct.pack(">I", 0)
-        + struct.pack(">H", streamid)
-        + bytes([c.kXR_pgwrite - c.kXR_1stRequest, c.kXR_FinalResult])
-        + bytes(4)
-        + struct.pack(">i", len(trailer))
-        + struct.pack(">q", 0)
-    )
-    return frame(streamid, c.kXR_status, status) + trailer
-
-
-_frame = frame
-_error = error
-
-
-def _clean(path: str) -> str:
-    """Strip any CGI and normalise, the way a server resolves a path."""
-    base = path.partition("?")[0]
-    return posixpath.normpath("/" + base.lstrip("/")) if base else "/"
-
 
 def _endpoint(server: socketserver.BaseServer) -> tuple[str, int]:
     """The bound ``(host, port)``. These servers are always AF_INET, which is
@@ -134,26 +166,17 @@ def _endpoint(server: socketserver.BaseServer) -> tuple[str, int]:
     return host, port
 
 
-@dataclass
-class _Checkpoint:
-    """One open checkpoint: what to put back, and how much has been journaled."""
-
-    path: str
-    snapshot: bytearray = field(default_factory=bytearray)
-    used: int = 0
-
-
-class _NotFound(Exception):
-    """Raised inside a handler to produce a ``kXR_NotFound``."""
-
-    def __init__(self, path: str, code: int = 3011, message: str = "no such file or directory"):
-        self.path = path
-        self.code = code
-        self.message = message
-
-
 class FakeServer:
-    """An in-memory XRootD server listening on an ephemeral loopback port."""
+    """An in-memory XRootD server listening on an ephemeral loopback port.
+
+    Everything a test arranges or inspects is a public attribute: the
+    namespace (``files``, ``dirs``, ``links``, ``xattrs`` ...), the request
+    logs (``seen``, ``opened``, ``arguments``, ``reads`` ...) and the fault
+    knobs (``redirects``, ``waits``, ``chunk_reads``, ``auth_rounds``,
+    ``pgwrite_corrupt``, ``handlers``). Knobs are read per request, so a
+    test may change them while a client is connected. The port is bound on
+    first use and kept until :meth:`stop`.
+    """
 
     def __init__(
         self,
@@ -167,6 +190,15 @@ class FakeServer:
         sessid: bytes = b"\x11" * 16,
         version: int = 0x0500_0000,
     ) -> None:
+        """Hold ``files`` and ``dirs``; bind nothing until the address is first needed.
+
+        ``sec`` is the security trailer the login reply carries (``""`` for
+        none, so no authentication); ``flags`` and ``version`` are what
+        ``kXR_protocol`` reports, which is how a test impersonates a
+        redirector (``kXR_isManager``) or an older server. ``sessid`` seeds
+        the session ids :meth:`next_sessid` hands out. All of these are
+        keyword-only so a test reads as a description of the server it wants.
+        """
         #: Path to contents. Mutated by the client, readable by the test.
         self.files: dict[str, bytearray] = {}
         #: Directories that exist, including the parents of every file.
@@ -267,11 +299,16 @@ class FakeServer:
         #: that named one.
         self.colocated: dict[str, str] = {}
 
-        self._live: set[object] = set()
+        #: Every connected socket, so :meth:`disconnect` can sever them all.
+        self._live: set[socket.socket] = set()
+        #: Guards ``_live``, ``_sessions``, ``_parked`` and the session counter,
+        #: which connection threads update concurrently.
         self._live_lock = threading.Lock()
         #: Logged-in connections by session id, so ``kXR_bind`` can find the
         #: one a data path is asking to join.
         self._sessions: dict[bytes, _Connection] = {}
+        #: Wake-ups for bound data-path threads that have handed their socket
+        #: to the control link and are waiting to exit; set on disconnect.
         self._parked: set[threading.Event] = set()
         self._sessions_issued = 0
 
@@ -344,7 +381,7 @@ class FakeServer:
         host, port = self.address
         return parse(f"root://{host}:{port}/")
 
-    def start(self) -> FakeServer:
+    def start(self) -> Self:
         """Serve in a background thread. Idempotent."""
         if self._thread is None:
             # A short poll interval keeps stop() from costing half a second,
@@ -374,11 +411,11 @@ class FakeServer:
             waiting.set()
         for sock in live:
             try:
-                sock.shutdown(socket.SHUT_RDWR)  # type: ignore[attr-defined]
+                sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
             finally:
-                sock.close()  # type: ignore[attr-defined]
+                sock.close()
 
     def stop(self) -> None:
         """Stop serving and release the port. Idempotent."""
@@ -392,13 +429,16 @@ class FakeServer:
         self._bound = None
         self.disconnect()
 
-    def __enter__(self) -> FakeServer:
+    def __enter__(self) -> Self:
+        """Start serving; the ``with`` block is the server's lifetime."""
         return self.start()
 
     def __exit__(self, *exc: object) -> None:
+        """Stop, release the port and drop every connection, raised or not."""
         self.stop()
 
     def __repr__(self) -> str:
+        """Where it listens and how much it holds - for a failing test's output."""
         # Reading the address would bind the port; a repr must not do that.
         bound = _endpoint(self._bound) if self._bound else self._last
         where = f"{bound[0]}:{bound[1]}" if bound else "unbound"
@@ -406,27 +446,52 @@ class FakeServer:
 
 
 class _TCPServer(socketserver.ThreadingTCPServer):
+    """The listening socket, with a back-reference to the fake it serves.
+
+    ``allow_reuse_address`` lets the next test bind a port this one just
+    released; ``daemon_threads`` keeps a client's idle connection from
+    holding the interpreter open.
+    """
+
     allow_reuse_address = True
     daemon_threads = True
     fake: FakeServer
 
 
 class _Handler(socketserver.BaseRequestHandler):
+    """The ``socketserver`` hook: hand each accepted socket to a :class:`_Connection`."""
+
     def handle(self) -> None:
-        _Connection(self.server.fake, self.request).run()  # type: ignore[attr-defined]
+        """Run the connection's protocol loop on this (per-connection) thread."""
+        server, sock = self.server, self.request
+        # Always so: _Handler serves only a _TCPServer, which accepts TCP sockets.
+        assert isinstance(server, _TCPServer) and isinstance(sock, socket.socket)
+        _Connection(server.fake, sock).run()
 
 
 class _Connection:
-    """One client connection's worth of protocol."""
+    """One client connection's worth of protocol.
 
-    def __init__(self, server: FakeServer, sock: object) -> None:
+    Per-connection state is what xrootd keeps per link: open handles, open
+    checkpoints, authentication progress and the session id. A connection
+    that sends ``kXR_bind`` to join another becomes one of its data paths - it then
+    *shares* its owner's handle table, and its socket is read and written by
+    the owner's thread for the requests that route data through it.
+    """
+
+    def __init__(self, server: FakeServer, sock: socket.socket) -> None:
+        """Wrap ``sock`` for ``server``; nothing is read until :meth:`run`."""
         self.s = server
         self.sock = sock
-        self.rfile = sock.makefile("rb")  # type: ignore[attr-defined]
+        self.rfile = sock.makefile("rb")
+        #: Open file handles (4-byte, big-endian counters) to their paths.
         self.handles: dict[bytes, str] = {}
+        #: The open checkpoint per handle, if any.
         self.checkpoints: dict[bytes, _Checkpoint] = {}
         self.next_handle = 1
+        #: ``kXR_auth`` requests seen, against ``FakeServer.auth_rounds``.
         self.auth_seen = 0
+        #: The session id this link's login was given; ``b""`` before login.
         self.sessid = b""
         #: Data connections bound to this one, by path id.
         self.paths: dict[int, _Connection] = {}
@@ -435,11 +500,18 @@ class _Connection:
         self.bound_to: _Connection | None = None
         #: Which link the reply to the request in hand goes out on.
         self.route = 0
+        #: Set to let a parked data-path thread finish (see ``_serve_request``).
         self.unpark = threading.Event()
 
     # -- plumbing -------------------------------------------------------
 
     def run(self) -> None:
+        """Serve until the client goes, the link is parked, or the server stops.
+
+        Socket errors and malformed frames end the connection quietly: a
+        client hanging up mid-request is a normal event for a test server,
+        and the test that caused it asserts on the client side.
+        """
         with self.s._live_lock:
             self.s._live.add(self.sock)
         try:
@@ -451,6 +523,10 @@ class _Connection:
 
     def _serve(self) -> None:
         """Handshake, then answer requests until the link is done with."""
+        # The client's 20-byte initial handshake (five int32s ending in 4
+        # and 2012) is read but not checked; the answer is the 8-byte
+        # handshake reply on stream 0. The real role and version come later,
+        # from kXR_protocol, which is what clients act on.
         if len(self.rfile.read(20) or b"") < 20:
             return
         self._send(_frame(0, c.kXR_ok, struct.pack(">ii", 0, c.ROOTD_PQ)))
@@ -483,6 +559,12 @@ class _Connection:
         return bool(opcode != c.kXR_endsess)
 
     def _teardown(self) -> None:
+        """Forget this link everywhere it was registered, then close it.
+
+        A data path detaches from its owner so that later routing cannot
+        pick a closed socket; the session is dropped so a ``kXR_bind`` to it
+        is refused, as it would be after a real server lost the link.
+        """
         with self.s._live_lock:
             self.s._live.discard(self.sock)
             self.s._parked.discard(self.unpark)
@@ -494,21 +576,31 @@ class _Connection:
             )
         try:
             self.rfile.close()
-            self.sock.close()  # type: ignore[attr-defined]
+            self.sock.close()
         except OSError:
             pass
 
     def _send(self, data: bytes) -> None:
+        """Write a frame to the link the current request's reply is routed to."""
         target = self.paths.get(self.route, self)
-        target.sock.sendall(data)  # type: ignore[attr-defined]
+        target.sock.sendall(data)
 
     def _dispatch(self, sid: int, opcode: int, params: bytes, body: bytes) -> Iterator[bytes]:
+        """The frames that answer one request, after the fault knobs have had their say.
+
+        Order matters and is pinned by tests: a pending redirect wins (and is
+        consumed), then the argument is logged, then a pending ``kXR_wait``,
+        then a test-installed handler, then the built-in one. An opcode with
+        no handler is ``kXR_Unsupported`` (3013), as from a server that
+        predates it.
+        """
         if opcode == c.kXR_sigver:
             return  # the signature prefixes the next frame; nothing to answer
 
         target = self.s.redirects.pop(opcode, None)
         if target is not None:
             host, port, token = target
+            # kXR_redirect body: port[4] then "host[?opaque]", NUL-terminated.
             where = f"{host}{'?' + token if token else ''}".encode()
             yield _frame(sid, c.kXR_redirect, struct.pack(">i", port) + where + b"\x00")
             return
@@ -517,6 +609,8 @@ class _Connection:
 
         if self.s.waits.get(opcode, 0):
             self.s.waits[opcode] -= 1
+            # kXR_wait body: seconds[4] then a message. Zero seconds keeps
+            # the suite fast while still making the client go round again.
             yield _frame(sid, c.kXR_wait, struct.pack(">i", 0) + b"try again\x00")
             return
 
@@ -550,6 +644,12 @@ class _Connection:
         raise _NotFound("", 3001, "no path and no handle")
 
     def _stat_line(self, path: str, *, follow: bool = True) -> bytes:
+        """The ``"<id> <size> <flags> <mtime>"`` text a stat reply carries for ``path``.
+
+        The id is a hash of the path - stable within a run, which is all a
+        client may assume of it. Directories report 4096 bytes, as a POSIX
+        filesystem under xrootd does. ``_NotFound`` if nothing is there.
+        """
         pointed_at = self.s.links.get(path)
         if pointed_at is not None:
             if not follow:
@@ -578,6 +678,7 @@ class _Connection:
         return self.s.times.get(path, (0, 1700000000 * 10**9))[1] // 10**9
 
     def _children(self, path: str) -> list[str]:
+        """The sorted names directly inside ``path``: files, directories and links."""
         # Listing a link lists what it points at, as readdir(3) through a
         # link to a directory does; the links themselves are entries.
         path = self.s.links.get(path, path)
@@ -592,402 +693,38 @@ class _Connection:
         return sorted(names)
 
     def _file(self, path: str) -> bytearray:
+        """The live, mutable contents at ``path`` - not a copy; ``_NotFound`` if absent."""
         try:
             return self.s.files[path]
         except KeyError:
             raise _NotFound(path) from None
 
 
-# --------------------------------------------------------------------------
-# Handlers. Each yields the frames to send back.
-# --------------------------------------------------------------------------
-
-
-def _h_protocol(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    yield _frame(sid, c.kXR_ok, struct.pack(">iI", conn.s.version, conn.s.flags))
-
-
 def _data_path(opcode: int, params: bytes) -> int:
-    """The path a request's *data* travels on, if it named one."""
+    """The path a request's *data* travels on, if it named one.
+
+    ``kXR_write`` and ``kXR_pgwrite`` carry a path id in ``params[12]``
+    (``pathid``); 0 is the control link itself.
+    """
     return params[12] if opcode in (c.kXR_write, c.kXR_pgwrite) else 0
 
 
 def _reply_path(opcode: int, params: bytes, body: bytes) -> int:
-    """The path a request's *reply* travels on, if it named one."""
+    """The path a request's *reply* travels on, if it named one.
+
+    A read names it in its optional ``read_args`` body (first byte,
+    ``pathid``); ``kXR_readv`` in ``params[15]``. Everything else is
+    answered on the link the request came in on.
+    """
     if opcode in (c.kXR_read, c.kXR_pgread):
         return body[0] if body else 0
     return params[15] if opcode == c.kXR_readv else 0
 
 
-def _h_bind(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    owner = conn.s._sessions.get(params[:16])
-    if owner is None:
-        yield _error(sid, 3010, "no such session")
-        return
-    pathid = owner.next_pathid
-    owner.next_pathid += 1
-    owner.paths[pathid] = conn
-    conn.bound_to = owner
-    # The same dict, not a copy: a file opened on the control link after this
-    # bind is still the file a request arriving here names.
-    conn.handles = owner.handles
-    yield _frame(sid, c.kXR_ok, bytes([pathid]))
-
-
-def _h_login(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    trailer = conn.s.sec.encode() + b"\x00" if conn.s.sec else b""
-    conn.sessid = conn.s.next_sessid()
-    with conn.s._live_lock:
-        conn.s._sessions[conn.sessid] = conn
-    yield _frame(sid, c.kXR_ok, conn.sessid + trailer)
-
-
-def _h_auth(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    conn.auth_seen += 1
-    if conn.auth_seen <= conn.s.auth_rounds:
-        yield _frame(sid, c.kXR_authmore, b"challenge")
-    else:
-        yield _frame(sid, c.kXR_ok)
-
-
-def _h_ping(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    yield _frame(sid, c.kXR_ok)
-
-
-def _h_endsess(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    yield _frame(sid, c.kXR_ok)
-
-
-def _h_stat(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    if params[0] & c.kXR_vfs:
-        yield _frame(sid, c.kXR_ok, b"1 1000000 50 1 500000 20\x00")
-        return
-    path = conn._path(params, body)
-    follow = not params[0] & c.kXR_statNoFollow
-    yield _frame(sid, c.kXR_ok, conn._stat_line(path, follow=follow) + b"\x00")
-
-
-def _h_statx(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    out = bytearray()
-    for raw in body.split(b"\x00", 1)[0].decode().split("\n"):
-        path = _clean(raw)
-        if path in conn.s.dirs:
-            out.append(c.kXR_isDir)
-        elif path in conn.s.files:
-            offline = c.kXR_offline if path in conn.s.nearline else 0
-            out.append(c.kXR_readable | c.kXR_writable | offline)
-        else:
-            out.append(c.kXR_other)
-    yield _frame(sid, c.kXR_ok, bytes(out))
-
-
-def _h_dirlist(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    args = body.split(b"\x00", 1)[0].decode()
-    path = _clean(args)
-    path = conn.s.links.get(path, path)
-    names = conn._children(path)
-    if not params[15] & c.kXR_dstat:
-        yield _frame(sid, c.kXR_ok, "\n".join(names).encode() + b"\x00")
-        return
-    algorithm = ""
-    if params[15] & c.kXR_dcksm:
-        query = parse_qs(args.partition("?")[2])
-        algorithm = query.get("cks.type", ["adler32"])[0]
-    out = bytearray(b".\n" + conn._stat_line(path) + b"\n")
-    for name in names:
-        full = posixpath.join(path, name)
-        try:
-            line = conn._stat_line(full)
-        except _NotFound:
-            # A dangling link has nothing to describe, and stock xrootd
-            # leaves it out of a stat'ed listing rather than failing it.
-            continue
-        if algorithm:
-            # A directory has nothing to digest, and the server says so in the
-            # token rather than leaving it out.
-            value = (
-                _checksum(algorithm, bytes(conn.s.files[full])) if full in conn.s.files else "none"
-            )
-            line += f" [ {algorithm}:{value} ]".encode()
-        out += name.encode() + b"\n" + line + b"\n"
-    yield _frame(sid, c.kXR_ok, bytes(out) + b"\x00")
-
-
-def _h_mkdir(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    path = _clean(body.split(b"\x00", 1)[0].decode())
-    if path in conn.s.dirs or path in conn.s.files:
-        yield _error(sid, 3018, f"already exists: {path}")
-        return
-    parent = posixpath.dirname(path)
-    if not params[0] & c.kXR_mkdirpath and parent not in conn.s.dirs:
-        yield _error(sid, 3011, f"no such file or directory: {parent}")
-        return
-    conn.s.add_dir(path)
-    yield _frame(sid, c.kXR_ok)
-
-
-def _h_rm(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    path = _clean(body.split(b"\x00", 1)[0].decode())
-    if path in conn.s.links:
-        # unlink(2) on a link removes the link, never what it points at.
-        del conn.s.links[path]
-        yield _frame(sid, c.kXR_ok)
-        return
-    if path in conn.s.dirs:
-        yield _error(sid, 3016, f"is a directory: {path}")
-        return
-    conn._file(path)
-    del conn.s.files[path]
-    conn.s.xattrs.pop(path, None)
-    yield _frame(sid, c.kXR_ok)
-
-
-def _h_rmdir(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    path = _clean(body.split(b"\x00", 1)[0].decode())
-    if path in conn.s.links:
-        # rmdir(2) never follows a link, so it is not a directory; stock
-        # xrootd reports ENOTDIR as kXR_FSError.
-        yield _error(sid, 3005, f"not a directory: {path}")
-        return
-    if path not in conn.s.dirs:
-        raise _NotFound(path)
-    if conn._children(path):
-        # ENOTEMPTY, which stock xrootd reports as kXR_ItExists.
-        yield _error(sid, 3018, f"directory not empty: {path}")
-        return
-    conn.s.dirs.discard(path)
-    yield _frame(sid, c.kXR_ok)
-
-
-def _h_mv(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    src, dst = _two_paths(params, body)
-    conn.s.files[dst] = conn._file(src)
-    del conn.s.files[src]
-    conn.s.add_dir(posixpath.dirname(dst))
-    yield _frame(sid, c.kXR_ok)
-
-
-def _h_chmod(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    path = _clean(body.split(b"\x00", 1)[0].decode())
-    if path not in conn.s.files and path not in conn.s.dirs:
-        raise _NotFound(path)
-    conn.s.modes[path] = struct.unpack(">H", params[14:16])[0]
-    yield _frame(sid, c.kXR_ok)
-
-
-def _h_truncate(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    size = struct.unpack(">q", params[4:12])[0]
-    path = conn._path(params, body, at=slice(0, 4))
-    data = conn._file(path)
-    if size < len(data):
-        del data[size:]
-    else:
-        data.extend(bytes(size - len(data)))
-    yield _frame(sid, c.kXR_ok)
-
-
-def _h_set(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    conn.s.properties.append(body.split(b"\x00", 1)[0].decode("utf-8", "replace").strip())
-    yield _frame(sid, c.kXR_ok)
-
-
-def _h_open(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    _mode, options, optiont = struct.unpack(">HHH", params[:6])
-    raw = body.split(b"\x00", 1)[0].decode()
-    conn.s.opened.append(raw)
-    template = params[12:16] if optiont & (c.kXR_dup | c.kXR_samefs) else None
-    path = _clean(raw)
-    refusal = _template_refusal(conn, sid, options, optiont, template) if template else b""
-    refusal = refusal or _target_refusal(conn, sid, path, options)
-    if refusal:
-        yield refusal
-        return
-    if template is not None:
-        _colocate(conn, path, conn.handles[template], dup=bool(optiont & c.kXR_dup))
-    handle = struct.pack(">I", conn.next_handle)
-    conn.next_handle += 1
-    conn.handles[handle] = path
-    reply = handle
-    if options & c.kXR_retstat:
-        reply += bytes(8) + conn._stat_line(path) + b"\x00"
-    yield _frame(sid, c.kXR_ok, reply)
-
-
-def _target_refusal(conn: _Connection, sid: int, path: str, options: int) -> bytes:
-    """Why ``path`` cannot be opened with ``options``, or ``b""`` once it is ready."""
-    exists = path in conn.s.files
-    if path in conn.s.dirs:
-        return _error(sid, 3016, f"is a directory: {path}")
-    if options & c.kXR_new and exists:
-        return _error(sid, 3018, f"already exists: {path}")
-    # Only kXR_new and kXR_delete create; kXR_open_updt and kXR_open_apnd on
-    # their own are "open what is there", exactly as stock xrootd has it. The
-    # fake used to create for any write flag, which let a client that never
-    # asked for creation pass here and fail against a real server.
-    if not exists:
-        if not options & (c.kXR_new | c.kXR_delete):
-            raise _NotFound(path)
-        parent = posixpath.dirname(path)
-        if parent not in conn.s.dirs and not options & c.kXR_mkpath:
-            return _error(sid, 3011, f"no such file or directory: {parent}")
-        conn.s.add_file(path)
-    elif options & c.kXR_delete:
-        conn.s.files[path] = bytearray()
-    return b""
-
-
-def _template_refusal(
-    conn: _Connection, sid: int, options: int, optiont: int, template: bytes
-) -> bytes:
-    """Why xrootd would refuse an open against ``template``, or ``b""``.
-
-    The checks, their order and their words are ``do_Open``'s.
-    """
-    dup = optiont & c.kXR_dup
-    if not conn.s.colocates:
-        what = "file cloning" if dup else "colocating with a specified file"
-        return _error(sid, 3013, f"{what} is not supported")
-    writes = not options & c.kXR_open_read and options & (c.kXR_open_updt | c.kXR_open_wrto)
-    if dup and not writes:
-        return _error(sid, 3000, "cloned file is not being opened R/W")
-    if not options & c.kXR_new:
-        return _error(sid, 3000, "file must be opened as a new file in order to colocate")
-    if template not in conn.handles:
-        return _error(sid, 3004, "file template does not refer to an open file")
-    return b""
-
-
-def _colocate(conn: _Connection, path: str, source: str, *, dup: bool) -> None:
-    """Note where ``path`` was placed, and give it ``source``'s bytes for a dup."""
-    conn.s.colocated[path] = source
-    if dup:
-        conn.s.files[path] = bytearray(conn.s.files[source])
-
-
-def _h_close(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    conn.checkpoints.pop(params[:4], None)
-    if conn.handles.pop(params[:4], None) is None:
-        yield _error(sid, 3004, "file is not open")
-        return
-    yield _frame(sid, c.kXR_ok)
-
-
-def _h_read(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    offset, length = struct.unpack(">qi", params[4:16])
-    path = conn._path(params, b"", at=slice(0, 4))
-    conn.s.reads.append((path, offset, length))
-    data = conn._file(path)[offset : offset + length]
-    step = conn.s.chunk_reads
-    if step and len(data) > step:
-        for start in range(0, len(data) - step, step):
-            yield _frame(sid, c.kXR_oksofar, bytes(data[start : start + step]))
-        last = ((len(data) - 1) // step) * step
-        yield _frame(sid, c.kXR_ok, bytes(data[last:]))
-        return
-    yield _frame(sid, c.kXR_ok, bytes(data))
-
-
-def _h_write(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    offset = struct.unpack(">q", params[4:12])[0]
-    _splice(conn._file(conn._path(params, b"", at=slice(0, 4))), offset, body)
-    yield _frame(sid, c.kXR_ok)
-
-
-def _h_sync(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    conn._path(params, b"", at=slice(0, 4))
-    yield _frame(sid, c.kXR_ok)
-
-
-def _h_readv(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    out = Writer()
-    reader = Reader(body, "kXR_readv")
-    while reader.remaining >= c.READ_LIST_ENTRY_LEN:
-        handle = reader.bytes(4)
-        length = reader.i32()
-        offset = reader.i64()
-        data = conn._file(conn.handles[handle])[offset : offset + length]
-        out.raw(handle).i32(len(data)).i64(offset).raw(bytes(data))
-    yield _frame(sid, c.kXR_ok, out.bytes())
-
-
-def _h_writev(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    # dlen counts the write_list and nothing else, so the body is exactly N
-    # descriptors and the data for them arrives afterwards, uncounted.
-    if len(body) % c.READ_LIST_ENTRY_LEN:
-        yield _error(sid, kXR_ArgInvalid, "Write vector is invalid")
-        return
-    reader = Reader(body, "kXR_writev")
-    entries: list[tuple[bytes, int, int]] = []
-    while reader.remaining >= c.READ_LIST_ENTRY_LEN:
-        handle = reader.bytes(4)
-        length = reader.i32()
-        offset = reader.i64()
-        entries.append((handle, offset, length))
-    for handle, offset, length in entries:
-        _splice(conn._file(conn.handles[handle]), offset, conn.rfile.read(length))
-    yield _frame(sid, c.kXR_ok)
-
-
-def _h_clone(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    """``kXR_clone``: copy ranges between two open handles, without the wire."""
-    if not body or len(body) % c.CLONE_ITEM_LEN:
-        yield _error(sid, kXR_ArgInvalid, "Clone list is invalid")
-        return
-    target = conn._file(conn._path(params, b"", at=slice(0, 4)))
-    reader = Reader(body, "kXR_clone")
-    while reader.remaining >= c.CLONE_ITEM_LEN:
-        handle = reader.bytes(4)
-        reader.bytes(4)
-        offset, length, at = reader.i64(), reader.i64(), reader.i64()
-        if handle not in conn.handles:
-            yield _error(sid, 3004, "file is not open")
-            return
-        source = conn._file(conn.handles[handle])
-        _splice(target, at, bytes(source[offset : offset + length]))
-    yield _frame(sid, c.kXR_ok)
-
-
-def _h_pgread(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    from ..crypto.crc32c import pack_pages
-
-    offset, length = struct.unpack(">qi", params[4:16])
-    data = bytes(conn._file(conn._path(params, b"", at=slice(0, 4)))[offset : offset + length])
-    packed = pack_pages(data, offset)
-    status = (
-        struct.pack(">I", 0)
-        + struct.pack(">H", sid)
-        + bytes([c.kXR_pgread - c.kXR_1stRequest, c.kXR_FinalResult])
-        + bytes(4)
-        + struct.pack(">i", len(packed))
-        + struct.pack(">q", offset)
-    )
-    yield _frame(sid, c.kXR_status, status) + packed
-
-
-def _h_pgwrite(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    from ..crypto.crc32c import page_span, unpack_pages
-
-    offset = struct.unpack(">q", params[4:12])[0]
-    data, corrupt = unpack_pages(body, offset)
-    conn.s.pgwrites.append((offset, len(data), params[13]))
-    # A real server stores what it was sent and reports the pages whose CRC
-    # did not survive; it does not throw the whole request away. The client
-    # is expected to come back for those pages with kXR_pgRetry.
-    _splice(conn._file(conn._path(params, b"", at=slice(0, 4))), offset, data)
-
-    injected = []
-    at = offset
-    while at < offset + len(data):
-        if conn.s.pgwrite_corrupt.get(at, 0):
-            conn.s.pgwrite_corrupt[at] -= 1
-            injected.append(at)
-        at += page_span(at, offset + len(data) - at)
-    corrupt = tuple(sorted({*corrupt, *injected}))
-
-    if corrupt:
-        yield pgwrite_cse(sid, corrupt)
-        return
-    yield _frame(sid, c.kXR_ok)
+# --------------------------------------------------------------------------
+# What tests may patch, and the dispatch table. The handlers in ``_server``
+# read these through this module when they run, never at import.
+# --------------------------------------------------------------------------
 
 
 #: What a checkpoint on this server may journal, in bytes. Small enough that a
@@ -995,358 +732,8 @@ def _h_pgwrite(conn: _Connection, sid: int, params: bytes, body: bytes) -> Itera
 CHECKPOINT_CAPACITY = 1 << 20
 
 
-def _h_chkpoint(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    handle, subcode = params[:4], params[15]
-    open_checkpoint = conn.checkpoints.get(handle)
-
-    if subcode == c.kXR_ckpBegin:
-        path = conn._path(params, b"", at=slice(0, 4))
-        conn.checkpoints[handle] = _Checkpoint(path, bytearray(conn._file(path)))
-        yield _frame(sid, c.kXR_ok)
-        return
-
-    if open_checkpoint is None:
-        yield _error(sid, kXR_FileNotOpen, "no checkpoint is open on this handle")
-        return
-    if subcode == c.kXR_ckpQuery:
-        yield _frame(sid, c.kXR_ok, struct.pack(">II", CHECKPOINT_CAPACITY, open_checkpoint.used))
-    elif subcode == c.kXR_ckpCommit:
-        del conn.checkpoints[handle]
-        yield _frame(sid, c.kXR_ok)
-    elif subcode == c.kXR_ckpRollback:
-        del conn.checkpoints[handle]
-        conn._file(open_checkpoint.path)[:] = open_checkpoint.snapshot
-        yield _frame(sid, c.kXR_ok)
-    elif subcode == c.kXR_ckpXeq:
-        yield from _checkpoint_exec(conn, sid, body, open_checkpoint)
-    else:
-        yield _error(sid, kXR_ArgInvalid, f"unknown checkpoint subcode {subcode}")
-
-
-def _checkpoint_exec(
-    conn: _Connection, sid: int, body: bytes, state: _Checkpoint
-) -> Iterator[bytes]:
-    """Run the request embedded in a ``kXR_ckpXeq``.
-
-    Its 24-byte header is the body; whatever data it carries follows the frame
-    uncounted, the way ``kXR_writev`` streams its own, so the handler for the
-    embedded opcode reads it off the socket itself.
-    """
-    if len(body) != c.REQUEST_HDRLEN:
-        yield _error(sid, kXR_ArgInvalid, "checkpoint payload is not one request header")
-        return
-    _, opcode, inner, dlen = _REQ.unpack(body)
-    # Drain the embedded request's data first, whatever happens next: leaving
-    # it on the socket would make the following request read this one's bytes.
-    data = conn.rfile.read(dlen)
-    if opcode not in (c.kXR_write, c.kXR_pgwrite, c.kXR_truncate):
-        yield _error(sid, kXR_Unsupported, f"{c.request_name(opcode)} is not checkpointable")
-        return
-    state.used += dlen
-    if state.used > CHECKPOINT_CAPACITY:
-        yield _error(sid, kXR_NoSpace, "checkpoint is full")
-        return
-    yield from _HANDLERS[opcode](conn, sid, inner, data)
-
-
-def _h_symlink(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    target, link = _two_paths(params, body)
-    if target not in conn.s.files and target not in conn.s.dirs:
-        raise _NotFound(target)
-    conn.s.links[link] = target
-    yield _frame(sid, c.kXR_ok)
-
-
-def _h_setattr(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    flags, at_s, at_ns, mt_s, mt_ns, uid, gid = struct.unpack(">iqqqqii", body[:44])
-    path = _clean(body[44:].split(b"\x00", 1)[0].decode())
-    if path not in conn.s.files and path not in conn.s.dirs and path not in conn.s.links:
-        raise _NotFound(path)
-    if flags & c.kXR_sa_times:
-        was = conn.s.times.get(path, (0, 1700000000 * 10**9))
-        kept = []
-        for (s, ns), before in zip_strict(((at_s, at_ns), (mt_s, mt_ns)), was):
-            if ns == c.UTIME_OMIT:
-                kept.append(before)
-            elif ns == c.UTIME_NOW:
-                # The server's clock, not the client's, which is the whole
-                # point of having a value that means "now".
-                kept.append(int(time.time() * 10**9))
-            else:
-                kept.append(s * 10**9 + ns)
-        conn.s.times[path] = (kept[0], kept[1])
-    if flags & c.kXR_sa_owner:
-        conn.s.owners[path] = (uid, gid)
-    yield _frame(sid, c.kXR_ok)
-
-
-def _h_link(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    src, dst = _two_paths(params, body)
-    # A hard link is the same bytes under a second name, and a bytearray is
-    # shared by reference - which is exactly the semantics wanted.
-    conn.s.files[dst] = conn._file(src)
-    conn.s.add_dir(posixpath.dirname(dst))
-    yield _frame(sid, c.kXR_ok)
-
-
-def _h_readlink(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    path = _clean(body.split(b"\x00", 1)[0].decode())
-    try:
-        target = conn.s.links[path]
-    except KeyError:
-        raise _NotFound(path, 3011, "not a symbolic link") from None
-    yield _frame(sid, c.kXR_ok, target.encode() + b"\x00")
-
-
-def _two_paths(params: bytes, body: bytes) -> tuple[str, str]:
-    """``"<first> <second>"``, split at the ``arg1len`` the params carry."""
-    split = struct.unpack(">H", params[14:16])[0]
-    text = body.split(b"\x00", 1)[0].decode()
-    return _clean(text[:split]), _clean(text[split + 1 :])
-
-
-def _config_value(conn: _Connection, name: str) -> str:
-    """One ``kXR_Qconfig`` answer. ``brix.substreams`` tracks whether this
-    server actually serves arrivals, so the advertisement and the behaviour
-    cannot drift apart in a test; ``config_values`` still overrides it, for
-    the test about a server that lies."""
-    value = conn.s.config_values.get(name)
-    if value is not None:
-        return value
-    if name == "brix.substreams" and conn.s.serves_arrivals:
-        return "rw"
-    return ""
-
-
-def _q_cksum(conn: _Connection, sid: int, args: str) -> Iterator[bytes]:
-    path = _clean(args)
-    algorithm = "adler32"
-    for pair in args.partition("?")[2].split("&"):
-        if pair.startswith("cks.type="):
-            algorithm = pair.split("=", 1)[1]
-    value = _checksum(algorithm, bytes(conn._file(path)))
-    yield _frame(sid, c.kXR_ok, f"{algorithm} {value}".encode() + b"\x00")
-
-
-def _q_config(conn: _Connection, sid: int, args: str) -> Iterator[bytes]:
-    names = args.split("\n")
-    values = [_config_value(conn, n) for n in names]
-    yield _frame(sid, c.kXR_ok, "\n".join(values).encode() + b"\x00")
-
-
-def _q_ckscan(conn: _Connection, sid: int, args: str) -> Iterator[bytes]:
-    conn.s.cancelled_checksums.append(_clean(args))
-    yield _frame(sid, c.kXR_ok)
-
-
-def _q_stats(conn: _Connection, sid: int, args: str) -> Iterator[bytes]:
-    yield _frame(sid, c.kXR_ok, f'<statistics sel="{args}"/>'.encode() + b"\x00")
-
-
-def _q_space(conn: _Connection, sid: int, args: str) -> Iterator[bytes]:
-    yield _frame(sid, c.kXR_ok, conn.s.space.encode() + b"\x00")
-
-
-def _q_prep(conn: _Connection, sid: int, args: str) -> Iterator[bytes]:
-    handle, *wanted = args.split("\n")
-    if handle not in conn.s.prepared:
-        yield _error(sid, 3000, f"prepare request {handle} is not one of ours")
-        return
-    asked = conn.s.prepared[handle]
-    yield _frame(
-        sid,
-        c.kXR_ok,
-        json.dumps(
-            {
-                "request_id": handle,
-                "responses": [
-                    {
-                        "path": _clean(path),
-                        "path_exists": _clean(path) in conn.s.files,
-                        "on_tape": _clean(path) in conn.s.nearline,
-                        "online": _clean(path) in conn.s.files
-                        and _clean(path) not in conn.s.nearline,
-                        "requested": _clean(path) in asked,
-                        "has_reqid": _clean(path) in asked,
-                        "req_time": "",
-                        "error_text": "" if _clean(path) in conn.s.files else "no such file",
-                    }
-                    for path in wanted
-                ],
-            }
-        ).encode()
-        + b"\x00",
-    )
-
-
-def _q_visa(conn: _Connection, sid: int, args: str) -> Iterator[bytes]:
-    yield _frame(sid, c.kXR_ok, b"visa\x00")
-
-
-_QUERIES: dict[int, Callable[[_Connection, int, str], Iterator[bytes]]] = {
-    c.kXR_Qcksum: _q_cksum,
-    c.kXR_Qconfig: _q_config,
-    c.kXR_Qckscan: _q_ckscan,
-    c.kXR_QStats: _q_stats,
-    c.kXR_Qspace: _q_space,
-    c.kXR_QPrep: _q_prep,
-    c.kXR_Qvisa: _q_visa,
-}
-
-
-def _h_query(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    infotype = struct.unpack(">H", params[:2])[0]
-    args = body.split(b"\x00", 1)[0].decode("utf-8", "replace")
-    query = _QUERIES.get(infotype)
-    if query is None:
-        yield _error(sid, 3013, f"query {infotype} is not supported")
-        return
-    yield from query(conn, sid, args)
-
-
-def _h_query_fctl(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    """``kXR_query``, with ``kXR_Qopaqug`` - XrdCl's ``Fcntl`` - taken first.
-
-    As xrootd's ``do_Qfh``: the handle is checked before anything is asked of
-    the storage.
-    """
-    if struct.unpack(">H", params[:2])[0] != c.kXR_Qopaqug:
-        yield from _h_query(conn, sid, params, body)
-        return
-    plugin = conn.s.fctl
-    path = conn.handles.get(params[4:8])
-    if path is None:
-        yield _error(sid, 3004, "query does not refer to an open file")
-    elif plugin is None:
-        yield _error(sid, 3013, "fctl operation not supported")
-    else:
-        yield _frame(sid, c.kXR_ok, plugin(path, body))
-
-
-def _h_locate(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    asked = body.split(b"\x00", 1)[0].decode()
-    # A ``*`` in front is create mode: the question is where the file could
-    # go, so one that is not there yet is the normal case, not a miss.
-    create = asked.startswith("*")
-    path = _clean(asked[1:] if create else asked)
-    if not create and path not in conn.s.files and path not in conn.s.dirs:
-        raise _NotFound(path)
-    host, port = conn.s.address
-    yield _frame(sid, c.kXR_ok, f"Sw{host}:{port}".encode() + b"\x00")
-
-
-def _h_prepare(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    conn.s.prepare_options.append((params[0], int.from_bytes(params[4:6], "big")))
-    if params[0] & c.kXR_cancel:
-        conn.s.cancelled_prepares.append(body.split(b"\x00", 1)[0].decode().strip())
-        yield _frame(sid, c.kXR_ok)
-        return
-    handle = "prep-0001"
-    paths = [_clean(p) for p in body.decode().split("\n") if p.strip()]
-    conn.s.prepared[handle] = paths
-    if conn.s.prepare_options[-1][1] & c.kXR_evict:  # optionX, not the options byte
-        conn.s.evicted.extend(paths)
-    yield _frame(sid, c.kXR_ok, handle.encode() + b"\x00")
-
-
-def _h_fattr(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
-    subcode, numattr, options = params[4], params[5], params[6]
-    reader = Reader(body, "kXR_fattr")
-    path = _fattr_path(conn, params, reader)
-    if subcode == c.kXR_fattrList and options & c.kXR_fattrRecurse and path in conn.s.dirs:
-        yield _frame(sid, c.kXR_ok, _fattr_walk(conn, path))
-        return
-    store = conn.s.xattrs.setdefault(path, {})
-    if subcode == c.kXR_fattrList:
-        yield _frame(sid, c.kXR_ok, _fattr_list(store, bool(options & c.kXR_fattrAData)))
-        return
-    yield _frame(sid, c.kXR_ok, _fattr_edit(store, reader, subcode, numattr, options))
-
-
-def _fattr_path(conn: _Connection, params: bytes, reader: Reader) -> str:
-    """The path the request names, by body or by open handle; must exist."""
-    path = reader.cstring()
-    if not path:
-        path = conn.handles.get(params[:4], "")
-    path = _clean(path)
-    if path not in conn.s.files and path not in conn.s.dirs:
-        raise _NotFound(path)
-    return path
-
-
-def _fattr_edit(
-    store: dict[str, bytes], reader: Reader, subcode: int, numattr: int, options: int
-) -> bytes:
-    """Apply a set, get or delete to each named attribute; the coded reply."""
-    items: list[tuple[str, int, bytes | None]] = []
-    edit = _FATTR_EDITS.get(subcode)
-    for _ in range(max(numattr, 1)):
-        if reader.remaining < 3:
-            break
-        reader.u16()
-        name = reader.cstring()
-        if edit is not None:
-            items.append(edit(store, name, reader, options))
-    return _fattr_reply(items)
-
-
-def _fattr_walk(conn: _Connection, path: str) -> bytes:
-    """The recursive reply: a flat run of ``relpath:name`` entries with no
-    header, and only regular files carry them - directories in the way are
-    walked through rather than reported."""
-    prefix = path.rstrip("/") + "/"
-    entries = bytearray()
-    for name in sorted(conn.s.files):
-        if not name.startswith(prefix):
-            continue
-        for attribute in sorted(conn.s.xattrs.get(name, {})):
-            entries += f"{name[len(prefix) :]}:{attribute}".encode() + b"\x00"
-    return bytes(entries)
-
-
-def _fattr_list(store: dict[str, bytes], values: bool) -> bytes:
-    """A list reply is bare ``name\\0 [len value]`` records: no count header
-    and no per-attribute code, unlike the other subcodes."""
-    reply = Writer()
-    for name in sorted(store):
-        reply.text(name, nul=True)
-        if values:
-            reply.i32(len(store[name])).raw(store[name])
-    return reply.bytes()
-
-
-def _fattr_set(
-    store: dict[str, bytes], name: str, reader: Reader, options: int
-) -> tuple[str, int, bytes | None]:
-    value = reader.bytes(reader.i32())
-    if options & c.kXR_fattrIsNew and name in store:
-        return (name, kXR_ItExists, None)
-    store[name] = bytes(value)
-    return (name, 0, None)
-
-
-def _fattr_get(
-    store: dict[str, bytes], name: str, reader: Reader, options: int
-) -> tuple[str, int, bytes | None]:
-    current = store.get(name)
-    return (name, 0 if current is not None else kXR_AttrNotFound, current or b"")
-
-
-def _fattr_del(
-    store: dict[str, bytes], name: str, reader: Reader, options: int
-) -> tuple[str, int, bytes | None]:
-    return (name, 0 if store.pop(name, None) is not None else kXR_AttrNotFound, None)
-
-
-_FATTR_EDITS: dict[
-    int, Callable[[dict[str, bytes], str, Reader, int], tuple[str, int, bytes | None]]
-] = {
-    c.kXR_fattrSet: _fattr_set,
-    c.kXR_fattrGet: _fattr_get,
-    c.kXR_fattrDel: _fattr_del,
-}
-
-
+#: Opcode to built-in handler. :attr:`FakeServer.handlers` is consulted
+#: first, so a test overrides an entry without patching this table.
 _HANDLERS = {
     c.kXR_protocol: _h_protocol,
     c.kXR_login: _h_login,
@@ -1386,30 +773,15 @@ _HANDLERS = {
 }
 
 
-def _splice(data: bytearray, offset: int, payload: bytes) -> None:
-    """Write ``payload`` at ``offset``, zero-filling any hole.
-
-    Writing nothing does nothing, as for :func:`os.pwrite`: an empty write
-    past the end does not extend the file to reach it.
-    """
-    if not payload:
-        return
-    if offset > len(data):
-        data.extend(bytes(offset - len(data)))
-    data[offset : offset + len(payload)] = payload
-
-
-def _fattr_reply(items: list[tuple[str, int, bytes | None]]) -> bytes:
-    w = Writer().u8(sum(1 for _, code, _ in items if code)).u8(len(items))
-    for name, code, value in items:
-        w.u16(code).text(name, nul=True)
-        if value is not None:
-            w.i32(len(value)).raw(value)
-    return w.bytes()
-
-
 def _checksum(algorithm: str, data: bytes) -> str:
-    from ..crypto.checksum import checksum_bytes
+    """The checksum a ``kXR_Qcksum`` or ``kXR_dcksm`` listing reports, as lowercase hex.
+
+    An algorithm the library cannot compute falls back to adler32 rather
+    than failing, so a test about the *request* need not care what the
+    value is. Tests patch this (here, on the facade) to force a mismatch.
+    Imported lazily so ``xrdclient.testing`` stays cheap to import.
+    """
+    from xrdcore.checksum import checksum_bytes
 
     try:
         return checksum_bytes(algorithm, data)
@@ -1445,7 +817,7 @@ def from_directory(
     return FakeServer(files=files, host=host, port=port)
 
 
-def _block() -> None:  # pragma: no cover - waits for a signal that ends it
+def _block() -> None:
     """Wait until the terminal interrupts us."""
     threading.Event().wait()
 

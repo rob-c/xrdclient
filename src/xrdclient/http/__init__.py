@@ -19,17 +19,17 @@ from .file import HTTPRawIO, open_http
 from .tpc import Marker, third_party
 
 __all__ = [
-    "open_http",
-    "digest",
-    "macaroon",
-    "propfind",
-    "third_party",
-    "HTTPFileSystem",
     "HTTPClient",
+    "HTTPFileSystem",
     "HTTPRawIO",
     "Marker",
     "Response",
     "bearer_token",
     "check_status",
+    "digest",
+    "macaroon",
+    "open_http",
+    "propfind",
     "status_code",
+    "third_party",
 ]

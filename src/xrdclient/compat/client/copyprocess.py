@@ -29,16 +29,25 @@ What the keywords do here:
   XrdCl counts them), and ``coerce`` opens the target with ``kXR_force``.
   ``inittimeout`` bounds a third-party copy's set-up, and - as in XrdCl -
   nothing about a classic one.
+
+How it is built: :meth:`CopyProcess.add_job` only records a :class:`_Job`
+(with XrdCl's environment defaults resolved at that moment);
+:meth:`CopyProcess.run` drives each job through ``_run`` -> ``_attempts``
+(retry policy) -> ``_once`` (one try, then the checksum check) ->
+``_transfer`` (third-party, else ``_classic``). Every
+failure is turned into the status XrdCl would report, never raised, because
+the bindings' ``run`` always returns ``(status, results)``.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import errno
+import functools
 import os
 import posixpath
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
+
+from xrdcore.fanout import run_all
 
 from ... import errors
 from ...client.filesystem import FileSystem
@@ -72,7 +81,15 @@ class _Cancelled(Exception):
 
 @dataclasses.dataclass
 class _Job:
-    """One :meth:`CopyProcess.add_job`, with the keywords that affect it."""
+    """One :meth:`CopyProcess.add_job`, with the keywords that affect it.
+
+    Field names are the bindings' keyword spellings (``rmBadCksum``,
+    ``xrateThreshold``) so the mapping from :meth:`~CopyProcess.add_job` stays
+    one-to-one and greppable. Every ``int | None`` keyword is resolved to an
+    ``int`` before it lands here: 0 means "off" or "not given". It is
+    treated as a value: a retry changes it with :func:`dataclasses.replace`
+    (see ``_attempts``), never in place.
+    """
 
     source: str
     target: str
@@ -109,32 +126,48 @@ class ProgressHandlerWrapper:
     """
 
     def __init__(self, handler: Any) -> None:
+        """Wrap ``handler``, which may be ``None``; every call then does nothing."""
         self.handler = handler
 
     def begin(self, jobId: int, total: int, source: Any, target: Any) -> None:
+        """Job ``jobId`` (1-based) of ``total`` starts; the ends arrive as ``URL``s."""
         if self.handler:
             self.handler.begin(jobId, total, URL(source), URL(target))
 
     def end(self, jobId: int, results: dict[str, Any]) -> None:
+        """Job ``jobId`` finished; ``results`` is updated in place.
+
+        The engine reports ``status`` as a plain dict; the handler is promised
+        an :class:`XRootDStatus`, and the caller sees the converted value too
+        because it is the same dict.
+        """
         if isinstance(results.get("status"), dict):
             results["status"] = XRootDStatus(results["status"])
         if self.handler:
             self.handler.end(jobId, results)
 
     def update(self, jobId: int, processed: int, total: int) -> None:
+        """Progress: ``processed`` of ``total`` bytes (``total`` is 0 when unknown)."""
         if self.handler:
             self.handler.update(jobId, processed, total)
 
     def should_cancel(self, jobId: int) -> bool:
+        """Whether the handler wants job ``jobId`` stopped; never, without one."""
         if self.handler:
             return bool(self.handler.should_cancel(jobId))
         return False
 
 
 class CopyProcess:
-    """Copy jobs run together, in the bindings' shape."""
+    """Copy jobs run together, in the bindings' shape.
+
+    Jobs are kept in the order added and reported with 1-based ids in that
+    order, whatever order they finish in under :meth:`parallel`. :meth:`run`
+    leaves the queue as it was, so running again repeats every job.
+    """
 
     def __init__(self) -> None:
+        """An empty queue that runs one job at a time."""
         self.__jobs: list[_Job] = []
         self.__parallel = 1
 
@@ -168,7 +201,15 @@ class CopyProcess:
         cont: bool = False,
         rtrplc: str | None = None,
     ) -> None:
-        """Queue a copy of ``source`` to the file ``target``."""
+        """Queue a copy of ``source`` to the file ``target``.
+
+        The signature is the bindings' own, keyword for keyword and default
+        for default, which is why it is this long; the module docstring says
+        what each keyword does. A keyword left ``None`` takes XrdCl's
+        environment setting (``XRD_CPRETRY``, ``XRD_CPTIMEOUT`` and so on) as
+        it stands now, not when the job runs. Nothing is checked here: a bad
+        URL or ``thirdparty`` value is reported by :meth:`prepare`.
+        """
         self.__jobs.append(
             _Job(
                 source=str(source),
@@ -213,8 +254,10 @@ class CopyProcess:
         total = len(self.__jobs)
         numbered = list(enumerate(self.__jobs, 1))
         if self.__parallel > 1 and total > 1:
-            with ThreadPoolExecutor(min(self.__parallel, total)) as pool:
-                results = list(pool.map(lambda item: _run(item, total, handler), numbered))
+            # _run reports a job's failure as its status rather than raising,
+            # so the fan-out's stop-on-first-failure only ever sees Ctrl-C.
+            calls = [functools.partial(_run, item, total, handler) for item in numbered]
+            results = run_all(calls, workers=min(self.__parallel, total), name="xrd-copyprocess")
         else:
             results = [_run(item, total, handler) for item in numbered]
         failed = next((r["status"] for r in results if not r["status"].ok), OK)
@@ -222,6 +265,7 @@ class CopyProcess:
 
 
 def _int(key: str) -> int:
+    """XrdCl's integer setting ``key``, 0 where it is unset."""
     return env.EnvGetInt(key) or 0
 
 
@@ -270,7 +314,9 @@ def _job_failure(exc: Exception, job: _Job) -> XRootDStatus:
     detail = (exc.strerror or str(exc)).lower()
     source = parse(job.source)
     end = "source" if source.is_local and exc.filename == source.path else "destination"
-    return status(errLocalError, errno=_LOCAL_ERRNOS.get(eno, eno), message=f"{detail}:  ({end})")
+    return status(
+        errLocalError, errno=errors.kxr_for(eno, default=eno), message=f"{detail}:  ({end})"
+    )
 
 
 def _server_failure(exc: errors.ServerError, job: _Job) -> XRootDStatus:
@@ -326,21 +372,6 @@ def _named(code: int, words: str, detail: str) -> XRootDStatus:
     )
 
 
-#: ``XProtocol::mapError`` for the errors a local copy end meets.
-_LOCAL_ERRNOS = {
-    errno.ENOENT: errors.kXR_NotFound,
-    errno.EPERM: errors.kXR_NotAuthorized,
-    errno.EACCES: errors.kXR_NotAuthorized,
-    errno.EIO: errors.kXR_IOError,
-    errno.ENOSPC: errors.kXR_NoSpace,
-    errno.ENAMETOOLONG: errors.kXR_ArgTooLong,
-    errno.EISDIR: errors.kXR_isDirectory,
-    errno.EEXIST: errors.kXR_ItExists,
-    errno.EROFS: errors.kXR_fsReadOnly,
-    errno.EDQUOT: errors.kXR_overQuota,
-}
-
-
 def _attempts(job: _Job, job_id: int, handler: Any) -> dict[str, Any]:
     """Copy, retrying a transient failure ``job.retry`` times.
 
@@ -348,18 +379,22 @@ def _attempts(job: _Job, job_id: int, handler: Any) -> dict[str, Any]:
     failed attempt left at the target, and under any other - ``"force"`` is
     the default - overwrites it.
     """
-    for attempt in range(job.retry + 1):
+    for _ in range(job.retry):
         try:
             return _once(job, job_id, handler)
         except errors.TransientError:
-            if attempt == job.retry:
-                raise
             resume = job.rtrplc == "continue"
             job = dataclasses.replace(job, force=not resume, cont=resume)
-    raise AssertionError("unreachable")  # pragma: no cover
+    return _once(job, job_id, handler)
 
 
 def _once(job: _Job, job_id: int, handler: Any) -> dict[str, Any]:
+    """One attempt at ``job``: the copy, then the checksum comparison.
+
+    A transient error propagates so ``_attempts`` can retry it; a checksum
+    mismatch the engine itself reports, and a failure while verifying, become
+    the job's status here, so they are reported rather than retried.
+    """
     target = _destination(job)
     _make_parent(target, remote=job.mkdir)
     try:
@@ -441,6 +476,12 @@ def _classic(job: _Job, job_id: int, target: str, handler: Any, config: Any) -> 
     """The copy through this process, reporting to ``handler`` as it goes."""
 
     def progress(done: int, size: int | None) -> None:
+        """The engine's progress hook: ask about cancelling first, then report.
+
+        Raising :class:`_Cancelled` from inside the engine is how a stop
+        request unwinds the copy; ``_run`` turns it into
+        ``errOperationInterrupted``, which is what XrdCl reports.
+        """
         if _tell(handler, "should_cancel", job_id):
             raise _Cancelled
         _tell(handler, "update", job_id, done, size or 0)

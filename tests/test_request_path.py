@@ -13,8 +13,8 @@ import struct
 
 import pytest
 
-from conftest import frame, ok
-from test_machine import SID, drain, kinds, ready, status_frame
+from tests.conftest import frame, ok
+from tests.test_machine import SID, drain, kinds, ready, status_frame
 from xrdclient.config import Config
 from xrdclient.errors import ProtocolError
 from xrdclient.flags import StatInfoFlags
@@ -27,7 +27,7 @@ from xrdclient.proto.frames import Request, encode, header_fields
 from xrdclient.session import pool
 from xrdclient.session.router import _path_fields
 from xrdclient.session.sync import Session
-from xrdclient.transport.memory import pipe
+from xrdclient.transport.memory import MemoryTransport, pipe
 from xrdclient.url import parse
 
 # --------------------------------------------------------------------------
@@ -144,11 +144,17 @@ def test_a_whole_reply_in_one_read_completes_without_buffering():
     assert not machine._framers[0].buffer
 
 
+def _data(events: list[m.Event]) -> list[bytes]:
+    """What each event delivered; every one of them must be a completion."""
+    assert all(isinstance(event, m.Completed) for event in events)
+    return [event.data for event in events if isinstance(event, m.Completed)]
+
+
 def test_two_replies_in_one_read_both_complete():
     machine = ready()
     first, second = _read(machine), _read(machine)
     machine.receive_data(ok(first, b"a" * 8) + ok(second, b"b" * 8))
-    assert [e.data for e in machine.drain()] == [b"a" * 8, b"b" * 8]
+    assert _data(machine.drain()) == [b"a" * 8, b"b" * 8]
 
 
 def test_a_reply_split_across_reads_is_reassembled():
@@ -161,7 +167,7 @@ def test_a_reply_split_across_reads_is_reassembled():
     assert machine.drain() == []
     # A whole-looking frame after a partial one belongs to the buffer.
     machine.receive_data(wire[11:])
-    assert [e.data for e in machine.drain()] == [b"12345678"]
+    assert _data(machine.drain()) == [b"12345678"]
 
 
 def test_a_header_waiting_on_its_body_sends_the_next_read_to_the_buffer():
@@ -171,7 +177,7 @@ def test_a_header_waiting_on_its_body_sends_the_next_read_to_the_buffer():
     machine.receive_data(wire[:8])
     assert machine._framers[0].dlen == 8 and not machine._framers[0].buffer
     machine.receive_data(wire[8:])
-    assert [e.data for e in machine.drain()] == [b"12345678"]
+    assert _data(machine.drain()) == [b"12345678"]
 
 
 def test_a_status_trailer_owed_sends_the_next_read_to_the_buffer():
@@ -287,7 +293,7 @@ def test_the_stat_flag_memory_is_bounded(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def _session():  # type: ignore[no-untyped-def]
+def _session() -> tuple[Session, MemoryTransport]:
     """A ready session on a memory pipe, and the server's end of it."""
     transport, peer = pipe()
     return Session(transport, ready(), Config()), peer

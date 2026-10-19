@@ -16,12 +16,16 @@ flight at once. What has to hold is what held on the event path:
 
 from __future__ import annotations
 
+import functools
 import io
 import struct
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import replace
+from typing import Any
 
 import pytest
+from xrdcore.fanout import run_all
 
 from xrdclient.client import file as file_module
 from xrdclient.client.file import File
@@ -139,7 +143,7 @@ def test_writing_nothing_sends_nothing(server, small):
 def test_a_write_on_a_lost_connection_is_transient(server, small, monkeypatch):
     with _writer(server, small) as handle:
         transport = type(handle.session.transport)
-        monkeypatch.setattr(transport, "send", lambda self, data: _lost())
+        monkeypatch.setattr(transport, "send_buffers", lambda self, buffers: _lost())
         with pytest.raises(TransientError, match="went away"):
             handle.write(PAYLOAD, 0)
         monkeypatch.undo()
@@ -155,7 +159,9 @@ def _lost() -> None:
 
 def test_the_event_path_reports_a_lost_writer_the_same_way(server, small, monkeypatch):
     with _writer(server, replace(small, bulk=False)) as handle:
-        monkeypatch.setattr(type(handle.session.transport), "send", lambda self, data: _lost())
+        monkeypatch.setattr(
+            type(handle.session.transport), "send_buffers", lambda self, buffers: _lost()
+        )
         with pytest.raises(TransientError, match="went away"):
             handle.write(PAYLOAD, 0)
         monkeypatch.undo()
@@ -294,12 +300,14 @@ def test_a_lost_connection_is_transient_even_when_the_transport_says_otherwise()
 
 
 def test_a_stream_reuses_its_buffers_from_one_call_to_the_next(big, small):
-    with _reader(big, small) as handle:
-        with handle.session.bulk(handle.handle, chunk=4096, depth=2) as reader:
-            first = b"".join(bytes(v) for _, v in reader.stream(0, 10_000))
-            buffers = list(reader._bufs)
-            second = b"".join(bytes(v) for _, v in reader.stream(10_000, 10_000))
-            assert reader._bufs == buffers
+    with (
+        _reader(big, small) as handle,
+        handle.session.bulk(handle.handle, chunk=4096, depth=2) as reader,
+    ):
+        first = b"".join(bytes(v) for _, v in reader.stream(0, 10_000))
+        buffers = list(reader._bufs)
+        second = b"".join(bytes(v) for _, v in reader.stream(10_000, 10_000))
+        assert reader._bufs == buffers
     assert first + second == PAYLOAD[:20_000]
 
 
@@ -381,7 +389,9 @@ def test_a_vector_read_too_big_for_one_request_is_pipelined(big, small):
     assert big.seen.count(c.kXR_readv) == 2
 
 
-def _readv_answer(transform):
+def _readv_answer(
+    transform: Callable[[list[bytes]], list[bytes]],
+) -> Callable[[Any, int, bytes, bytes], Iterator[bytes]]:
     """A ``kXR_readv`` handler whose segments pass through ``transform`` first."""
 
     def handler(conn, sid, params, body):
@@ -457,17 +467,22 @@ def test_a_vector_read_the_server_asks_to_wait_for_is_read_on_the_event_path(big
 
 
 def _lose_the_first_send(monkeypatch, handle: File) -> None:
+    """Fail the next request put on the wire, as a dropped connection would.
+
+    Every request goes out through the vectored send, header and payload
+    together, so that is the call to fail.
+    """
     transport = type(handle.session.transport)
-    real = transport.send
+    real = transport.send_buffers
     calls = {"n": 0}
 
-    def once(self, data):
+    def once(self, buffers):
         calls["n"] += 1
         if calls["n"] == 1:
             _lost()
-        real(self, data)
+        real(self, buffers)
 
-    monkeypatch.setattr(transport, "send", once)
+    monkeypatch.setattr(transport, "send_buffers", once)
 
 
 def test_a_vector_read_on_a_lost_connection_is_read_again_elsewhere(big, small, monkeypatch):
@@ -486,9 +501,11 @@ def test_a_vector_read_on_a_lost_connection_fails_where_it_cannot_recover(big, s
 
 
 def test_a_gather_of_nothing_sends_nothing(big, small):
-    with _reader(big, small) as handle:
-        with handle.session.bulk(handle.handle, chunk=1, depth=1) as channel:
-            assert channel.gather([]) == []
+    with (
+        _reader(big, small) as handle,
+        handle.session.bulk(handle.handle, chunk=1, depth=1) as channel,
+    ):
+        assert channel.gather([]) == []
     assert big.seen.count(c.kXR_readv) == 0
 
 
@@ -595,9 +612,11 @@ def test_a_deferred_reply_still_owed_is_drained_before_the_wire_is_reused(big, s
     big.handlers[c.kXR_read] = handler
     with _reader(big, replace(small, readahead=0)) as handle:
         view = memoryview(bytearray(2 * 4096))
-        with pytest.raises(XRootDError, match="no such range"):
-            with handle.session.bulk(handle.handle, chunk=4096, depth=2) as reader:
-                reader.into(view, 0)
+        with (
+            pytest.raises(XRootDError, match="no such range"),
+            handle.session.bulk(handle.handle, chunk=4096, depth=2) as reader,
+        ):
+            reader.into(view, 0)
         assert not handle.session.broken
         assert handle.read(100, 300) == PAYLOAD[300:400]
 
@@ -690,14 +709,31 @@ def test_a_read_that_loses_step_is_read_again_on_a_fresh_connection(big, small):
 
 def test_a_read_that_loses_step_fails_where_it_cannot_recover(big, small):
     big.handlers[c.kXR_read] = _nth(S._h_read, 1, _stray)
-    with _reader(big, replace(small, readahead=0, recover_handles=False)) as handle:
-        with pytest.raises(ProtocolError, match="not one of"):
-            handle.read(100, 0)
+    with (
+        _reader(big, replace(small, readahead=0, recover_handles=False)) as handle,
+        pytest.raises(ProtocolError, match="not one of"),
+    ):
+        handle.read(100, 0)
 
 
 def test_a_protocol_error_on_a_sound_connection_is_not_recovered(big, small):
     with _reader(big, replace(small, recover_handles=True)) as handle:
-        with handle.session.bulk(handle.handle, chunk=4096, depth=1):
-            with pytest.raises(ProtocolError, match="already lent"):
-                handle.readv([(0, 4)])
+        with (
+            handle.session.bulk(handle.handle, chunk=4096, depth=1),
+            pytest.raises(ProtocolError, match="already lent"),
+        ):
+            handle.readv([(0, 4)])
         assert handle.recoveries == 0
+
+
+def test_threads_sharing_one_handle_read_ahead_without_tearing(config):
+    """The readahead block, window and cursor are kept behind the file's lock."""
+    data = bytes(range(256)) * 2048
+    with S.FakeServer(files={"/f": data}) as srv, File(srv.url.with_path("/f"), config) as fh:
+
+        def scan(start: int) -> bytes:
+            return b"".join(fh.read(4096, at) for at in range(start, start + 65536, 4096))
+
+        calls = [functools.partial(scan, start) for start in range(0, len(data), 65536)]
+        got = run_all(calls, workers=4)
+    assert b"".join(got) == data

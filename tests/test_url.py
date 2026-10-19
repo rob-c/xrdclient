@@ -126,8 +126,9 @@ def test_http_url_maps_dav_schemes():
 def test_urls_are_hashable_and_frozen():
     u = XRootDURL(host="h", path="/p")
     assert {u, XRootDURL(host="h", path="/p")} == {u}
-    with pytest.raises(AttributeError):
-        u.host = "other"  # type: ignore[misc]
+    for field in ("host", "path"):
+        with pytest.raises(AttributeError):
+            setattr(u, field, "other")
 
 
 def test_host_and_scheme_are_lowercased():

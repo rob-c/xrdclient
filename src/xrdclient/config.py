@@ -25,20 +25,23 @@ import contextvars
 import difflib
 import getpass
 import os
-import sys
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import MISSING, Field, dataclass, field, fields, replace
 from types import MappingProxyType
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
-from ._compat import SLOTS
+from xrdsec.credentials import grid_ca_path
+
 from .errors import TooLargeError
+from .log import get_logger
 
 if TYPE_CHECKING:
     from .auth.prompt import Prompter
 
-__all__ = ["Config", "current", "configure", "override", "find_config_file", "CONFIG_PATHS"]
+__all__ = ["CONFIG_PATHS", "Config", "configure", "current", "find_config_file", "override"]
+
+_log = get_logger(__name__)
 
 #: Where :meth:`Config.from_file` looks when it is not told, in order.
 #: ``$XRD_CONFIG`` beats all of them and, being explicit, must exist.
@@ -50,22 +53,16 @@ DEFAULTS_SECTION = "defaults"
 #: Settings a file has no business carrying: a callable cannot be spelled in
 #: INI, and a literal token in a dotfile is a secret in every backup of it -
 #: ``token_file`` says the same thing without copying the bearer around.
-_NOT_IN_FILES = {"prompter": "it is a callable", "token": "use token_file instead"}
+_NOT_IN_FILES = {
+    "prompter": "it is a callable",
+    "key_password": "it is a callable",
+    "token": "use token_file instead",
+}
 
-
-def _grid_ca_path() -> str | None:
-    configured = os.environ.get("X509_CERT_DIR")
-    if configured:
-        return configured
-    candidates = ["/etc/grid-security/certificates"]
-    if sys.platform == "darwin":
-        candidates.extend(
-            (
-                "/opt/homebrew/etc/grid-security/certificates",
-                "/usr/local/etc/grid-security/certificates",
-            )
-        )
-    return next((path for path in candidates if os.path.isdir(path)), None)
+#: The stock client's SSS keytab variables, mixed case as XRootD spells them;
+#: the second spelling is the one its own documentation also uses.
+_SSS_KEYTAB = "XrdSecSSSKT"
+_SSS_KEYTAB_LOWER = "XrdSecsssKT"
 
 
 def _env_flag(name: str) -> bool | None:
@@ -76,24 +73,81 @@ def _env_flag(name: str) -> bool | None:
     return raw.strip().lower() not in ("0", "no", "off", "false")
 
 
+#: Variables already complained about, so that a malformed value is reported
+#: once per process rather than once per ``Config()`` - which is once per call
+#: for every entry point that builds its own.
+_WARNED: set[str] = set()
+_warned_lock = threading.Lock()
+
+
+def _malformed(name: str, raw: str, default: object, expected: str) -> None:
+    """Say, once, that ``$name`` was ignored and what is used instead.
+
+    Falling back silently is how ``XRD_REQUESTTIMEOUT=5m`` turned into five
+    minutes' worth of the default rather than an error anyone saw: the value
+    looked set, so nobody looked further. A warning rather than an exception,
+    because the environment is shared with every other tool that reads it and
+    a typo there should not stop an unrelated script dead.
+    """
+    with _warned_lock:
+        if name in _WARNED:
+            return
+        _WARNED.add(name)
+    _log.warning("ignoring $%s=%r: not %s; using the default %r", name, raw, expected, default)
+
+
+def crl_mode(value: str) -> str:
+    """A CRL setting as :attr:`Config.check_crl` holds it: ``""``, ``"leaf"`` or ``"chain"``.
+
+    The vocabulary ``$XRD_CHECKCRL`` has always had: unset or a "no" is off,
+    ``chain`` is the whole chain, and anything else - ``1``, ``yes``,
+    ``leaf`` - the server's own certificate.
+    """
+    word = value.strip().lower()
+    if word in ("", "0", "no", "off", "false"):
+        return ""
+    return "chain" if word == "chain" else "leaf"
+
+
 def _env_int(name: str, default: int) -> int:
+    """``$name`` as an int; unset, empty or malformed gives ``default`` (malformed warns once)."""
     raw = os.environ.get(name)
     if not raw:
         return default
     try:
         return int(raw)
     except ValueError:
+        _malformed(name, raw, default, "a whole number")
         return default
 
 
 def _env_float(name: str, default: float) -> float:
+    """``$name`` as a float of seconds; unset, empty or malformed gives ``default`` (warns once)."""
     raw = os.environ.get(name)
     if not raw:
         return default
     try:
         return float(raw)
     except ValueError:
+        _malformed(name, raw, default, "a number of seconds")
         return default
+
+
+#: The address families :attr:`Config.network_stack` may name, spelled as
+#: XrdCl spells its ``NetworkStack`` values. Matched without regard to case.
+NETWORK_STACKS = ("IPAuto", "IPv4", "IPv6", "IPv4Mapped6")
+
+
+def _env_choice(name: str, default: str, choices: Sequence[str]) -> str:
+    """One of ``choices``, case-insensitively, or ``default`` with a warning."""
+    raw = os.environ.get(name)
+    if not raw or not raw.strip():
+        return default
+    for choice in choices:
+        if raw.strip().lower() == choice.lower():
+            return choice
+    _malformed(name, raw, default, "one of " + ", ".join(choices))
+    return default
 
 
 def find_config_file() -> str | None:
@@ -152,6 +206,7 @@ def _empty_optional(text: str, annotation: str) -> bool:
 
 
 def _numeric_converter(annotation: str) -> type[int] | type[float] | None:
+    """``int`` or ``float`` for a numeric field's annotation string, else ``None``."""
     if annotation.startswith("int"):
         return int
     if annotation.startswith("float"):
@@ -159,9 +214,7 @@ def _numeric_converter(annotation: str) -> type[int] | type[float] | None:
     return None
 
 
-def _settings_from(
-    parser: configparser.ConfigParser, section: str, where: str
-) -> dict[str, object]:
+def _settings_from(parser: configparser.ConfigParser, section: str, where: str) -> dict[str, Any]:
     """One section, validated against the fields :class:`Config` actually has."""
     known = {f.name: str(f.type) for f in fields(Config)}
     settings: dict[str, object] = {}
@@ -179,6 +232,13 @@ def _settings_from(
 
 
 def _default_user() -> str:
+    """The login name sent in ``kXR_login`` when the URL names none.
+
+    ``$XRD_USER`` first, as XrdCl honours it; then the usual POSIX variables;
+    then the password database. Never raises: a container with no passwd entry
+    for its UID still gets a name (``nobody``), since the server only uses it
+    for logging and ``unix`` mapping.
+    """
     for var in ("XRD_USER", "USER", "LOGNAME"):
         val = os.environ.get(var)
         if val:
@@ -216,6 +276,7 @@ def _ambient_default(name: str, fallback: Callable[[], object]) -> Callable[[], 
     """A field default that defers to the ambient configuration first."""
 
     def default() -> object:
+        """Look the setting up in the ambient changes at the moment a ``Config`` is built."""
         changes = _ambient_changes()
         return changes[name] if name in changes else fallback()
 
@@ -255,7 +316,7 @@ def _ambient(cls: type[_T]) -> type[_T]:
     return cls
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 @_ambient
 class Config:
     """Immutable client settings. Use :meth:`evolve` to derive a variant."""
@@ -265,7 +326,6 @@ class Config:
     # -- timeouts and retries (XRD_* names match the official client) --
     connect_timeout: float = field(default_factory=lambda: _env_float("XRD_CONNECTIONWINDOW", 30.0))
     request_timeout: float = field(default_factory=lambda: _env_float("XRD_REQUESTTIMEOUT", 300.0))
-    stream_timeout: float = field(default_factory=lambda: _env_float("XRD_STREAMTIMEOUT", 60.0))
     connect_retries: int = field(default_factory=lambda: _env_int("XRD_CONNECTIONRETRY", 3))
     #: Seconds to wait before the first reconnection attempt, doubling for
     #: each one after it and capped by :attr:`wait_cap`. Zero retries flat out.
@@ -290,7 +350,36 @@ class Config:
     #: for. A single wait is already clamped by :attr:`wait_cap`; this is what
     #: stops a server answering every resend with another one.
     wait_budget: float = field(default_factory=lambda: _env_float("XRD_WAITBUDGET", 1800.0))
-    keepalive_interval: float = 60.0
+    #: How long a ``root://`` third-party copy waits for its pull - the
+    #: destination's second ``kXR_sync``, which answers (often through a
+    #: ``kXR_waitresp``) only once the whole file has moved. XrdCl's
+    #: ``CPTPCTimeout``, by its environment name and default. The pull is
+    #: one long silence on the destination's connection, so neither
+    #: :attr:`request_timeout` (one read) nor :attr:`stall_deadline` nor
+    #: :attr:`wait_budget` is the right bound for it: :func:`~xrdclient.third_party`
+    #: lifts all three on that connection to this, and expires the pull
+    #: once it is spent. A ``timeout`` given to the copy itself takes its
+    #: place; ``0`` leaves the pull to the ordinary limits.
+    tpc_timeout: float = field(default_factory=lambda: _env_float("XRD_CPTPCTIMEOUT", 1800.0))
+    #: Seconds a connection may sit idle before the operating system starts
+    #: probing it with TCP keepalives - control and data sockets alike. The
+    #: probes then go every third of that, and three unanswered ones drop the
+    #: connection, so a peer that vanished without a word (a rebooted node, a
+    #: NAT that forgot the flow) is noticed within about twice this, rather
+    #: than at the next request's :attr:`request_timeout`. ``0`` turns
+    #: keepalive off. ``$XRD_TCPKEEPALIVETIME`` - XrdCl's name for the same
+    #: idle time - sets it.
+    keepalive_interval: float = field(
+        default_factory=lambda: _env_float("XRD_TCPKEEPALIVETIME", 60.0)
+    )
+    #: Which address families a connection may use, in XrdCl's vocabulary:
+    #: ``IPAuto`` (both, as the resolver offers them, raced as RFC 8305
+    #: describes), ``IPv4`` or ``IPv6`` (only that one), or ``IPv4Mapped6``
+    #: (IPv6 sockets throughout, IPv4 addresses reached as ``::ffff:a.b.c.d``).
+    #: ``$XRD_NETWORKSTACK`` sets it.
+    network_stack: str = field(
+        default_factory=lambda: _env_choice("XRD_NETWORKSTACK", "IPAuto", NETWORK_STACKS)
+    )
 
     # -- transfer tuning ----------------------------------------------
     #: Connections a bulk read fans out over. Each carries one span of the
@@ -370,11 +459,38 @@ class Config:
     token: str | None = None
     token_file: str | None = field(default_factory=lambda: os.environ.get("BEARER_TOKEN_FILE"))
     keytab: str | None = field(
-        default_factory=lambda: os.environ.get("XrdSecSSSKT") or os.environ.get("XrdSecsssKT")
+        default_factory=lambda: os.environ.get(_SSS_KEYTAB) or os.environ.get(_SSS_KEYTAB_LOWER)
     )
     proxy: str | None = field(default_factory=lambda: os.environ.get("X509_USER_PROXY"))
-    ca_path: str | None = field(default_factory=_grid_ca_path)
+    #: A user certificate and its private key, kept in two files rather than
+    #: combined as a proxy is - ``usercert.pem`` and ``userkey.pem``. Used
+    #: when both are set and no :attr:`proxy` is: HTTPS (and ``roots://``)
+    #: presents them as the client certificate, and GSI logs in with a
+    #: short-lived proxy it makes from them in memory, as ``XrdSecgsi``'s
+    #: ``createpxy`` does - nothing is written to disk either way. The key
+    #: must be private to this user (``chmod 600``). ``$X509_USER_CERT`` and
+    #: ``$X509_USER_KEY`` set them, as for ``XrdSecgsi`` and gfal2.
+    usercert: str | None = field(default_factory=lambda: os.environ.get("X509_USER_CERT"))
+    userkey: str | None = field(default_factory=lambda: os.environ.get("X509_USER_KEY"))
+    #: Where the pass phrase of an encrypted :attr:`userkey` comes from: a
+    #: callable returning it, asked only when the key turns out to need one.
+    #: ``None`` asks a person through :attr:`prompter`, if there is one to
+    #: ask (see :attr:`prompt`); otherwise an encrypted key is refused.
+    key_password: Callable[[], str | bytes] | None = None
+    ca_path: str | None = field(default_factory=grid_ca_path)
     ca_file: str | None = field(default_factory=lambda: os.environ.get("SSL_CERT_FILE"))
+    #: Add the operating system's CA store to :attr:`ca_path`/:attr:`ca_file`
+    #: for TLS: ``True`` for every scheme, ``False`` never, and ``None`` - the
+    #: default - by scheme: ``https://`` and ``s3://`` add it, ``davs://`` and
+    #: ``roots://`` do not (see :func:`~xrdclient.transport.base.tls_context`).
+    #: ``$XRD_TLSSYSTEMCA`` sets it (``1``/``0``).
+    tls_system_ca: bool | None = field(default_factory=lambda: _env_flag("XRD_TLSSYSTEMCA"))
+    #: Check the server's certificate against the CRLs (``<hash>.r0``) in
+    #: :attr:`ca_path`: ``"leaf"`` the certificate itself, ``"chain"`` every
+    #: certificate of its chain, ``""`` - the default - not at all. Needs
+    #: :attr:`ca_path`, and is ignored with :attr:`verify_tls` off.
+    #: ``$XRD_CHECKCRL`` sets it (``1`` meaning ``leaf``).
+    check_crl: str = field(default_factory=lambda: crl_mode(os.environ.get("XRD_CHECKCRL", "")))
     auth_order: Sequence[str] = ("gsi", "ztn", "krb5", "sss", "unix", "host")
     verify_tls: bool = True
     require_tls: bool = False
@@ -398,6 +514,15 @@ class Config:
     #: number turns it on, as it does there. Only done once the server's
     #: certificate chains to a CA in :attr:`ca_path` and names the host.
     gsi_delegate: bool = field(default_factory=lambda: _env_int("XrdSecGSIDELEGPROXY", 0) > 0)
+    #: Make a GSI server prove who it is before the proxy chain is sent to
+    #: it, on every login, as ``XrdSecgsi`` clients do: its certificate must
+    #: chain to a CA in :attr:`ca_path` and name the host dialled (or match
+    #: a pattern in ``$XrdSecGSISRVNAMES``). On by default; ``False`` - or
+    #: ``$XRD_GSI_VERIFY_SERVER=0`` - is for a broken test setup only, and
+    #: even then a proxy is never *delegated* to an unverified server.
+    gsi_verify_server: bool = field(
+        default_factory=lambda: _env_flag("XRD_GSI_VERIFY_SERVER") is not False
+    )
     #: Ask for missing credentials rather than failing. ``None`` - the default,
     #: overridable with ``$XRD_PROMPT`` - means "only if somebody is there",
     #: which is a terminal on both stdin and stderr. See :mod:`xrdclient.auth.prompt`.
@@ -432,6 +557,25 @@ class Config:
     #: ``dir/`` marker object, ``stat`` believes one, listings hide them.
     #: Off - the default - directories remain the fiction every prefix is.
     s3_folder_markers: bool = False
+    #: Whether a ``kXR_redirect`` to a ``file://`` URL is followed by reading
+    #: the file from local disk, as XrdCl's ``LocalFileHandler`` does for
+    #: XCache and disk-local deployments. ``"local"`` - the default - follows
+    #: one only when the server that sent it is on this host (a loopback or
+    #: this machine's own address), since a remote server that could point
+    #: this client at any local file could have it copy that file anywhere.
+    #: ``"always"`` follows one from any server, as XrdCl does; ``"never"``
+    #: refuses them all. Only reading and stat are served locally - a write
+    #: redirected to local disk is refused. ``$XRD_LOCALREDIRECT`` sets it.
+    local_redirect: str = field(
+        default_factory=lambda: _env_choice(
+            "XRD_LOCALREDIRECT", "local", ("never", "local", "always")
+        )
+    )
+    #: Worker threads :mod:`xrdclient.aio` runs blocking calls on - its own
+    #: pool, so neither the event loop's default executor nor its size (a
+    #: handful on a small machine) limits how many requests are in flight.
+    #: Read when the pool is first needed. ``$XRD_AIOWORKERS`` sets it.
+    aio_workers: int = field(default_factory=lambda: _env_int("XRD_AIOWORKERS", 32))
 
     def check_whole_read(self, size: int, path: str | None = None) -> None:
         """Refuse a read of ``size`` bytes that nobody put a number on.
@@ -443,9 +587,9 @@ class Config:
         if self.max_read_size and size > self.max_read_size:
             raise TooLargeError(size, self.max_read_size, path=path)
 
-    def evolve(self, **changes: object) -> Config:
-        """A copy with ``changes`` applied."""
-        return replace(self, **changes)  # type: ignore[arg-type]
+    def evolve(self, **changes: Any) -> Config:
+        """A copy with ``changes`` applied (any field, by name, with its own type)."""
+        return replace(self, **changes)
 
     @classmethod
     def from_file(
@@ -472,9 +616,14 @@ class Config:
         # An override outranks the file, as the module docstring orders them;
         # passing the file's values explicitly would otherwise put it first.
         settings.update(_ambient_changes())
-        return cls(**settings)  # type: ignore[arg-type]
+        return cls(**settings)
 
     def __repr__(self) -> str:
+        """Every field, with a bearer ``token`` shown as ``'<redacted>'``.
+
+        Configs end up in logs and bug reports; the token is the one field that
+        is a credential in itself (key passwords are callables and print as such).
+        """
         secret = {"token"}
         parts = []
         for f in self.__dataclass_fields__:
@@ -484,6 +633,7 @@ class Config:
 
 
 def _read_config(target: str) -> configparser.ConfigParser:
+    """Parse ``target`` as UTF-8 INI; a syntax error becomes ``ValueError`` naming the file."""
     parser = configparser.ConfigParser()
     try:
         with open(target, encoding="utf-8") as handle:
@@ -495,7 +645,13 @@ def _read_config(target: str) -> configparser.ConfigParser:
 
 def _file_settings(
     parser: configparser.ConfigParser, target: str, alias: str | None
-) -> dict[str, object]:
+) -> dict[str, Any]:
+    """``[defaults]`` overlaid with ``[alias <alias>]``, each section validated.
+
+    An alias the file does not define is a :class:`KeyError` listing the ones
+    it does: silently falling back to the defaults would connect as someone
+    else.
+    """
     settings = (
         _settings_from(parser, DEFAULTS_SECTION, target)
         if parser.has_section(DEFAULTS_SECTION)

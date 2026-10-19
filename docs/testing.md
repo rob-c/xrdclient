@@ -1,8 +1,9 @@
 # Testing against it
 
-`xrdclient.testing` ships three servers. They are part of the installed package, not
-test-suite scaffolding, because the code that is hardest to test is yours -
-the retry loop, the failure handler, the thing that has to cope with a data
+`xrdclient.testing` ships three servers, plus shared PKI, VOMS and HTTPS
+fixtures for other projects' test suites (see *Shared fixtures* below).
+They are part of the installed package, not test-suite scaffolding,
+because the code that is hardest to test is yours - the retry loop, the failure handler, the thing that has to cope with a data
 server disappearing.
 
 ```python
@@ -139,6 +140,15 @@ will try to hold gigabytes.
 
 ## `FakeDAVServer` - HTTP and WebDAV
 
+Since 0.4.0 `FakeDAVServer` and `FakeS3Server` are thin presets of
+`xrdhttp.testing.StorageServer`, the fake storage element xrdhttp ships and
+xgfalclient's suite runs against too. Everything documented there works on
+these: `fault(...)` (a status, a drop, a delay, a truncated or stalled
+answer), `tokens`/`basic`, `redirect_prefixes`, `metalinks`, CDMI `qos`,
+`requests` (one `Request` record per request), and the XrdCl-style
+switches listed in `xrdhttp.testing.STYLES`. The table below is the
+vocabulary this package keeps on top.
+
 ```python
 with FakeDAVServer(files={"/store/f.root": b"payload"}) as dav:
     fs = xrdclient.FileSystem(str(dav.url))          # already http://host:port/
@@ -152,7 +162,7 @@ with FakeDAVServer(files={"/store/f.root": b"payload"}) as dav:
 | `dav.redirects[path] = url` | 307 before the real answer |
 | `dav.no_dav = True` | refuse `PROPFIND`, like a plain HTTP server |
 | `dav.ignore_ranges = True` | answer a ranged `GET` with the whole body |
-| `dav.digests = False` | no `Want-Digest` support |
+| `dav.digests = set()` | no `Want-Digest` support (the set holds the algorithms offered) |
 | `dav.macaroon = "..."` | what a macaroon request mints |
 | `dav.no_tpc = True` | refuse `COPY`, like an endpoint without third-party copy |
 | `dav.tpc_failure = "..."` | answer `202` and then fail, which is the awkward one |
@@ -308,9 +318,144 @@ $ BRIX_FAULT_FS=/path/to/brix-fault-fs \
     pytest tests/test_brix_fault_fs.py
 ```
 
+Those checks are not this suite's own: they are the local-copy conformance
+suites of `xrdclient.testing.brix` (`WriteFaultSuite`, `DurabilitySuite`,
+`SourceFaultSuite`, together `LocalCopySuite`), which any client runs by
+subclassing one with a `LocalCopyAdapter` - "copy local file A to local file
+B" through its own API, its errors read as a neutral `Kind`. xgfalclient
+runs the same suite through `Gfal2Context.filecopy`; each client keeps only
+its own error classes and wording, as overrides that call `super()` and then
+look at `self.error`, `self.reply` or the backing directory.
+`tests/test_testing_brix_suites.py` pins the suites without FUSE, against a
+scripted filesystem and client, and checks that a client which reports
+success through a fault, or misreads the failure, fails them.
+
 Both tools are built by the adjacent `brix-cache/client` project. The suites
 are skipped when their environment variable is unset, so the ordinary test
 suite remains daemon- and FUSE-free.
+
+## Shared fixtures: PKI, VOMS and a bare HTTPS server
+
+Three more pieces of `xrdclient.testing` exist for the test suites of
+*other* grid tools - xgfalclient and the ARC client xrdarc use them, and so
+can yours - so that a CA, a proxy, a VOMS attribute certificate or a fake
+REST service is written once rather than once per project. They are public
+test API: **everything under `xrdclient.testing.*` follows the package's
+semantic versioning** - a name or behaviour documented here changes only
+with a deprecation period in a minor release, or in a major one. (Names with
+a leading underscore are not covered.)
+
+`pki` and `voms` need `cryptography` (a runtime dependency anyway) and are
+imported on demand, not by `import xrdclient.testing`.
+
+Since 0.4.0 `pki`, `voms` and `FakeHTTPSServer` are
+[xrdsec](https://github.com/rob-c/xrdsec)'s test helpers under these names -
+`xrdclient.testing.pki is xrdsec.testing.pki` - so xrdclient's, xgfalclient's
+and xrdarc's suites all mint the same PKI. One visible change came with the
+move: the default subjects read `/DC=org/DC=xrdsec/...` (`xrdsec Test CA`)
+where they read `DC=xrdclient`; set the `*_SUBJECT` class attributes on a
+`BasePKI` subclass for names of your own.
+
+### `xrdclient.testing.pki` - a throwaway grid PKI
+
+```python
+from xrdclient.testing.pki import create_pki, test_key, test_key_pem
+
+pki = create_pki(tmp_path)                 # CA, host (localhost/127.0.0.1/::1), user, proxy
+server_ctx = pki.server_context()          # host cert; demands and verifies a client proxy
+client_ctx = pki.client_context()          # presents pki.proxy_path, trusts the CA
+os.environ.update(pki.environment())       # X509_USER_PROXY, X509_CERT_DIR
+pki.proxy("limited", lifetime=600)         # rfc | limited | legacy; issuer= for proxy-of-proxy
+pki.install_crl([pki.host.serial_number])  # <hash>.r0 beside <hash>.0
+```
+
+| | |
+|---|---|
+| `create_pki(dir, hosts=, host_cn=, lifetime=, key_slots=)` | mint and write a PKI (`PKI.create` for a subclass) |
+| `pki.ca_dir`, `ca_file`, `ca_hash` | `X509_CERT_DIR` layout: `<hash>.0` and an IGTF `.signing_policy` |
+| `pki.host_cert_path` / `host_key_path`, `user_cert_path` / `user_key_path`, `proxy_path` | grid-security file names; keys and proxies `0600` |
+| `pki.ca`, `host`, `user` / `*_key` | `cryptography` certificates and keys |
+| `pki.ca_signer`, `host_signer`, `user_signer` | `Signer(chain, key)`: DER chain and key, for minting more |
+| `pki.credential(path=None)`, `pki.user_credential` | loaded with `xrdsec.x509.load_proxy` |
+| `pki.crl(serials)`, `pki.install_crl(serials)` | a CRL as PEM; written where OpenSSL looks |
+| `test_key(slot)` / `test_key_pem(slot)` | eight *fixed* 2048-bit RSA keys (0-7) as `cryptography` keys / PKCS#1 PEM |
+| `ca_certificate`, `host_certificate`, `user_certificate`, `proxy_certificate` | one certificate as DER, for tests that need just one |
+| `subject_hash(name_der)` | OpenSSL's `X509_NAME_hash`: a CA's file name |
+
+The keys are frozen (and public - they protect nothing) so a suite does not
+spend its time generating 2048-bit keys; certificates are minted at run time
+and never expire in a checkout. Slot conventions: 0-2 CA/host/user, 3 proxy,
+4 a server's delegation key, 5-7 a second independent PKI and one-off keys.
+Proxies follow Globus's rules - lifetime capped by the issuer chain, a limited
+proxy only begets limited ones, a GT2 issuer begets a GT2 child.
+
+`BasePKI` is generic in how it *presents* what it minted: override
+`_certificate_view`, `_key_view` and `_load_credential` (and the
+`CA_SUBJECT` / `USER_SUBJECT` / `HOST_PREFIX` class attributes) to hand out
+your own types. `xgfalclient.testing.pki` is exactly that: the same PKI in
+xgfalclient's `Certificate`/`Credential` types, with `/DC=org/DC=xgfal/...`
+names.
+
+### `xrdclient.testing.voms` - attribute certificates and a VOMS server
+
+```python
+from xrdclient.testing.voms import ACSpec, FakeVOMSServer, make_ac, voms_proxy, write_lsc
+
+voms = pki.host_signer                                  # any certificate + key
+ac = make_ac(pki.user, voms.der, voms.key, ACSpec(fqans=("/atlas", "/atlas/higgs")))
+proxy = voms_proxy(pki, [ac])                           # a proxy carrying the AC extension
+write_lsc(tmp_path / "vomsdir", "atlas", "voms.example", voms.chain)
+```
+
+`make_ac(holder, voms_cert, voms_key, spec)` returns DER. The defaults of
+`ACSpec` make an AC that `xrdclient.crypto.voms.validate_voms` accepts; each
+field breaks or varies one thing: `fqans`, `attributes` (VOMS generic
+attributes), `targets` (RFC 5755 `targetInformation`), the validity window,
+`version`, `serial`, holder serial/issuer, issuer name, the embedded VOMS
+chain, extra extensions, and the signature - RSA PKCS#1 v1.5 over any SHA-2
+(or SHA-1), RSASSA-PSS (`pss=True`), ECDSA and Ed25519 by the key's type, or
+any `sign=` function with explicit `algorithm`/`outer_algorithm`
+identifiers. `ac_sequence`/`ac_extension` wrap ACs for a proxy;
+`lsc_text`/`write_lsc` and `vomses_line` write the trust and client
+configuration files.
+
+`FakeVOMSServer(voms_signer, tls, vo=, members=)` answers the VOMS REST call
+`GET /generate-ac?fqans=<a>,<b>&lifetime=<s>` with
+`<voms><ac>base64</ac></voms>`, minting a real AC for the calling
+certificate (on Python before 3.13 a server sees only the proxy, so set
+`server.holder` when the AC must name the user certificate), or with
+`<voms><error><code>…</code><message>…</message></error></voms>`:
+`403 NoSuchUser` (no certificate, not in `members`), `403 NoSuchAttribute`,
+`400 BadRequest`; a lifetime over `max_lifetime` is cut, with a `<warning>`.
+`server.refuse(code, message, status)` cans the next answer; `server.issued`
+holds every AC minted.
+
+### `xrdclient.testing.http.FakeHTTPSServer` - a bare TLS test server
+
+The plumbing every in-process HTTP fake needs, without any service on top:
+
+```python
+from xrdclient.testing.http import FakeHTTPSServer, Fault, Response, ranged_reply
+
+with FakeHTTPSServer(tls=pki.server_context()) as srv:
+    srv.route("GET", r"/data/(?P<name>.+)", lambda req: ranged_reply(blob, req.header("Range")))
+    srv.add_fault(Fault("GET", r"/data/big", status=None, truncate=100))  # dies 100 bytes in
+    ...                                                                   # client at srv.url
+    srv.requests[-1].peer.identity    # '/DC=org/DC=xrdsec/OU=People/CN=Test User'
+```
+
+| | |
+|---|---|
+| `route(method, pattern, handler)` | `handler(Request) -> Response` (or `None` to hang up); `*` matches any verb, named groups land in `request.params`; 404/405 otherwise |
+| `requests` | every `Request`: method, raw `target`, decoded `path`, `query`, `headers`, `body`, `peer` |
+| `add_fault(Fault(...))` | per-request: `status` instead of the answer, `delay` before it, `stall` between headers and body, `truncate` the body, `drop` the connection; `times=None` for every match |
+| `peer_identity(sock)` / `PeerIdentity` | the client's chain (whole chain on 3.13+, leaf before), its `subject`, and `identity` - the end-entity subject without proxy CNs |
+| `ranged_reply(data, range_header, several=)` | 200 / 206 / `multipart/byteranges` / 416; `several="first"` or `"coalesce"` for servers that do that |
+| `propfind_reply(entries)`, `DAVEntry`, `dav_entries(dir, href, depth)` | a WebDAV `207` multistatus, from entries or from a real directory |
+| `read_body(handler)`, `TLSServer` | the chunked/`Content-Length` body reader and the TLS-per-connection server, for a fake that needs its own handler |
+
+`FakeDAVServer` is built from the same `TLSServer`, `read_body`,
+`ranged_reply` and `propfind_reply`; its knobs and behaviour are unchanged.
 
 ## Suite markers
 
@@ -334,14 +479,19 @@ including the fake servers in `xrdclient.testing`, which are shipped code and so
 held to the same standard:
 
 ```console
-$ pytest --cov                              # gated: proto/, crypto/, client/ at 100%
-$ coverage run --branch -m pytest && coverage report -m --include='*/xrd/*'
+$ pytest -n 4 -m "not interop and not parity" --cov=xrdclient   # gated at 100%
 ```
 
-The gate in `pyproject.toml` deliberately covers only the wire protocol, the
-cryptography and the client surface, because coverage of the optional adapters
-(fsspec, the CLI, `asyncio`) depends on which extras are installed. Run the
-second form to see the whole package.
+The gate in `pyproject.toml` (`fail_under = 100`, branch coverage on) covers
+the whole package: there is no `include` list and no `omit`, and nothing is
+marked `pragma: no cover`. The only lines coverage leaves out are the shapes
+`exclude_also` names - `if TYPE_CHECKING:`, `@overload` stubs,
+`raise NotImplementedError`, `...` bodies and `if __name__ == "__main__":` -
+which are the same in every repository of the chain. A branch that depends on
+the platform or on a failure nobody can arrange for real is reached through
+its seam instead (`tests/test_edge_paths.py`), so Linux and macOS cover the
+same lines. pytest runs with `filterwarnings = ["error"]`: a warning is a
+failure.
 
 ## Pre-commit quality gates
 
@@ -349,31 +499,80 @@ CI treats formatting, static analysis, maintainability and the built package
 as separate contracts. Run the same checks locally before opening a change:
 
 ```console
-$ ruff check src tests benchmarks tools examples
-$ ruff format --check src tests benchmarks tools examples
+$ ruff check src tests benchmarks tools examples typings
+$ ruff format --check src tests benchmarks tools examples typings
 $ mypy
-$ python tools/maintainability.py check
+$ complexipy
+$ xrddevtools maintainability check
+$ xrddevtools conformance --repo .
 $ python -m build && twine check --strict dist/*
 ```
+
+`xrddevtools` is the command of
+[xrd-devtools](https://github.com/rob-c/xrd-devtools), the repository that
+holds what serves the whole chain rather than one package. It is not on PyPI
+and cannot be a dependency (PyPI refuses direct-URL requirements), so it is
+used from a checkout: a sibling `../xrd-devtools` in the workspace layout,
+`.dependencies/xrd-devtools` in CI, or anywhere else after `pip install -e`
+(or with its `src` on `PYTHONPATH`). pytest's `pythonpath` lists the first two,
+which is how `tests/test_scorecard.py` and `tests/test_maintainability.py` -
+a few lines each, loading `xrddevtools.pytest_plugin` - find the gates.
+Without a checkout they skip, saying so, as they do without radon and
+complexipy (the `dev` extra); CI loads the plugin with `-p` and sets
+`XRD_DEVTOOLS_REQUIRED=1`, so there they can never skip.
+
+None of them has a baseline, a snapshot or an allowance list, and none of
+the code has suppression comments to get past them, so new code and old are
+held to the same rules (see [Maintainability](maintainability.md#no-grandfathered-code)).
 
 Ruff includes a focused set of high-confidence security checks. Wider generic
 security rules are reviewed rather than enabled blindly because protocol code
 legitimately contains specified hashes, XML parsing and subprocess transports.
-The CI test matrix covers Python 3.9 through 3.14.
+The CI test matrix covers Python 3.11 through 3.14.
+
+CI is xrd-devtools' reusable workflows, the same in every repository of the
+chain: `static.yml` (ruff, mypy, complexipy, the scorecard, here also the
+maintainability check, and `xrddevtools conformance`), `tests.yml` (the
+pytest matrix with the coverage gate) and `chain.yml` (all seven
+repositories checked out side by side, this commit among them, for
+`xrddevtools dupes` - no function copied between repositories - and the
+conformance check of every one); so CI runs only once `rob-c/xrd-devtools`
+exists. xrdclient is built on xrdcore, xrdsec and xrdhttp. Until those are on
+PyPI, every job gets them through xrd-devtools' candidates action, which
+checks out `rob-c/xrdcore`, `rob-c/xrdsec` and `rob-c/xrdhttp` (and
+xrd-devtools) under `.dependencies/` and installs them editable (or, for the
+wheel-only jobs, builds their wheels into `.dependencies/wheels`). The refs
+default to `main`; the CI workflow's manual inputs `xrdcore-ref`,
+`xrdsec-ref`, `xrdhttp-ref` and `devtools-ref` select other candidates.
+Locally, the workspace's shared environment has all three installed editable
+from their sibling checkouts. The package job also runs the chain pre-flight
+without builds (`xrddevtools preflight workspace --no-build`) over this
+candidate and the libraries it checked out, so a version or pin that drifts
+apart fails a pull request, not a release. `publish.yml` never uses the
+candidates: it gates on the libraries being on PyPI (see
+[Releasing](releasing.md#releasing-the-040-chain)).
+
+The packaging tools (`platforms`, `distribution_package`, `homebrew_package`,
+`installed_smoke`, `chain_preflight`) are xrd-devtools', tested there at 100 %
+with the rest of its tools. `tests/test_distribution_tools.py` here only pins
+that this repository's CI, platform matrix and publish job call the shared
+ones.
 
 ## Maintainability regression test
 
 The suite also measures every handwritten Python function for cyclomatic,
 cognitive and NPath complexity, Halstead Volume and maximum nesting depth. The
 same absolute limits apply to existing and new code; there is no baseline or
-allowance mechanism. A separate policy test pins CCN at 10, Cognitive
-Complexity at 15, NPath at 200, Halstead Volume at 500 and maximum nesting at
-4 so the suite cannot be made green by quietly relaxing a threshold.
+allowance mechanism. The gate refuses a `maintainability.json` looser than
+the standard limits (`xrddevtools.maintainability.STANDARD_LIMITS`: CCN 10,
+Cognitive Complexity 15, NPath 200, Halstead Volume 500, maximum nesting 4)
+or with any exclusion, so the suite cannot be made green by quietly relaxing
+a threshold. `tests/test_maintainability.py` runs it as a test.
 
 ```console
-$ python tools/maintainability.py check
-$ python tools/maintainability.py hotspots
-$ python tools/maintainability.py report --top 50
+$ xrddevtools maintainability check
+$ xrddevtools maintainability hotspots
+$ xrddevtools maintainability report --top 50
 ```
 
 See [Maintainability metrics](maintainability.md) for the metric definitions,

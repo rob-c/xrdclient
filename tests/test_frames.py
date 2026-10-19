@@ -8,11 +8,11 @@ from xrdclient.errors import ProtocolError
 from xrdclient.proto import constants as c
 from xrdclient.proto import requests as r
 from xrdclient.proto.buffer import Writer
-from xrdclient.proto.frames import HANDSHAKE, Request, decode_header, encode
+from xrdclient.proto.frames import HANDSHAKE, Request, decode_header, encode, encode_parts
 
 
 def test_handshake_is_the_documented_20_bytes():
-    assert HANDSHAKE == bytes(12) + struct.pack(">II", 4, 2012)
+    assert bytes(12) + struct.pack(">II", 4, 2012) == HANDSHAKE
     assert len(HANDSHAKE) == 20
 
 
@@ -241,7 +241,7 @@ def test_setattr_puts_a_44_byte_attribute_block_before_the_path():
     """The offsets are a contract with the two implementations that speak it,
     XRootD.jl's encoder and nginx-xrootd's decoder: flags, atime and mtime as
     second/nanosecond pairs, then uid and gid, then the path."""
-    body = body_of(r.Setattr("/a", c.kXR_sa_times | c.kXR_sa_owner, (1, 2), (3, 4), 500, 501))
+    body = body_of(r.Setattr("/a", c.kXR_sa_times | c.kXR_sa_owner, (1, 2), (3, 4), (500, 501)))
     assert struct.unpack(">iqqqqii", body[:44]) == (3, 1, 2, 3, 4, 500, 501)
     assert body[44:] == b"/a\x00"
 
@@ -249,7 +249,7 @@ def test_setattr_puts_a_44_byte_attribute_block_before_the_path():
 def test_setattr_leaves_an_unnamed_id_at_minus_one():
     """``chown(2)``'s rule, and the one the server applies: -1 means "not this
     one" - a zero there would hand the file to root."""
-    body = body_of(r.Setattr("/a", c.kXR_sa_owner, gid=42))
+    body = body_of(r.Setattr("/a", c.kXR_sa_owner, owner=(-1, 42)))
     assert struct.unpack(">ii", body[36:44]) == (-1, 42)
 
 
@@ -463,9 +463,55 @@ def test_every_request_declares_whether_it_may_be_replayed(request_):
 
 def test_the_unrepeatable_list_names_only_real_requests():
     """A typo in it would silently let a mutation be replayed."""
-    assert UNREPEATABLE <= set(IDS)
+    assert set(IDS) >= UNREPEATABLE
 
 
 def test_repr_never_shows_credential_bytes():
     assert "cred=<0 bytes>" in repr(r.Auth("ztn", b""))
     assert "eyJ" not in repr(r.Auth("ztn", b"ztn\x00eyJhbGciOiJIUzI1NiJ9"))
+
+
+# ---------------------------------------------------------------------------
+# Frames as buffers: a large payload is never copied on its way out
+# ---------------------------------------------------------------------------
+
+
+def test_a_request_without_a_body_is_its_header_alone():
+    (only,) = encode_parts(r.Ping(), 3)
+    assert type(only) is bytes and len(only) == 24
+    assert encode(r.Ping(), 3) == only
+
+
+def test_a_short_body_rides_in_its_headers_buffer():
+    (whole,) = encode_parts(r.Stat("/tmp/x"), 7)
+    assert whole == encode(r.Stat("/tmp/x"), 7)
+
+
+def test_a_large_write_is_framed_around_the_callers_own_buffer():
+    data = bytearray(b"x" * 10_000)
+    head, body = encode_parts(r.Write(b"\0\0\0\1", 5, data), 9)
+    assert struct.unpack(">I", head[20:24])[0] == len(data)
+    assert isinstance(body, memoryview) and body.obj is data  # a view, not a copy
+    assert encode(r.Write(b"\0\0\0\1", 5, data), 9) == bytes(head) + bytes(data)
+
+
+def test_a_write_of_a_wider_buffer_counts_its_bytes():
+    import array
+
+    data = array.array("d", [1.0] * 1000)  # 8000 bytes in 1000 items
+    head, body = encode_parts(r.Write(b"\0\0\0\1", 0, memoryview(data)), 4)
+    assert struct.unpack(">I", head[20:24])[0] == len(body) == 8000
+
+
+def test_a_large_trailer_is_a_buffer_of_its_own():
+    chunks = [(b"\0\0\0\1", 0, b"y" * 9000)]
+    parts = encode_parts(r.WriteV(chunks), 6)
+    assert len(parts) == 3  # header, the write list, the data that follows it
+    assert b"".join(parts) == encode(r.WriteV(chunks), 6)
+    assert bytes(parts[2]) == b"y" * 9000
+
+
+def test_a_bodyless_request_with_a_large_trailer_sends_header_then_trailer():
+    tail = b"t" * 5000
+    head, trailer = encode_parts(r.ChkPoint(b"\0\0\0\1", c.kXR_ckpXeq, b"", tail), 2)
+    assert len(head) == 24 and trailer == tail

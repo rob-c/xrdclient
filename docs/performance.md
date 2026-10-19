@@ -209,11 +209,21 @@ Three things carry the load:
 **No copy that can be avoided.** Response bodies are sliced out of the receive
 buffer through a `memoryview`, so a multi-megabyte read is frozen to `bytes`
 exactly once. The obvious spellings - `bytes(buf[:n])`, `pending + body` -
-each copy twice; profiling this benchmark is how they were found.
+each copy twice; profiling this benchmark is how they were found. Outbound,
+a write's payload is never copied by the client: the request is framed as a
+list of buffers - the 24-byte header and a view of the caller's own data -
+and handed to the kernel in one `sendmsg`. TLS has no vectored send, so there
+the header is joined to the start of the payload and the rest goes out in
+record-sized slices of the caller's buffer.
 
 **One socket, many requests.** Requests on a connection are multiplexed by
-stream ID, so they do not wait for each other's responses, and a `FileSystem`
-holds its connection open for its whole life. A thousand-file dataset read
+stream ID, so they do not wait for each other's responses: any number of
+threads (or `xrdclient.aio` coroutines) may have a request in flight on one
+session at once. Nothing is locked for a request's lifetime - a `kXR_wait`
+is sat out, and a `kXR_waitresp` answer waited for, without holding up the
+other requests on the connection; one thread at a time reads the socket and
+hands each reply to whoever it belongs to. A `FileSystem` holds its
+connection open for its whole life. A thousand-file dataset read
 through one `FileSystem` - or one `fsspec` instance, which is cached by its
 constructor arguments - costs one login. Constructing a fresh `FileSystem` per
 file costs one login *in total* as well, because a closed connection goes into
@@ -288,7 +298,12 @@ default.
 
 For many files, go wide rather than deep - one session per worker thread, or
 `asyncio.gather` over separate handles ([Asynchronous use](async.md)). A
-single session serialises its own calls.
+single session carries concurrent calls together, multiplexed on one socket,
+so small requests from many threads share it well; what one connection
+cannot do is move more bytes than one socket and one reading thread can, so
+large transfers still want connections of their own. A bulk read or write
+has its connection to itself while it runs, and other calls on that session
+wait for it.
 
 Turn off what you are not using:
 

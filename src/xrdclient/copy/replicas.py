@@ -12,11 +12,14 @@ replica nobody has tried. The copy fails only when every replica has.
 
 from __future__ import annotations
 
+import functools
 import threading
 from collections import deque
 from collections.abc import Callable
 from contextlib import ExitStack
 from typing import IO, TYPE_CHECKING
+
+from xrdcore import fanout
 
 from ..config import Config
 from ..errors import XRootDError
@@ -26,7 +29,7 @@ from ..url import XRootDURL
 if TYPE_CHECKING:
     from ..io.raw import XRootDRawIO
 
-__all__ = ["NoMoreReplicasError", "locate", "fetch", "BLOCK_SIZE"]
+__all__ = ["BLOCK_SIZE", "NoMoreReplicasError", "fetch", "locate"]
 
 #: XrdCl's ``XCpBlockSize``: the most one reader takes at a time.
 BLOCK_SIZE = 128 << 20
@@ -88,6 +91,7 @@ class _Blocks:
     """
 
     def __init__(self, size: int, block: int) -> None:
+        """Split ``size`` bytes into ``block``-sized spans, the last possibly short."""
         spans = ((offset, min(block, size - offset)) for offset in range(0, size, block))
         self._pending = deque(spans)
         self._busy = 0
@@ -118,6 +122,11 @@ class _Blocks:
             self._stopped = True
             self._ready.notify_all()
 
+    @property
+    def stopped(self) -> bool:
+        """Whether the copy has failed, for a reader part-way through a block."""
+        return self._stopped
+
 
 class _Fetch:
     """The state every reader of one copy shares."""
@@ -130,6 +139,13 @@ class _Fetch:
         chunk: int,
         progress: Progress | None,
     ) -> None:
+        """Share the untried ``replicas`` and the ``writer`` between all readers.
+
+        ``_lock`` guards the replica queue and every seek-and-write on
+        ``writer``: the target is one file object, and a seek from one
+        reader between another's seek and write would misplace a block.
+        ``failures`` is appended to without it - ``list.append`` is atomic.
+        """
         self._replicas = deque(replicas)
         self._writer = writer
         self._config = config
@@ -162,7 +178,7 @@ class _Fetch:
                 offset, length = block
                 moved = 0
                 try:
-                    moved = self._span(reader, offset, length)
+                    moved = self._span(reader, offset, length, blocks)
                 except BaseException:
                     blocks.stop()
                     raise
@@ -172,10 +188,17 @@ class _Fetch:
                     stack.close()
                     reader = self.open_next(stack)
 
-    def _span(self, reader: XRootDRawIO, offset: int, length: int) -> int:
-        """Read one block into the target; the bytes moved before a failure."""
+    def _span(self, reader: XRootDRawIO, offset: int, length: int, blocks: _Blocks) -> int:
+        """Read one block into the target; the bytes moved before a failure.
+
+        Gives up between chunks once another reader has failed the copy:
+        the rest of the block would only be written into a target that is
+        about to be reported incomplete.
+        """
         moved = 0
         while moved < length:
+            if blocks.stopped:
+                raise fanout.Stopped(f"block at {offset} stopped: another reader failed")
             data = self._read(reader, offset + moved, min(self._chunk, length - moved))
             if not data:
                 break  # this replica failed, or is shorter than the file
@@ -193,6 +216,7 @@ class _Fetch:
             return b""
 
     def _put(self, offset: int, data: bytes) -> None:
+        """Write ``data`` at ``offset`` and report progress, under the shared lock."""
         with self._lock:
             self._writer.seek(offset)
             self._writer.write(data)
@@ -227,44 +251,25 @@ def fetch(
         count = min(sources, len(replicas))
         blocks = _Blocks(shared.size, max(chunk, min(block, shared.size // count)))
         _together(shared, blocks, first, count)
-    if shared.moved < shared.size or any(isinstance(f, _Fatal) for f in shared.failures):
+    if shared.moved < shared.size:
         raise _exhausted(shared)
     return shared.moved
 
 
 def _together(shared: _Fetch, blocks: _Blocks, first: XRootDRawIO, count: int) -> None:
-    """``count`` readers at once: this thread on ``first``, the rest on their own."""
-    readers = [threading.Thread(target=_guarded, args=(shared, blocks)) for _ in range(1, count)]
-    for thread in readers:
-        thread.start()
-    try:
-        shared.run(blocks, first)
-    finally:
-        for thread in readers:
-            thread.join()
+    """``count`` readers at once, the first on the replica already open.
 
-
-def _guarded(shared: _Fetch, blocks: _Blocks) -> None:
-    """A reader thread: its failure is recorded for the copy to raise."""
-    try:
-        shared.run(blocks)
-    except BaseException as exc:
-        shared.failures.insert(0, _Fatal(exc))
-
-
-class _Fatal(Exception):
-    """A reader's failure that is the copy's, not the replica's: raise it."""
-
-    def __init__(self, error: BaseException) -> None:
-        super().__init__(str(error))
-        self.error = error
+    The first reader to fail stops the rest - no more blocks are handed out,
+    and a reader part-way through one gives up at its next chunk - and its
+    failure is the copy's, with any that followed noted on it.
+    """
+    readers = [functools.partial(shared.run, blocks, first)]
+    readers += [functools.partial(shared.run, blocks) for _ in range(1, count)]
+    fanout.run_all(readers, name="xrd-replica", on_failure=blocks.stop)
 
 
 def _exhausted(shared: _Fetch) -> BaseException:
-    """What to raise when the copy stops: a reader's own failure, else the replicas'."""
-    fatal = next((f.error for f in shared.failures if isinstance(f, _Fatal)), None)
-    if fatal is not None:
-        return fatal
+    """What to raise when every replica has failed before the file was read."""
     last = shared.failures[-1] if shared.failures else None
     detail = f": {last}" if last is not None else ""
     return NoMoreReplicasError(f"No more replicas to try{detail}")

@@ -17,12 +17,14 @@ one moment where at-most-once is the only safe answer.
 
 from __future__ import annotations
 
+import contextlib
 import struct
 import time
+from collections.abc import Iterator
 
 import pytest
 
-from conftest import handshake_reply, login_body, ok, protocol_body
+from tests.conftest import handshake_reply, login_body, ok, protocol_body
 from xrdclient.client.file import File
 from xrdclient.config import Config
 from xrdclient.errors import ChecksumMismatchError, TransientError, WaitLimitError
@@ -33,7 +35,8 @@ from xrdclient.proto import constants as c
 from xrdclient.proto import machine as m
 from xrdclient.proto import requests as r
 from xrdclient.session.sync import Session
-from xrdclient.testing import error, frame
+from xrdclient.testing import FakeServer, error, frame
+from xrdclient.testing.server import _Connection
 
 IMPATIENT = Config(
     username="tester",
@@ -60,7 +63,7 @@ def fs(server):
         filesystem.close()
 
 
-def vanish_once(server, opcode):
+def vanish_once(server: FakeServer, opcode: int) -> None:
     """Take the request, answer nothing, and drop the connection.
 
     A server that has already done the work and dies before the reply leaves
@@ -68,7 +71,7 @@ def vanish_once(server, opcode):
     answer and the test can tell "retried" from "never got through".
     """
 
-    def handler(conn, sid, params, body):
+    def handler(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
         server.handlers.pop(opcode, None)
         crash(conn)
         return iter(())
@@ -76,7 +79,7 @@ def vanish_once(server, opcode):
     server.handlers[opcode] = handler
 
 
-def crash(conn):
+def crash(conn: _Connection) -> None:
     """Cut the connection now.
 
     ``close`` alone would only mark the socket: the server keeps a file object
@@ -86,11 +89,12 @@ def crash(conn):
     """
     import socket as _socket
 
-    try:
-        conn.sock.shutdown(_socket.SHUT_RDWR)
-    except OSError:  # pragma: no cover - the peer may already have gone
-        pass
-    conn.sock.close()
+    sock = conn.sock
+    assert isinstance(sock, _socket.socket)
+    # The peer may already have gone.
+    with contextlib.suppress(OSError):
+        sock.shutdown(_socket.SHUT_RDWR)
+    sock.close()
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +182,7 @@ def test_the_session_a_reconnection_replaces_gives_its_socket_back(server, fs):
 def test_giving_up_counts_the_attempts_it_made(server, fs):
     """``attempts`` is what a caller logs; it has to be the real number."""
 
-    def handler(conn, sid, params, body):
+    def handler(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
         crash(conn)
         return iter(())
 
@@ -379,9 +383,11 @@ def test_a_server_that_dribbles_is_given_up_on_too(server):
             yield b"\x00"
 
     server.handlers[c.kXR_stat] = dribble
-    with Session.connect(server.url, config=IMPATIENT_STALL) as session:
-        with pytest.raises(XrdTimeoutError, match="stall deadline"):
-            session.execute(r.Stat("/data/a.root"), path="/data/a.root")
+    with (
+        Session.connect(server.url, config=IMPATIENT_STALL) as session,
+        pytest.raises(XrdTimeoutError, match="stall deadline"),
+    ):
+        session.execute(r.Stat("/data/a.root"), path="/data/a.root")
 
 
 def test_a_wait_restarts_the_deadline_rather_than_spending_it(server):
@@ -429,9 +435,11 @@ def test_the_parking_a_server_asks_for_is_bounded_in_total(server):
         yield frame(sid, c.kXR_wait, struct.pack(">i", 10) + b"come back\x00")
 
     server.handlers[c.kXR_stat] = parked
-    with Session.connect(server.url, config=IMPATIENT_STALL.evolve(wait_budget=0.5)) as session:
-        with pytest.raises(WaitLimitError, match="budget for one operation"):
-            session.execute(r.Stat("/data/a.root"), path="/data/a.root")
+    with (
+        Session.connect(server.url, config=IMPATIENT_STALL.evolve(wait_budget=0.5)) as session,
+        pytest.raises(WaitLimitError, match="budget for one operation"),
+    ):
+        session.execute(r.Stat("/data/a.root"), path="/data/a.root")
 
 
 def test_the_deadline_can_be_turned_off(server):

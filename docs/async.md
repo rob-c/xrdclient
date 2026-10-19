@@ -22,14 +22,24 @@ asyncio.run(main())
 
 ## How it runs
 
-Each call is handed to a worker thread with `asyncio.to_thread`, so the event
-loop is never blocked. Two consequences are worth knowing before you design
-around it.
+Each call is handed to a worker thread of the facade's own pool, so the event
+loop is never blocked. The pool is not the loop's default executor - that one
+is sized for the machine's cores and would quietly cap how many requests are
+in flight - but one of `Config.aio_workers` threads (32 by default,
+`$XRD_AIOWORKERS`), made on first use. The caller's context variables travel
+with each call, as with `asyncio.to_thread`, so a `deadline()` or
+`config.override()` around an `await` applies to the work it awaits. A few
+consequences are worth knowing before you design around it.
 
-**Concurrency is per endpoint.** Calls on one session are serialised by that
-session's lock, exactly as concurrent threads are in the synchronous API.
-Concurrency across *different* endpoints is real. To read four files at once,
-open four handles:
+**Calls on one session run together.** Concurrent calls on one session are
+multiplexed on its connection, exactly as concurrent threads are in the
+synchronous API: each request goes out at once on a stream of its own, and a
+slow one - a server's `kXR_wait`, a `kXR_waitresp` parked for minutes - holds
+up nobody else. One worker thread at a time reads the socket and hands each
+reply to the call it answers. A bulk transfer (a large read or write) has the
+connection to itself while it runs, and the other calls on it wait their
+turn. To move four large files at once, give each a connection by opening
+four handles:
 
 ```python
 async def read_all(urls):
@@ -39,13 +49,64 @@ async def read_all(urls):
     return await asyncio.gather(*(one(u) for u in urls))
 ```
 
-Note that `asyncio.gather` over a single `FileSystem` still helps: the calls
-queue on one connection but the round trips overlap with everything else your
-loop is doing.
+`asyncio.gather` over a single `FileSystem` overlaps the round trips of its
+calls on the one connection - many `stat`s cost about as long as the slowest.
 
-**Cancellation stops your coroutine, not the request.** A cancelled `await`
-leaves the in-flight request running on its worker thread. Anything that must
-be undone on cancellation belongs in a `finally:`.
+**One file may be shared.** `asyncio.gather(fh.pread(4096, 0),
+fh.pread(4096, 1 << 20))` runs both reads at once on one handle, and is safe:
+`xrdclient.File` keeps its readahead, its data-stream cursor and its recovery
+after a lost server behind a lock of its own, so concurrent calls neither tear
+that state nor re-open the file twice. Calls that move the cursor - `read`,
+`seek`, `write` - still race each other for the *position*, as two threads
+sharing a file object would; use `pread` and `pwrite` for concurrent access.
+
+**Cancellation abandons the request.** Each call runs inside a cancel scope
+of its own, and cancelling the coroutine - `task.cancel()`, an
+`asyncio.timeout()` running out, a `TaskGroup` whose sibling failed - cancels
+the scope. The coroutine raises `CancelledError` at once. Its worker notices
+within about 50 ms wherever it is waiting on a `root://` connection, and the
+request it was waiting on is *abandoned*: its stream id is kept out of use
+until the server's late answer arrives, and that answer is dropped. The
+connection stays in step and goes on serving the calls after it, and the
+worker thread is free for the next one, so cancelling a hundred stalled calls
+does not use up the pool.
+
+```python
+async with xrdclient.aio.FileSystem("root://eos.example.org") as fs:
+    try:
+        async with asyncio.timeout(5):
+            info = await fs.stat("/store/slow.root")
+    except TimeoutError:
+        info = None          # the stat is abandoned, the connection still good
+    await fs.ping()          # same connection, no reconnect
+```
+
+Nothing more is sent for a cancelled call: a `copy` reads and writes no
+further chunk, a `readv` split into several requests sends no further batch,
+and nothing is retried. A bulk transfer (a large read, the bulk download)
+stops between frames and leaves the replies still on their way to be dropped
+the same way. If it is caught part-way through a frame, it waits up to a
+quarter of a second for the rest of that frame. If the frame does not
+arrive, it closes the connection rather than leave it out of step. Calls
+after it go over a fresh connection, and a file's next bulk read re-opens the
+file there.
+
+What is *not* cancelled:
+
+- An `open()` that has already started still completes on its thread,
+  because an abandoned open would leave a handle on the server that nobody
+  could close. The handle it produces is closed for you.
+- Over `http(s)://` and `s3://`, a request already sent runs until it is
+  answered or times out (stopping it part-way would cost the connection).
+  Nothing after it is sent.
+- Connecting: a TCP connect or TLS handshake already started runs to its
+  `connect_timeout`. The login after it is cancelled.
+- A cancelled call's own clean-up round trips. Examples are a checkpoint
+  rollback inside a cancelled `copy`, or removing a partial remote target.
+  These would be waits on the server that was too slow. Clean-up you write
+  yourself, in an `except` or `finally` around the `await`, is a call of its
+  own and runs normally. That includes `async with` closing a file, and an
+  `AsyncFile.checkpoint()` block rolling back.
 
 ## What is mirrored
 

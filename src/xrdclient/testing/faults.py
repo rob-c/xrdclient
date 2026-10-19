@@ -14,25 +14,36 @@ the bytes going past::
 
 Every fault is armed by a call and disarmed by :meth:`heal`, so the usual
 shape of a test is "break it, do the thing, assert it survived". Faults apply
-to connections *accepted after* they are armed, plus the live ones for the
-byte-counting faults, which is what makes "fail the first attempt, succeed on
-the retry" expressible.
+to live connections as well as to ones accepted later (:meth:`refuse`, by its
+nature, only to later ones), and byte offsets count from the start of each
+connection - so a ``drop_after`` cuts the first attempt part-way and cuts the
+retry at the same offset too, until the test heals it. "Fail the first
+attempt, succeed on the retry" is :meth:`cut` (one-shot, on the live
+connections only) or :meth:`flaky` with a seed.
 
 It is pure stdlib sockets and threads: no privileges, no ``iptables``, no
-external proxy. The counters (:attr:`connections`, :attr:`bytes_from_server`,
+external proxy. One thread accepts; each accepted connection gets one thread
+that shuttles both directions in turn, polling each socket with a short
+timeout. That is slower than a ``select`` loop by up to a poll interval per
+idle direction, and in exchange the fault logic reads as straight-line code
+and every armed setting is re-read per chunk, so arming or healing takes
+effect on live connections at their next chunk.
+
+The counters (:attr:`connections`, :attr:`bytes_from_server`,
 :attr:`bytes_from_client`) are the other half of the point — a test can assert
 that a retry really did open a second connection.
 """
 
 from __future__ import annotations
 
+import contextlib
 import random
 import socket
 import threading
 import time
 from collections.abc import Callable
+from typing import Self
 
-from .._compat import TIMEOUTS
 from ..url import XRootDURL, parse
 
 __all__ = ["FaultProxy"]
@@ -44,6 +55,14 @@ class FaultProxy:
     ``target`` is anything with an address: an :class:`~xrdclient.url.XRootDURL`, a
     ``"host:port"`` string, a ``(host, port)`` pair, or an object exposing
     ``.url`` (so a :class:`~xrdclient.testing.FakeServer` can be passed directly).
+
+    The proxy speaks no protocol: it forwards bytes, so it works in front of
+    ``root://``, ``http://`` and ``s3`` endpoints alike. Its own :attr:`url` is
+    a ``root://`` one for convenience; HTTP tests build theirs from
+    :attr:`address`. The listening socket is bound in the constructor, and the
+    threads are daemons, so a proxy that is never closed cannot hang the
+    interpreter - but :meth:`close` (or the ``with`` block) is what releases
+    the port.
     """
 
     def __init__(
@@ -54,8 +73,15 @@ class FaultProxy:
         port: int = 0,
         backlog: int = 16,
     ) -> None:
+        """Bind the listener and start accepting at once - the proxy is live on return.
+
+        ``backlog`` only matters to a test that opens many connections
+        before the accept thread runs; 16 is ample for the suite.
+        """
         self.target = _address(target)
         self._listener = socket.create_server((host, port), backlog=backlog, reuse_port=False)
+        # A timeout on accept is how the accept loop notices close(): a
+        # blocked accept() is not reliably woken by closing the socket.
         self._listener.settimeout(0.2)
         self._threads: list[threading.Thread] = []
         self._live: set[socket.socket] = set()
@@ -90,6 +116,7 @@ class FaultProxy:
 
     @property
     def address(self) -> tuple[str, int]:
+        """The proxy's own ``(host, port)`` - point the client here, not at the target."""
         host, port = self._listener.getsockname()[:2]
         return (host, int(port))
 
@@ -100,6 +127,7 @@ class FaultProxy:
         return parse(f"root://{host}:{port}/")
 
     def __repr__(self) -> str:
+        """Both ends and the armed faults, which is what a failing test wants to see."""
         host, port = self.address
         armed = ",".join(self.armed) or "healthy"
         return f"FaultProxy({host}:{port} -> {self.target[0]}:{self.target[1]}, {armed})"
@@ -202,7 +230,13 @@ class FaultProxy:
         return self
 
     def heal(self) -> FaultProxy:
-        """Disarm every fault. Connections already made are unaffected."""
+        """Disarm every fault. Connections already made are not cut or reset.
+
+        A live connection stops misbehaving from its next chunk, but what
+        already happened to it stands: a dropped one stays closed, and a
+        stalled one has been *discarding* the server's bytes, so its stream
+        has a hole in it - the client should be expected to reconnect.
+        """
         self._drop_after = self._stall_after = None
         self._delay = 0.0
         self._delay_after = 0
@@ -226,10 +260,12 @@ class FaultProxy:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    def __enter__(self) -> FaultProxy:
+    def __enter__(self) -> Self:
+        """The proxy is already running; the ``with`` block bounds its lifetime."""
         return self
 
     def __exit__(self, *exc: object) -> None:
+        """Close the proxy, whether or not the block raised."""
         self.close()
 
     def close(self) -> None:
@@ -246,6 +282,13 @@ class FaultProxy:
     # ------------------------------------------------------------------
 
     def _accept_loop(self) -> None:
+        """Accept until closed, giving each connection a forwarding thread.
+
+        A connection that arrives while :meth:`refuse` is in force is still
+        accepted and counted, then closed at once: the client's connect
+        succeeds and the first read hits end of stream, which is what a
+        server behind a load balancer that has dropped it looks like.
+        """
         while not self._stop.is_set():
             try:
                 client, _ = self._listener.accept()
@@ -262,6 +305,13 @@ class FaultProxy:
             self._threads.append(thread)
 
     def _serve(self, client: socket.socket) -> None:
+        """Forward one connection both ways until either end or a fault ends it.
+
+        If the target cannot be reached the client is closed straight away,
+        so a test against a dead upstream fails fast instead of hanging.
+        Both sockets are tracked in ``_live`` so :meth:`cut` can reach them
+        from another thread.
+        """
         try:
             upstream = socket.create_connection(self.target, timeout=10.0)
         except OSError:
@@ -269,6 +319,8 @@ class FaultProxy:
             return
         with self._lock:
             self._live.update({client, upstream})
+        # Short timeouts let one thread alternate between the two directions
+        # without either recv blocking the other, and let it notice close().
         client.settimeout(0.2)
         upstream.settimeout(0.2)
         seen = 0  # bytes from the server on *this* connection
@@ -302,6 +354,9 @@ class FaultProxy:
     def _forward_chunk(self, client: socket.socket, chunk: bytes, seen: int) -> tuple[bool, int]:
         """Apply an armed stop or deliver one non-empty server chunk."""
         if self._stall_after is not None and seen >= self._stall_after:
+            # The chunk is swallowed, not queued: a stall is a black hole,
+            # and keeping reading keeps the server from blocking on a full
+            # socket buffer, which would make the stall visible upstream.
             time.sleep(0.05)
             return True, seen
         if self._drop_after is not None and seen >= self._drop_after:
@@ -353,6 +408,9 @@ class FaultProxy:
         """Apply the byte-level faults to one outbound chunk."""
         if self._filter is not None:
             chunk = self._filter(chunk)
+        # Corruption offsets are in the server stream of *this* connection;
+        # ``seen`` is where this chunk starts in it. Applied after the filter,
+        # so the offsets name bytes as the client would receive them.
         if not self._corrupt:
             return chunk
         out = bytearray(chunk)
@@ -380,21 +438,25 @@ def _read(sock: socket.socket, size: int = 65536) -> bytes | None:
     """A chunk, ``b""`` at end of stream, or ``None`` if nothing was ready."""
     try:
         return sock.recv(size)
-    except TIMEOUTS:
+    except TimeoutError:
         return None
     except OSError:
         return b""
 
 
 def _pieces(chunk: bytes, size: int) -> list[bytes]:
+    """``chunk`` split for :meth:`FaultProxy.chop`; ``size`` 0 means whole."""
     if not size or len(chunk) <= size:
         return [chunk]
     return [chunk[at : at + size] for at in range(0, len(chunk), size)]
 
 
 def _shutdown(sock: socket.socket) -> None:
-    try:
+    """Shut down and close, tolerating a socket the peer already closed.
+
+    ``shutdown`` before ``close`` is what makes the other end see the
+    connection end now, even if another thread is blocked reading it.
+    """
+    with contextlib.suppress(OSError):
         sock.shutdown(socket.SHUT_RDWR)
-    except OSError:
-        pass
     sock.close()

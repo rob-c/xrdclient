@@ -16,20 +16,26 @@ import os
 import pickle
 import socket
 import time
+from collections.abc import Iterator
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
 import xrdclient
 import xrdclient.crypto
 import xrdclient.transport
-from xrdclient.client import bulk as client_bulk
 from xrdclient.client.bulk import BulkResult, download, stream
 from xrdclient.client.file import File
 from xrdclient.config import Config
 from xrdclient.crypto.sigver import Signer
 from xrdclient.errors import ConnectionError as XrdConnectionError
-from xrdclient.errors import PageIntegrityError, ProtocolError, WaitLimitError, XRootDError
+from xrdclient.errors import (
+    PageIntegrityError,
+    ServerError,
+    WaitLimitError,
+    XRootDError,
+)
 from xrdclient.errors import TimeoutError as XrdTimeoutError
 from xrdclient.proto import constants as c
 from xrdclient.proto import requests as r
@@ -74,7 +80,7 @@ def _opened(server: FakeServer, config: Config) -> File:
     return handle
 
 
-def _hang_up(conn, sid, params, body):  # type: ignore[no-untyped-def]
+def _hang_up(conn: Any, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
     """Cut the connection the way a crashed data server does."""
     conn.sock.shutdown(socket.SHUT_RDWR)
     conn.sock.close()
@@ -127,7 +133,7 @@ def test_a_destination_that_cannot_be_sized_is_still_written(tmp_path, big, cfg,
     def refuse(fd: int, length: int) -> None:
         raise OSError("this device has no length")
 
-    monkeypatch.setattr(client_bulk.os, "ftruncate", refuse)
+    monkeypatch.setattr(os, "ftruncate", refuse)
     target = tmp_path / "unsized.bin"
     result = download(big.url.with_path("/big.bin"), target, config=cfg)
     assert result.size == len(PAYLOAD)
@@ -169,11 +175,19 @@ def test_readinto_assembles_replies_sent_in_instalments(big, cfg):
     assert bytes(buffer) == PAYLOAD
 
 
-def test_a_bulk_read_error_without_a_code_is_a_protocol_error(big, cfg):
-    """An error reply whose code maps to nothing still stops the read."""
+def test_a_bulk_read_error_without_a_code_stops_the_read_as_the_event_path_would(big, cfg):
+    """An error reply whose code maps to nothing still stops the read.
+
+    With the same :class:`ServerError` the event path raises for it: both
+    paths turn a ``kXR_error`` into an exception through one function.
+    """
     big.handlers[c.kXR_read] = lambda conn, sid, params, body: iter([error(sid, 0, "odd")])
-    with _opened(big, cfg) as handle, pytest.raises(ProtocolError, match="error code 0: odd"):
+    with _opened(big, cfg) as handle, pytest.raises(ServerError, match="odd") as bulk:
         handle.readinto(bytearray(len(PAYLOAD)))
+    with _opened(big, cfg.evolve(bulk=False)) as handle, pytest.raises(ServerError) as event:
+        handle.readinto(bytearray(len(PAYLOAD)))
+    assert bulk.value.code == event.value.code == 0
+    assert type(bulk.value) is type(event.value)
 
 
 def test_a_bulk_reader_asked_for_nothing_sends_nothing(big, cfg):
@@ -189,7 +203,10 @@ def test_a_bulk_reader_asked_for_nothing_sends_nothing(big, cfg):
 
 
 class _Lent:
-    """What a :class:`BulkReader` borrows from a session, over a memory pipe."""
+    """What a :class:`BulkReader` borrows from a session, over a memory pipe.
+
+    A stand-in, cast to :class:`Session` where a reader is built.
+    """
 
     def __init__(self, config: Config) -> None:
         self.transport, self.peer = pipe()
@@ -212,7 +229,7 @@ def test_a_bulk_read_past_its_stall_deadline_gives_up(monkeypatch):
     ticks = itertools.count(0.0, 10.0)
     monkeypatch.setattr(session_bulk, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
     lent = _Lent(Config(stall_deadline=5.0))
-    reader = BulkReader(lent, b"HDL0", chunk=16, depth=1)
+    reader = BulkReader(cast(Session, lent), b"HDL0", chunk=16, depth=1)
     with pytest.raises(XrdTimeoutError, match="stalled"):
         list(reader.stream(0, 16))
     assert lent.broken
@@ -225,10 +242,22 @@ def test_a_bulk_read_whose_connection_closes_mid_frame_says_so():
     reader must stop with the bytes it was still owed rather than wait.
     """
     lent = _Lent(Config(stall_deadline=0))
-    reader = BulkReader(lent, b"HDL0", chunk=16, depth=1)
+    reader = BulkReader(cast(Session, lent), b"HDL0", chunk=16, depth=1)
     lent.peer.close()
-    with pytest.raises(XrdTimeoutError, match="connection closed"):
+    with pytest.raises(XrdConnectionError, match="connection closed") as caught:
         list(reader.stream(0, 16))
+    # The peer going away is the event path's ConnectionError, not a timeout:
+    # nothing ran out of time, and a retry on a fresh link may well succeed.
+    assert not isinstance(caught.value, TimeoutError)
+
+
+def test_a_bulk_write_whose_connection_closes_says_so_the_same_way():
+    lent = _Lent(Config(stall_deadline=0))
+    writer = BulkReader(cast(Session, lent), b"HDL0", chunk=16, depth=1)
+    lent.peer.close()
+    with pytest.raises(XrdConnectionError, match="connection closed") as caught:
+        writer.write_from(memoryview(b"x" * 16), 0)
+    assert not isinstance(caught.value, TimeoutError)
 
 
 # ---------------------------------------------------------------------------
@@ -271,9 +300,8 @@ def test_a_bulk_read_goes_unsigned_when_the_session_does_not_sign_reads():
 
 def test_a_receive_whose_deadline_has_passed_is_a_timeout(server, config):
     """No read is attempted once the operation's deadline is behind it."""
-    with Session.connect(server.url, config=config) as session:
-        with pytest.raises(XrdTimeoutError):
-            session._receive(0, time.monotonic() - 1.0)
+    with Session.connect(server.url, config=config) as session, pytest.raises(XrdTimeoutError):
+        session._receive(0, time.monotonic() - 1.0)
 
 
 def test_a_bulk_reader_is_refused_while_a_request_is_outstanding(server, config):
@@ -283,9 +311,11 @@ def test_a_bulk_reader_is_refused_while_a_request_is_outstanding(server, config)
     """
     with Session.connect(server.url, config=config) as session:
         session.machine.submit(r.Ping())
-        with pytest.raises(BulkUnsupported, match="still has requests outstanding"):
-            with session.bulk(b"HDL0", chunk=1024, depth=1):
-                pass  # pragma: no cover - the entry is what raises
+        with (
+            pytest.raises(BulkUnsupported, match="still has requests outstanding"),
+            session.bulk(b"HDL0", chunk=1024, depth=1),
+        ):
+            pass  # the entry is what raises
 
 
 def test_a_busy_data_server_is_not_retried_from_the_manager(config):
@@ -345,7 +375,7 @@ def test_the_memory_transport_is_imported_on_first_use(monkeypatch):
     assert xrdclient.transport.pipe is pipe
     assert xrdclient.transport.MemoryTransport.__name__ == "MemoryTransport"
     with pytest.raises(AttributeError, match="no attribute 'nothing'"):
-        xrdclient.transport.nothing  # noqa: B018
+        _ = xrdclient.transport.nothing
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +388,7 @@ def test_the_crypto_package_lists_and_refuses_names():
     names = dir(xrdclient.crypto)
     assert "Signer" in names and names == sorted(names)
     with pytest.raises(AttributeError, match="no attribute 'nothing'"):
-        xrdclient.crypto.nothing  # noqa: B018
+        _ = xrdclient.crypto.nothing
 
 
 def test_a_page_integrity_error_survives_pickling():

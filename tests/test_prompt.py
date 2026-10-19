@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import argparse
 import io
+import socket
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import pytest
+from xrdhttp.connection import HTTPResponse
+from xrdsec.testing.rawpki import proxy_chain, throwaway_key
 
-from _pki import proxy_chain, throwaway_key
 from xrdclient import auth
 from xrdclient.auth import Ask, GSICredential, TokenCredential, UnixCredential, prompt
 from xrdclient.auth.base import Credential, Offer
@@ -49,6 +53,7 @@ def key():
 def proxy_path(tmp_path, key):
     path = tmp_path / "x509up_u1000"
     path.write_bytes(proxy_chain(key))
+    path.chmod(0o600)
     return str(path)
 
 
@@ -291,6 +296,7 @@ def test_gsi_says_where_it_looked(nowhere):
 def test_gsi_says_how_long_ago_the_proxy_expired(tmp_path, key):
     path = tmp_path / "stale.pem"
     path.write_bytes(proxy_chain(key, not_after=time.time() - 4500))
+    path.chmod(0o600)
     ask = GSICredential.missing(GSI, Config(proxy=str(path)), username="", host="")
     assert ask is not None
     assert ask.reason == f"the proxy in {path} expired 1h 15m ago"
@@ -299,15 +305,18 @@ def test_gsi_says_how_long_ago_the_proxy_expired(tmp_path, key):
 def test_gsi_says_when_the_file_is_not_a_proxy_at_all(tmp_path):
     path = tmp_path / "notes.txt"
     path.write_text("this is not a certificate\n")
+    path.chmod(0o600)
     ask = GSICredential.missing(GSI, Config(proxy=str(path)), username="", host="")
     assert ask is not None
     assert "could not be read as a proxy" in ask.reason
 
 
 def test_gsi_says_when_the_key_is_the_wrong_kind(monkeypatch, proxy_path):
-    loaded = auth.gsi.load_proxy(proxy_path)
+    loaded = auth.gsi.read_proxy(proxy_path)
     monkeypatch.setattr(
-        auth.gsi, "load_proxy", lambda path: type(loaded)(loaded.chain, key=object(), path=path)
+        auth.gsi,
+        "read_proxy",
+        lambda path, named: type(loaded)(loaded.chain, key=object(), path=path),
     )
     ask = GSICredential.missing(GSI, Config(proxy=proxy_path), username="", host="")
     assert ask is not None
@@ -324,7 +333,7 @@ def test_gsi_takes_a_path_with_a_tilde_in_it(monkeypatch, tmp_path):
 
 
 def test_ztn_lists_every_place_it_looked(nowhere, monkeypatch):
-    monkeypatch.setattr("os.getuid", lambda: 4242)
+    monkeypatch.setattr("os.geteuid", lambda: 4242)
     ask = TokenCredential.missing(ZTN, nowhere, username="", host="dav.example.org")
     assert ask is not None
     assert ask.secret  # a token is not for the scrollback
@@ -346,6 +355,7 @@ def test_a_pasted_token_is_used_as_a_token(nowhere):
 def test_a_token_path_is_read_from_instead(tmp_path, nowhere):
     path = tmp_path / "bt_u1000"
     path.write_text("eyJ.from.a.file\n")
+    path.chmod(0o600)
     config = TokenCredential.using(str(path), nowhere.evolve(token="stale"))
     assert config.token is None and config.token_file == str(path)
     assert auth.discover_token(config) == "eyJ.from.a.file"
@@ -646,16 +656,16 @@ def test_a_401_with_a_token_in_hand_is_a_refusal_not_a_question(nowhere):
     config = nowhere.evolve(prompt=True, prompter=scripted, token="the wrong one")
     with FakeDAVServer(files={"/d/a.root": b"hello"}) as dav:
         dav.require_token = "open-sesame"
-        with HTTPClient(config) as client:
-            with pytest.raises(PermissionError):
-                client.request("GET", parse(f"{dav.url}/d/a.root"), expect=(200,))
+        with HTTPClient(config) as client, pytest.raises(PermissionError):
+            client.request("GET", parse(f"{dav.url}/d/a.root"), expect=(200,))
     assert scripted.asked == []
 
 
 def test_a_401_over_tls_asks_for_the_proxy_first(nowhere, proxy_path):
     scripted = Scripted(proxy_path)
     client = HTTPClient(nowhere.evolve(prompt=True, prompter=scripted))
-    assert client._ask_for_credentials(parse("https://dav.example.org/f"), _Challenge(None))
+    with _challenge(None) as challenge:
+        assert client._ask_for_credentials(parse("https://dav.example.org/f"), _header(challenge))
     assert client.config.proxy == proxy_path
     assert [a.mechanism for a in scripted.asked] == ["gsi"]
 
@@ -663,24 +673,40 @@ def test_a_401_over_tls_asks_for_the_proxy_first(nowhere, proxy_path):
 def test_a_bearer_challenge_over_tls_asks_for_a_token(nowhere):
     scripted = Scripted("eyJ.a.b")
     client = HTTPClient(nowhere.evolve(prompt=True, prompter=scripted))
-    challenge = _Challenge('Bearer realm="wlcg", scope="storage.read:/"')
-    assert client._ask_for_credentials(parse("https://dav.example.org/f"), challenge)
+    with _challenge('Bearer realm="wlcg", scope="storage.read:/"') as challenge:
+        assert client._ask_for_credentials(parse("https://dav.example.org/f"), _header(challenge))
     assert client.config.token == "eyJ.a.b"
 
 
 def test_a_401_that_nobody_answers_is_left_as_it_is(nowhere):
     client = HTTPClient(nowhere.evolve(prompt=True, prompter=Scripted(None, None)))
-    assert not client._ask_for_credentials(parse("https://dav.example.org/f"), _Challenge(None))
+    with _challenge(None) as challenge:
+        assert not client._ask_for_credentials(
+            parse("https://dav.example.org/f"), _header(challenge)
+        )
 
 
-class _Challenge:
-    """Just enough of a response to carry a ``WWW-Authenticate`` header."""
+def _header(challenge: HTTPResponse) -> str:
+    """The ``WWW-Authenticate`` a ``401`` carried, as the session hands it over."""
+    return challenge.getheader("WWW-Authenticate") or ""
 
-    def __init__(self, header: str | None) -> None:
-        self.header = header
 
-    def getheader(self, name: str, default: str | None = None) -> str | None:
-        return self.header if name == "WWW-Authenticate" else default
+@contextmanager
+def _challenge(header: str | None) -> Iterator[HTTPResponse]:
+    """A real ``401``, read off a socket pair, with ``header`` as its challenge."""
+    ours, theirs = socket.socketpair()
+    with ours:
+        head = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n"
+        if header is not None:
+            head += f"WWW-Authenticate: {header}\r\n"
+        ours.sendall(f"{head}\r\n".encode())
+    with theirs:
+        response = HTTPResponse(theirs)
+    try:
+        response.begin()
+        yield response
+    finally:
+        response.close()
 
 
 # ---------------------------------------------------------------------------

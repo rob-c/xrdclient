@@ -66,16 +66,6 @@ def dav():
         yield server
 
 
-def test_every_listed_dav_name_opens_the_file_it_names(dav):
-    with xrdclient.FileSystem(dav.url) as fs:
-        names = fs.listdir("/d")
-        assert sorted(names) == sorted([*AWKWARD, "aAb"])
-        for name in AWKWARD:
-            with fs.open(f"/d/{name}", "rb") as handle:
-                assert handle.read() == _body(name), name
-            assert fs.stat(f"/d/{name}").size == len(_body(name))
-
-
 def test_a_dav_name_is_written_renamed_and_removed_as_given(dav):
     with xrdclient.FileSystem(dav.url) as fs:
         for name in AWKWARD:

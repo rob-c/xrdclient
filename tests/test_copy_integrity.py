@@ -15,23 +15,24 @@ from collections.abc import Iterator
 import pytest
 
 import xrdclient
+from xrdclient.crypto import checksum_bytes
 from xrdclient.errors import XRootDError
 from xrdclient.proto import constants as c
 from xrdclient.testing import FakeServer
-from xrdclient.testing.server import _HANDLERS
+from xrdclient.testing.server import _HANDLERS, Handler, _Connection
 
 PAYLOAD = bytes(range(256)) * 40  # 10 240 bytes
 CUT = 4096  # where the misbehaving server's reads run dry
 
 
-def _cut_short(opcode: int):  # type: ignore[no-untyped-def]
+def _cut_short(opcode: int) -> Handler:
     """A read handler that treats the file as ending at :data:`CUT`.
 
     The stat still reports the whole length, which is what a server losing
     its backing store part way through a file looks like from here.
     """
 
-    def handler(conn, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:  # type: ignore[no-untyped-def]
+    def handler(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
         offset, length = struct.unpack(">qi", params[4:16])
         clamped = max(0, min(length, CUT - offset))
         params = params[:4] + struct.pack(">qi", offset, clamped) + params[16:]
@@ -74,15 +75,14 @@ def test_a_short_download_into_a_stream_names_the_stream(short, pump_only):
 
 def test_a_short_pumped_move_keeps_the_source(short, pump_only):
     """The data-loss case: a truncated copy followed by deleting the original."""
-    with FakeServer() as dst:
-        with pytest.raises(XRootDError, match="incomplete"):
-            xrdclient.copy(
-                short.url / "f.bin",
-                dst.url / "f.bin",
-                config=pump_only,
-                verify=False,
-                remove_source=True,
-            )
+    with FakeServer() as dst, pytest.raises(XRootDError, match="incomplete"):
+        xrdclient.copy(
+            short.url / "f.bin",
+            dst.url / "f.bin",
+            config=pump_only,
+            verify=False,
+            remove_source=True,
+        )
     assert short.contents("/f.bin") == PAYLOAD
 
 
@@ -133,7 +133,8 @@ def test_a_strict_local_copy_compares_the_two_files(tmp_path):
     source.write_bytes(PAYLOAD)
     result = xrdclient.copy(source, tmp_path / "b.bin", verify=True, algorithm="adler32")
     assert result.verified
-    assert result.checksum.value == xrdclient.crypto.checksum_bytes("adler32", PAYLOAD)
+    assert result.checksum is not None
+    assert result.checksum.value == checksum_bytes("adler32", PAYLOAD)
 
 
 def test_a_strict_copy_between_streams_and_local_files_is_refused(tmp_path):

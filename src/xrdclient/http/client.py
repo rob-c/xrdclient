@@ -1,36 +1,74 @@
-"""One HTTP/1.1 connection pool, spelled the way the rest of the package is.
+"""Every ``http``/``https``/``dav``/``davs`` request: this package's policy over xrdhttp's session.
 
 Built on :mod:`http.client` because the whole point of this package is that a
 plain interpreter can talk to a storage element: no ``requests``, no
-``httpx``, no wheels. What this adds on top of the stdlib is the part every
-grid client needs anyway - persistent connections keyed by endpoint, bearer
-tokens (macaroons and SciTokens are just bearer tokens), X.509 proxies,
-redirect following across hosts, one retry when a pooled connection turns out
-to have gone stale, and HTTP status codes translated into the same exceptions
-the ``root://`` side raises.
+``httpx``, no wheels. The machinery every grid client needs - persistent
+connections keyed by endpoint and TLS context, one retry when a pooled
+connection turns out to have gone stale, the redirect loop, ``Expect:
+100-continue``, retries with ``Retry-After`` - is
+:class:`xrdhttp.session.Session`, the session xgfalclient and xrdarc use too.
+What is this package's own, and lives here, is the policy it is run with:
+
+* **credentials** - bearer tokens found exactly as ``root://``'s ``ztn``
+  finds them (:func:`bearer_token`; macaroons and SciTokens are just bearer
+  tokens), X.509 proxies in the TLS context ``roots://`` gets
+  (:func:`~xrdclient.transport.base.tls_context`), a ``401`` answered once by
+  acquiring a credential, and a request signer for S3;
+* **where credentials may follow a redirect** - RFC 9110 section 15.4's
+  advice and the browsers' practice: only to the same origin, or to a domain
+  the user named in :attr:`Config.trusted_redirect_domains`
+  (:func:`carries_credentials`); a ``COPY``'s ``TransferHeader*`` within the
+  site (:func:`relays_transfer_headers`);
+* **errors** - HTTP statuses mapped onto the ``kXR_*`` codes the ``root://``
+  side raises (:data:`_ERRORS`, overridable per verb), which is what lets
+  one ``except`` clause serve ``root://`` and ``davs://`` alike;
+* **retries** - a request that may be sent twice (:data:`_RETRYABLE`, no
+  ``If-*`` condition) is sent once more after a connection failure, at once,
+  or after a ``429``/``503`` as long as its ``Retry-After`` asks (capped at
+  :attr:`Config.wait_cap`). A timeout is not repeated.
+
+Where it sits: :class:`HTTPClient` is the one object that owns sockets for
+every HTTP request the package makes. :mod:`.dav` (the
+:class:`~xrdclient.FileSystem` verbs), :mod:`.file` (ranged reads and
+streamed writes), :mod:`.tpc` (WLCG third-party ``COPY``), :mod:`.tape` (the
+WLCG Tape REST API) and :mod:`xrdclient.s3` all borrow one. Start reading at
+:meth:`HTTPClient.open`, then :meth:`HTTPClient._prepare` (one hop's headers).
+
+How it differs from the two clients users compare it with:
+
+* **davix** (gfal2's HTTP layer) also pools connections, but re-sends every
+  header - the ``Authorization`` it was given included - to whatever host a
+  redirect names. Here credentials stay with their origin unless the user
+  says otherwise.
+* **XrdCl** reaches HTTP through a plug-in (XrdClHttp, itself on davix) that
+  reports failures as XRootD status codes; :data:`_ERRORS` does the same
+  mapping here.
+
+What must not break: request targets are encoded exactly once
+(:func:`wire_path`), bearer tokens never appear in a request target
+(:func:`request_target`), and an error response is always read before it is
+raised so that the pooled connection stays usable (the session does that).
 """
 
 from __future__ import annotations
 
-import contextlib
-import http.client
-import os
 import ssl
-import urllib.parse
-import weakref
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 
-from .._compat import SLOTS, TIMEOUTS
-from .._log import get_logger
+from xrdhttp import redirects as _policy
+from xrdhttp import session as _http
+from xrdhttp.connection import HTTPMessage, IncompleteRead
+from xrdhttp.redirects import wire_path
+
+from .._tokens import TOKEN_FIELDS, discover_token, url_token
 from ..config import Config
 from ..errors import (
-    ConnectionError as XRDConnectionError,
-)
-from ..errors import (
+    AbortedError,
     ProtocolError,
     RedirectLimitError,
     TransientError,
+    _error_for_status,
     kXR_ArgInvalid,
     kXR_FileLocked,
     kXR_ItExists,
@@ -42,15 +80,11 @@ from ..errors import (
     kXR_Unsupported,
     raise_for_status,
 )
-from ..errors import (
-    TimeoutError as XRDTimeoutError,
-)
+from ..errors import ConnectionError as XRDConnectionError
+from ..errors import TimeoutError as XRDTimeoutError
+from ..log import get_logger, redact
 from ..transport.base import tls_context
-from ..url import XRootDURL, parse, quote_path
-from ._connection import HTTPConnection, HTTPSConnection
-from ._engine import REDIRECTS as _REDIRECTS
-from ._engine import Request, attempt, redirects
-from .expect import InterimAnswer, await_continue, wants_expect
+from ..url import XRootDURL, parse
 
 __all__ = [
     "HTTPClient",
@@ -78,6 +112,8 @@ _RETRYABLE = frozenset(
     {"GET", "HEAD", "PUT", "DELETE", "OPTIONS", "PROPFIND", "MKCOL", "MOVE", "COPY"}
 )
 
+#: Sent with every request: who is asking, and that any answer will do.
+_STANDING = {"User-Agent": "xrd/1.0 (pure python)", "Accept": "*/*"}
 
 #: HTTP status to the ``kXR_*`` code that means the same thing, so one status
 #: table feeds the one exception table the whole package already has.
@@ -101,79 +137,146 @@ _ERRORS: dict[int, int] = {
 
 #: What a body is truncated to when a caller asks for the whole thing. A
 #: PROPFIND against a huge collection is the realistic way to blow up memory.
-MAX_BODY = 1 << 26
+MAX_BODY = _http.MAX_BODY
 
-#: How much of an abandoned body is read out to keep its connection. Less
-#: than this costs less than the handshake a new connection would; more is
-#: cheaper to throw away with the socket.
-DRAIN_LIMIT = 64 * 1024
-
-#: Query fields that are bearer tokens. They are presented in the
-#: ``Authorization`` header and never sent in a request target.
-_TOKEN_FIELDS = ("authz", "access_token")
-
-#: Request headers that are credentials, lower-cased. ``TransferHeader*`` is
-#: a whole family: a ``COPY`` asks the server to pass each one on to the far
-#: side, and the one that matters is the far side's token.
-_CREDENTIAL_HEADERS = frozenset({"authorization", "proxy-authorization", "cookie"})
-_CREDENTIAL_PREFIX = "transferheader"
+#: Every status below 400 is an answer unless a request says otherwise.
+_SUCCESS = range(400)
 
 
-@dataclass(**SLOTS)
+@dataclass(slots=True)
 class Response:
     """A finished HTTP response: status line, headers, and the whole body."""
 
     status: int
     reason: str
-    headers: http.client.HTTPMessage
+    headers: HTTPMessage
     body: bytes = b""
     url: str = ""
 
     def header(self, name: str, default: str = "") -> str:
+        """The value of header ``name`` (case-insensitive), or ``default``.
+
+        A header sent more than once comes back as its first occurrence,
+        which is :meth:`email.message.Message.get`'s rule.
+        """
         return self.headers.get(name, default)
 
     @property
     def content_length(self) -> int | None:
+        """The declared ``Content-Length``, or ``None`` when absent or malformed.
+
+        ``isdigit`` rather than ``int()`` in a ``try``: a signed or spaced
+        value is not a valid length under RFC 9110 section 8.6, and a server
+        that sends one is better treated as having declared nothing.
+        """
         raw = self.headers.get("Content-Length")
         return int(raw) if raw is not None and raw.isdigit() else None
 
     def text(self, encoding: str = "utf-8") -> str:
+        """The body decoded as ``encoding``, undecodable bytes replaced.
+
+        Used for error bodies and XML, where a stray byte must not turn a
+        diagnostic into a ``UnicodeDecodeError``.
+        """
         return self.body.decode(encoding, "replace")
 
 
 def bearer_token(config: Config, url: XRootDURL | None = None) -> str | None:
-    """The token to present, in the order a grid user expects it to be found.
+    """The token to present, found exactly as ``root://``'s ``ztn`` finds it.
 
     A token in the URL wins because it was written at the call site; then the
-    explicit :attr:`~xrdclient.Config.token`, then the token file that
-    ``BEARER_TOKEN_FILE`` (or :attr:`~xrdclient.Config.token_file`) names, then
-    ``$BEARER_TOKEN``.
+    explicit :attr:`~xrdclient.Config.token` (or an explicitly set
+    :attr:`~xrdclient.Config.token_file`), then the WLCG Bearer Token
+    Discovery order: ``$BEARER_TOKEN``, ``$BEARER_TOKEN_FILE``,
+    ``$XDG_RUNTIME_DIR/bt_u<euid>``, ``/tmp/bt_u<euid>``. See
+    :mod:`xrdclient._tokens`; a token file that is not private to this
+    user raises :class:`~xrdclient.errors.InsecureCredentialError`.
     """
-    from_url = _url_token(url) if url is not None else None
-    if from_url:
-        return from_url
-    if config.token:
-        return config.token
-    if config.token_file:
-        try:
-            with open(config.token_file, encoding="utf-8") as fh:
-                return fh.read().strip() or None
-        except OSError:
-            _log.debug("token file %s is unreadable", config.token_file)
-    return os.environ.get("BEARER_TOKEN") or None
+    return discover_token(config, url)
 
 
-def _context(config: Config) -> ssl.SSLContext:
+def _context(config: Config, *, system_ca: bool = False) -> ssl.SSLContext:
     """A TLS context — the same one ``roots://`` gets.
 
     ``davs://`` and ``roots://`` must trust the same CAs and present the same
     X.509 proxy, so this defers to :func:`xrdclient.transport.base.tls_context`
-    rather than building a second context that could drift from it.
+    rather than building a second context that could drift from it - and
+    that shares one context between every connection made with the same
+    settings and credential, which is what lets the session pool by context.
+    ``system_ca`` adds the operating system's CAs to a grid CA directory; see
+    :meth:`HTTPClient.system_ca_for`.
     """
-    return tls_context(config)
+    return tls_context(config, system_ca=system_ca)
 
 
-@dataclass(**SLOTS)
+class _Errors(_http.Errors):
+    """This package's words for what the session reports.
+
+    ``table`` overrides :data:`_ERRORS` for one request, because WebDAV
+    reuses statuses: a ``405`` from ``MKCOL`` means the collection is already
+    there, while everywhere else it means the server does not implement the
+    verb.
+    """
+
+    def __init__(self, table: dict[int, int] | None = None) -> None:
+        """Map statuses through ``table`` first, then :data:`_ERRORS`."""
+        self.table = table
+
+    def status(self, answer: _http.Answer) -> Exception:
+        """The ``kXR_*`` exception the status means (see :func:`status_code`)."""
+        message = f"HTTP {answer.status} {answer.reason}"
+        code = status_code(answer.status, self.table)
+        return _error_for_status(code, message, path=parse(answer.url).path)
+
+    def transport(self, failure: _http.Failure) -> Exception:
+        """A timeout, a body cut short, or a connection that failed - this package's errors.
+
+        A body that ends before its declared ``Content-Length`` is a dropped
+        connection, not a shorter answer: a :class:`TransientError`, which a
+        caller that resumes (:mod:`.file`) resumes.
+        """
+        what = f"{failure.method} {redact(failure.url)}"
+        error = failure.error
+        if isinstance(error, IncompleteRead):
+            return TransientError(
+                f"connection closed {error.expected} bytes short of the declared "
+                f"Content-Length for {what}"
+            )
+        if isinstance(error, TimeoutError):
+            return XRDTimeoutError(f"{what} timed out")
+        return XRDConnectionError(f"{what} failed: {error}")
+
+    def redirect(
+        self, method: str, url: str, problem: str, error: Exception | None = None
+    ) -> Exception:
+        """:class:`RedirectLimitError` for one too many; a ``Location`` not HTTP is malformed."""
+        if error is None:
+            return RedirectLimitError(f"{problem} for {redact(url)}")
+        return ProtocolError(f"{method} {redact(url)}: {problem}")
+
+    def closed(self, aborted: bool) -> Exception:
+        """:class:`AbortedError`: only :meth:`HTTPClient.abort` closes the session."""
+        return AbortedError("this HTTP client was aborted")
+
+
+_DEFAULT_ERRORS = _Errors()
+
+
+def _session_url(url: XRootDURL) -> str:
+    """``url`` as the session carries it: this package's scheme, the path wire-encoded.
+
+    The scheme stays ``dav``/``davs``/``https`` so a hop knows which trust
+    anchors it gets (:meth:`HTTPClient.system_ca_for`); the path is encoded
+    once (:func:`wire_path`), which :func:`~xrdclient.url.parse` undoes once,
+    so a hop parsed back is the URL it was; and the query goes as written,
+    tokens included - :meth:`HTTPClient._prepare` takes them out of the
+    request target and into the ``Authorization`` header.
+    """
+    query = f"?{url.cgi}" if url.cgi else ""
+    return f"{url.scheme}://{url.netloc}{wire_path(url.path or '/')}{query}"
+
+
+@dataclass(slots=True)
 class HTTPClient:
     """Connections to one or more HTTP endpoints, reused between requests.
 
@@ -181,12 +284,11 @@ class HTTPClient:
         >>> client.request("HEAD", parse("https://dav.example.org/store/f")).status
         200
 
-    Not thread-safe, exactly like the :mod:`http.client` connections it holds:
-    give each thread its own.
+    Safe to share between threads (the session underneath is): parallel
+    streams each get a connection of their own.
     """
 
     config: Config = field(default_factory=Config)
-    _pool: dict[tuple[str, str, int], http.client.HTTPConnection] = field(default_factory=dict)
     #: Called with ``(method, url, headers, body)`` just before a request goes
     #: out, and answers with the headers that authorise it. ``None`` is an
     #: endpoint that wants no such thing; :mod:`xrdclient.s3` is what sets one.
@@ -197,11 +299,56 @@ class HTTPClient:
     #: :attr:`Config.trusted_redirect_domains`, which is empty unless set -
     #: the rule browsers and ``requests`` follow; see :func:`carries_credentials`.
     trusted_redirect_domains: tuple[str, ...] | None = None
-    #: The connection each response not yet finished with is being read
-    #: from, so that :meth:`abandon` can find it after a redirect.
-    _serving: weakref.WeakKeyDictionary[http.client.HTTPResponse, http.client.HTTPConnection] = (
-        field(default_factory=weakref.WeakKeyDictionary, repr=False)
-    )
+    #: Whether a TLS connection also trusts the operating system's CAs, on
+    #: top of a grid CA directory. ``None`` decides by scheme: ``https://`` -
+    #: the web's scheme, and the one every S3 endpoint is reached by - does;
+    #: ``davs://``, the grid's, keeps to the IGTF CAs as gfal2 and XrdCl do.
+    #: See :func:`~xrdclient.transport.base.tls_context`.
+    system_ca: bool | None = None
+    #: The pooled session every request goes through, made with the client.
+    _session: _http.Session = field(init=False, repr=False)
+    #: Set by :meth:`abort`, and never cleared.
+    _aborted: bool = field(default=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """Make the session, with this package's policy (see the module documentation)."""
+        config = self.config
+        retry = _http.RetryPolicy(
+            retries=1,
+            statuses=frozenset({429, 503}),
+            transport=True,
+            backoff=0.0,
+            cap=config.wait_cap,
+            methods=_RETRYABLE,
+        )
+        policy = _http.Policy(
+            headers=_STANDING,
+            connect_timeout=config.connect_timeout,
+            timeout=config.request_timeout,
+            retry=retry,
+            redirects=_http.RedirectPolicy(config.redirect_limit, self._carries, self._relays),
+            # Verification off is the user's explicit choice in this package.
+            warn_unverified=False,
+        )
+        self._session = _http.Session(tls=self._tls, policy=policy, errors=_DEFAULT_ERRORS)
+
+    def system_ca_for(self, url: XRootDURL) -> bool:
+        """Whether a connection to ``url`` trusts the system CAs as well."""
+        if not url.use_tls:
+            return False
+        if self.system_ca is not None:
+            return self.system_ca
+        return url.scheme == "https"
+
+    def _tls(self, url: str) -> ssl.SSLContext:
+        """The session's TLS factory: one hop's context, by the scheme that hop has.
+
+        A ``davs://`` request must not ride a connection whose server was
+        vouched for by a commercial CA, and the session pools by context, so
+        the two never share a connection.
+        """
+        parsed = parse(url)
+        return _context(self.config, system_ca=self.system_ca_for(parsed))
 
     def _trusted(self) -> tuple[str, ...]:
         """The domains credentials may follow a redirect to, from here or the config."""
@@ -209,128 +356,81 @@ class HTTPClient:
             return self.trusted_redirect_domains
         return tuple(self.config.trusted_redirect_domains)
 
+    def _carries(self, origin: str, target: str) -> bool:
+        """:func:`carries_credentials` with this client's trusted domains, logged.
+
+        The debug line is the only trace a user gets when a redirect to
+        another host fails with ``401`` because their token stayed behind.
+        """
+        source, destination = parse(origin), parse(target)
+        trusted = carries_credentials(source, destination, self._trusted())
+        if not trusted:
+            _log.debug("not sending credentials for %s to %s", source.host, destination.host)
+        return trusted
+
+    def _relays(self, origin: str, target: str) -> bool:
+        """:func:`relays_transfer_headers` over the session's URL strings."""
+        return relays_transfer_headers(parse(origin), parse(target))
+
     def close(self) -> None:
-        """Drop every pooled connection. Idempotent."""
-        for conn in self._pool.values():
-            conn.close()
-        self._pool.clear()
+        """Drop every idle connection; the client stays usable. Idempotent."""
+        self._session.clear()
+
+    def idle_count(self) -> int:
+        """How many connections wait to be reused (tests pin pooling with it)."""
+        return self._session.idle_count()
+
+    def abort(self) -> None:
+        """Shut every connection down now, and refuse every request after.
+
+        Safe from another thread: it wakes a thread blocked on a connection -
+        a request in flight, or a response being streamed - to an end of
+        stream. Such a request, and every later one, raises
+        :class:`~xrdclient.errors.AbortedError`. Idempotent.
+        """
+        self._aborted = True
+        self._session.abort()
 
     def __enter__(self) -> HTTPClient:
+        """Use the client as a context manager; :meth:`close` runs on exit."""
         return self
 
     def __exit__(self, *exc: object) -> None:
+        """Close every pooled connection; exceptions are never suppressed."""
         self.close()
 
     def __repr__(self) -> str:
-        return f"HTTPClient({len(self._pool)} connection(s))"
-
-    # ------------------------------------------------------------------
-    # Connections
-    # ------------------------------------------------------------------
-
-    def connection(self, url: XRootDURL) -> http.client.HTTPConnection:
-        """The pooled connection for ``url``'s endpoint, opened on demand."""
-        key = _key(url)
-        conn = self._pool.get(key)
-        if conn is None:
-            conn = self._connect(url)
-            self._pool[key] = conn
-        return conn
-
-    def ready(self, url: XRootDURL, timeout: float | None = None) -> http.client.HTTPConnection:
-        """The pooled connection for ``url``, connected and set to read.
-
-        The handshake is bounded by :attr:`Config.connect_timeout`, which
-        is all that setting is for. Every read after it waits up to
-        ``timeout``, or :attr:`Config.request_timeout` - a transfer that is
-        slow but alive is not cut off at the connect window. The read
-        timeout is set on every request, so one request's override does not
-        outlive it on the pooled connection.
-        """
-        conn = self.connection(url)
-        if conn.sock is None:
-            conn.connect()
-        wait = self.config.request_timeout if timeout is None else timeout
-        # Zero or less is "no limit" here, as it is for the other deadlines;
-        # a socket given zero would be non-blocking instead.
-        conn.sock.settimeout(wait if wait > 0 else None)
-        return conn
-
-    def _connect(self, url: XRootDURL) -> http.client.HTTPConnection:
-        scheme, host, port = _key(url)
-        timeout = self.config.connect_timeout
-        if scheme == "https":
-            return HTTPSConnection(host, port, timeout=timeout, ssl_context=_context(self.config))
-        return HTTPConnection(host, port, timeout=timeout)
-
-    def _discard(self, url: XRootDURL) -> None:
-        conn = self._pool.pop(_key(url), None)
-        if conn is not None:
-            conn.close()
-
-    def abandon(self, response: http.client.HTTPResponse) -> None:
-        """Close a response that will not be read to the end, cleanly.
-
-        Closing a response does not close its connection, and one given up
-        mid-body leaves the rest on the socket, where the next request on
-        that connection would read it as its status line - and a ``POST`` is
-        not retried, so it fails outright. So a short remainder is read out,
-        which keeps the connection; anything more costs the connection
-        instead, and the pool reconnects on the next request. Idempotent.
-        """
-        conn = self._serving.pop(response, None)
-        try:
-            if not response.isclosed() and not _drain(response) and conn is not None:
-                self._forget(conn)
-        finally:
-            response.close()
-
-    def _forget(self, conn: http.client.HTTPConnection) -> None:
-        """Close ``conn`` and take it out of the pool, wherever it is keyed."""
-        conn.close()
-        for key in [k for k, pooled in self._pool.items() if pooled is conn]:
-            del self._pool[key]
+        """A summary that shows the pool size and nothing that could be a secret."""
+        return f"HTTPClient({self.idle_count()} connection(s))"
 
     # ------------------------------------------------------------------
     # Requests
     # ------------------------------------------------------------------
 
-    def headers_for(
-        self,
-        url: XRootDURL,
-        extra: dict[str, str] | None = None,
-        *,
-        credentials: bool = True,
-        relay: bool | None = None,
-    ) -> dict[str, str]:
-        """Standing headers for ``url``, with ``extra`` layered on top.
+    def _prepare(self, hop: _http.Hop) -> None:
+        """One hop's credentials and request target, just before it is sent.
 
-        ``credentials=False`` is a request to a host the credentials were not
-        meant for: the configured token and every credential header in
-        ``extra`` are left out. A token in ``url``'s own query is still
-        presented, because whoever wrote that URL chose to hand it over.
-        ``relay`` overrides that for the ``TransferHeader*`` family alone -
-        see :func:`relays_transfer_headers`.
+        RFC 6750 section 2.1: the token goes in ``Authorization``, never in
+        the target, where proxies and access logs would keep it. Where the
+        caller's credentials may not go (see :func:`carries_credentials`),
+        only a token in the hop's own URL is presented, because whoever wrote
+        that URL chose to hand it over. A signer signs last, for the host it
+        is given, so its signature covers the final headers.
         """
-        headers = {"User-Agent": "xrd/1.0 (pure python)", "Accept": "*/*"}
-        token = bearer_token(self.config, url) if credentials else _url_token(url)
+        url = parse(hop.url)
+        token = bearer_token(self.config, url) if hop.credentials else url_token(url)
         if token:
-            headers["Authorization"] = f"Bearer {token}"
-        if extra:
-            keep = credentials if relay is None else relay
-            headers.update(
-                extra if credentials else _without_credentials(extra, keep_transfer=keep)
-            )
-        return headers
-
-    def sign(
-        self, method: str, url: XRootDURL, headers: dict[str, str], body: bytes | None
-    ) -> dict[str, str]:
-        """Add whatever authorises this request, in place. A no-op without a
-        :attr:`signer`, which is every endpoint that takes a bearer token."""
+            hop.headers["Authorization"] = f"Bearer {token}"
         if self.signer is not None:
-            headers.update(self.signer(method, url, headers, body))
-        return headers
+            body = hop.body if isinstance(hop.body, bytes) else None
+            hop.headers.update(self.signer(hop.method, url, hop.headers, body))
+        hop.url = f"{url.scheme}://{url.netloc}{request_target(url)}"
+
+    def _reauth(self, url: str, response: _http.Response) -> _http.Auth | None:
+        """The session's ``401`` hook: credentials to repeat the hop with, if any were found."""
+        if self._ask_for_credentials(parse(url), response.header("WWW-Authenticate")):
+            return _http.Auth(prepare=self._prepare)
+        return None
 
     def open(
         self,
@@ -342,81 +442,28 @@ class HTTPClient:
         expect: tuple[int, ...] = (),
         errors: dict[int, int] | None = None,
         timeout: float | None = None,
-    ) -> http.client.HTTPResponse:
+    ) -> _http.Response:
         """Issue a request and hand back the *unread* response.
 
         The connection stays busy until the caller reads and closes it, which
         is what makes a ranged ``GET`` a stream rather than a buffer.
-        ``timeout`` is the longest any one read of it may wait, in place of
-        :attr:`Config.request_timeout` (see :meth:`ready`).
+        ``expect`` replaces the default success set (every status below 400)
+        rather than adding to it: ``MKCOL`` lists ``201`` alone, because
+        RFC 4918 section 9.3.1 defines no other success for it. ``timeout``
+        is the longest any one read may wait, in place of
+        :attr:`Config.request_timeout`; zero or less is no limit.
         """
-        origin = final = url
-        asked = False
-
-        def send(request: Request[XRootDURL, bytes]) -> http.client.HTTPResponse:
-            nonlocal final
-            final = request.url
-            return self._once(
-                request.method,
-                request.url,
-                request.body,
-                headers,
-                credentials=request.credentials,
-                relay=request.relay,
-                timeout=timeout,
-            )
-
-        def advance(
-            request: Request[XRootDURL, bytes], response: http.client.HTTPResponse
-        ) -> XRootDURL | None:
-            nonlocal asked, origin
-            if response.status == 401 and not asked:
-                asked = True
-                if self._ask_for_credentials(request.url, response):
-                    origin, request.credentials = request.url, True
-                    response.read(MAX_BODY)
-                    response.close()
-                    return request.url
-            if response.status in _REDIRECTS and response.getheader("Location"):
-                target, request.credentials, request.relay = self._next_hop(
-                    response, origin, request.url, request.credentials, request.relay
-                )
-                _log.debug("%s redirected to %s", request.method, target)
-                return target
-            return None
-
-        response = redirects(
-            Request(method, url, body),
-            send,
-            advance,
-            self.config.redirect_limit,
-            lambda: RedirectLimitError(
-                f"more than {self.config.redirect_limit} redirects for {url}"
-            ),
+        return self._session.request(
+            method,
+            _session_url(url),
+            body=body,
+            headers=headers,
+            auth=_http.Auth(prepare=self._prepare),
+            expect=expect or _SUCCESS,
+            timeout=self.config.request_timeout if timeout is None else timeout,
+            reauth=self._reauth,
+            errors=_Errors(errors) if errors else None,
         )
-        return _checked(response, final, expect, errors)
-
-    def _next_hop(
-        self,
-        response: http.client.HTTPResponse,
-        origin: XRootDURL,
-        current: XRootDURL,
-        trusted: bool,
-        relay: bool,
-    ) -> tuple[XRootDURL, bool, bool]:
-        """Where a redirect goes, and what may still be sent there.
-
-        Both rights only ever narrow along a chain: once a hop leaves the
-        origin, the caller's credentials stay behind for good, and a copy's
-        ``TransferHeader*`` headers once they leave its site.
-        """
-        location = response.getheader("Location", "")
-        response.read()
-        response.close()
-        target = _redirect(current, location)
-        trusted = trusted and self._carries_credentials(origin, target)
-        relay = relay and (trusted or relays_transfer_headers(origin, target))
-        return target, trusted, relay
 
     def request(
         self,
@@ -437,194 +484,65 @@ class HTTPClient:
         deliberately, which is different: nothing was lost on the wire.)
         """
         response = self.open(method, url, body=body, headers=headers, expect=expect, errors=errors)
-        try:
-            payload = b"" if method == "HEAD" else response.read(MAX_BODY)
-            if method != "HEAD" and len(payload) < MAX_BODY and response.length:
-                raise TransientError(
-                    f"connection closed {response.length} bytes short of the "
-                    f"declared Content-Length for {method} {url}"
-                )
-        finally:
-            response.close()
-        return Response(response.status, response.reason, response.msg, payload, str(url))
+        payload = response.body(MAX_BODY)
+        # A body already buffered reads whole after an abort; the request was
+        # still in progress when it came, so it fails.
+        if self._aborted:
+            raise AbortedError(f"{method} {url} was aborted")
+        return Response(response.status, response.reason, response.headers, payload, str(url))
 
-    def _ask_for_credentials(self, url: XRootDURL, response: http.client.HTTPResponse) -> bool:
+    def _ask_for_credentials(self, url: XRootDURL, challenge: str) -> bool:
         """Ask for what a ``401`` says is needed. ``True`` if worth retrying.
 
         HTTP has no security trailer, so the challenge stands in for one:
         ``WWW-Authenticate: Bearer`` wants a token, and an ``https`` endpoint
         that says anything else is asking for the X.509 proxy it would have
         wanted in the handshake. Plain ``http`` can only ever use a token.
+        ``challenge`` is the answer's ``WWW-Authenticate``. The new credential
+        changes the ``Authorization`` header and the context the handshake
+        presents - a new context, so a new pool.
         """
         from ..auth import supply
 
-        challenge = (response.getheader("WWW-Authenticate") or "").lower()
-        wanted = ["ztn"] if "bearer" in challenge or not url.use_tls else ["gsi", "ztn"]
+        bearer = "bearer" in challenge.lower()
+        wanted = ["ztn"] if bearer or not url.use_tls else ["gsi", "ztn"]
         for name in wanted:
             config = supply(name, self.config, host=url.host)
             if config is not None:
                 self.config = config
-                # Both halves of the request change with the answer: the
-                # Authorization header, and the certificate the context
-                # presents - and a pooled connection has the old one.
                 self.close()
                 return True
         return False
 
-    def _send_expecting(
-        self,
-        conn: http.client.HTTPConnection,
-        method: str,
-        target: str,
-        body: bytes,
-        headers: dict[str, str],
-    ) -> http.client.HTTPResponse:
-        """Send the headers, wait for ``100 Continue``, then the body.
-
-        A server that answers first - EOS's ``307`` to a disk server - gets
-        its answer returned without a byte of the body having been sent, so
-        :meth:`open` follows the redirect instead of dying mid-upload.
-        """
-        announced = {**headers, "Expect": "100-continue"}
-        if not any(name.lower() == "content-length" for name in announced):
-            announced["Content-Length"] = str(len(body))
-        conn.request(method, target, body=None, headers=announced)
-        try:
-            await_continue(conn, method)
-        except InterimAnswer as early:
-            self._release(conn)
-            return early.response
-        conn.send(body)
-        return conn.getresponse()
-
-    def _release(self, conn: http.client.HTTPConnection) -> None:
-        """Take a connection with a half-sent request out of the pool.
-
-        It is not closed here: the early response is still being read from
-        its socket, and closing that response closes the socket with it.
-        """
-        for key in [k for k, pooled in self._pool.items() if pooled is conn]:
-            del self._pool[key]
-
     def begin_upload(
         self, method: str, url: XRootDURL, headers: dict[str, str]
-    ) -> tuple[http.client.HTTPConnection, XRootDURL]:
+    ) -> tuple[_http.Upload, XRootDURL]:
         """Open a chunked upload of unknown length, following early redirects.
 
         The headers go out with ``Expect: 100-continue``, so a server that
         redirects the upload does it before any of the body is committed to
-        the wrong host. Returns the connection to stream the chunks into and
-        the URL they are going to.
+        the wrong host. Returns the upload to stream the chunks into and the
+        URL they are going to. A server that refuses before the body is sent
+        is raised here, as its status means.
         """
-        target, trusted = url, True
-        for _ in range(self.config.redirect_limit + 1):
-            conn = self.ready(target)
-            standing = self.headers_for(target, headers, credentials=trusted)
-            sent = self.sign(method, target, standing, None)
-            conn.putrequest(method, request_target(target))
-            for name, value in sent.items():
-                conn.putheader(name, value)
-            conn.putheader("Transfer-Encoding", "chunked")
-            conn.putheader("Expect", "100-continue")
-            conn.endheaders()
-            try:
-                await_continue(conn, method)
-            except InterimAnswer as early:
-                self._release(conn)
-                response = early.response
-                location = response.getheader("Location")
-                try:
-                    response.read(MAX_BODY)
-                finally:
-                    response.close()
-                if response.status in _REDIRECTS and location:
-                    target = _redirect(target, location)
-                    trusted = trusted and self._carries_credentials(url, target)
-                    _log.debug("%s redirected to %s", method, target)
-                    continue
-                check_status(response.status, response.reason, target, (), None)
-                raise ProtocolError(
-                    f"{target.host} answered {method} with {response.status} "
-                    f"{response.reason} before the body was sent"
-                ) from None
-            return conn, target
-        raise RedirectLimitError(f"more than {self.config.redirect_limit} redirects for {url}")
-
-    def _carries_credentials(self, origin: XRootDURL, target: XRootDURL) -> bool:
-        trusted = carries_credentials(origin, target, self._trusted())
-        if not trusted:
-            _log.debug("not sending credentials for %s to %s", origin.host, target.host)
-        return trusted
-
-    def _once(
-        self,
-        method: str,
-        url: XRootDURL,
-        body: bytes | None,
-        headers: dict[str, str] | None,
-        *,
-        credentials: bool = True,
-        relay: bool | None = None,
-        timeout: float | None = None,
-    ) -> http.client.HTTPResponse:
-        """One request, retried once if a pooled connection had gone stale.
-
-        A timeout is not retried: a stale connection fails at once, and a
-        server that has not answered in the time allowed would only be
-        given it twice.
-        """
-        target = request_target(url)
-        # A signer signs for the host it is given, so its signature is no
-        # use anywhere else and is added whoever that host is.
-        standing = self.headers_for(url, headers, credentials=credentials, relay=relay)
-        sent = self.sign(method, url, standing, body)
-        # A conditional request is not safe to repeat: the first attempt may
-        # have been applied, which makes the second one fail its condition.
-        repeatable = method in _RETRYABLE and not any(k.lower().startswith("if-") for k in sent)
-
-        def send(unused: None) -> http.client.HTTPResponse:
-            conn = self.ready(url, timeout)
-            if body is not None and wants_expect(method, len(body)):
-                response = self._send_expecting(conn, method, target, body, sent)
-            else:
-                conn.request(method, target, body=body, headers=sent)
-                response = conn.getresponse()
-            self._serving[response] = conn
-            return response
-
-        return attempt(
-            lambda: None,
-            send,
-            lambda unused: self._discard(url),
-            lambda unused, error: repeatable and not isinstance(error, TIMEOUTS),
-            lambda error: _wrap(error, method, url),
+        upload = self._session.upload(
+            method,
+            _session_url(url),
+            None,
+            headers=headers,
+            auth=_http.Auth(prepare=self._prepare),
+            timeout=self.config.request_timeout,
         )
-
-
-def _key(url: XRootDURL) -> tuple[str, str, int]:
-    scheme = "https" if url.use_tls else "http"
-    return (scheme, url.host, url.port)
-
-
-def _checked(
-    response: http.client.HTTPResponse,
-    url: XRootDURL,
-    expect: tuple[int, ...],
-    errors: dict[int, int] | None,
-) -> http.client.HTTPResponse:
-    """``response``, unless its status is one the caller did not ask for."""
-    try:
-        check_status(response.status, response.reason, url, expect, errors)
-    except Exception:
-        # Drain before unwinding: an error response left unread makes the
-        # pooled connection unusable, and the next request on it would be
-        # silently re-sent on a fresh one.
-        try:
-            response.read(MAX_BODY)
-        finally:
-            response.close()
-        raise
-    return response
+        target = parse(upload.url)
+        early = upload.early
+        if early is not None:
+            status, reason = early.status, early.reason
+            early.close()
+            check_status(status, reason, target, (), None)
+            raise ProtocolError(
+                f"{target.host} answered {method} with {status} {reason} before the body was sent"
+            )
+        return upload, target
 
 
 def request_target(url: XRootDURL) -> str:
@@ -638,23 +556,8 @@ def request_target(url: XRootDURL) -> str:
     request target.
     """
     target = wire_path(url.path or "/")
-    query = url.cgi_except(_TOKEN_FIELDS)
+    query = url.cgi_except(TOKEN_FIELDS)
     return f"{target}?{query}" if query else target
-
-
-def wire_path(path: str) -> str:
-    """A plain path percent-encoded, exactly once, for an HTTP request.
-
-    Every byte but ``/`` and RFC 3986's unreserved characters is escaped -
-    a ``%`` included. By the time a path gets here it is a name: a path
-    argument is one as given, and an ``http(s)://`` URL's path was decoded
-    once when it was parsed. Keeping an existing ``%41`` as an escape would
-    send a file literally called ``a%41b`` to ``aAb``, and a name read back
-    from a listing would not open the file it came from. The escaping is
-    also exactly what S3 signs as its canonical URI, so the signature and
-    the wire agree.
-    """
-    return quote_path(path)
 
 
 def absolute_url(url: XRootDURL) -> str:
@@ -670,98 +573,44 @@ def absolute_url(url: XRootDURL) -> str:
     return f"{scheme}://{url.netloc}{wire_path(url.path or '/')}{query}"
 
 
+def _origin(url: XRootDURL) -> str:
+    """``url``'s origin as xrdhttp's policy reads one: ``http(s)://host:port``.
+
+    The policy needs nothing past the authority, and only ``http``/``https``
+    (and the grid's ``dav``/``davs``) are schemes it knows, so the wire
+    scheme is spelt out here rather than handing over whatever this package
+    called the URL.
+    """
+    return f"{'https' if url.use_tls else 'http'}://{url.netloc}"
+
+
 def carries_credentials(
     origin: XRootDURL, target: XRootDURL, trusted: Collection[str] = ()
 ) -> bool:
     """Whether a redirect from ``origin`` to ``target`` may carry credentials.
 
-    The rule browsers, ``curl`` and ``requests`` follow: only to the same
-    scheme, host and port, and never from HTTPS down to plain HTTP. A host
-    in one of the ``trusted`` domains (see
-    :attr:`HTTPClient.trusted_redirect_domains`) is let through whatever its
-    port - that is how a site whose head node hands off to its data nodes is
-    opted in - but still not over a downgrade.
+    The rule browsers, ``curl`` and ``requests`` follow
+    (:func:`xrdhttp.redirects.carries_credentials`): only to the same scheme,
+    host and port, and never from HTTPS down to plain HTTP. A host in one of
+    the ``trusted`` domains (see :attr:`HTTPClient.trusted_redirect_domains`)
+    is let through whatever its port - that is how a site whose head node
+    hands off to its data nodes is opted in - but still not over a downgrade.
     """
-    if origin.use_tls and not target.use_tls:
-        return False
-    if _key(origin) == _key(target):
-        return True
-    return any(_in_domain(target.host, domain) for domain in trusted)
+    return _policy.carries_credentials(_origin(origin), _origin(target), trusted)
 
 
 def relays_transfer_headers(origin: XRootDURL, target: XRootDURL) -> bool:
     """Whether a redirect may carry a ``COPY``'s ``TransferHeader*`` headers.
 
-    Those are not this client's credential for the host it is talking to:
-    they are what the node that runs a third-party copy must present to the
-    *far* endpoint - in practice a macaroon minted for this one transfer,
-    scoped to one file and a few activities, for minutes. EOS's head node
-    hands every ``COPY`` to a disk server of its own over plain ``http``
-    (``st-*.cern.ch:8443``, authorised by a capability it signs), and a copy
-    whose headers stayed behind fails there with ``401``. So they follow a
-    redirect within the site that sent it - the origin's parent domain,
-    which the origin proved it speaks for over TLS - even down to ``http``,
-    and never anywhere else. The caller's own ``Authorization`` keeps the
-    stricter rule of :func:`carries_credentials`. davix and gfal2 send
-    everything everywhere.
+    They follow within the site that sent the redirect - the origin's parent
+    domain, unless that is a public suffix such as ``ac.uk`` - even down to
+    ``http``, because EOS hands every ``COPY`` to a disk server of its own
+    over plain ``http`` and a copy whose headers stayed behind fails there
+    with ``401``; never anywhere else. The caller's own ``Authorization``
+    keeps the stricter :func:`carries_credentials`. The rule, and why, is
+    :func:`xrdhttp.redirects.relays_transfer_headers`.
     """
-    labels = origin.host.lower().split(".")
-    if len(labels) < 3 or labels[-1].isdigit():  # a bare domain, or an address
-        return origin.host.lower() == target.host.lower()
-    return _in_domain(target.host.lower(), ".".join(labels[1:]))
-
-
-def _in_domain(host: str, domain: str) -> bool:
-    domain = domain.lower().strip(".")
-    return domain == "*" or host == domain or host.endswith("." + domain)
-
-
-def _url_token(url: XRootDURL) -> str | None:
-    """The bearer token ``url`` carries in its own query, if any."""
-    for name in _TOKEN_FIELDS:
-        value = url.query.get(name)
-        if value:
-            return value.removeprefix("Bearer ").strip()
-    return None
-
-
-def _without_credentials(headers: dict[str, str], *, keep_transfer: bool = False) -> dict[str, str]:
-    """``headers`` less any that would authenticate the request.
-
-    ``keep_transfer`` keeps the ``TransferHeader*`` family, which a
-    same-site redirect of a ``COPY`` must carry to the node that runs it.
-    """
-    return {
-        name: value
-        for name, value in headers.items()
-        if name.lower() not in _CREDENTIAL_HEADERS
-        and (keep_transfer or not name.lower().startswith(_CREDENTIAL_PREFIX))
-    }
-
-
-def _drain(response: http.client.HTTPResponse) -> bool:
-    """Read out a short remainder. ``True`` if the response is now finished."""
-    if response.length is None or response.length > DRAIN_LIMIT:
-        return False
-    with contextlib.suppress(http.client.HTTPException, OSError):
-        response.read()
-    return response.isclosed()
-
-
-def _redirect(current: XRootDURL, location: str) -> XRootDURL:
-    """Resolve a ``Location`` against the URL that produced it.
-
-    A ``Location`` is a URL a server encoded; :func:`~xrdclient.url.parse`
-    decodes its path once, and :func:`request_target` encodes it once again
-    when it is followed.
-    """
-    if "://" in location:
-        target = parse(location)
-    else:
-        base = f"{_key(current)[0]}://{current.netloc}{wire_path(current.path)}"
-        joined = urllib.parse.urljoin(base, location)
-        target = parse(joined).evolve(username=current.username, password=current.password)
-    return target
+    return _policy.relays_transfer_headers(_origin(origin), _origin(target))
 
 
 def check_status(
@@ -777,6 +626,8 @@ def check_status(
     a ``405`` from ``MKCOL`` means the collection is already there, while
     everywhere else it means the server does not implement the verb.
     """
+    # ``expect`` replaces the default success set (every status below 400)
+    # rather than adding to it, as for :meth:`HTTPClient.open`.
     if status in expect if expect else status < 400:
         return
     raise_for_status(status_code(status, errors), f"HTTP {status} {reason}", path=url.path)
@@ -793,10 +644,3 @@ def status_code(status: int, errors: dict[int, int] | None = None) -> int:
     if code is not None:
         return code
     return kXR_ServerError if status >= 500 else kXR_ArgInvalid
-
-
-def _wrap(exc: Exception, method: str, url: XRootDURL) -> Exception:
-    """Present a transport failure as this package's error, not the stdlib's."""
-    if isinstance(exc, TIMEOUTS):
-        return XRDTimeoutError(f"{method} {url} timed out")
-    return XRDConnectionError(f"{method} {url} failed: {exc}")

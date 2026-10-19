@@ -21,14 +21,18 @@ over with a round trip that would only be a guess.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import urllib.parse
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Sequence
-from typing import IO, Any, Literal, overload
+from typing import IO, Any, Literal, TypedDict, overload
 
-from .._xml import UnsafeXML
+from xrdcore.safexml import UnsafeXML
+from xrdhttp.s3.codec import decode, listing_items, manifest, modified
+from xrdhttp.s3.sigv4 import DEFAULT_REGION, Credentials, hash_payload, sign
+
 from ..config import Config
 from ..errors import (
     BusyError,
@@ -48,10 +52,8 @@ from ..http.file import HTTPRawIO, open_http
 from ..io.raw import OpenBinaryMode, OpenTextMode
 from ..types import ChecksumInfo, DirEntry, PrepareStatus, StatInfo
 from ..url import XRootDURL, parse
-from ._codec import decode, listing_items, manifest, modified
-from .sigv4 import DEFAULT_REGION, Credentials, hash_payload, sign
 
-__all__ = ["S3FileSystem", "S3RawIO", "open_s3", "MIN_PART_SIZE"]
+__all__ = ["MIN_PART_SIZE", "S3FileSystem", "S3RawIO", "open_s3"]
 
 #: The smallest part S3 accepts in a multipart upload, except for the last
 #: one. A streamed write holds this much before it can send anything.
@@ -83,6 +85,12 @@ def endpoint_from_env() -> str:
 
 
 def _list_params(prefix: str, token: str) -> dict[str, str]:
+    """The query of one ``ListObjectsV2`` page under ``prefix``.
+
+    The ``/`` delimiter is what folds deeper keys into ``CommonPrefixes`` -
+    one level of a tree, the way ``readdir`` sees it. ``token`` continues a
+    truncated listing (S3 returns at most 1000 entries a page).
+    """
     params = {"delimiter": "/", "prefix": prefix}
     if token:
         params["continuation-token"] = token
@@ -90,6 +98,14 @@ def _list_params(prefix: str, token: str) -> dict[str, str]:
 
 
 def _entry(name: str, item: dict[str, Any] | None, parent: str, algorithm: str) -> DirEntry:
+    """One listing row as a :class:`~xrdclient.types.DirEntry`.
+
+    ``item`` is the object's listing record, or ``None`` for a common
+    prefix, which becomes a directory with no size, time or ETag. The ETag
+    doubles as the entry's ``id`` and, when ``algorithm`` asked for one and it
+    is a plain MD5 (see :func:`_is_md5`), as its checksum - free, because S3
+    already sent it.
+    """
     info = item or {}
     tag = _etag(info.get("ETag", ""))
     flags = StatInfoFlags.IS_READABLE | (
@@ -107,6 +123,14 @@ def _entry(name: str, item: dict[str, Any] | None, parent: str, algorithm: str) 
         ),
         checksum=ChecksumInfo("md5", tag) if algorithm and _is_md5(tag) else None,
     )
+
+
+class S3Options(TypedDict, total=False):
+    """The keywords :class:`S3FileSystem` takes beyond a URL and a config."""
+
+    credentials: Credentials | None
+    region: str
+    endpoint: str
 
 
 class S3FileSystem(HTTPFileSystem):
@@ -136,6 +160,14 @@ class S3FileSystem(HTTPFileSystem):
         region: str = "",
         endpoint: str = "",
     ) -> None:
+        """Address the bucket ``url`` names; no request is made yet.
+
+        ``url``'s host is the bucket and its path is where relative paths
+        given to the methods resolve from. ``region`` scopes the signature and, for AWS
+        itself, picks the hostname; it defaults to ``AWS_REGION`` /
+        ``AWS_DEFAULT_REGION`` and then ``us-east-1``. A URL without a bucket
+        raises :class:`ValueError`.
+        """
         self.url = parse(url)
         if not self.url.host:
             raise ValueError(f"{str(self.url)!r} names no bucket; an S3 URL is s3://bucket/key")
@@ -148,13 +180,15 @@ class S3FileSystem(HTTPFileSystem):
         self.region = region or region_from_env()
         where = endpoint or endpoint_from_env()
         self._endpoint = parse(where) if where else None
-        self.client = HTTPClient(self.config, signer=self._sign)
+        # An S3 service is vouched for by a commercial CA, not an IGTF one.
+        self.client = HTTPClient(self.config, signer=self._sign, system_ca=True)
         #: There is no XRootD session behind this one either.
-        self._router = None  # type: ignore[assignment]
+        self._router = None
 
     # -- plumbing ------------------------------------------------------
 
     def __repr__(self) -> str:
+        """The bucket URL, without a query that might carry credentials."""
         return f"S3FileSystem({str(self.url.evolve(query={}))!r})"
 
     @property
@@ -204,6 +238,7 @@ class S3FileSystem(HTTPFileSystem):
         )
 
     def _unsupported(self, what: str) -> ServerError:
+        """The error for an operation S3 cannot express (``kXR_Unsupported``)."""
         return UnsupportedError(kXR_Unsupported, f"{what} has no S3 equivalent")
 
     # -- interrogation -------------------------------------------------
@@ -233,6 +268,7 @@ class S3FileSystem(HTTPFileSystem):
         )
 
     def _stat_object(self, key: str) -> StatInfo:
+        """``HEAD`` one key: an object, never a prefix; a 404 propagates."""
         response = self.client.request("HEAD", self._url(key))
         return StatInfo(
             id=_etag(response.header("ETag")),
@@ -468,16 +504,27 @@ class S3FileSystem(HTTPFileSystem):
         fresh: bool = False,
         priority: int = 0,
         flags: PrepareFlags | int | str | None = None,
+        cancel: bool = False,
+        reqid: str | None = None,
     ) -> str:
+        """Refused: S3 has no tape staging (Glacier restores are another API).
+
+        The signature is :meth:`~xrdclient.FileSystem.prepare`'s, kept whole so
+        a caller written against any backend gets the same refusal rather
+        than a :class:`TypeError`.
+        """
         raise self._unsupported("staging from tape")
 
     def query_prepare(self, handle: str, paths: Sequence[str]) -> list[PrepareStatus]:
+        """Refused, like :meth:`prepare`."""
         raise self._unsupported("staging from tape")
 
-    def cancel_prepare(self, handle: str) -> None:
+    def cancel_prepare(self, handle: str, paths: Sequence[str] = ()) -> None:
+        """Refused, like :meth:`prepare`."""
         raise self._unsupported("staging from tape")
 
     def archive_info(self, paths: Sequence[str]) -> list[PrepareStatus]:
+        """Refused: an object store has no notion of disk versus tape residency."""
         raise self._unsupported("asking where a file is")
 
 
@@ -490,7 +537,12 @@ class S3RawIO(HTTPRawIO):
     it does over WebDAV, and anything larger becomes a multipart upload with
     parts of at least :data:`MIN_PART_SIZE` - which is what the protocol
     requires of every part but the last.
+
+    A vector read asks for one range at a time: S3 answers a request for
+    several with the whole object, which is the one answer worth avoiding.
     """
+
+    multirange = False
 
     def __init__(
         self,
@@ -500,6 +552,11 @@ class S3RawIO(HTTPRawIO):
         config: Config | None = None,
         client: HTTPClient | None = None,
     ) -> None:
+        """Open ``url`` as :class:`~xrdclient.http.file.HTTPRawIO` does.
+
+        ``client`` is normally the owning :class:`S3FileSystem`'s, which is
+        what signs every request this object makes - parts included.
+        """
         # Before the base class, which can fail and then close this object.
         self._upload_id = ""
         self._parts: list[str] = []
@@ -511,16 +568,23 @@ class S3RawIO(HTTPRawIO):
         super().__init__(url, mode, config=config, client=client)
 
     def __repr__(self) -> str:
+        """The object URL and mode."""
         return f"S3RawIO({str(self.url)!r}, mode={self.mode!r})"
 
     @property
     def _streaming(self) -> bool:
+        """Whether writes have become a multipart upload (the base class asks)."""
         # A failed upload still counts: that keeps later writes and the close
         # on the path that reports the failure, rather than the one that
         # would PUT what is left as if it were the whole object.
         return bool(self._upload_id) or self._failure is not None
 
     def _stream_after(self) -> int:
+        """How much the base class buffers before switching to :meth:`_begin_upload`.
+
+        Never below :data:`MIN_PART_SIZE`: the first part must be at least
+        that, and the buffer becomes the first part.
+        """
         return max(self.config.chunk_size, MIN_PART_SIZE)
 
     def _begin_upload(self) -> None:
@@ -542,6 +606,7 @@ class S3RawIO(HTTPRawIO):
         self._drain(final=False)
 
     def _send_chunk(self, payload: bytes) -> None:
+        """Take one write's worth into the pending part; send it once it is big enough."""
         self._check_intact()
         self._pending += payload
         self._drain(final=False)
@@ -610,12 +675,11 @@ class S3RawIO(HTTPRawIO):
     def _abort(self, upload: str) -> None:
         """Throw the parts away. A failure here is not worth masking the one
         that led to it, so it is swallowed."""
-        try:
+        with contextlib.suppress(OSError, ServerError):
             self.client.request("DELETE", self._with({"uploadId": upload}), expect=(200, 202, 204))
-        except (OSError, ServerError):  # pragma: no cover - best effort only
-            pass
 
     def _with(self, params: dict[str, str]) -> XRootDURL:
+        """The object URL with multipart query parameters added to its own."""
         return self.url.evolve(query={**self.url.query, **params})
 
 
@@ -634,7 +698,8 @@ def open_s3(  # type: ignore[overload-overlap]
     credentials: Credentials | None = ...,
     region: str = ...,
     endpoint: str = ...,
-) -> S3RawIO: ...
+) -> S3RawIO:
+    """``buffering=0``: the raw layer itself."""
 
 
 @overload
@@ -650,7 +715,8 @@ def open_s3(
     credentials: Credentials | None = ...,
     region: str = ...,
     endpoint: str = ...,
-) -> IO[bytes]: ...
+) -> IO[bytes]:
+    """A binary mode: a buffered reader, writer or random-access stream."""
 
 
 @overload
@@ -666,7 +732,8 @@ def open_s3(
     credentials: Credentials | None = ...,
     region: str = ...,
     endpoint: str = ...,
-) -> IO[str]: ...
+) -> IO[str]:
+    """A literal text mode: a :class:`io.TextIOWrapper`."""
 
 
 @overload
@@ -682,7 +749,8 @@ def open_s3(
     credentials: Credentials | None = ...,
     region: str = ...,
     endpoint: str = ...,
-) -> IO[Any]: ...
+) -> IO[Any]:
+    """A mode only known at run time: bytes or text, the type cannot say which."""
 
 
 def open_s3(
@@ -699,6 +767,11 @@ def open_s3(
     endpoint: str = "",
 ) -> IO[Any] | io.RawIOBase:
     """Open an ``s3://`` URL like :func:`open`.
+
+    ``credentials``, ``region`` and ``endpoint`` are as for
+    :class:`S3FileSystem`; the rest are :func:`open`'s. The signature is
+    public and longer than this code base otherwise allows; it mirrors
+    :func:`~xrdclient.io.open_url` plus the three S3 settings.
 
         >>> with open_s3("s3://my-bucket/runs/a.root") as fh:   # doctest: +SKIP
         ...     header = fh.read(4)
@@ -739,6 +812,7 @@ def _close_with(stream: Any, done: Callable[[], None]) -> None:
     closer = stream.close
 
     def close() -> None:
+        """The stream's own close, then ``done`` - even if the first raises."""
         try:
             closer()
         finally:

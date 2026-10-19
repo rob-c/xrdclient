@@ -25,10 +25,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from xrdcore import log as core_log
 
-from xrdclient import _log
+from xrdclient import log as _log
 from xrdclient.compat import client
 from xrdclient.compat.client import _channels, _convert, _dispatch, env
+from xrdclient.compat.client.file import _answering
 from xrdclient.compat.client.flags import DirListFlags
 from xrdclient.config import Config
 from xrdclient.proto import constants as c
@@ -180,10 +182,12 @@ def test_a_file_that_does_not_follow_fails_its_open(manager, data):
 def test_a_files_properties_change_an_open_file(data):
     f = client.File()
     ok(f.open(_url(data) + "/d/a"))
+    native = f.native
+    assert native is not None
     assert f.set_property("FollowRedirects", "false")
-    assert f.native._router.follow_redirects is False
+    assert native._router.follow_redirects is False
     assert f.set_property("ReadRecovery", "no")
-    assert (f.get_property("ReadRecovery"), f.native.recover_handles) == ("false", False)
+    assert (f.get_property("ReadRecovery"), native.recover_handles) == ("false", False)
     assert f.set_property("WriteRecovery", "false") and f.get_property("WriteRecovery") == "false"
     assert not f.set_property("Nonsense", "true")
     ok(f.close())
@@ -313,10 +317,12 @@ def test_read_recovery_decides_whether_a_lost_server_is_survived(data, recover):
     data.disconnect()
     time.sleep(0.2)
     status, response = f.read(0, 5)
+    native = f.native
+    assert native is not None
     if recover == "true":
-        assert (status.ok, response, f.native.recoveries) == (True, b"alpha", 1)
+        assert (status.ok, response, native.recoveries) == (True, b"alpha", 1)
     else:
-        assert not status.ok and f.native.recoveries == 0
+        assert not status.ok and native.recoveries == 0
 
 
 # -- dirlist ------------------------------------------------------------------------------
@@ -545,7 +551,7 @@ class _Kept(logging.Handler):
 
 @pytest.fixture
 def kept(monkeypatch):
-    monkeypatch.setattr(_log, "_muted", {})
+    monkeypatch.setattr(core_log, "_muted", {})  # the table is xrdcore's
     root = logging.getLogger("xrdclient")
     before = root.level
     root.setLevel(logging.DEBUG)  # through setLevel, which clears the loggers' caches
@@ -601,10 +607,10 @@ def test_every_topic_names_loggers_under_this_package():
 
 
 def test_unmuting_forgets_the_band(monkeypatch):
-    monkeypatch.setattr(_log, "_muted", {})
+    monkeypatch.setattr(core_log, "_muted", {})  # the table is xrdcore's
     _log.mute(10, 20, ["xrdclient.a"])
     _log.mute(10, 20, [])
-    assert _log._muted == {}
+    assert core_log._muted == {}
 
 
 # -- environment keys -----------------------------------------------------------------------
@@ -613,6 +619,17 @@ def test_unmuting_forgets_the_band(monkeypatch):
 def test_every_registered_key_says_what_it_does():
     assert set(env.EFFECTS) == set(env._INTS) | set(env._STRINGS)
     assert all(env.EFFECTS[key] for key in env.EFFECTS)
+
+
+def test_the_network_stack_and_keepalive_time_reach_the_native_config(monkeypatch):
+    monkeypatch.setattr(env, "_ints", {})
+    monkeypatch.setattr(env, "_strings", {})
+    monkeypatch.delenv("XRD_NETWORKSTACK", raising=False)
+    monkeypatch.delenv("XRD_TCPKEEPALIVETIME", raising=False)
+    assert env.EnvPutString("NetworkStack", "IPv4")
+    assert env.EnvPutInt("TCPKeepAliveTime", 45)
+    native = env._build_config()  # env.config is pinned for this module
+    assert (native.network_stack, native.keepalive_interval) == ("IPv4", 45.0)
 
 
 def test_a_put_to_a_key_xrdcl_does_not_register_ignores_the_shell(monkeypatch):
@@ -628,7 +645,9 @@ def test_a_put_to_a_key_xrdcl_does_not_register_ignores_the_shell(monkeypatch):
 
 @pytest.fixture
 def official():
-    return pytest.importorskip("XRootD.client", reason="the official bindings are not installed")
+    return pytest.importorskip(
+        "XRootD.client", reason="environmental: the official XRootD bindings are not installed"
+    )
 
 
 def _plain(text: str) -> str:
@@ -645,7 +664,7 @@ def _callback_answer(call: Any) -> tuple[Any, Any, Any]:
 @pytest.fixture
 def fronted(real_server, sandbox, monkeypatch):
     """A fake manager in front of the real daemon, and a file behind it."""
-    from conftest import _REAL_CONFIG
+    from tests.conftest import _REAL_CONFIG
 
     monkeypatch.setattr(env, "config", lambda: _REAL_CONFIG)
     Path(sandbox, "f").write_bytes(b"payload")
@@ -752,7 +771,7 @@ def _listings(module: Any, url: str, path: str) -> list[Any]:
 @pytest.mark.interop
 @pytest.mark.parity
 def test_listings_by_flag_are_the_bindings_listings(official, real_server, sandbox, monkeypatch):
-    from conftest import _REAL_CONFIG
+    from tests.conftest import _REAL_CONFIG
 
     monkeypatch.setattr(env, "config", lambda: _REAL_CONFIG)
     big = Path(sandbox, "big")
@@ -767,7 +786,7 @@ def test_listings_by_flag_are_the_bindings_listings(official, real_server, sandb
 
 def _local_root(base: Path, name: str, files: dict[str, bytes]) -> Any:
     """A real daemon whose ``/data`` lives under a root of its own."""
-    import _xrootd
+    from tests import _xrootd
 
     root = base / name
     for rel, payload in files.items():
@@ -795,17 +814,18 @@ def _local_root(base: Path, name: str, files: dict[str, bytes]) -> Any:
 
 def _started(stack: contextlib.ExitStack, make: Any) -> Any:
     """A daemon started, trying again on a fresh port if another process took its one."""
-    for attempt in range(3):
+    for _ in range(2):
         server = make()
         try:
             server.start()
         except RuntimeError:
-            if attempt == 2:
-                raise
             continue
         stack.callback(server.stop)
         return server
-    raise AssertionError("unreachable")  # pragma: no cover
+    server = make()
+    server.start()  # the third try: a failure now is the test's
+    stack.callback(server.stop)
+    return server
 
 
 def _described(entry: Any) -> tuple[str, str, int | None]:
@@ -815,7 +835,7 @@ def _described(entry: Any) -> tuple[str, str, int | None]:
 @pytest.mark.interop
 @pytest.mark.parity
 def test_a_located_merged_listing_is_the_bindings(official, real_server, tmp_path, monkeypatch):
-    from conftest import _REAL_CONFIG
+    from tests.conftest import _REAL_CONFIG
 
     monkeypatch.setattr(env, "config", lambda: _REAL_CONFIG)
     with contextlib.ExitStack() as stack:
@@ -924,10 +944,13 @@ def test_every_key_reads_as_the_bindings_read_it(official, monkeypatch):
 def test_a_file_whose_connection_has_gone_still_names_its_server(data):
     f = client.File()
     ok(f.open(_url(data) + "/d/a"))
-    session, f.native._router._session = f.native._router._session, None
+    native = f.native
+    assert native is not None
+    session, native._router._session = native._router._session, None
     try:
-        hosts = f._File__hosts([])  # type: ignore[attr-defined]
-        assert [(h.protocol, h.flags) for h in hosts] == [(0, 0)]
+        # What a request answered without a hop is named after.
+        hop = _answering(native)
+        assert (hop.url, hop.version, hop.flags) == (native._router.url, 0, 0)
     finally:
-        f.native._router._session = session
+        native._router._session = session
     ok(f.close())

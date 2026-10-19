@@ -1,12 +1,14 @@
 # Machine-readable command output
 
-Every `xrd-fs` subcommand and `xrd-cp` accepts:
+Every `xrd-fs` and `xrd-proxy` subcommand and `xrd-cp` accepts, before or
+after the subcommand:
 
 ```console
 $ xrd-fs stat --output-format json root://storage.example//store/a.root
 $ xrd-fs prepare --xml root://tape.example//store/a.root
 $ xrd-cp --output-format xml input.root root://storage.example//store/input.root
 $ xrd-fs --output-format json --help
+$ xrd-proxy --output-format json info -exists
 $ xrd-cp --output-format json --version
 ```
 
@@ -86,6 +88,42 @@ GFAL staging and other compatibility commands can retain exit 0 while a file
 fails: coordinators must check both `summary.ok` and individual states.
 `error_count` counts error observations, not unique failed files.
 
+## Schema contract and versioning
+
+The document is identified by `schema` (`"storage-client-report"`, which
+names the format, not the tool) and `version` (an integer, now `1`). Within
+one version:
+
+- **May change:** new record `kind`s, new fields in any record or in
+  `summary`, new `status` values, new tools and commands, the wording of
+  `message` and `error.message` text. Consumers must ignore what they do
+  not recognise.
+- **Will not change:** the meaning, type or presence of an existing field;
+  `sequence` order; the `summary` fields and their rule (`ok` is exit `0`
+  *and* no `error` records); numeric `code`/`errno` namespaces; the XML
+  type and encoding attributes.
+
+Anything in the second list changing means `version` 2, and a consumer
+that sees a version it does not know should stop rather than guess. The
+version is `xrdclient.report.VERSION` and the schema name
+`xrdclient.report.SCHEMA`; xgfalclient and xrdarc write the same document
+through the same module, so they cannot drift apart.
+
+## Writing a tool that emits it
+
+`xrdclient.report` is public: build the parser with `report.Parser`, add
+the format options with `report.flags(parser)`, call `report.identify`
+once the command is known and `report.record` / `report.error` /
+`report.message` as it runs, and wrap the command in `report.run_cli(tool,
+argv, run)`, which owns the exit code and writes the document. With
+`--output-format text` the same calls print or do nothing, so a command
+has one code path. An example is in
+[Building a tool on xrdclient](building-tools.md#command-line-reports).
+(`xrdclient.report` is `xrdcore.report`, where the implementation lives since
+0.4.0; importing it through xrdclient registers `XRootDURL` so URLs are
+written as strings. The pre-0.4.0 private name `xrdclient.cli._output` was
+removed in 0.4.0.)
+
 ## XML types and binary data
 
 XML carries the same values as JSON, including null, booleans, arrays and
@@ -117,7 +155,9 @@ built-in XML serializer, without a new parser dependency. Strings containing
 XML-invalid characters or carriage returns, including undecodable filenames, have
 `encoding="utf8-surrogatepass-base64"`; decode base64 then UTF-8 with
 `surrogatepass`. Invalid field names are similarly encoded, with
-`name_encoding="utf8-surrogatepass-base64"`.
+`name_encoding="utf8-surrogatepass-base64"`. From Python,
+`xrdcore.report.parse(text, "xml")` (or `"json"`) does all of this and returns
+the same tree for either format.
 
 Binary values in either format are objects containing `encoding="base64"`
 and `data`. For `cat`, `tail` or copies to stdout, concatenate the decoded

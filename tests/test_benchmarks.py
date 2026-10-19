@@ -20,6 +20,7 @@ BENCH = Path(__file__).resolve().parent.parent / "benchmarks" / "bench.py"
 @pytest.fixture(scope="module")
 def bench():
     spec = importlib.util.spec_from_file_location("xrd_bench", BENCH)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

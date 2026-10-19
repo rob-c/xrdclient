@@ -1,58 +1,35 @@
 # Builds the sdist and wheel on a version tag and uploads them to PyPI through
 # trusted publishing (no API token: PyPI trusts this workflow's OIDC identity,
-# registered under the project's "Publishing" settings).
+# registered under the project's "Publishing" settings, with the "pypi"
+# environment).
+#
+# xrdclient is built on xrdcore, xrdsec and xrdhttp, which must already be on
+# PyPI: the pre-flight refuses to publish otherwise, and the release wheel is
+# then installed from PyPI's libraries alone, never from a checkout. Release
+# order and the whole chain's runbook: docs/releasing.md.
 name: Publish
 
 on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: read
+
 jobs:
+  # Every step but the upload is xrd-devtools' shared publish action: build,
+  # `twine check --strict`, the pre-flight (the libraries are on PyPI), then a
+  # clean install whose tag, runtime version and dated changelog section agree.
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Install GSSAPI build prerequisites on Linux
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
-      - uses: actions/setup-python@v5
+      - uses: rob-c/xrd-devtools/.github/actions/publish@main
         with:
-          python-version: "3.12"
-      - run: pip install 'build>=1,<2' 'twine>=6,<7'
-      - run: python -m build
-      - run: twine check --strict dist/*
-      - name: verify tag, changelog and installed wheel
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          python -m venv /tmp/xrdclient-release
-          /tmp/xrdclient-release/bin/python -m pip install dist/*.whl
-          /tmp/xrdclient-release/bin/python - <<'PY'
-          import importlib.metadata
-          import os
-          from pathlib import Path
+          package: xrdclient
+          preflight: true
 
-          import xrdclient
-
-          version = importlib.metadata.version("xrdclient")
-          if version != xrdclient.__version__:
-              raise SystemExit("wheel metadata and runtime version disagree")
-          if os.environ["RELEASE_TAG"] != f"v{version}":
-              raise SystemExit(f"tag must be v{version}")
-          headings = [
-              line for line in Path("CHANGELOG.md").read_text().splitlines()
-              if line.startswith(f"## [{version}]")
-          ]
-          if not headings:
-              raise SystemExit(f"CHANGELOG.md has no {version} entry")
-          if headings[0].endswith("Unreleased"):
-              raise SystemExit("date the changelog before tagging")
-          PY
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
-
+  # Trusted publishing ties PyPI's trust to this job of this workflow, so the
+  # upload stays here, in a job that only downloads what the build staged.
   publish:
     needs: build
     runs-on: ubuntu-latest

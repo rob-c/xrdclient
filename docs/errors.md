@@ -20,20 +20,23 @@ except PermissionError:
 
 ```
 Exception
-└── XRootDError
-    ├── ProtocolError                 the peer is not speaking XRootD correctly
-    ├── ConnectionError               (also builtins.ConnectionError)
-    │   └── TransientError            worth retrying
-    │       ├── TimeoutError          (also builtins.TimeoutError)
+└── XRootDError                       is xrdcore.errors.XrdError           *
+    ├── ProtocolError                 the peer is not speaking XRootD correctly  *
+    │   └── MetalinkError             (also ValueError)                    *
+    ├── ConnectionError               (also builtins.ConnectionError)      *
+    │   └── TransientError            worth retrying                       *
+    │       ├── TimeoutError          (also builtins.TimeoutError)         *
     │       └── WaitLimitError        the server kept saying "come back later"
-    ├── AuthenticationError
+    ├── AuthenticationError                                                *
     │   ├── NoMechanismError          nothing we have was accepted
-    │   └── CredentialError
-    │       └── TokenExpiredError
+    │   └── CredentialError                                                *
+    │       ├── TokenExpiredError                                          *
+    │       └── InsecureCredentialError (also PermissionError)             *
     ├── RedirectLimitError
     ├── ChecksumMismatchError
     ├── PageIntegrityError            a page kept arriving corrupt on a pgwrite
     ├── TooLargeError                 a whole-file read that would not fit
+    ├── AbortedError                  + OSError             ECANCELED
     └── ServerError                   a kXR_error response
         ├── NotFoundError             + FileNotFoundError   ENOENT
         ├── ExistsError               + FileExistsError     EEXIST
@@ -53,7 +56,84 @@ Exception
 ```
 
 Catch broadly with `xrdclient.XRootDError`, or narrowly with the builtin you already
-know.
+know. The classes marked `*` are [xrdcore's](#one-hierarchy-with-the-libraries).
+
+## One hierarchy with the libraries
+
+Since 0.4.0 the pieces xrdclient shares with xgfalclient and xrdarc live in
+libraries - xrdcore (safe XML, checksums, the copy pump, the report),
+xrdsec (credentials, proxies, VOMS, tokens) and xrdhttp (the HTTP engine,
+WebDAV, S3, Metalink) - and those raise the vocabulary in `xrdcore.errors`,
+never a client's own classes. The design question is how `except` written
+against xrdclient's names still catches them.
+
+The answer is that the names *are* those classes. `xrdclient.errors` binds
+each of its names that means the same thing as an xrdcore error to the
+xrdcore class itself:
+
+| xrdclient name | is |
+|---|---|
+| `XRootDError` | `xrdcore.errors.XrdError` |
+| `ProtocolError`, `MetalinkError` | `xrdcore.errors.ProtocolError`, `.MetalinkError` |
+| `ConnectionError`, `TransientError`, `TimeoutError` | the xrdcore classes of those names |
+| `AuthenticationError`, `CredentialError`, `TokenExpiredError`, `InsecureCredentialError` | the xrdcore classes of those names |
+
+```python
+from xrdcore import errors as core
+import xrdclient
+
+assert xrdclient.XRootDError is core.XrdError
+assert xrdclient.errors.CredentialError is core.CredentialError
+```
+
+So a `CredentialError` raised deep inside xrdsec while xrdclient finds a
+proxy is caught by `except xrdclient.CredentialError`, by `except
+xrdclient.XRootDError`, and by `except xrdcore.errors.CredentialError` alike,
+with nothing translated or re-raised on the way - and the attributes it
+carries (`TransientError.attempts`/`committed`,
+`InsecureCredentialError.path`) arrive intact, pickling included.
+
+The errors only XRootD has - `ServerError` and its `OSError` family with
+their `kXR_*` `code` and `errno`, `NoMechanismError`, `RedirectLimitError`,
+`WaitLimitError`, `ChecksumMismatchError`, `PageIntegrityError`,
+`TooLargeError`, `AbortedError` - are defined in `xrdclient.errors` and join
+the shared hierarchy by inheritance, by multiple inheritance where they are a
+builtin as well (`ServerTimeoutError` is a `ServerError`, an
+`xrdcore.errors.TimeoutError` and a builtin `TimeoutError`). Code that only
+knows the libraries catches them too: `except xrdcore.errors.XrdError`
+catches every error xrdclient raises.
+
+Why not subclass the other way, `class CredentialError(XRootDError,
+xrdcore.errors.CredentialError)`? Because `except` catches a class and what
+is *below* it: the library's `CredentialError` is not below a client
+subclass of it, so every library call would need wrapping to re-raise in the
+client's class, and one forgotten wrapper is an error that slips past
+`except xrdclient.XRootDError`. Binding the names costs one visible change:
+`XRootDError.__name__` is `"XrdError"`.
+
+### xrdsec's own errors
+
+xrdsec (credentials, proxies, VOMS, TLS - `xrdclient.credentials`,
+`xrdclient.crypto.*` and `xrdclient.tls` are its modules since 0.4.0) raises
+the shared classes above for everything a user can act on: an insecure or
+unreadable credential file is `InsecureCredentialError` / `CredentialError`,
+an expired token `TokenExpiredError`, and `VOMSError` with its kinds
+(`VOMSConfigError`, `VOMSRefusedError`, `VOMSUnavailableError`) subclasses
+`CredentialError`. All of those are `XRootDError`s already, so nothing is
+translated at the client boundary.
+
+The rest are deliberately *not* client errors, and stay `ValueError`s:
+`DERError` (and its `SignatureAlgorithmError`) for bytes that are not the
+structure expected, `DelegationError` (also `xrdsec.proxies.ProxyError`)
+for a proxy request that must not be signed, and `TrustError` for a server
+certificate that does not check out. Each is a fact about some bytes, not
+about an operation, and only the caller knows which operation it was: the
+GSI login catches them where it calls xrdsec and raises
+`AuthenticationError` or `CredentialError` naming the server and the step
+(`xrdsec.gsi.secgsi`, which raises `xrdcore.errors.CredentialError` - this
+package's class of that name - and is tested in xrdsec's `tests/test_gsi_secgsi.py`). Code that calls `xrdclient.crypto` (xrdsec) directly sees them as they
+are - which is what a tool parsing a certificate wants - and
+`tests/test_on_xrdsec.py` pins both halves of this split.
 
 `TLSRequiredError` is a server refusing to do this in the clear (`kXR_error`
 3028): its message names the fix, which is to connect with `roots://` (or

@@ -5,46 +5,95 @@ or an already-open file object - is reduced to a binary stream first, so the
 loop in the middle knows nothing about XRootD, and adding a protocol means
 teaching :func:`_reader`/`_writer` one more scheme rather than touching the
 transfer logic.
+
+This module is the core: the public :func:`copy`, :func:`copy_tree` and
+:class:`CopyResult`, and the job -> plan -> move -> verify pipeline between
+them. The pieces around it live in private siblings, each re-exported here so
+every name that was importable from ``xrdclient.copy.engine`` still is:
+``_endpoints`` (the stream adapters and per-endpoint questions), ``_local``
+(local-filesystem recovery and durability), ``_fastpath`` (the bulk data
+plane), ``_metalink`` (Metalink failover) and ``_tree`` (walking, selecting and
+running a tree). Code here calls those names through this module's globals, so
+``monkeypatch.setattr(engine, "_probe", ...)`` still changes what a transfer
+does. See ``docs/architecture.md`` for the map.
 """
 
 from __future__ import annotations
 
-import errno
-import io
+import functools
 import os
-import stat as stat_module
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, suppress
-from dataclasses import dataclass, replace
-from fnmatch import fnmatch
+from dataclasses import dataclass
 from typing import IO, Any, Literal, cast
 
-from .._compat import SLOTS, TIMEOUTS
-from .._log import get_logger
+from xrdcore import fanout
+from xrdcore import retry as _retry
+from xrdcore.checksum import new as new_checksum
+from xrdcore.pipeline import fill as _fill
+from xrdcore.pipeline import pump as _pump
+
 from ..config import Config
-from ..crypto import new as new_checksum
 from ..errors import (
     ChecksumMismatchError,
     UnsupportedError,
     WaitLimitError,
     XRootDError,
-    kXR_Unsupported,
 )
 from ..errors import ConnectionError as XRDConnectionError
 from ..errors import TimeoutError as XRDTimeoutError
+from ..log import get_logger
 from ..session import deadline as dl
 from ..session.bulk import BulkUnsupported
 from ..types import ChecksumInfo
 from ..url import XRootDURL, parse
 from . import replicas
-from ._pipeline import fill as _fill
-from ._pipeline import pump as _pump
+from ._endpoints import _is_stream as _is_stream
+from ._endpoints import _make_parent_collection as _make_parent_collection
+from ._endpoints import _parents_already_made as _parents_already_made
+from ._endpoints import _probe as _probe
+from ._endpoints import _reader as _reader
+from ._endpoints import _remove as _remove
+from ._endpoints import _resumer as _resumer
+from ._endpoints import _root_writer as _root_writer
+from ._endpoints import _server_checksum as _server_checksum
+from ._endpoints import _target_url as _target_url
+from ._endpoints import _writer as _writer
+from ._endpoints import _zip_member as _zip_member
+from ._fastpath import _bulk_to_file as _bulk_to_file
+from ._fastpath import _bulk_to_stream as _bulk_to_stream
+from ._fastpath import _bulk_usable as _bulk_usable
+from ._fastpath import _create as _create
+from ._fastpath import _descriptor_of as _descriptor_of
+from ._fastpath import _write_descriptor as _write_descriptor
+from ._local import _TRANSIENT_LOCAL_READ_ERRORS as _TRANSIENT_LOCAL_READ_ERRORS
+from ._local import _file_identity as _file_identity
+from ._local import _RecoveringLocalReader as _RecoveringLocalReader
+from ._local import _sync_local_target as _sync_local_target
+from ._metalink import _copy_metalink as _copy_metalink
+from ._metalink import _copy_metalink_replica as _copy_metalink_replica
+from ._metalink import _copy_metalink_replicas as _copy_metalink_replicas
+from ._metalink import _load_metalink as _load_metalink
+from ._metalink import _metalink_checksum as _metalink_checksum
+from ._metalink import _metalink_dry_run as _metalink_dry_run
+from ._metalink import _metalink_endpoint as _metalink_endpoint
+from ._metalink import _metalink_replica_config as _metalink_replica_config
+from ._metalink import _metalink_urls as _metalink_urls
+from ._metalink import _secure_metalink_url as _secure_metalink_url
+from ._tree import _each as _each
+from ._tree import _in_order as _in_order
+from ._tree import _make_tree_dirs as _make_tree_dirs
+from ._tree import _prune as _prune
+from ._tree import _selected as _selected
+from ._tree import _sync_options as _sync_options
+from ._tree import _Total as _Total
+from ._tree import _tree_total as _tree_total
+from ._tree import _walk as _walk
 from .limits import Limits, Pace, _Stop
 
-__all__ = ["copy", "copy_tree", "CopyResult", "SyncMode"]
+__all__ = ["CopyResult", "SyncMode", "copy", "copy_tree"]
 
 #: Called with ``(bytes_done, total_or_None)`` after every chunk.
 Progress = Callable[[int, "int | None"], None]
@@ -60,7 +109,7 @@ _log = get_logger(__name__)
 Endpoint = "str | os.PathLike[str] | XRootDURL | IO[bytes]"
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class CopyResult:
     """What one completed transfer did."""
 
@@ -84,248 +133,62 @@ class CopyResult:
 
     @property
     def resumed(self) -> bool:
+        """Whether this call continued a partial target rather than writing it whole."""
         return self.resumed_at > 0
 
     @property
     def verified(self) -> bool:
+        """Whether end-to-end checksum verification ran and passed.
+
+        A mismatch never produces a result - it raises
+        :class:`~xrdclient.errors.ChecksumMismatchError` - so a checksum here
+        is always one both ends agreed on.
+        """
         return self.checksum is not None
 
     def __str__(self) -> str:
+        """``src -> dst (N bytes, resumed at M, R MB/s)``, as the CLI prints it."""
         # A dry run, or a copy too quick for the clock, has no rate to quote.
         rate = f", {self.rate / 1e6:.1f} MB/s" if self.seconds > 0 else ""
         resumed = f", resumed at {self.resumed_at}" if self.resumed_at else ""
         return f"{self.source} -> {self.target} ({self.size} bytes{resumed}{rate})"
 
 
-# ---------------------------------------------------------------------------
-# Endpoint adapters
-# ---------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class _CopyOptions:
+    """Every control of one :func:`copy` call, as a single value.
 
-
-def _is_stream(obj: object) -> bool:
-    """True for something already open - a file object, a socket wrapper."""
-    return hasattr(obj, "read") or hasattr(obj, "write")
-
-
-def _target_url(obj: object) -> XRootDURL | None:
-    """The URL ``obj`` names, or ``None`` if it is an open stream."""
-    return None if _is_stream(obj) else parse(obj)  # type: ignore[arg-type]
-
-
-def _zip_member(url: XRootDURL | None) -> str | None:
-    """The member selected from ``url`` by XrdCl's opaque ZIP parameter."""
-    return None if url is None else url.query.get("xrdcl.unzip")
-
-
-_TRANSIENT_LOCAL_READ_ERRORS = frozenset(
-    getattr(errno, name)
-    for name in ("EAGAIN", "EBUSY", "EINTR", "ESTALE", "ETIMEDOUT")
-    if hasattr(errno, name)
-)
-
-
-def _file_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
-    """Fields that distinguish a file generation even on inode-virtualising FUSE."""
-    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
-
-
-class _RecoveringLocalReader:
-    """A read-only local handle that survives transient filesystem invalidation.
-
-    Network filesystems can return ``ESTALE`` after an otherwise healthy read.
-    Reopening by name is safe only when it is still the same inode; otherwise
-    continuing would silently splice two file generations into one copy.
+    :func:`copy` takes these as keyword arguments (its public signature);
+    inside the engine they travel together, from :func:`copy` to
+    :func:`_copy_one` and :func:`_transfer`, and through the Metalink
+    failover in :mod:`._metalink`, which rewrites a few per replica with
+    :func:`dataclasses.replace` instead of re-spelling all of them. Each
+    field means exactly what the :func:`copy` argument of the same name
+    does, except that ``config`` is already resolved (never ``None``) and
+    ``declared`` has no public spelling at all.
     """
 
-    def __init__(self, path: str, config: Config) -> None:
-        self._path = path
-        self._config = config
-        attempts = 0
-        while True:
-            try:
-                self._handle: IO[bytes] = open(path, "rb", buffering=0)
-                break
-            except OSError as exc:
-                attempts += 1
-                if (
-                    exc.errno not in _TRANSIENT_LOCAL_READ_ERRORS
-                    or attempts > config.connect_retries
-                ):
-                    raise
-                self._pause(attempts)
-        try:
-            info = os.fstat(self._handle.fileno())
-        except BaseException:
-            self._handle.close()
-            raise
-        self._identity = _file_identity(info)
-        self._position = 0
-        self._recovery_chunk: int | None = None
-
-    def _pause(self, attempts: int) -> None:
-        pause = min(self._config.retry_backoff * 2 ** (attempts - 1), self._config.wait_cap)
-        if pause > 0:
-            time.sleep(pause)
-
-    def _retry(self, operation: Callable[[IO[bytes]], Any]) -> Any:
-        attempts = 0
-        while True:
-            try:
-                return operation(self._handle)
-            except OSError as exc:
-                attempts += 1
-                if (
-                    exc.errno not in _TRANSIENT_LOCAL_READ_ERRORS
-                    or attempts > self._config.connect_retries
-                ):
-                    raise
-                self._recovery_chunk = 4096
-                with suppress(OSError):
-                    self._handle.close()
-                self._pause(attempts)
-                replacement = open(self._path, "rb", buffering=0)
-                try:
-                    info = os.fstat(replacement.fileno())
-                    same_file = _file_identity(info) == self._identity
-                    replacement.seek(self._position)
-                except BaseException:
-                    replacement.close()
-                    raise
-                if not same_file:
-                    replacement.close()
-                    raise OSError(errno.ESTALE, "local source changed while recovering") from exc
-                self._handle = replacement
-
-    def read(self, size: int = -1) -> bytes:
-        def read(handle: IO[bytes]) -> bytes:
-            wanted = size
-            if self._recovery_chunk is not None and (wanted < 0 or wanted > self._recovery_chunk):
-                wanted = self._recovery_chunk
-            return handle.read(wanted)
-
-        data = cast("bytes", self._retry(read))
-        self._position += len(data)
-        return data
-
-    def readinto(self, buffer: bytearray) -> int:
-        def readinto(handle: IO[bytes]) -> int:
-            view = memoryview(buffer)
-            if self._recovery_chunk is not None:
-                view = view[: self._recovery_chunk]
-            return cast("int", cast("Any", handle).readinto(view))
-
-        count = cast("int", self._retry(readinto))
-        self._position += count
-        return count
-
-    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
-        position = cast("int", self._retry(lambda handle: handle.seek(offset, whence)))
-        self._position = position
-        return position
-
-    def close(self) -> None:
-        self._handle.close()
+    config: Config
+    chunk_size: int | None = None
+    verify: bool | None = None
+    algorithm: str | None = None
+    overwrite: bool = True
+    progress: Progress | None = None
+    dry_run: bool = False
+    remove_source: bool = False
+    resume: bool = False
+    sources: int = 1
+    dynamic_source: bool = False
+    max_rate: float | None = None
+    min_rate: float | None = None
+    timeout: float | None = None
+    coerce: bool = False
+    #: A checksum the catalogue promised (a Metalink ``<hash>``): the copy
+    #: must match it, rather than whatever the server reports.
+    declared: ChecksumInfo | None = None
 
 
-def _reader(url: XRootDURL, config: Config, stack: ExitStack) -> tuple[IO[bytes], int | None]:
-    """A binary reader for ``url``, plus its size when the endpoint knows it."""
-    if _zip_member(url) is not None:
-        from ..io import open_url
-
-        raw = stack.enter_context(open_url(url, "rb", buffering=0, config=config))
-        size = raw.seek(0, io.SEEK_END)
-        raw.seek(0)
-        return cast("IO[bytes]", raw), size
-    if url.is_local:
-        reader = _RecoveringLocalReader(url.path, config)
-        stack.callback(reader.close)
-        return cast("IO[bytes]", reader), os.path.getsize(url.path)
-    if url.is_root:
-        from ..io import open_url
-
-        raw = stack.enter_context(open_url(url, "rb", buffering=0, config=config))
-        # A RawIOBase reads bytes but is not an ``IO[bytes]`` as far as
-        # typeshed is concerned; the pump only ever calls ``read``.
-        return cast("IO[bytes]", raw), raw.file.size
-    if url.is_http:
-        from ..http import open_http
-
-        return stack.enter_context(open_http(url, "rb", config=config)), None
-    if url.is_s3:
-        from ..s3 import open_s3
-
-        return stack.enter_context(open_s3(url, "rb", config=config)), None
-    raise UnsupportedError(kXR_Unsupported, f"cannot read from {url.scheme}://")
-
-
-def _writer(
-    url: XRootDURL, config: Config, stack: ExitStack, *, overwrite: bool, coerce: bool = False
-) -> IO[bytes]:
-    """A binary writer for ``url``. ``overwrite=False`` means exclusive create.
-
-    ``coerce`` opens a ``root://`` target with ``kXR_force``, which tells the
-    server to ignore its file usage rules - another client's open of the same
-    file - as XrdCl's ``coerce`` does. Nothing else has such rules to ignore.
-    """
-    mode = "wb" if overwrite else "xb"
-    if url.is_local:
-        return stack.enter_context(open(url.path, mode))
-    if url.is_root:
-        return _root_writer(url, mode, config, stack, coerce=coerce)
-    if url.is_http:
-        from ..http import open_http
-
-        return stack.enter_context(open_http(url, mode, config=config))
-    if url.is_s3:
-        from ..s3 import open_s3
-
-        return stack.enter_context(open_s3(url, mode, config=config))
-    raise UnsupportedError(kXR_Unsupported, f"cannot write to {url.scheme}://")
-
-
-def _root_writer(
-    url: XRootDURL, mode: str, config: Config, stack: ExitStack, *, coerce: bool
-) -> IO[bytes]:
-    """``url`` opened for writing in ``mode``, with ``kXR_force`` if ``coerce``."""
-    if not coerce:
-        from ..io import open_url
-
-        raw = stack.enter_context(open_url(url, mode, buffering=0, config=config))
-        return cast("IO[bytes]", raw)
-    from ..client.file import File
-    from ..flags import Access, OpenFlags, flags_for_mode
-    from ..io.raw import XRootDRawIO
-
-    handle = File(url, config)
-    access = Access.OWNER_READ | Access.OWNER_WRITE | Access.GROUP_READ
-    try:
-        handle.open(flags_for_mode(mode) | OpenFlags.FORCE, access)
-    except BaseException:
-        handle.close()
-        raise
-    return cast("IO[bytes]", stack.enter_context(XRootDRawIO(handle, mode, opened=True)))
-
-
-def _resumer(
-    url: XRootDURL, config: Config, stack: ExitStack, offset: int, *, coerce: bool = False
-) -> IO[bytes]:
-    """A writer for ``url`` positioned at ``offset``, keeping what is there.
-
-    An HTTP target has no such thing: a ``PUT`` replaces the whole resource,
-    so a partial upload can only be repeated, never continued.
-    """
-    if url.is_local:
-        handle = stack.enter_context(open(url.path, "r+b"))
-        handle.seek(offset)
-        return handle
-    if url.is_root:
-        raw = _root_writer(url, "r+b", config, stack, coerce=coerce)
-        raw.seek(offset)
-        return raw
-    raise UnsupportedError(kXR_Unsupported, f"cannot resume a copy into {url.scheme}://")
-
-
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class _Ends:
     """The two files a transfer that cannot digest its stream must compare."""
 
@@ -333,14 +196,14 @@ class _Ends:
     target: XRootDURL
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class _Resume(_Ends):
     """A transfer that picks up where an interrupted one stopped."""
 
     offset: int
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class _Spread(_Ends):
     """A transfer moved as several spans at once, one connection each."""
 
@@ -411,23 +274,32 @@ def _spans(size: int, workers: int) -> list[tuple[int, int]]:
     return [(offset, min(step, size - offset)) for offset in range(0, size, step)]
 
 
-def _in_parallel(
-    plan: _Spread,
-    config: Config,
-    chunk: int,
-    progress: Progress | None,
-    *,
-    overwrite: bool,
-    coerce: bool = False,
-) -> int:
-    """Move every byte, one span per worker, and report the total as it goes."""
+def _in_parallel(job: _Job, plan: _Spread, progress: Progress | None) -> int:
+    """Move every byte, one span per worker, and report the total as it goes.
+
+    ``plan`` names the two ends and how many spans; the job supplies the
+    config, the chunk size, and how the target may be opened. ``progress``
+    sees the sum over all spans, serialised by a lock, since the workers
+    report from their own threads.
+    """
+    config, chunk, coerce = job.config, job.chunk, job.coerce
     with ExitStack() as stack:
         # Create it, then fill it in.
-        _writer(plan.target, config, stack, overwrite=overwrite, coerce=coerce)
+        _writer(plan.target, config, stack, overwrite=job.overwrite, coerce=coerce)
     reported = 0
     lock = threading.Lock()
+    # Set by the fan-out the moment one span fails: the copy has failed, and
+    # the other spans stop at their next chunk rather than finish moving
+    # bytes into a target nobody will use.
+    halt = threading.Event()
 
     def move(span: tuple[int, int]) -> int:
+        """One worker: its own reader and writer, positioned at its span.
+
+        Each span opens both ends afresh, so no handle is shared between
+        threads; the target was created above, and is opened here for
+        writing at an offset without truncation.
+        """
         nonlocal reported
         offset, length = span
         moved = 0
@@ -436,6 +308,8 @@ def _in_parallel(
             reader.seek(offset)
             writer = _resumer(plan.target, config, stack, offset, coerce=coerce)
             while moved < length:
+                if halt.is_set():
+                    raise fanout.Stopped(f"span at {offset} stopped: another span failed")
                 data = reader.read(min(chunk, length - moved))
                 if not data:
                     break
@@ -447,8 +321,15 @@ def _in_parallel(
                         progress(reported, plan.size)
         return moved
 
-    with ThreadPoolExecutor(plan.workers, thread_name_prefix="xrd-copy") as pool:
-        moved = sum(pool.map(move, _spans(plan.size, plan.workers)))
+    spans = _spans(plan.size, plan.workers)
+    moved = sum(
+        fanout.run_all(
+            [functools.partial(move, span) for span in spans],
+            workers=plan.workers,
+            name="xrd-copy",
+            stop=halt,
+        )
+    )
     # A span whose reads ran dry stops quietly, so the only sign that the
     # source ended early is the sum coming up short of what it promised.
     _require_whole(plan.target, moved, plan.size)
@@ -482,40 +363,9 @@ def _shifted(progress: Progress | None, offset: int) -> Progress | None:
     return lambda done, total: report(done + offset, total)
 
 
-def _probe(url: XRootDURL, config: Config) -> tuple[int, int] | None:
-    """``(size, mtime)`` for ``url``, or ``None`` when there is nothing there."""
-    if _zip_member(url) is not None:
-        try:
-            with ExitStack() as stack:
-                reader, size = _reader(url, config, stack)
-                assert size is not None
-                reader.seek(0)
-            archive = url.evolve(
-                query={name: value for name, value in url.query.items() if name != "xrdcl.unzip"}
-            )
-            outer = _probe(archive, config)
-            return size, outer[1] if outer is not None else 0
-        except (OSError, XRootDError, KeyError):
-            return None
-    if url.is_local:
-        try:
-            info = os.stat(url.path)
-        except OSError:
-            return None
-        return info.st_size, int(info.st_mtime)
-    from ..client import FileSystem
-
-    with FileSystem(url.with_path("/"), config) as fs:
-        try:
-            stat = fs.stat(url.path)
-        except OSError:
-            return None
-    return stat.st_size, stat.st_mtime
-
-
 #: Failures that say an end could not be reached: there is nothing to clean up
 #: on it, and asking would only wait out the same timeout again.
-_UNREACHABLE = (*TIMEOUTS, XRDConnectionError, XRDTimeoutError, UnsupportedError)
+_UNREACHABLE = (TimeoutError, XRDConnectionError, XRDTimeoutError, UnsupportedError)
 
 
 @contextmanager
@@ -571,183 +421,6 @@ def _discard_empty_target(job: _Job) -> None:
         _log.debug("removed the empty %s a failed copy left behind", target)
 
 
-def _remove(url: XRootDURL, config: Config) -> None:
-    """Delete ``url`` - what turns a copy into a move."""
-    if url.is_local:
-        os.remove(url.path)
-        return
-    from ..client import FileSystem
-
-    with FileSystem(url.with_path("/"), config) as fs:
-        fs.remove(url.path)
-
-
-def _server_checksum(url: XRootDURL, config: Config, algorithm: str) -> ChecksumInfo:
-    """Ask whichever server owns ``url`` what it thinks the checksum is."""
-    if url.is_http:
-        from ..http import digest
-
-        return digest(url, algorithm, config=config)
-    from ..client import FileSystem
-
-    with FileSystem(url.with_path("/"), config) as fs:
-        return fs.checksum(url.path, algorithm)
-
-
-# ---------------------------------------------------------------------------
-# The fast path
-# ---------------------------------------------------------------------------
-
-
-def _bulk_usable(source: XRootDURL | None, target: XRootDURL | None, config: Config) -> bool:
-    """Whether this pair can go over the bulk data plane.
-
-    It reads ``root://`` and writes either a local file, which every worker
-    fills at its own offset, or an open stream, which one worker feeds in
-    order. Anything else - an upload, a remote target, a resume - keeps the
-    general pump.
-    """
-    return bool(
-        config.bulk
-        and source is not None
-        and source.is_root
-        and _zip_member(source) is None
-        and (target is None or target.is_local)
-    )
-
-
-def _bulk_to_file(
-    source: XRootDURL,
-    target: XRootDURL,
-    config: Config,
-    progress: Progress | None,
-    *,
-    overwrite: bool,
-) -> int:
-    """Download to a local path with every connection writing its own span.
-
-    The target is opened before the source is, so a copy that fails before
-    a byte arrives - no such source, say - leaves the destination as it was
-    found: a file it created is removed again, and one that was there is not
-    truncated, since the download sizes the file itself once the source has
-    answered. A failure after that keeps what was written, for a resume.
-    """
-    from ..client import bulk
-
-    fd, created = _create(target.path, overwrite=overwrite)
-    arrived = False
-
-    def reported(done: int, total: int | None) -> None:
-        nonlocal arrived
-        arrived = True
-        if progress is not None:
-            progress(done, total)
-
-    try:
-        return bulk.download(source, fd, config=config, progress=reported).size
-    except BaseException as exc:
-        # ``BulkUnsupported`` sends the caller the ordinary way next, which
-        # must find an exclusive create still exclusive.
-        if created and (not arrived or isinstance(exc, BulkUnsupported)):
-            with suppress(OSError):
-                os.remove(target.path)
-        raise
-    finally:
-        os.close(fd)
-
-
-def _create(path: str, *, overwrite: bool) -> tuple[int, bool]:
-    """A descriptor for writing ``path``, and whether this call created the file."""
-    try:
-        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644), True
-    except FileExistsError:
-        if not overwrite:
-            raise
-    return os.open(path, os.O_WRONLY | os.O_CREAT), False
-
-
-def _descriptor_of(writer: IO[bytes]) -> int | None:
-    """``writer``'s file descriptor, with its buffer flushed, or ``None``.
-
-    ``None`` covers everything that is not a real file: an in-memory buffer, a
-    compressing wrapper, anything that only implements ``write``.
-    """
-    try:
-        writer.flush()
-        fd = writer.fileno()
-    except (AttributeError, OSError, ValueError):
-        return None
-    return fd if isinstance(fd, int) and fd >= 0 else None
-
-
-def _write_descriptor(fd: int, view: memoryview) -> None:
-    """Write all bytes, rejecting a filesystem that reports no progress."""
-    written = 0
-    while written < len(view):
-        count = os.write(fd, view[written:])
-        if count <= 0:
-            raise OSError(errno.EIO, "local write made no progress")
-        written += count
-
-
-def _sync_local_target(target: XRootDURL | None, expected_size: int | None) -> None:
-    """Commit a completed regular local target before reporting success.
-
-    Closing a descriptor only hands dirty pages to the filesystem. A FUSE
-    cache, network filesystem or failing disk can acknowledge every write and
-    still lose them before they reach its backing store. One durability barrier
-    at the end keeps the hot copy loop untouched and makes a late ENOSPC/EIO
-    visible before verification or ``remove_source`` declares success. Devices,
-    sockets and FIFOs are streams, not durable files, and are left alone.
-    """
-    if target is None or not target.is_local:
-        return
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
-    fd = os.open(target.path, flags)
-    try:
-        info = os.fstat(fd)
-        if stat_module.S_ISREG(info.st_mode):
-            os.fsync(fd)
-            info = os.fstat(fd)
-            if expected_size is not None and info.st_size != expected_size:
-                raise OSError(
-                    errno.EIO,
-                    f"local target has {info.st_size} bytes after sync; expected {expected_size}",
-                )
-    finally:
-        os.close(fd)
-
-
-def _bulk_to_stream(
-    source: XRootDURL,
-    writer: IO[bytes],
-    config: Config,
-    progress: Progress | None,
-    digest: Any | None,
-) -> int:
-    """Stream to an open file object, in file order, digesting on the way."""
-    from ..client import bulk
-
-    write = writer.write
-    # A buffered writer copies a multi-megabyte chunk through its own buffer
-    # and takes its lock to do it. When the object is backed by a descriptor,
-    # the bytes can go straight there instead - after flushing whatever the
-    # caller had already put in the buffer, so the file stays in order.
-    fd = _descriptor_of(writer)
-
-    def emit(view: memoryview) -> None:
-        if digest is not None:
-            digest.update(view)
-        if fd is None:
-            write(view)
-            return
-        _write_descriptor(fd, view)
-
-    # One connection: the writer is the serialisation point, so a second would
-    # only wait its turn. Depth, not width, is what hides the round trip here.
-    return bulk.stream(source, emit, config=config, progress=progress, workers=1).size
-
-
 # ---------------------------------------------------------------------------
 # The pump
 # ---------------------------------------------------------------------------
@@ -761,10 +434,16 @@ class _Dynamic:
     """
 
     def __init__(self, reader: IO[bytes]) -> None:
+        """Wrap ``reader``; it is not closed here, its opener's stack owns it."""
         self._reader = reader
         self._done = False
 
     def readinto(self, buffer: bytearray) -> int:
+        """Fill ``buffer``; after the first short read, report end of data for good.
+
+        A growing file may have more bytes a moment later, but XrdCl's
+        dynamic-source copy stops at the first short read, and so does this.
+        """
         if self._done:
             return 0
         count = _fill(self._reader, buffer)
@@ -772,7 +451,7 @@ class _Dynamic:
         return count
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class _Job:
     """One transfer, as :func:`copy` was asked for it."""
 
@@ -796,7 +475,7 @@ class _Job:
         )
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class _Plan:
     """Which way the bytes go, and what that leaves to compare afterwards."""
 
@@ -810,6 +489,7 @@ class _Plan:
 
     @property
     def offset(self) -> int:
+        """Where the bytes start: the resume point, or 0 for a whole copy."""
         return self.resuming.offset if self.resuming is not None else 0
 
 
@@ -860,7 +540,7 @@ def _both_ends(source: XRootDURL | None, target: XRootDURL | None) -> _Ends | No
     return _Ends(source, target) if source is not None and target is not None else None
 
 
-@dataclass(**SLOTS)
+@dataclass(slots=True)
 class _Verify:
     """What checking a copy will take, settled before the first byte moves."""
 
@@ -959,14 +639,7 @@ def _checked(check: _Verify, config: Config) -> ChecksumInfo | None:
 
 
 def _transfer(
-    job: _Job,
-    algorithm: str,
-    verify: bool | None,
-    resume: bool,
-    sources: int,
-    progress: Progress | None,
-    pace: Pace,
-    declared: ChecksumInfo | None = None,
+    job: _Job, options: _CopyOptions, algorithm: str, pace: Pace
 ) -> tuple[int, _Plan, _Verify]:
     """Move the file, reconnecting and continuing when the link drops under it.
 
@@ -980,12 +653,17 @@ def _transfer(
     persists nothing. A timeout or a busy-server wait is not a dropped link and
     is left to stand; so is a mid-transfer failure the copy cannot safely redo
     (an exclusive create, whose retry could clobber another writer's file).
+
+    ``algorithm`` is the resolved digest name (``options.algorithm`` or the
+    configured preference); ``pace`` is the copy's rate and time limits,
+    shared across retries so a timeout counts the whole copy, not one try.
     """
     attempts = 0
+    resume, progress = options.resume, options.progress
     resume_now = resume
     while True:
-        plan = _plan(job, resume=resume_now, sources=sources)
-        check = _verification(job, plan.ends, algorithm, verify, declared)
+        plan = _plan(job, resume=resume_now, sources=options.sources)
+        check = _verification(job, plan.ends, algorithm, options.verify, options.declared)
         pace.check()
         report = pace.watch(progress, start=plan.offset) if pace.limited else progress
         pace.begin()
@@ -1014,10 +692,7 @@ def _retry_transfer(job: _Job, exc: XRDConnectionError, attempts: int, *, resume
     remaining = dl.remaining()
     if remaining is not None and remaining <= 0:
         raise exc
-    backoff = cfg.retry_backoff
-    if backoff > 0:
-        pause = min(backoff * 2 ** (attempts - 1), cfg.wait_cap)
-        time.sleep(pause if remaining is None else max(min(pause, remaining), 0.0))
+    _retry.pause(attempts, cfg.retry_backoff, cfg.wait_cap, remaining=remaining)
     return _writes_at_offset(job.dst_url)
 
 
@@ -1049,10 +724,7 @@ def _move(job: _Job, plan: _Plan, progress: Progress | None, digest: Any) -> int
     if plan.sources:
         return _from_replicas(job, plan.sources, progress)
     if plan.spread is not None:
-        return _in_parallel(
-            plan.spread, job.config, job.chunk, progress, overwrite=job.overwrite,
-            coerce=job.coerce,
-        )  # fmt: skip
+        return _in_parallel(job, plan.spread, progress)
     return _one_stream(job, plan.resuming, progress, digest)
 
 
@@ -1109,7 +781,12 @@ def _one_stream(job: _Job, resuming: _Resume | None, progress: Progress | None, 
             # XrdCl's dynamic source reads: reading ahead would find the end
             # of a growing file before its writer had got there.
             reader, depth = cast("IO[bytes]", _Dynamic(reader)), 1
-        moved = _pump(reader, writer, total, job.chunk, report, digest, depth)
+        # The read-ahead's buffers are reused once each chunk is written,
+        # which every writer this module opens allows: each copies what it is
+        # handed before returning. A stream the caller passed in may keep the
+        # view instead, so it gets a fresh buffer per chunk.
+        theirs = writer is job.target
+        moved = _pump(reader, writer, total, job.chunk, report, digest, depth, recycle=not theirs)
     _require_whole(job.dst_url or repr(job.target), offset + moved, total)
     return moved
 
@@ -1212,35 +889,13 @@ def copy(
     cfg = config or Config()
     from ..metalink import is_metalink
 
-    if cfg.metalink_processing and is_metalink(source):
-        return _copy_metalink(
-            source,
-            target,
-            chunk_size=chunk_size,
-            verify=verify,
-            algorithm=algorithm,
-            overwrite=overwrite,
-            progress=progress,
-            config=cfg,
-            dry_run=dry_run,
-            remove_source=remove_source,
-            resume=resume,
-            sources=sources,
-            dynamic_source=dynamic_source,
-            max_rate=max_rate,
-            min_rate=min_rate,
-            timeout=timeout,
-            coerce=coerce,
-        )
-    return _copy_one(
-        source,
-        target,
+    options = _CopyOptions(
+        config=cfg,
         chunk_size=chunk_size,
         verify=verify,
         algorithm=algorithm,
         overwrite=overwrite,
         progress=progress,
-        config=cfg,
         dry_run=dry_run,
         remove_source=remove_source,
         resume=resume,
@@ -1251,262 +906,47 @@ def copy(
         timeout=timeout,
         coerce=coerce,
     )
+    if cfg.metalink_processing and is_metalink(source):
+        return _copy_metalink(source, target, options)
+    return _copy_one(source, target, options)
 
 
-def _copy_one(
-    source: Any,
-    target: Any,
-    *,
-    chunk_size: int | None,
-    verify: bool | None,
-    algorithm: str | None,
-    overwrite: bool,
-    progress: Progress | None,
-    config: Config,
-    dry_run: bool,
-    remove_source: bool,
-    resume: bool,
-    sources: int,
-    dynamic_source: bool,
-    max_rate: float | None,
-    min_rate: float | None,
-    timeout: float | None,
-    coerce: bool,
-    declared: ChecksumInfo | None = None,
-) -> CopyResult:
-    """Copy one concrete source; Metalink dispatch has already happened."""
-    cfg = config
-    pace = Pace(Limits(max_rate, min_rate, timeout, interval=cfg.in_flight))
+def _copy_one(source: Any, target: Any, options: _CopyOptions) -> CopyResult:
+    """Copy one concrete source; Metalink dispatch has already happened.
+
+    The Metalink failover calls this once per replica (looked up on this
+    module at call time, so a test can replace it), with ``options`` already
+    carrying the catalogue's checksum as ``declared``.
+    """
+    cfg = options.config
+    pace = Pace(Limits(options.max_rate, options.min_rate, options.timeout, interval=cfg.in_flight))
     job = _Job(
         source,
         target,
         _target_url(source),
         _target_url(target),
         cfg,
-        chunk_size or cfg.chunk_size,
-        overwrite,
-        coerce=coerce,
-        dynamic=dynamic_source,
+        options.chunk_size or cfg.chunk_size,
+        options.overwrite,
+        coerce=options.coerce,
+        dynamic=options.dynamic_source,
         paced=pace.limited,
     )
-    if dry_run:
+    if options.dry_run:
         return _dry_run(job)
-    algo = algorithm or cfg.preferred_checksum
+    _make_parent_collection(job.dst_url, cfg)
+    algo = options.algorithm or cfg.preferred_checksum
     started = time.monotonic()
-    with _cleaned_on_failure(job, resume=resume):
-        size, plan, check = _transfer(job, algo, verify, resume, sources, progress, pace, declared)
+    with _cleaned_on_failure(job, resume=options.resume):
+        size, plan, check = _transfer(job, options, algo, pace)
         _sync_local_target(job.dst_url, plan.offset + size)
     elapsed = time.monotonic() - started
     checksum = _checked(check, cfg)
-    if remove_source and job.src_url is not None:
+    if options.remove_source and job.src_url is not None:
         _remove(job.src_url, cfg)  # only now: a failed verification kept the original
     return CopyResult(
         *job.names(), size=size, seconds=elapsed, checksum=checksum, resumed_at=plan.offset
     )
-
-
-def _copy_metalink(
-    source: Any,
-    target: Any,
-    *,
-    chunk_size: int | None,
-    verify: bool | None,
-    algorithm: str | None,
-    overwrite: bool,
-    progress: Progress | None,
-    config: Config,
-    dry_run: bool,
-    remove_source: bool,
-    resume: bool,
-    sources: int,
-    dynamic_source: bool,
-    max_rate: float | None,
-    min_rate: float | None,
-    timeout: float | None,
-    coerce: bool,
-) -> CopyResult:
-    """Resolve one XrdCl-style Metalink source and fail over between replicas."""
-    descriptor_url, catalog_url, selected_member, descriptor = _load_metalink(source, config)
-    if dry_run:
-        return _metalink_dry_run(descriptor_url, target, descriptor.size)
-    checksum = _metalink_checksum(descriptor, selected_member, algorithm, config)
-    options = _MetalinkOptions(
-        target,
-        chunk_size,
-        verify,
-        algorithm,
-        overwrite,
-        progress,
-        config,
-        resume,
-        sources,
-        dynamic_source,
-        max_rate,
-        min_rate,
-        timeout,
-        coerce,
-    )
-    result, replica = _copy_metalink_replicas(
-        _metalink_urls(descriptor.replicas, config), selected_member, checksum, options
-    )
-    if remove_source:
-        _remove(catalog_url, config)
-    return replace(result, source=str(descriptor_url), replica=replica)
-
-
-@dataclass(frozen=True, **SLOTS)
-class _MetalinkOptions:
-    """Ordinary-copy controls shared by every replica attempt."""
-
-    target: Any
-    chunk_size: int | None
-    verify: bool | None
-    algorithm: str | None
-    overwrite: bool
-    progress: Progress | None
-    config: Config
-    resume: bool
-    sources: int
-    dynamic_source: bool
-    max_rate: float | None
-    min_rate: float | None
-    timeout: float | None
-    coerce: bool
-
-
-def _load_metalink(source: Any, config: Config) -> tuple[XRootDURL, XRootDURL, str | None, Any]:
-    """Read and parse a descriptor, excluding the internal ZIP selector."""
-    from ..metalink import MAX_DESCRIPTOR_SIZE, parse_metalink
-
-    descriptor_url = _target_url(source)
-    assert descriptor_url is not None
-    selected_member = _zip_member(descriptor_url)
-    catalog_url = descriptor_url.evolve(
-        query={name: value for name, value in descriptor_url.query.items() if name != "xrdcl.unzip"}
-    )
-    with ExitStack() as stack:
-        reader, _ = _reader(catalog_url, config, stack)
-        document = reader.read(MAX_DESCRIPTOR_SIZE + 1)
-    return (
-        descriptor_url,
-        catalog_url,
-        selected_member,
-        parse_metalink(document, base_url=str(catalog_url)),
-    )
-
-
-def _metalink_dry_run(descriptor_url: XRootDURL, target: Any, size: int | None) -> CopyResult:
-    """Describe a Metalink copy without opening any concrete replica."""
-    target_url = _target_url(target)
-    target_name = str(target_url) if target_url is not None else repr(target)
-    return CopyResult(str(descriptor_url), target_name, size or 0, 0.0)
-
-
-def _metalink_checksum(
-    descriptor: Any,
-    selected_member: str | None,
-    algorithm: str | None,
-    config: Config,
-) -> ChecksumInfo | None:
-    """Choose metadata integrity, respecting ZIP's opt-in semantics."""
-    available = selected_member is None or config.zip_metalink_checksum
-    if not available:
-        return None
-    if algorithm is None:
-        return cast("ChecksumInfo | None", descriptor.checksum)
-    wanted = algorithm.lower().replace("-", "")
-    return next((item for item in descriptor.checksums if item.algorithm == wanted), None)
-
-
-def _metalink_urls(replicas: Sequence[str], config: Config) -> tuple[str, ...]:
-    """Apply the optional transport upgrade once, before failover."""
-    if not config.tls_metalink:
-        return tuple(replicas)
-    return tuple(_secure_metalink_url(url) for url in replicas)
-
-
-def _copy_metalink_replicas(
-    replicas: Sequence[str],
-    selected_member: str | None,
-    checksum: ChecksumInfo | None,
-    options: _MetalinkOptions,
-) -> tuple[CopyResult, str]:
-    """Try concrete replicas in order, retaining the final useful error."""
-    from .replicas import NoMoreReplicasError
-
-    failures: list[Exception] = []
-    for index, replica in enumerate(replicas):
-        try:
-            result = _copy_metalink_replica(
-                replica, index, len(replicas), selected_member, checksum, options
-            )
-        except (OSError, XRootDError) as exc:
-            failures.append(exc)
-            _log.debug("Metalink replica %s failed: %s", replica, exc)
-            continue
-        return result, replica
-    last = failures[-1] if failures else None
-    detail = f": {last}" if last is not None else ""
-    raise NoMoreReplicasError(f"Metalink: no more replicas to try{detail}") from last
-
-
-def _copy_metalink_replica(
-    replica: str,
-    index: int,
-    count: int,
-    selected_member: str | None,
-    checksum: ChecksumInfo | None,
-    options: _MetalinkOptions,
-) -> CopyResult:
-    """Run one ordinary copy with the catalogue's endpoint and integrity."""
-    source = _metalink_endpoint(replica, selected_member)
-    config = _metalink_replica_config(options.config, another=index + 1 < count)
-    return _copy_one(
-        source,
-        options.target,
-        chunk_size=options.chunk_size,
-        verify=True if checksum is not None else options.verify,
-        algorithm=checksum.algorithm if checksum is not None else options.algorithm,
-        overwrite=options.overwrite if index == 0 else True,
-        progress=options.progress,
-        config=config,
-        dry_run=False,
-        remove_source=False,
-        resume=options.resume,
-        sources=options.sources,
-        dynamic_source=options.dynamic_source,
-        max_rate=options.max_rate,
-        min_rate=options.min_rate,
-        timeout=options.timeout,
-        coerce=options.coerce,
-        declared=checksum,
-    )
-
-
-def _metalink_endpoint(replica: str, selected_member: str | None) -> str | XRootDURL:
-    """Apply a selected ZIP member without losing local-URL query state."""
-    if selected_member is None:
-        return replica
-    return parse(replica).with_query(**{"xrdcl.unzip": selected_member})
-
-
-def _metalink_replica_config(config: Config, *, another: bool) -> Config:
-    """Limit server-requested waits only while failover remains possible."""
-    if not another:
-        return config
-    limit = max(config.max_metalink_wait, 0.0)
-    if config.wait_budget > 0:
-        limit = min(limit, config.wait_budget)
-    # ``wait_budget=0`` means unlimited, whereas XrdCl's
-    # ``MaxMetalinkWait=0`` means fail over on the first positive wait.
-    return config.evolve(wait_budget=limit or 1e-9)
-
-
-def _secure_metalink_url(url: str) -> str:
-    parsed = parse(url)
-    if parsed.scheme in ("root", "xroot"):
-        return str(parsed.evolve(scheme=parsed.scheme + "s"))
-    return url
 
 
 def _dry_run(job: _Job) -> CopyResult:
@@ -1609,18 +1049,24 @@ def _compare_ends(
 # ---------------------------------------------------------------------------
 
 
+def _open_for_digest(url: XRootDURL, config: Config) -> IO[bytes]:
+    """A local file, or a ZIP member through :func:`~xrdclient.io.open_url`, to hash.
+
+    The caller owns the handle and closes it.
+    """
+    if _zip_member(url) is not None:
+        from ..io import open_url
+
+        return cast("IO[bytes]", open_url(url, "rb", config=config))
+    return open(url.path, "rb")
+
+
 def _digest_of(url: XRootDURL, config: Config, algorithm: str) -> str:
     """``algorithm`` over ``url``: the server's answer, or ours if it is local."""
     if not url.is_local and _zip_member(url) is None:
         return _server_checksum(url, config, algorithm).value.lower()
     digest = new_checksum(algorithm)
-    if _zip_member(url) is not None:
-        from ..io import open_url
-
-        opened = open_url(url, "rb", config=config)
-    else:
-        opened = open(url.path, "rb")
-    with opened as handle:
+    with _open_for_digest(url, config) as handle:
         while chunk := handle.read(1 << 20):
             digest.update(chunk)
     return digest.hexdigest().lower()
@@ -1644,106 +1090,6 @@ def _up_to_date(
     return _digest_of(source, config, algorithm) == _digest_of(target, config, algorithm)
 
 
-def _selected(rel: str, include: Sequence[str], exclude: Sequence[str]) -> bool:
-    """``rsync``'s rule: an explicit include list is a whitelist, exclude wins."""
-    if include and not any(fnmatch(rel, pattern) for pattern in include):
-        return False
-    return not any(fnmatch(rel, pattern) for pattern in exclude)
-
-
-def _prune(target: XRootDURL, config: Config, keep: set[str], *, dry_run: bool) -> list[str]:
-    """Remove everything under ``target`` that ``keep`` does not name.
-
-    Each removal is logged, because a deletion nobody asked for by name is
-    the one thing in a copy worth being able to read back afterwards.
-    """
-    removed = []
-    for rel in _walk(target, config):
-        if rel in keep:
-            continue
-        removed.append(rel)
-        _log.info("%s %s", "would delete" if dry_run else "deleting", target / rel)
-        if not dry_run:
-            _remove(target / rel, config)
-    return removed
-
-
-def _walk(url: XRootDURL, config: Config) -> Iterator[str]:
-    """Every file under ``url``, as paths relative to it."""
-    if url.is_local:
-        for root, _, names in os.walk(url.path):
-            rel = os.path.relpath(root, url.path)
-            for name in names:
-                yield name if rel == "." else os.path.join(rel, name)
-        return
-    from ..client import FileSystem
-
-    with FileSystem(url.with_path("/"), config) as fs:
-        base = url.path.rstrip("/")
-        for root, _, names in fs.walk(url.path):
-            rel = root[len(base) :].strip("/")
-            for name in names:
-                yield f"{rel}/{name}" if rel else name
-
-
-class _Total:
-    """Every worker's progress added up, because their files interleave.
-
-    A per-file ``(done, total)`` pair means nothing once several files are in
-    flight at once, so each worker reports its own deltas here and the caller
-    hears about the tree instead: bytes moved so far, against a total nobody
-    can know without walking ahead and asking every file its length.
-    """
-
-    def __init__(self, report: Progress) -> None:
-        self._report = report
-        self._lock = threading.Lock()
-        self._done = 0
-
-    def worker(self) -> Progress:
-        """A ``progress`` callback for one file, counted into the whole."""
-        seen = 0
-
-        def report(done: int, _total: int | None) -> None:
-            nonlocal seen
-            with self._lock:
-                self._done += done - seen
-                seen = done
-                self._report(self._done, None)
-
-        return report
-
-
-def _in_order(
-    items: Sequence[str], workers: int, run: Callable[[str], CopyResult | None]
-) -> list[CopyResult]:
-    """``run`` over ``items``, several at a time, answering in the order asked.
-
-    A file that raises stops the tree, as it does one at a time: the first
-    failure is re-raised and whatever has not started is cancelled rather than
-    left to copy on behind the exception.
-    """
-    with ThreadPoolExecutor(workers, thread_name_prefix="xrd-tree") as pool:
-        pending = [pool.submit(run, item) for item in items]
-        try:
-            return [done for future in pending if (done := future.result()) is not None]
-        finally:
-            for future in pending:
-                future.cancel()
-
-
-def _sync_options(options: dict[str, Any], sync: SyncMode | None) -> dict[str, Any]:
-    """The options each file of a tree is copied with.
-
-    A sync only copies what it has already judged out of date, and replacing
-    that is the whole point: an exclusive create would turn every changed file
-    into a :class:`FileExistsError`, so that a sync could only ever add files
-    and never bring one up to date. ``overwrite=False`` still holds for a tree
-    copied without ``sync``.
-    """
-    return options if sync is None else {**options, "overwrite": True}
-
-
 def copy_tree(
     source: Any,
     target: Any,
@@ -1759,10 +1105,11 @@ def copy_tree(
 ) -> list[CopyResult]:
     """Copy a directory recursively, returning one result per file copied.
 
-    Local target directories are created as needed; remote ones are, too,
-    because a remote write asks the server for ``kXR_mkpath``. Options other
-    than the ones named here - ``dry_run`` and ``verify`` among them - are
-    passed through to :func:`copy`.
+    Target directories are created as needed, wherever the target is: a local
+    copy calls ``os.makedirs``, a ``root://`` write asks the server for
+    ``kXR_mkpath``, and a WebDAV tree has its directories made up front, since
+    ``PUT`` makes none. Options other than the ones named here - ``dry_run``
+    and ``verify`` among them - are passed through to :func:`copy`.
 
     ``include`` and ``exclude`` are :mod:`fnmatch` patterns matched against
     each path relative to ``source``; an include list is a whitelist and an
@@ -1789,31 +1136,25 @@ def copy_tree(
     count = cfg.parallel_files if workers is None else workers
     total = _tree_total(progress, count)
     options = _sync_options(options, sync)
+    dry_run = bool(options.get("dry_run"))
+    if not dry_run:
+        # A WebDAV tree's directories are made once, here, rather than one
+        # connection and MKCOL per file inside every copy() below.
+        _make_tree_dirs(dst_url, wanted, cfg)
 
     def move(rel: str) -> CopyResult | None:
+        """Copy one file of the tree; ``None`` when a sync found it up to date."""
         destination = dst_url / rel
         if sync is not None and _up_to_date(src_url / rel, destination, cfg, sync, algo):
             return None
-        if destination.is_local and not options.get("dry_run"):
+        if destination.is_local and not dry_run:
             os.makedirs(os.path.dirname(destination.path), exist_ok=True)
         report = progress if total is None else total.worker()
-        return copy(src_url / rel, destination, config=cfg, progress=report, **options)
+        # Set in this worker's own thread, so it covers exactly this copy.
+        with _parents_already_made():
+            return copy(src_url / rel, destination, config=cfg, progress=report, **options)
 
     results = _each(wanted, count, move)
     if delete:
-        _prune(dst_url, cfg, set(wanted), dry_run=bool(options.get("dry_run")))
+        _prune(dst_url, cfg, set(wanted), dry_run=dry_run)
     return results
-
-
-def _tree_total(progress: Progress | None, count: int) -> _Total | None:
-    """Where a tree's workers add up their progress, when there are several."""
-    return _Total(progress) if progress is not None and count > 1 else None
-
-
-def _each(
-    items: Sequence[str], workers: int, run: Callable[[str], CopyResult | None]
-) -> list[CopyResult]:
-    """``run`` over ``items``, ``workers`` at a time, keeping what it copied."""
-    if workers > 1:
-        return _in_order(items, workers, run)
-    return [done for item in items if (done := run(item)) is not None]

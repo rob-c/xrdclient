@@ -16,10 +16,11 @@ import ssl
 import threading
 import weakref
 from collections import deque
+from typing import cast
 
 import pytest
+from xrdsec.testing.pki import PKI
 
-from _pki import make_certificate, name, pem, private_key_pem, throwaway_key
 from xrdclient.config import Config
 from xrdclient.errors import ConnectionError as XrdConnectionError
 from xrdclient.errors import TimeoutError as XrdTimeoutError
@@ -83,16 +84,9 @@ def refused_port() -> int:
 
 
 @pytest.fixture(scope="module")
-def server_tls(tmp_path_factory):
-    """A TLS context holding a self-signed certificate for ``localhost``."""
-    key = throwaway_key(3)
-    subject = name(("2.5.4.3", "localhost"))
-    certificate = make_certificate(subject, subject, key.public, key)
-    path = tmp_path_factory.mktemp("tls") / "server.pem"
-    path.write_bytes(pem("CERTIFICATE", certificate) + private_key_pem(key))
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.load_cert_chain(str(path))
-    return context
+def server_tls(pki: PKI) -> ssl.SSLContext:
+    """A TLS context presenting a ``localhost`` certificate from a CA nobody here trusts."""
+    return pki.server_context(require_client=False)
 
 
 # ----------------------------------------------------------------------
@@ -204,10 +198,12 @@ def test_connecting_where_nothing_listens_names_the_endpoint():
 
 
 def test_a_connect_that_times_out_is_a_timeout_error(monkeypatch):
-    def never(address, timeout=None):
+    from xrdclient.transport import _dial
+
+    def never(host, port, **kwargs):
         raise TimeoutError("timed out")
 
-    monkeypatch.setattr(socket, "create_connection", never)
+    monkeypatch.setattr(_dial, "dial", never)
     with pytest.raises(XrdTimeoutError, match="connecting to storage:1094 timed out"):
         SocketTransport.connect("storage", 1094, CONFIG)
 
@@ -268,7 +264,8 @@ def test_a_send_that_outlasts_the_timeout_says_so():
             raise TimeoutError("timed out")
 
     with pytest.raises(XrdTimeoutError, match="send to storage:1094 timed out"):
-        SocketTransport(Blocked(), "storage", 1094).send(b"stuck")
+        # The transport only calls sendall here, which is all the fake has.
+        SocketTransport(cast(socket.socket, Blocked()), "storage", 1094).send(b"stuck")
 
 
 def test_writing_to_a_closed_connection_is_a_connection_error():
@@ -312,7 +309,8 @@ def test_an_abandoned_transport_closes_its_socket():
             self.closed = True
 
     sock = Watched()
-    transport = SocketTransport(sock, "storage", 1094)
+    # The transport only calls close here, which is all the fake has.
+    transport = SocketTransport(cast(socket.socket, sock), "storage", 1094)
     reference = weakref.ref(transport)
     del transport
     gc.collect()
@@ -338,7 +336,7 @@ def test_a_connection_upgrades_in_place(server_tls):
 
 
 def test_an_unverifiable_certificate_stops_the_upgrade(server_tls):
-    """The self-signed certificate is exactly what verification is there for."""
+    """A certificate from an untrusted CA is exactly what verification is there for."""
     with listener(echo, context=server_tls) as (host, port):
         transport = SocketTransport.connect(host, port, CONFIG)
         try:
@@ -376,6 +374,7 @@ def test_a_socket_that_will_not_close_is_let_go_anyway():
 
     with listener(echo) as (host, port):
         transport = SocketTransport.connect(host, port, CONFIG)
-        real, transport._sock = transport._sock, Stubborn()
+        # The transport only calls close here, which is all the fake has.
+        real, transport._sock = transport._sock, cast(socket.socket, Stubborn())
         transport.close()
         real.close()

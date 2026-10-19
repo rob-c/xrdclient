@@ -83,6 +83,12 @@ def _append_source(
 
 
 def _source_name(source: Any, url: XRootDURL | None) -> str:
+    """The member name to append under when ``member=`` was not given.
+
+    The URL's last path component, else a file object's ``name`` (a real
+    file's; ``io.BytesIO`` has none). Without either there is no sensible
+    name for the archive entry, so the caller must supply one.
+    """
     if url is not None:
         name = posixpath.basename(url.path.rstrip("/"))
     else:
@@ -98,6 +104,12 @@ def _source_name(source: Any, url: XRootDURL | None) -> str:
 
 
 def _remaining_size(reader: IO[bytes]) -> int:
+    """Bytes from the current position to the end, found by seeking there and back.
+
+    The ZIP local header must state the member's size before its data is
+    written (the appender does not use a data descriptor), so a stream of
+    unknown length cannot be appended.
+    """
     try:
         start = reader.tell()
         end = reader.seek(0, io.SEEK_END)

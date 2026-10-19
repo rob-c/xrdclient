@@ -25,13 +25,47 @@ whatever a storage server tells it. The threat model has three parties:
 
 ## What the implementation guarantees
 
-**Nothing turns TLS verification off implicitly.** `tls_context()` builds an
+**Nothing turns TLS verification off implicitly.** `tls_context()`, and the
+public `xrdclient.tls.client_context()` it is built on (xrdsec's, shared with
+xgfalclient and xrdarc), build an
 `ssl.create_default_context()` - certificate chain and hostname both checked -
-and only `Config(verify_tls=False)` relaxes it. The CLI spells that
+and only `Config(verify_tls=False)` (`verify=False`) relaxes it. The CLI spells that
 `--no-verify-tls`, so it appears in shell history and in the command a
 reviewer reads. `Config(require_tls=True)` refuses to speak to a server that
 will not upgrade, which is the setting to use when you are carrying a bearer
 token.
+
+<a id="which-cas-are-trusted"></a>
+**Which CAs are trusted depends on what the endpoint is.** On a grid node,
+`/etc/grid-security/certificates` (or `$X509_CERT_DIR`) becomes `ca_path`, and
+`ssl.create_default_context(capath=...)` then trusts those CAs and nothing
+else. That is the grid norm, and right for `davs://` and `roots://`: a
+storage element is vouched for by an IGTF CA, and trusting the hundred-odd
+commercial CAs as well would let any of them vouch for it. It is wrong for an
+S3 service or a public `https://` site, whose certificates come from those
+commercial CAs and which would otherwise fail on every grid node. So the
+default is:
+
+| Scheme | Grid CA directory present | No grid CA directory |
+| --- | --- | --- |
+| `davs://`, `roots://` | grid CAs only | system store |
+| `https://`, `s3://` | grid CAs **and** system store | system store |
+
+`XRD_TLSSYSTEMCA=0` restricts `https://` and `s3://` to the grid CAs too (for
+a site whose object store has an IGTF certificate and that wants nothing
+else); `XRD_TLSSYSTEMCA=1` adds the system store everywhere. A pooled
+connection is only reused for a request with the same trust, so a `davs://`
+request never rides a connection that a commercial CA vouched for.
+
+**Revocation is checked when asked.** `XRD_CHECKCRL=1` (or `leaf`) makes
+OpenSSL check the server certificate against the CRLs in the CA directory -
+the `<hash>.r0` files `fetch-crl` maintains, found by the issuer's hash -
+and `XRD_CHECKCRL=chain` checks every certificate in the chain. It is off by
+default because it fails closed: a CA with no CRL in the directory, or an
+expired one because `fetch-crl` stopped running, fails every handshake it
+signs for. Turn it on where `fetch-crl` is known to run. A rewritten CA
+directory changes its modification time, which makes the next connection
+build a fresh context, so new CRLs take effect without a restart.
 
 **A server's own TLS demand is honoured, including the one about data.** A
 `kXR_protocol` reply carries what the server insists on encrypting; `kXR_gotoTLS`,
@@ -48,8 +82,11 @@ result, so a secret that only becomes recognisable once the format string and
 its arguments are joined is still caught. `Config`, `XRootDURL`,
 `TokenCredential`, `SSSKey`, `SSSCredential`, `Blowfish`, `AES`,
 `RSAPrivateKey` and `ProxyCredential` all print `<redacted>` in place of key
-material, and no exception message carries a credential. Tests enforce each of
-these; see `tests/test_auth.py`.
+material, and no exception message carries a credential. The patterns cover
+bearer tokens, JWTs, macaroons, `Authorization` headers (SigV4 included), S3
+pre-signed parameters, `sig=`, EOS `cap.sym`/`cap.msg` and `access_token`;
+CLI error output goes through the same filter. Tests enforce each of these;
+see `tests/test_auth.py`.
 
 **A prompt cannot leak the answer.** A secret is read with `getpass`, so it
 is never echoed and never lands in the scrollback; questions go to `stderr`,
@@ -98,17 +135,34 @@ redirects are capped by `config.redirect_limit`, `kXR_wait` intervals by
 server cannot hold a client forever or make it buffer an unbounded amount by
 sending a header alone.
 
-**No dependencies and no dynamic execution.** The core imports nothing outside
-the standard library, so there is no third-party supply chain to audit. Nothing
-in the package calls `eval`, `exec`, `pickle`, or `subprocess`, and no code
-path constructs a shell command.
+**A small, vetted dependency set and no dynamic execution.** The runtime
+depends on three maintained, general-purpose libraries - `cryptography`,
+`asn1crypto` and `botocore` - plus this project's own two libraries, `xrdcore`
+(no dependencies at all) and `xrdsec` (the grid security code, on
+`cryptography` and `asn1crypto`), and nothing else outside the standard
+library; HTTP, TLS and JWT claim decoding are the standard library's. Each is
+pinned to a minimum release in `pyproject.toml` (the two libraries to the same
+minor series as this package), resolved from wheels on every supported
+platform in CI, and recorded with its hash in the deployment bundles, so the
+supply chain to audit is those projects and their own dependencies. The
+optional `krb5` extra adds `python-gssapi`, and the optional
+`fast` extra `google-crc32c`, only when asked for. Nothing in the package
+calls `eval`, `exec`, `pickle`, or `subprocess`, and no code path constructs a
+shell command.
 
 **The cryptography is used, not invented.** TLS is `ssl`. Digests are
-`hashlib` and `zlib`. The from-scratch primitives - Blowfish, AES-CBC, RSA,
-DER/X.509 parsing - exist only because the XRootD `sss` and `gsi` handshakes
-specify them on the wire, and they are pinned against test vectors and against
-the real daemon. They are not offered as a general-purpose crypto library and
-`__all__` does not export them for that use.
+`hashlib` and `zlib`. Ciphers, RSA, elliptic-curve and Ed25519 signatures and
+X.509 parsing come from `cryptography`; ASN.1 structures from `asn1crypto`;
+AWS SigV4 signing from `botocore`. What remains local is protocol policy
+rather than primitives: the XRootD `sss` and `gsi` handshake framing here, and
+in xrdsec the RFC 3820 proxy rules, VOMS attribute-certificate policy, and the
+legacy raw-RSA and 512-bit-key compatibility paths those handshakes still
+specify on the wire. xrdsec has its own threat model and security policy
+(its `SECURITY.md`), and its own suite holds that code to every line and
+branch.
+Those are pinned against test vectors and against the real daemon, and are not
+offered as a general-purpose crypto library; `__all__` does not export them
+for that use.
 
 ## Limits you should know about
 
@@ -132,15 +186,28 @@ the real daemon. They are not offered as a general-purpose crypto library and
   domain and everything under it. A token the redirect's own `Location`
   carries (`?authz=`) is kept, since the redirecting server chose to send it.
   See [HTTP and WebDAV](https://rob-c.github.io/xrdclient/http/).
+- **Redirect targets are redacted in the debug log.** A `Location` can
+  carry a token or a signature in its query; it passes through
+  `xrdclient.log.redact` before it is logged.
+- **Multi-range answers are bounded.** A `multipart/byteranges` body may only
+  carry the ranges that were asked for, and its framing is read within fixed
+  limits, so a hostile server cannot make a vector read buffer a whole file.
 - **Checksum verification is a data-integrity check, not authentication.** A
   server that serves you wrong bytes can serve you the matching checksum.
   `verify=True` catches corruption in transit and on disk; it does not catch a
   server that is lying to you.
 - **`verify_tls=False` is a footgun and is meant to look like one.** It exists
   because self-signed test endpoints exist. Never set it in production.
-- **Bearer token files are read wherever the WLCG discovery specification says
-  to look**, including `/tmp/bt_u$UID`. Their permissions are not enforced,
-  matching the C client; on a shared machine, keep them at `0600`.
+- **Credential files must be private.** Bearer-token files are read wherever
+  the WLCG discovery specification says to look, including `/tmp/bt_u$UID`,
+  but - like X.509 proxies and SSS keytabs - only if they are regular files
+  owned by the effective uid with mode `0600` or tighter, checked on the open
+  file; a symbolic link at a predictable `/tmp` or `$XDG_RUNTIME_DIR` name is
+  refused. A violation is an `InsecureCredentialError` naming the file and
+  `chmod 600`. See [Authentication](https://rob-c.github.io/xrdclient/auth/).
+- **A GSI server proves who it is before it sees your proxy chain.** Its
+  certificate must chain to a local CA and name the host dialled, on every
+  login; `XRD_GSI_VERIFY_SERVER=0` is the escape hatch for broken test setups.
 
 ## Auditing your own setup
 

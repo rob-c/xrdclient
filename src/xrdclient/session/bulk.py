@@ -25,6 +25,13 @@ flight, and the session must not reuse their stream ids until they have
 arrived, or its next request takes a stray chunk as its answer. The reader
 drains them before giving the connection back, and marks the session broken
 when it cannot.
+
+A cancelled reader (see :mod:`xrdcore.cancel`) does not drain: it stops at
+the next frame boundary and leaves the replies still owed to the machine to
+drop as they arrive, exactly as when the caller's deadline runs out, so the
+connection stays in step. Caught part-way through a frame it first gives the
+rest of that frame :data:`CANCEL_GRACE` to arrive, since it is nearly always
+already on its way; only a peer that stalls mid-frame costs the connection.
 """
 
 from __future__ import annotations
@@ -35,19 +42,59 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass
-from typing import NoReturn
+from typing import TYPE_CHECKING, NoReturn, Protocol
 
-from .._compat import SLOTS
-from .._log import get_logger
-from ..errors import ProtocolError, XRootDError, raise_for_status
+from xrdcore import cancel
+
+from ..errors import ConnectionError as XrdConnectionError
+from ..errors import ProtocolError, XRootDError
 from ..errors import TimeoutError as XrdTimeoutError
+from ..log import get_logger
 from ..proto import constants as c
 from ..proto import requests as r
 from ..proto import responses as rp
-from ..proto.frames import Request, ResponseHeader, decode_header
+from ..proto.frames import Payload, Request, ResponseHeader, decode_header
+from ..proto.machine import server_error
 from . import deadline as dl
 
+if TYPE_CHECKING:
+    from ..config import Config
+    from ..proto.machine import SessionMachine
+    from ..transport.base import Transport
+
 __all__ = ["BulkReader", "BulkUnsupported"]
+
+
+class Lender(Protocol):
+    """What a :class:`BulkReader` borrows from the session that lends it a link.
+
+    :class:`~xrdclient.session.sync.Session` is one; naming only these
+    members keeps this module free of an import of it (which imports this).
+    """
+
+    @property
+    def transport(self) -> Transport:
+        """The control link the reader reads and writes directly."""
+        ...
+
+    @property
+    def machine(self) -> SessionMachine:
+        """The protocol state, for framing requests on leased stream ids."""
+        ...
+
+    @property
+    def config(self) -> Config:
+        """The session's settings: timeouts, stall deadline, wait budget."""
+        ...
+
+    def mark_broken(self) -> None:
+        """Never trust the link again: a frame was left half read."""
+        ...
+
+    def note(self, info: rp.AttnInfo) -> None:
+        """Pass on an unsolicited ``kXR_attn`` that arrived mid-read."""
+        ...
+
 
 _log = get_logger(__name__)
 
@@ -63,9 +110,9 @@ WAITRESP_GRACE = 30.0
 #: What wraps a ``kXR_asynresp`` answer: action, reserved, then its own header.
 _ASYNC = 16
 
-#: Where ``dlen`` starts in a request header: streamid, requestid, 16 bytes of
-#: parameters.
-_DLEN = 20
+#: How long a cancelled reader caught part-way through a frame waits for the
+#: rest of it, so that it can stop between frames with the wire in step.
+CANCEL_GRACE = 0.25
 
 
 class BulkUnsupported(XRootDError):
@@ -78,7 +125,7 @@ class BulkUnsupported(XRootDError):
     """
 
 
-@dataclass(**SLOTS)
+@dataclass(slots=True)
 class _InFlight:
     """One outstanding read: where it belongs, and where its bytes land.
 
@@ -95,12 +142,41 @@ class _InFlight:
     got: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class _WriteReplies:
+    """How one :meth:`BulkReader.write_chunks` call treats each write's answer.
+
+    The caller's two callbacks and its strictness, fixed for the whole
+    stream and consulted by :meth:`BulkReader._write_answer` per reply.
+    """
+
+    #: ``(offset, length)`` of each write the server stored (``kXR_ok``).
+    acknowledged: Callable[[int, int], None] | None = None
+    #: ``(offset, length)`` of each write answered ``kXR_wait``; without
+    #: it a wait is an ordinary refusal.
+    waited: Callable[[int, int], None] | None = None
+    #: A reply that is neither acknowledgement, wait nor error tears the
+    #: connection down as a protocol error rather than being reported.
+    strict: bool = False
+
+
 class BulkReader:
     """Pipelined ``kXR_read`` over one open file on one connection.
 
-    Construct it through :meth:`xrdclient.session.sync.Session.bulk`, which holds the
-    session lock, checks that nothing else is outstanding, and settles the
-    reader when the connection is handed back.
+    Construct it through :meth:`xrdclient.session.sync.Session.bulk`, which
+    gives it the wire to itself - the control link's reader role and its send
+    lock, so every other request on the session waits - checks that nothing
+    else is outstanding, and settles the reader when the connection is handed
+    back.
+
+    Why a second framer, beside the machine's: the machine is fed bytes that
+    have already been received, which is one copy too many for a gigabyte. A
+    bulk read must know where the next body bytes go *before* the ``recv``,
+    so that the kernel writes them straight into the caller's buffer. The
+    wire codecs are still shared - :func:`~xrdclient.proto.frames.decode_header`
+    for every header and :mod:`~xrdclient.proto.responses` for every body
+    that is not data - so the two can only disagree about where bytes land,
+    not about what they mean.
 
     ``chunk`` is how much each request asks for and ``depth`` how many are in
     flight at once, so the reader's whole memory cost is ``chunk * depth``.
@@ -114,31 +190,41 @@ class BulkReader:
     """
 
     __slots__ = (
-        "_session",
-        "_transport",
-        "_machine",
-        "_handle",
-        "_chunk",
-        "_depth",
         "_bufs",
-        "_views",
-        "_leased",
-        "_owed",
-        "_torn",
-        "_expires",
+        "_cancel_by",
+        "_chunk",
         "_deadline",
+        "_depth",
+        "_expires",
+        "_handle",
+        "_leased",
+        "_machine",
+        "_owed",
         "_resting",
+        "_session",
+        "_torn",
+        "_transport",
+        "_views",
         "delivered",
     )
 
-    def __init__(self, session: object, handle: bytes, *, chunk: int, depth: int) -> None:
+    def __init__(self, session: Lender, handle: bytes, *, chunk: int, depth: int) -> None:
+        """Borrow ``session``'s control link for the open file ``handle``.
+
+        ``session`` is any :class:`Lender`; a
+        :class:`~xrdclient.session.sync.Session` is the one that does.
+        ``chunk`` may not exceed what one reply body may carry
+        (:data:`~xrdclient.proto.constants.MAX_RESPONSE_BODY`), since a read
+        answered in several ``kXR_oksofar`` pieces would no longer land in one
+        slot. Nothing is sent until the first call.
+        """
         if chunk < 1 or chunk > c.MAX_RESPONSE_BODY:
             raise ValueError(f"chunk must be 1..{c.MAX_RESPONSE_BODY} bytes, not {chunk}")
         if depth < 1:
             raise ValueError("depth must be at least 1")
         self._session = session
-        self._transport = session.transport  # type: ignore[attr-defined]
-        self._machine = session.machine  # type: ignore[attr-defined]
+        self._transport = session.transport
+        self._machine = session.machine
         self._handle = handle
         self._chunk = chunk
         self._depth = depth
@@ -158,14 +244,18 @@ class BulkReader:
         #: When the caller's :func:`~xrdclient.deadline` runs out, if it set one.
         self._deadline: float | None = None
         #: The link's own read timeout, put back after a deadline shortens it.
-        self._resting: float = session.config.request_timeout  # type: ignore[attr-defined]
+        self._resting: float = session.config.request_timeout
+        #: When a cancelled reader caught mid-frame stops waiting for the rest.
+        self._cancel_by: float | None = None
         #: Bytes handed to the caller so far, over every call to :meth:`stream`.
         self.delivered = 0
 
     def __enter__(self) -> BulkReader:
+        """The reader itself; the ``with`` exists so leaving it settles the wire."""
         return self
 
     def __exit__(self, *exc: object) -> None:
+        """:meth:`settle`, whatever the block did - the wire must be in step after."""
         self.settle()
 
     def stream(self, start: int, length: int) -> Iterator[tuple[int, memoryview]]:
@@ -340,6 +430,7 @@ class BulkReader:
         after this exchange settles. Without it, WAIT retains the ordinary
         :meth:`write_from` fallback. No write is silently retried here.
         """
+        replies = _WriteReplies(acknowledged, waited, strict_replies)
         pending: dict[int, tuple[int, int]] = {}
         header = memoryview(bytearray(_HEADER))
         source = iter(pieces)
@@ -362,9 +453,7 @@ class BulkReader:
                 self._owed.discard(reply.streamid)
                 span = pending.pop(reply.streamid)
                 free_sids.append(reply.streamid)
-                count, error = self._write_answer(
-                    reply, body, span, acknowledged, waited, strict_replies
-                )
+                count, error = self._write_answer(reply, body, span, replies)
                 acked += count
                 failure = failure or error
         finally:
@@ -379,6 +468,15 @@ class BulkReader:
         offset: int,
         check: Callable[[], None] | None,
     ) -> tuple[int, bool]:
+        """Issue writes from ``source`` until no stream id is free.
+
+        Returns the next file offset and whether ``source`` ran dry. Each id
+        sent is recorded in ``pending`` with its ``(offset, length)``, which
+        is how an answer - which names only its stream id - is matched to the
+        byte range it acknowledges. ``check`` runs after every send, so a
+        caller's cancellation or rate limit is honoured between frames, never
+        part-way through one.
+        """
         while free:
             try:
                 piece = next(source)
@@ -401,18 +499,23 @@ class BulkReader:
         reply: ResponseHeader,
         body: bytearray,
         span: tuple[int, int],
-        acknowledged: Callable[[int, int], None] | None,
-        waited: Callable[[int, int], None] | None,
-        strict: bool,
+        replies: _WriteReplies,
     ) -> tuple[int, XRootDError | None]:
+        """One write's answer: the bytes it acknowledged, and its refusal if any.
+
+        ``span`` is the ``(offset, length)`` the write carried. A refusal is
+        returned rather than raised so the caller can keep draining the
+        window - every reply owed must be read before the connection is
+        usable again - and raise the first refusal once it has.
+        """
         if reply.status == c.kXR_ok:
-            if acknowledged is not None:
-                acknowledged(*span)
+            if replies.acknowledged is not None:
+                replies.acknowledged(*span)
             return span[1], None
-        if reply.status == c.kXR_wait and waited is not None:
-            waited(*span)
+        if reply.status == c.kXR_wait and replies.waited is not None:
+            replies.waited(*span)
             return 0, None
-        if strict and reply.status != c.kXR_error:
+        if replies.strict and reply.status != c.kXR_error:
             self._torn = True
             raise ProtocolError(
                 f"unexpected reply to a write: stream {reply.streamid}, status {reply.status}"
@@ -437,7 +540,7 @@ class BulkReader:
         if not sids:
             return
         try:
-            if self._owed and not self._torn and not self._expired():
+            if self._owed and not self._torn and not self._stopped():
                 self._drain()
         finally:
             self._hand_back(sids)
@@ -445,23 +548,28 @@ class BulkReader:
     def _hand_back(self, sids: list[int]) -> None:
         """Return this call's stream ids, or mark the session broken.
 
-        Replies still owed after the caller's deadline ran out, with the wire
-        stopped between frames, are the machine's to drop: the ids go back as
-        abandoned, and the event path discards each reply as it arrives - the
-        connection stays in step and in use. Anything else still owed, or a
-        wire stopped part-way through a frame, cannot be trusted again.
+        Replies still owed after the caller's deadline ran out or it was
+        cancelled, with the wire stopped between frames, are the machine's to
+        drop: the ids go back as abandoned, and the event path discards each
+        reply as it arrives - the connection stays in step and in use.
+        Anything else still owed, or a wire stopped part-way through a frame,
+        cannot be trusted again.
         """
         owed, self._owed = self._owed, set()
         if not owed and not self._torn:
             self._machine.release_sids(sids)
-        elif not self._torn and self._expired():
+        elif not self._torn and self._stopped():
             self._machine.retire_sids(sids, owed)
         else:
-            self._session.mark_broken()  # type: ignore[attr-defined]
+            self._session.mark_broken()
 
     def _expired(self) -> bool:
         """Whether the caller's deadline has passed."""
         return self._deadline is not None and time.monotonic() >= self._deadline
+
+    def _stopped(self) -> bool:
+        """Whether the caller has stopped waiting: out of time, or cancelled."""
+        return cancel.cancelled() or self._expired()
 
     def _scratch(self) -> list[memoryview]:
         """The rotating buffers :meth:`stream` lands pieces in, made on first use."""
@@ -476,41 +584,38 @@ class BulkReader:
             # A second call while a stream is suspended would put two sets of
             # reads on the wire with nothing to tell their replies apart.
             raise ProtocolError("this bulk reader already has a read in progress")
-        deadline = self._session.config.stall_deadline  # type: ignore[attr-defined]
+        deadline = self._session.config.stall_deadline
         self._expires = time.monotonic() + deadline if deadline else None
         left = dl.remaining()
         self._deadline = None if left is None else time.monotonic() + left
         self._torn = False
+        self._cancel_by = None
         self._leased = self._machine.lease_sids(self._depth)
         return list(self._leased)
 
     def _issue(self, sid: int, request: Request) -> None:
         """Put ``request`` on the wire on ``sid`` and count its reply as owed."""
-        self._send(sid, self._machine.frame_for(request, sid))
+        self._send(sid, *self._machine.frame_parts_for(request, sid))
 
     def _issue_write(self, sid: int, offset: int, piece: memoryview) -> None:
         """Put one ``kXR_write`` of ``piece`` on the wire, without copying it.
 
-        The request header is framed with no payload and its length patched
-        in, and the payload follows from the caller's buffer. A session that
-        signs its requests signs the whole frame, payload included, so there
-        the frame is built whole.
+        The frame is the request header and the caller's own buffer, sent
+        together in one vectored call. A session that signs its requests
+        signs the whole frame, payload included, so there the frame is built
+        whole - the machine does that, as it does for every signed request.
         """
-        machine = self._machine
-        if machine.signer is not None:
-            frame = machine.frame_for(r.Write(self._handle, offset, piece.tobytes()), sid)
-            self._send(sid, frame)
-            return
-        head = machine.frame_for(r.Write(self._handle, offset, b""), sid)
-        self._send(sid, head[:_DLEN] + len(piece).to_bytes(4, "big"), piece)
+        self._send(sid, *self._machine.frame_parts_for(r.Write(self._handle, offset, piece), sid))
 
-    def _send(self, sid: int, *frames: bytes | memoryview) -> None:
+    def _send(self, sid: int, *frames: Payload) -> None:
         """Send one request's bytes on ``sid`` and count its reply as owed."""
+        # Nothing more goes out for a caller that has gone: what is already
+        # in flight is left for the machine to drop.
+        cancel.check("the bulk transfer")
         # A send that fails part-way leaves half a request on the wire, which
         # the server may answer or not; either way nothing after it is sound.
         self._torn = True
-        for frame in frames:
-            self._transport.send(frame)
+        self._transport.send_buffers(frames)
         self._torn = False
         self._owed.add(sid)
 
@@ -588,7 +693,7 @@ class BulkReader:
         if size >= _ASYNC:
             self._exact(header, _HEADER)
             head = bytes(header)
-            if int.from_bytes(head[:4], "big") == c.kXR_asynresp:
+            if rp.parse_attn(head).action == c.kXR_asynresp:
                 self._exact(header, _HEADER)
                 inner = decode_header(bytes(header))
                 # What is on the wire is what is left of this frame, whatever
@@ -596,12 +701,12 @@ class BulkReader:
                 return ResponseHeader(inner.streamid, inner.status, size - _ASYNC)
         notice = rp.parse_attn(head + self._body(size - len(head)))
         _log.debug("server notice during a bulk transfer: %r", notice)
-        self._session.note(notice)  # type: ignore[attr-defined]
+        self._session.note(notice)
         return None
 
     def _deferred(self, body: bytearray) -> None:
         """Give a ``kXR_waitresp``'s answer the time the server asked for."""
-        budget = self._session.config.wait_budget  # type: ignore[attr-defined]
+        budget = self._session.config.wait_budget
         seconds = min(rp.parse_waitresp(bytes(body)).seconds, budget)
         if self._expires is not None:
             self._expires = max(self._expires, time.monotonic() + seconds + WAITRESP_GRACE)
@@ -657,7 +762,11 @@ class BulkReader:
             self._check_clocks(size - got)
             read = self._receive_into(view[got:size])
             if not read:
-                raise XrdTimeoutError(
+                # The peer hung up: the event path's ConnectionError, so that
+                # a caller retries a dropped link as it would any other and
+                # does not mistake it for a stall (a TimeoutError is not
+                # retried - see copy.engine._retry_transfer).
+                raise XrdConnectionError(
                     f"connection closed with {size - got} bytes of a reply outstanding"
                 )
             if fresh:
@@ -665,7 +774,9 @@ class BulkReader:
             got += read
 
     def _check_clocks(self, outstanding: int) -> None:
-        """Raise if the caller's deadline or the stall clock has run out."""
+        """Raise if the caller is cancelled, or its deadline or the stall clock has run out."""
+        if cancel.cancelled() and self._abandon_now():
+            raise cancel.Cancelled("the bulk transfer was cancelled")
         if self._expired():
             raise dl.OperationExpiredError("the bulk transfer expired before it completed")
         if self._expires is not None and time.monotonic() > self._expires:
@@ -673,9 +784,39 @@ class BulkReader:
                 f"bulk read stalled with {outstanding} bytes of a frame outstanding"
             )
 
+    def _abandon_now(self) -> bool:
+        """Whether a cancelled reader stops here, or first finishes its frame.
+
+        Between frames it stops at once. Part-way through one it waits up to
+        :data:`CANCEL_GRACE` for the rest, which is usually already in
+        flight: stopping torn would cost the whole connection.
+        """
+        if not self._torn:
+            return True
+        now = time.monotonic()
+        if self._cancel_by is None:
+            self._cancel_by = now + CANCEL_GRACE
+        return now >= self._cancel_by
+
+    def _await_readable(self, outstanding: int) -> None:
+        """Wait for bytes to read in short slices, looking at the clocks between.
+
+        Only inside a cancel scope: a ``recv`` blocked for the link's whole
+        timeout would not notice a cancellation until it returned.
+        """
+        give_up = time.monotonic() + self._resting
+        while not self._transport.wait_readable(cancel.POLL):
+            self._check_clocks(outstanding)
+            if time.monotonic() >= give_up:
+                raise XrdTimeoutError(
+                    f"bulk read timed out with {outstanding} bytes of a frame outstanding"
+                )
+
     def _receive_into(self, view: memoryview) -> int:
         """One ``recv`` into ``view``, cut short by the caller's deadline."""
         transport = self._transport
+        if cancel.current() is not None:
+            self._await_readable(len(view))
         if self._deadline is None:
             return int(transport.receive_into(view))
         left = self._deadline - time.monotonic()
@@ -691,12 +832,14 @@ class BulkReader:
 
 
 def _refuse(status: int, body: bytearray) -> NoReturn:
-    """Raise for a final reply that is not the data or the ``kXR_ok`` asked for."""
+    """Raise for a final reply that is not the data or the ``kXR_ok`` asked for.
+
+    A ``kXR_error`` is parsed and turned into an exception exactly as the
+    event path does it (:func:`~xrdclient.proto.machine.server_error`), so a
+    refusal reads the same whichever path took it off the wire.
+    """
     if status == c.kXR_error:
-        code = int.from_bytes(body[:4], "big") if len(body) >= 4 else 0
-        text = bytes(body[4:]).split(b"\x00", 1)[0].decode("utf-8", "replace")
-        raise_for_status(code, text)
-        raise ProtocolError(f"bulk request failed with error code {code}: {text}")
+        raise server_error(rp.parse_error(bytes(body)))
     # kXR_wait, kXR_redirect: a conversation, not bytes.
     raise BulkUnsupported(
         f"server answered a bulk request with {c.status_name(status)}; "

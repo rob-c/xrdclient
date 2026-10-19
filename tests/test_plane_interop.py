@@ -15,7 +15,7 @@ from dataclasses import replace
 import pytest
 
 import xrdclient
-from conftest import _REAL_CONFIG
+from tests.conftest import _REAL_CONFIG
 from xrdclient.client.file import File
 from xrdclient.flags import OpenFlags
 

@@ -9,8 +9,7 @@ tested side by side, from one generated proxy.
 import ssl
 
 import pytest
-
-from _pki import (
+from xrdsec.testing.rawpki import (
     _cached_key,
     make_certificate,
     name,
@@ -21,6 +20,7 @@ from _pki import (
     throwaway_key,
     tlv,
 )
+
 from xrdclient.config import Config
 from xrdclient.http.client import _context as http_context
 from xrdclient.transport.base import tls_context
@@ -140,19 +140,20 @@ def test_with_nothing_named_the_default_proxy_is_presented(monkeypatch, tmp_path
     """
     path = tmp_path / "x509up_u1000"
     path.write_bytes(proxy_chain(throwaway_key(0)))
-    monkeypatch.setattr("xrdclient.transport.base.default_proxy_path", lambda: str(path))
+    monkeypatch.setattr("xrdsec.credentials.default_proxy_path", lambda: str(path))
     loaded = []
     monkeypatch.setattr(ssl.SSLContext, "load_cert_chain", lambda self, p: loaded.append(p))
-    for build in BUILDERS:
-        build(Config(proxy=None))
-    assert loaded == [str(path), str(path)]
+    contexts = {id(build(Config(proxy=None))) for build in BUILDERS}
+    # Both stacks share the one context built for this setup, so it is read once.
+    assert loaded == [str(path)]
+    assert len(contexts) == 1
 
 
 def test_a_default_proxy_that_will_not_load_is_passed_over(monkeypatch, tmp_path, caplog):
     """A guessed file must not break a request that needs no certificate."""
     path = tmp_path / "x509up_u1000"
     path.write_text("not a proxy")
-    monkeypatch.setattr("xrdclient.transport.base.default_proxy_path", lambda: str(path))
+    monkeypatch.setattr("xrdsec.credentials.default_proxy_path", lambda: str(path))
     with caplog.at_level("WARNING"):
         context = tls_context(Config(proxy=None))
     assert context.verify_mode is ssl.CERT_REQUIRED
@@ -163,7 +164,7 @@ def test_a_named_proxy_is_never_swapped_for_the_default(monkeypatch, tmp_path):
     """``$X509_USER_PROXY`` pointing nowhere is an error, not a cue to guess."""
     default = tmp_path / "x509up_u1000"
     default.write_bytes(proxy_chain(throwaway_key(0)))
-    monkeypatch.setattr("xrdclient.transport.base.default_proxy_path", lambda: str(default))
+    monkeypatch.setattr("xrdsec.credentials.default_proxy_path", lambda: str(default))
     with pytest.raises(OSError, match=r"absent\.pem"):
         tls_context(Config(proxy=str(tmp_path / "absent.pem")))
 

@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import difflib
+import functools
 import os
 import re
 import shutil
@@ -40,9 +41,10 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from xrdcore.fanout import run_all
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
@@ -53,7 +55,7 @@ COMPAT_IMPORT = "from xrdclient.compat import client"
 OFFICIAL_IMPORT = "from XRootD import client"
 
 #: A line an example needs only on the compat layer - ``install_hook.py``'s
-#: ``xrdclient.compat.install()`` - says so, and the official variant drops it.
+#: ``import _compat_hook`` - says so, and the official variant drops it.
 COMPAT_ONLY = "# compat only"
 
 #: Enough of a storage element for every example: one export rooted in the
@@ -69,8 +71,10 @@ xrootd.chksum max 2 adler32 crc32
 
 
 def examples() -> list[Path]:
-    """Every example script, in name order."""
-    return sorted(p for p in HERE.glob("*.py") if p.name != Path(__file__).name)
+    """Every example script, in name order (``_`` modules are helpers they import)."""
+    return sorted(
+        p for p in HERE.glob("*.py") if p.name != Path(__file__).name and not p.name.startswith("_")
+    )
 
 
 def to_official(source: str) -> str:
@@ -301,15 +305,13 @@ def _run_examples(
 ) -> list[Result]:
     """Every example, ``-j`` at a time, against one server."""
     with server(xrootd) as (url, local), tempfile.TemporaryDirectory() as scratch:
-        with ThreadPoolExecutor(max(args.jobs, 1)) as pool:
-            return list(
-                pool.map(
-                    lambda s: compare(
-                        s, args.python, url, local, official, args.timeout, Path(scratch)
-                    ),
-                    scripts,
-                )
+        calls = [
+            functools.partial(
+                compare, s, args.python, url, local, official, args.timeout, Path(scratch)
             )
+            for s in scripts
+        ]
+        return run_all(calls, workers=max(args.jobs, 1), name="pyxrootd-examples")
 
 
 def _summarise(results: list[Result], official: bool, verbose: bool) -> int:

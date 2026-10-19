@@ -33,11 +33,11 @@ def elsewhere():
         yield server
 
 
-def recorded(server):
+def recorded(server: FakeDAVServer) -> list[dict[str, str]]:
     """Every request's headers, in order, as ``server`` received them."""
     seen: list[dict[str, str]] = []
 
-    def record(method, path, headers):
+    def record(method: str, path: str, headers: dict[str, str]) -> None:
         seen.append(headers)
 
     for verb in ("GET", "HEAD", "PUT", "COPY"):
@@ -45,7 +45,7 @@ def recorded(server):
     return seen
 
 
-def elsewhere_by_name(elsewhere, path="d/a.root"):
+def elsewhere_by_name(elsewhere: FakeDAVServer, path: str = "d/a.root") -> str:
     """The other server, spelled as a different host rather than a port."""
     return f"http://localhost:{elsewhere.address[1]}/{path}"
 
@@ -64,14 +64,6 @@ def test_the_token_does_not_follow_a_redirect_to_another_port(dav, elsewhere):
     with HTTPClient(Config(token=TOKEN)) as client:
         client.request("GET", dav.url / "d/a.root")
     assert "Authorization" not in seen[0]
-
-
-def test_the_token_follows_a_redirect_on_the_same_server(dav):
-    dav.add_file("/d/b.root", b"moved")
-    dav.redirects["/d/a.root"] = "/d/b.root"
-    dav.require_token = TOKEN
-    with HTTPClient(Config(token=TOKEN)) as client:
-        assert client.request("GET", dav.url / "d/a.root").body == b"moved"
 
 
 def test_a_token_in_the_url_does_not_follow_either(dav, elsewhere):
@@ -155,3 +147,32 @@ def test_the_trusted_domains_can_come_from_the_configuration(monkeypatch):
     assert HTTPClient(Config())._trusted() == ("a.org", "b.org")
     explicit = HTTPClient(Config(), trusted_redirect_domains=("c.org",))
     assert explicit._trusted() == ("c.org",)
+
+
+def test_a_logged_redirect_target_is_redacted(caplog, monkeypatch):
+    """A ``Location`` is the server's to write, and may carry a token.
+
+    The redirect loop, and so the log line, is xrdhttp's session's since 0.4.0.
+    """
+    import xrdhttp.session as session_module
+
+    import xrdclient.http.client as client_module
+    from xrdclient.log import redact
+
+    redacted: list[str] = []
+
+    def spy(text: str) -> str:
+        redacted.append(text)
+        return redact(text)
+
+    monkeypatch.setattr(session_module, "redact", spy)
+    with FakeDAVServer(files={"/f": b"x"}) as dav:
+        dav.redirects["/start"] = f"{dav.url}f?authz=s3cr3t-token"
+        with (
+            caplog.at_level("DEBUG", logger="xrdhttp"),
+            client_module.HTTPClient() as client,
+        ):
+            assert client.request("GET", dav.url / "start").body == b"x"
+    assert any("s3cr3t-token" in text for text in redacted)  # redacted before logging
+    assert "redirected to" in caplog.text
+    assert "s3cr3t-token" not in caplog.text

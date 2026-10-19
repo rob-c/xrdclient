@@ -131,9 +131,11 @@ def test_a_read_that_starts_past_the_end_is_empty_not_an_error(reader):
 @pytest.mark.parametrize("chunk", [1, 7, PAGE - 1, PAGE, PAGE + 1, SIZE - 1])
 def test_a_read_split_at_this_chunk_size_still_reassembles(srv, chunk):
     """The client splits its own request; the seams must not lose bytes."""
-    with FileSystem(srv.url, _CONFIG.evolve(chunk_size=chunk)) as fs:
-        with handle(fs, "/d/pattern") as fh:
-            assert fh.read() == PATTERN
+    with (
+        FileSystem(srv.url, _CONFIG.evolve(chunk_size=chunk)) as fs,
+        handle(fs, "/d/pattern") as fh,
+    ):
+        assert fh.read() == PATTERN
 
 
 @pytest.mark.parametrize("chunk", [1024, PAGE, 100_000])
@@ -151,10 +153,12 @@ def test_a_read_the_server_chunks_into_oksofar_still_reassembles(srv, chunk):
 def test_a_megabyte_arrives_in_one_request(srv):
     payload = bytes(range(256)) * 4096
     srv.add_file("/d/mib", payload)
-    with FileSystem(srv.url, _CONFIG.evolve(chunk_size=len(payload))) as fs:
-        with handle(fs, "/d/mib") as fh:
-            assert fh.read() == payload
-            assert srv.seen.count(c.kXR_read) >= 1
+    with (
+        FileSystem(srv.url, _CONFIG.evolve(chunk_size=len(payload))) as fs,
+        handle(fs, "/d/mib") as fh,
+    ):
+        assert fh.read() == payload
+        assert srv.seen.count(c.kXR_read) >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +326,7 @@ def test_concurrent_requests_share_one_connection(client, srv):
         try:
             with handle(client, "/d/pattern") as fh:
                 results[index] = fh.read(PAGE, index * 97)
-        except BaseException as exc:  # pragma: no cover - only on a failure
+        except BaseException as exc:  # only on a failure
             errors.append(exc)
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(12)]
@@ -336,11 +340,20 @@ def test_concurrent_requests_share_one_connection(client, srv):
 
 
 def test_a_long_run_of_operations_leaks_no_streamid(client):
+    """Every id a call takes comes back to the pool when it is answered.
+
+    Measured against the pool as this module's shared connection left it:
+    the concurrent readers above really were in flight together, and each
+    left its id behind in the free list - as it should.
+    """
     machine = client._router.session._m
+    client.stat("/d/pattern")
+    minted, free = machine._next_sid, len(machine._free)
     for _ in range(200):
         client.stat("/d/pattern")
     assert machine._pending == {}
-    assert len(machine._free) <= 2
+    assert machine._next_sid == minted  # nothing new was minted
+    assert len(machine._free) == free
 
 
 def test_a_long_run_of_reads_leaks_no_streamid(reader, client):

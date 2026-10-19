@@ -125,6 +125,56 @@ A server that answers with a conversation rather than bytes - a `kXR_wait`, a
 redirect - gets the same request again the ordinary way, and `config.bulk =
 False` puts everything back on that path.
 
+### Uploading a stream of pieces
+
+`write()` wants the whole buffer at once. An upload whose bytes arrive a
+piece at a time - read off a local file, a socket, a pipeline stage - hands
+them to `write_pieces()` instead, which keeps `config.bulk_depth` writes in
+flight back to back from an offset and tells you what the server confirmed:
+
+```python
+done = handle.write_pieces(
+    iter(lambda: source.read(1 << 20), b""),
+    acknowledged=lambda at, n: progress(at + n),   # only confirmed bytes
+    waited=lambda at, n: again.append((at, n)),    # "not now": yours to resend
+    check=raise_if_cancelled,                      # asked after every piece
+)
+for at, n in again:
+    handle.write(source_bytes(at, n), at)
+```
+
+A piece is sent before the next is asked for, so a producer may reuse its
+buffer. Without `waited`, a `kXR_wait` fails the call with
+`BulkUnsupported` once the window has settled. Where the plane cannot be used
+(a checkpoint, an append handle, `bulk=False`) the pieces go through `write()`
+one at a time with the same callbacks.
+`xrdclient.client.bulk.upload(path_or_fd, url, cancel=...)` is that loop for a
+local file, resends included.
+
+### Calling it off: `abort()`
+
+`handle.abort()` - from any thread, at any time, as often as you like - shuts
+down the connection the handle is open on, so a call blocked on a silent
+server returns at once instead of at its timeout, raising
+`xrdclient.AbortedError` (an `OSError` with `errno` `ECANCELED`). Every later
+call on the handle raises the same; nothing more is sent, the handle is never
+re-opened, and `close()` becomes a quiet release (for a `posc` writer the
+server then drops the partial file). The connection is what an abort reaches,
+so another handle sharing it - opened through the same `FileSystem` - sees it
+dropped too. `FileSystem.abort()` is the same for a namespace; the bulk
+transfers and `third_party()` take `cancel=` and do this for you.
+
+```python
+timer = threading.Timer(30, handle.abort)   # a watchdog of your own
+timer.start()
+try:
+    data = handle.read(1 << 20, 0)
+except xrdclient.AbortedError:
+    ...
+finally:
+    timer.cancel()
+```
+
 `open()` takes what `xrdclient.open` takes - `"r"`, `"w"`, `"x"`, `"a"`, `"r+"` -
 or the flag names in a string, or the flags themselves; its second argument
 is the mode a created file gets, and reads either as `0o640` or as

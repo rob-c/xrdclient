@@ -8,13 +8,36 @@ outbox:
     machine = SessionMachine(host="example.org", config=cfg)
     machine.start()
     while True:
-        sock.sendall(machine.data_to_send())
+        sock.sendmsg(machine.buffers_to_send())   # or sendall(data_to_send())
         machine.receive_data(sock.recv(65536))
         while (event := machine.next_event()) is not None:
             ...
 
 That contract is what lets the blocking and the asyncio front ends share one
 implementation, and what makes the protocol testable without a socket.
+
+Where to start reading: :meth:`SessionMachine.start` and :meth:`_bringup` for
+the connection lifecycle (handshake -> ``kXR_protocol`` -> optional TLS ->
+``kXR_login`` or ``kXR_bind`` -> ``kXR_auth`` rounds -> READY), then
+:meth:`submit` / :meth:`_send` for the outbound half and :meth:`receive_data`
+-> :meth:`_parse` -> :meth:`_dispatch` -> the ``_response_*`` handlers for the
+inbound half. The drivers live in :mod:`xrdclient.session` (blocking) and
+:mod:`xrdclient.aio`; neither adds protocol logic.
+
+Invariants a maintainer must not break:
+
+* A stream id is never reused while an answer to its previous request may
+  still arrive (``_pending``, ``_retired`` and ``_leased`` are all checked
+  before an id is handed out). XRootD matches replies to requests by stream
+  id alone, so a reused id silently delivers the wrong data.
+* Events are appended in wire order and drained oldest first; drivers rely
+  on a ``Chunk`` never overtaking the ``Completed`` of the same stream.
+* Every reply body is bounded: by ``MAX_RESPONSE_BODY`` per frame (checked
+  in :func:`~xrdclient.proto.frames.header_fields`) and by the request's
+  :meth:`~xrdclient.proto.frames.Request.reply_cap` across ``kXR_oksofar``
+  chunks, so a hostile server cannot make the client buffer without limit.
+* Nothing here blocks, sleeps or reads a clock: ``kXR_wait`` becomes a
+  :class:`Waiting` event and the driver does the sleeping.
 """
 
 from __future__ import annotations
@@ -25,8 +48,6 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING
 
-from .._compat import SLOTS
-from .._log import get_logger
 from ..config import Config
 from ..crypto.sigver import Signer
 from ..errors import (
@@ -38,11 +59,12 @@ from ..errors import (
     raise_for_status,
 )
 from ..errors import ConnectionError as XrdConnectionError
+from ..log import get_logger
 from ..types import ProtocolInfo
 from . import constants as c
 from . import requests as r
 from . import responses as rp
-from .frames import HANDSHAKE, Request, encode, header_fields
+from .frames import HANDSHAKE, Payload, Request, encode, encode_parts, header_fields
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Iterable, Iterator
@@ -50,20 +72,21 @@ if TYPE_CHECKING:
     from ..auth.base import Credential
 
 __all__ = [
-    "State",
-    "SessionMachine",
-    "Event",
-    "Negotiated",
-    "NeedTLS",
-    "Ready",
-    "Completed",
-    "Chunk",
-    "Redirected",
-    "Waiting",
     "Attention",
-    "Failed",
-    "PathLost",
+    "Chunk",
+    "Completed",
     "Disconnected",
+    "Event",
+    "Failed",
+    "NeedTLS",
+    "Negotiated",
+    "PathLost",
+    "Ready",
+    "Redirected",
+    "SessionMachine",
+    "State",
+    "Waiting",
+    "server_error",
 ]
 
 _log = get_logger(__name__)
@@ -102,21 +125,21 @@ class Event:
     __slots__ = ()
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class Negotiated(Event):
     """``kXR_protocol`` answered; capabilities are known."""
 
     info: ProtocolInfo
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class NeedTLS(Event):
     """The driver must upgrade the socket, then call :meth:`tls_established`."""
 
     reason: str = ""
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class Ready(Event):
     """Login and authentication are complete; requests may be submitted."""
 
@@ -124,7 +147,7 @@ class Ready(Event):
     mechanism: str = ""
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class Completed(Event):
     """A request finished successfully."""
 
@@ -134,7 +157,7 @@ class Completed(Event):
     status: rp.StatusInfo | None = None
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class Chunk(Event):
     """A partial response body; more will follow on the same stream."""
 
@@ -143,7 +166,7 @@ class Chunk(Event):
     data: bytes
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class Redirected(Event):
     """The server handed this request off elsewhere."""
 
@@ -152,7 +175,7 @@ class Redirected(Event):
     target: rp.RedirectInfo
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class Waiting(Event):
     """The server asked for a retry after a delay.
 
@@ -168,14 +191,14 @@ class Waiting(Event):
     resend: bool = True
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class Attention(Event):
     """An unsolicited ``kXR_attn`` that was not an embedded response."""
 
     info: rp.AttnInfo
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class Failed(Event):
     """A request, or the session bring-up, failed."""
 
@@ -184,7 +207,7 @@ class Failed(Event):
     error: XRootDError
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class PathLost(Event):
     """A bound data connection went away.
 
@@ -196,7 +219,7 @@ class PathLost(Event):
     reason: str = ""
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class Disconnected(Event):
     """The peer closed, or the machine was closed locally."""
 
@@ -208,20 +231,30 @@ class Disconnected(Event):
 # --------------------------------------------------------------------------
 
 
-@dataclass(**SLOTS)
+@dataclass(slots=True)
 class _Pending:
+    """Everything the machine remembers about one stream owed an answer.
+
+    Created by :meth:`SessionMachine._send` and dropped by
+    :meth:`SessionMachine.release` when a final reply (or a failure) ends the
+    stream. ``buffer`` accumulates ``kXR_oksofar`` / partial ``kXR_status``
+    bodies until the final one; ``status`` holds the ``kXR_status`` header
+    whose raw data is still arriving as a trailer.
+    """
+
     request: Request
-    frame: bytes
+    #: The frame as it went out, buffer by buffer, for a ``kXR_wait`` resend.
+    parts: list[Payload]
     buffer: bytearray = field(default_factory=bytearray)
     status: rp.StatusInfo | None = None
     path: str = ""
     pathid: int = 0
-    path_bytes: bytes = b""
+    path_bytes: Payload = b""
     #: Most bytes this reply may accumulate; 0 for no limit.
     cap: int = 0
 
 
-@dataclass(**SLOTS)
+@dataclass(slots=True)
 class _Framer:
     """One link's inbound cursor.
 
@@ -250,18 +283,25 @@ class SessionMachine:
         host: str = "",
         port: int = c.DEFAULT_PORT,
         config: Config | None = None,
-        credentials: Iterator[Credential] | None = None,
         username: str = "",
         want_tls: bool = False,
-        bind_to: bytes = b"",
     ) -> None:
+        """A machine for one connection to ``host:port``, not yet started.
+
+        ``username`` and ``want_tls`` default to the config's
+        (``config.username``, ``config.require_tls``); ``want_tls`` can only
+        add TLS, never take away a requirement the config makes. A data
+        connection that joins an existing session instead of logging in is
+        made with :meth:`data_path`.
+        """
         self.host = host
         self.port = port
         self.config = config or Config()
         self.username = username or self.config.username
         self.want_tls = want_tls or self.config.require_tls
-        #: Session id to attach to with ``kXR_bind`` instead of logging in.
-        self.bind_to = bind_to
+        #: Session id to attach to with ``kXR_bind`` instead of logging in;
+        #: empty for a control connection (see :meth:`data_path`).
+        self.bind_to = b""
         #: The path id the server gave this connection, once bound.
         self.pathid = 0
 
@@ -275,8 +315,11 @@ class SessionMachine:
         self.signer: Signer | None = None
         self.tls_active = False
 
-        self._out = bytearray()
-        self._out_path: dict[int, bytearray] = {}
+        #: What is queued for the control link, as the buffers it was framed
+        #: in: a write's payload stays the caller's view until the driver's
+        #: vectored send hands the lot to the kernel in one call.
+        self._out: list[Payload] = []
+        self._out_path: dict[int, list[Payload]] = {}
         self._events: list[Event] = []
         self._pending: dict[int, _Pending] = {}
         #: Ids free for reuse, oldest first: an id goes back to the end of the
@@ -293,14 +336,38 @@ class SessionMachine:
         # Inbound framing cursor, one per link.
         self._framers: dict[int, _Framer] = {0: _Framer()}
 
-        # Authentication ladder.
-        self._credentials = credentials
+        # Authentication ladder. The credentials are chosen lazily, from the
+        # mechanisms the server offers (see :meth:`_next_credential`).
+        self._credentials: Iterator[Credential] | None = None
         self._credential: Credential | None = None
         self._auth_rejected: dict[str, str] = {}
         self._offered: list[str] = []
         #: The last refusal a server sent mid-exchange, kept to be the
         #: session's error should every mechanism after it fail too.
         self._auth_refusal: ServerError | None = None
+
+    @classmethod
+    def data_path(
+        cls, primary: SessionMachine, session_id: bytes, *, config: Config, want_tls: bool
+    ) -> SessionMachine:
+        """A machine for a second connection to ``primary``'s session.
+
+        It reaches the same endpoint as the same user, and on :meth:`start`
+        sends ``kXR_bind`` with ``session_id`` (the id the server gave
+        ``primary`` at login) instead of logging in - which is how XrdCl's
+        data streams attach. ``config`` is the owning session's (normally
+        ``primary.config`` too). ``want_tls`` is the primary's actual TLS
+        state, so a data path is never in the clear when its session is not.
+        """
+        machine = cls(
+            host=primary.host,
+            port=primary.port,
+            config=config,
+            username=primary.username,
+            want_tls=want_tls,
+        )
+        machine.bind_to = session_id
+        return machine
 
     # ------------------------------------------------------------------
     # Outbound
@@ -311,23 +378,39 @@ class SessionMachine:
         if self.state is not State.NEW:
             raise ProtocolError(f"start() called in state {self.state.name}")
         flags = c.kXR_secreqs | c.kXR_ableTLS | (c.kXR_wantTLS if self.want_tls else 0)
-        self._out += HANDSHAKE
-        self._out += encode(r.Protocol(flags), _SID_PROTOCOL)
+        self._out.append(HANDSHAKE)
+        self._out.append(encode(r.Protocol(flags), _SID_PROTOCOL))
         self.state = State.HANDSHAKE
 
     def data_to_send(self) -> bytes:
-        """Drain and return everything queued for the control link."""
-        data = bytes(self._out)
-        del self._out[:]
-        return data
+        """Drain and return everything queued for the control link, joined."""
+        return b"".join(self.buffers_to_send())
+
+    def buffers_to_send(self) -> list[Payload]:
+        """Drain everything queued for the control link, as separate buffers.
+
+        In wire order. A write's payload is still the view the caller handed
+        in, so a driver that sends the list with one vectored call
+        (``socket.sendmsg``) never copies it; one that cannot joins them.
+        """
+        out, self._out = self._out, []
+        return out
 
     def path_data_to_send(self, pathid: int) -> bytes:
-        """Drain and return everything queued for a bound data path."""
-        queued = self._out_path.pop(pathid, None)
-        return bytes(queued) if queued else b""
+        """Drain and return everything queued for a bound data path, joined."""
+        return b"".join(self.path_buffers_to_send(pathid))
+
+    def path_buffers_to_send(self, pathid: int) -> list[Payload]:
+        """Drain everything queued for a bound data path, as separate buffers."""
+        return self._out_path.pop(pathid, None) or []
 
     @property
     def has_data_to_send(self) -> bool:
+        """Whether anything is queued for the control link.
+
+        A driver checks this after every :meth:`receive_data`: replies such
+        as ``kXR_authmore`` make the machine queue a request of its own.
+        """
         return bool(self._out)
 
     @property
@@ -357,9 +440,9 @@ class SessionMachine:
         pending = self._pending.get(streamid)
         if pending is None:
             raise ProtocolError(f"stream {streamid} is not waiting")
-        self._out += pending.frame
+        self._out.extend(pending.parts)
         if pending.path_bytes:
-            self._out_path.setdefault(pending.pathid, bytearray()).extend(pending.path_bytes)
+            self._out_path.setdefault(pending.pathid, []).append(pending.path_bytes)
 
     def release(self, streamid: int) -> None:
         """Abandon a stream - after a redirect, or when the caller gives up."""
@@ -380,7 +463,7 @@ class SessionMachine:
     def close(self, *, graceful: bool = True) -> None:
         """Queue ``kXR_endsess`` and mark the machine closed."""
         if self.state is State.READY and graceful and self.session_id:
-            self._out += encode(r.EndSession(self.session_id), self._acquire_sid())
+            self._out.append(encode(r.EndSession(self.session_id), self._acquire_sid()))
         self.state = State.CLOSED
         self._events.append(Disconnected("closed by client"))
 
@@ -450,23 +533,40 @@ class SessionMachine:
         negotiated. Nothing is recorded as pending: the caller is reading the
         answer itself.
         """
+        return b"".join(self.frame_parts_for(request, sid))
+
+    def frame_parts_for(self, request: Request, sid: int) -> list[Payload]:
+        """:meth:`frame_for` as separate buffers, a write's payload uncopied."""
         if sid not in self._leased:
             raise ProtocolError(f"stream id {sid} was not leased for bulk use")
         return self._frame(request, sid)
 
-    def _frame(self, request: Request, sid: int) -> bytes:
-        """``request`` on ``sid``, behind its ``kXR_sigver`` when it needs one."""
-        frame = encode(request, sid)
+    def _frame(self, request: Request, sid: int) -> list[Payload]:
+        """``request`` on ``sid``, behind its ``kXR_sigver`` when it needs one.
+
+        As buffers in wire order (see :func:`~xrdclient.proto.frames.encode_parts`).
+        A signature covers the frame whole, so a signed request is joined to
+        be signed - the one case where a write's payload is copied.
+        """
+        parts = encode_parts(request, sid)
         if self.signer is None:
-            return frame
+            return parts
+        frame = b"".join(parts)
         signed = self.signer.sign(frame)
         if signed is None:
-            return frame
+            return [frame]
         seqno, signature, nodata = signed
         sigver = r.Sigver(request.opcode, seqno, signature, nodata=nodata)
-        return encode(sigver, sid) + frame
+        return [encode(sigver, sid) + frame]
 
     def _acquire_sid(self) -> int:
+        """A stream id no request, lease or late reply can still claim.
+
+        Freed ids are reused oldest first; otherwise the counter advances,
+        wrapping past ``0xFFFF`` (the field is 16 bits) back to the first id
+        above the bring-up range. If the id it lands on is still in use, all
+        65 532 are taken and the session cannot multiplex another request.
+        """
         if self._free:
             return self._free.popleft()
         sid = self._next_sid
@@ -480,11 +580,17 @@ class SessionMachine:
     def _send(
         self, request: Request, sid: int, *, path: str = "", arrive_on_path: bool = False
     ) -> None:
-        frame = self._frame(request, sid)
+        """Frame ``request`` on ``sid``, record it as pending, and queue it.
+
+        The pending record keeps the framed buffers so that a ``kXR_wait``
+        can resend exactly what went out, and the request's ``path_data``
+        so that it goes down the bound socket again too.
+        """
+        parts = self._frame(request, sid)
         data = request.path_data()
         pathid = request.pathid
         self._pending[sid] = _Pending(
-            request, frame, path=path, pathid=pathid, path_bytes=data, cap=request.reply_cap()
+            request, parts, path=path, pathid=pathid, path_bytes=data, cap=request.reply_cap()
         )
         # Arrival routing (BriX and any server that keys a sub-stream on which
         # connection a request *arrived* on): the whole frame goes down the
@@ -492,13 +598,14 @@ class SessionMachine:
         # back on the same socket. The standard split - header on the control
         # link, payload on the data socket - is what runs otherwise.
         if arrive_on_path and pathid:
-            buf = self._out_path.setdefault(pathid, bytearray())
-            buf += frame
-            buf += data
+            queue = self._out_path.setdefault(pathid, [])
+            queue.extend(parts)
+            if data:
+                queue.append(data)
             return
-        self._out += frame
+        self._out.extend(parts)
         if data:
-            self._out_path.setdefault(pathid, bytearray()).extend(data)
+            self._out_path.setdefault(pathid, []).append(data)
 
     # ------------------------------------------------------------------
     # Inbound
@@ -553,9 +660,28 @@ class SessionMachine:
 
     @property
     def in_flight(self) -> int:
+        """How many submitted requests are still owed a final answer.
+
+        Leased and retired ids are not counted: they belong to the bulk
+        reader or to replies nobody is waiting for.
+        """
         return len(self._pending)
 
+    def streams_on(self, pathid: int) -> list[int]:
+        """The streams still owed an answer that were routed over ``pathid``.
+
+        What a driver closing that path must fail: :meth:`forget_path` frees
+        their ids silently, and whoever is waiting on one would wait forever.
+        """
+        return [sid for sid, pending in self._pending.items() if pending.pathid == pathid]
+
     def _on_eof(self) -> None:
+        """The control link closed: fail every pending stream, then the session.
+
+        Each waiter gets its own :class:`Failed` before the final
+        :class:`Disconnected`, so a driver can resolve futures one by one and
+        then decide whether to reconnect. A second EOF is ignored.
+        """
         if self.state in (State.CLOSED, State.FAILED):
             return
         self.state = State.CLOSED
@@ -582,6 +708,7 @@ class SessionMachine:
         self._out_path.pop(pathid, None)
 
     def _on_path_eof(self, pathid: int) -> None:
+        """A bound data path closed: fail its streams only, then report :class:`PathLost`."""
         reason = f"data path {pathid} closed by peer"
         for sid, pending in list(self._pending.items()):
             if pending.pathid == pathid:
@@ -590,6 +717,14 @@ class SessionMachine:
         self._events.append(PathLost(pathid, reason))
 
     def _parse(self, framer: _Framer) -> None:
+        """Dispatch every complete frame in ``framer``'s buffer; keep the remainder.
+
+        Three things can be owed, in this order: the raw trailer of a
+        ``kXR_status`` reply (its ``dlen`` counted only the status block, the
+        data follows uncounted), a frame header, or the body that header
+        announced. Returning early leaves the cursor exactly where the next
+        :meth:`receive_data` must resume.
+        """
         buf = framer.buffer
         while True:
             if framer.need_trailer:
@@ -626,6 +761,15 @@ class SessionMachine:
     # ------------------------------------------------------------------
 
     def _dispatch(self, sid: int, status: int, body: bytes, framer: _Framer) -> None:
+        """Route one complete frame to bring-up or to its stream's handler.
+
+        A ``kXR_attn`` carrying ``kXR_asynresp`` is unwrapped first: it is the
+        late answer to a ``kXR_waitresp``, embedded with its own header, and
+        is then handled as if it had arrived directly on that stream. A reply
+        to an unknown stream is logged and dropped rather than failing the
+        session: nothing is waiting for it, and the other streams on the
+        connection are still good.
+        """
         if status == c.kXR_attn:
             inner = self._unwrap_attn(body)
             if inner is None:
@@ -680,6 +824,14 @@ class SessionMachine:
     # -- bring-up -------------------------------------------------------
 
     def _bringup(self, status: int, body: bytes) -> None:
+        """Advance the connection one bring-up step on the reply ``body``.
+
+        Bring-up replies are matched by state, not by stream id: only one
+        bring-up request is ever outstanding, and the handshake reply arrives
+        on stream 0 with no request behind it. ``kXR_authmore`` is the only
+        non-``ok`` status that continues; anything else unexpected fails the
+        session.
+        """
         if status == c.kXR_error:
             self._bringup_error(body)
             return
@@ -741,6 +893,13 @@ class SessionMachine:
         self.state = State.PROTOCOL
 
     def _after_protocol(self) -> None:
+        """Decide on TLS from the ``kXR_protocol`` reply, then log in.
+
+        TLS happens when the client wants it (``roots://``, ``require_tls``)
+        or the server's flags demand it; a server that demands or is asked
+        for TLS without ``kXR_haveTLS`` fails the session rather than letting
+        it continue in the clear.
+        """
         flags = self.protocol_info.flags
         # ``kXR_tlsData`` belongs here with the session-wide bits: this client
         # reads and writes on the connection it logged in on, so a server that
@@ -761,14 +920,15 @@ class SessionMachine:
         self._begin_login()
 
     def _begin_login(self) -> None:
+        """Queue ``kXR_login`` - or ``kXR_bind`` for a data path - on its reserved id."""
         if self.bind_to:
             # A data connection never logs in: it says which session it
             # belongs to and inherits that session's identity wholesale.
             self.state = State.BIND
-            self._out += encode(r.Bind(self.bind_to), _SID_BIND)
+            self._out.append(encode(r.Bind(self.bind_to), _SID_BIND))
             return
         self.state = State.LOGIN
-        self._out += encode(r.Login(self.username), _SID_LOGIN)
+        self._out.append(encode(r.Login(self.username), _SID_LOGIN))
 
     def _next_credential(self, sec: str) -> None:
         """Advance the ladder and send the next mechanism's first blob."""
@@ -791,7 +951,7 @@ class SessionMachine:
                 continue
             self._credential = cred
             self.mechanism = cred.name
-            self._out += encode(r.Auth(cred.name, blob), _SID_AUTH)
+            self._out.append(encode(r.Auth(cred.name, blob), _SID_AUTH))
             return
         refusal = self._auth_refusal
         if refusal is not None:
@@ -824,6 +984,13 @@ class SessionMachine:
         self._next_credential("")
 
     def _auth_step(self, challenge: bytes) -> None:
+        """Answer a ``kXR_authmore`` challenge with the mechanism in play.
+
+        A mechanism that raises or has nothing more to say is recorded as
+        rejected and the ladder moves on to the next one, so one broken
+        plug-in (an expired proxy, a missing keytab) does not stop a login
+        another mechanism could complete.
+        """
         cred = self._credential
         if cred is None:
             self._fail(AuthenticationError("server sent kXR_authmore with no exchange open"))
@@ -839,9 +1006,15 @@ class SessionMachine:
             )
             self._next_credential("")
             return
-        self._out += encode(r.Auth(cred.name, blob), _SID_AUTH)
+        self._out.append(encode(r.Auth(cred.name, blob), _SID_AUTH))
 
     def _become_ready(self) -> None:
+        """Enter READY, arming request signing if the mechanism produced a key.
+
+        Signing needs both a session key (only a mechanism that negotiates
+        one, GSI here, sets ``session_key``) and a server security level that asks for it; the
+        :class:`~xrdclient.crypto.sigver.Signer` decides per request.
+        """
         self.state = State.READY
         key = self._credential.session_key if self._credential else None
         if key:
@@ -854,12 +1027,14 @@ class SessionMachine:
         self._events.append(Ready(self.session_id, self.mechanism))
 
     def _fail(self, error: XRootDError) -> None:
+        """Fail the session (not a stream): ``Failed`` with no stream id."""
         self.state = State.FAILED
         self._events.append(Failed(None, None, error))
 
     # -- request responses ----------------------------------------------
 
     def _response_ok(self, sid: int, body: bytes, pending: _Pending, _framer: _Framer) -> None:
+        """Final answer: join it to any ``kXR_oksofar`` chunks and complete the stream."""
         if pending.cap and not self._within_cap(sid, pending, len(body)):
             return
         if pending.buffer:
@@ -872,21 +1047,29 @@ class SessionMachine:
         self._events.append(Completed(sid, pending.request, data, pending.status))
 
     def _response_chunk(self, sid: int, body: bytes, pending: _Pending, _framer: _Framer) -> None:
+        """``kXR_oksofar``: buffer a partial body and report it; the stream stays open."""
         if self._within_cap(sid, pending, len(body)):
             pending.buffer += body
             self._events.append(Chunk(sid, pending.request, body))
 
     def _response_error(self, sid: int, body: bytes, pending: _Pending, _framer: _Framer) -> None:
+        """``kXR_error``: end the stream with the exception the error code maps to."""
         info = rp.parse_error(body)
         self.release(sid)
-        self._events.append(Failed(sid, pending.request, _server_error(info, pending.path)))
+        self._events.append(Failed(sid, pending.request, server_error(info, pending.path)))
 
     def _response_redirect(
         self, sid: int, body: bytes, pending: _Pending, _framer: _Framer
     ) -> None:
+        """``kXR_redirect``: report the new target; the stream stays pending.
+
+        Following it means a new connection, which only the driver can make;
+        the driver calls :meth:`release` once it has re-sent elsewhere.
+        """
         self._events.append(Redirected(sid, pending.request, rp.parse_redirect(body)))
 
     def _response_wait(self, sid: int, body: bytes, pending: _Pending, _framer: _Framer) -> None:
+        """``kXR_wait``: ask the driver to sleep (capped by ``wait_cap``) and :meth:`resume`."""
         wait = rp.parse_wait(body)
         self._events.append(
             Waiting(sid, pending.request, min(wait.seconds, self.config.wait_cap), wait.message)
@@ -895,10 +1078,17 @@ class SessionMachine:
     def _response_waitresp(
         self, sid: int, body: bytes, pending: _Pending, _framer: _Framer
     ) -> None:
+        """``kXR_waitresp``: the answer will come later as a ``kXR_attn``; nothing to resend."""
         later = rp.parse_waitresp(body)
         self._events.append(Waiting(sid, pending.request, later.seconds, resend=False))
 
     def _response_status(self, sid: int, body: bytes, pending: _Pending, framer: _Framer) -> None:
+        """``kXR_status`` (pgread/pgwrite): note the header, then expect its raw data.
+
+        The frame's ``dlen`` covers only the status block; the data it
+        describes follows as ``state.dlen`` uncounted bytes, so the framer is
+        told to collect that trailer before reading the next header.
+        """
         state = rp.parse_status(body)
         pending.status = state
         if state.dlen:
@@ -908,6 +1098,7 @@ class SessionMachine:
             self._on_status_data(sid, b"")
 
     def _response_unexpected(self, sid: int, status: int, pending: _Pending) -> None:
+        """A status no request can be answered with: fail that stream only."""
         self.release(sid)
         self._events.append(
             Failed(
@@ -941,6 +1132,11 @@ class SessionMachine:
         return False
 
     def _on_status_data(self, sid: int, data: bytes) -> None:
+        """The raw data behind a ``kXR_status`` arrived: a chunk, or the final answer.
+
+        ``kXR_PartialResult`` in the status header means more frames follow
+        on this stream (as ``kXR_oksofar`` does for plain replies).
+        """
         pending = self._pending.get(sid)
         if pending is None or pending.status is None:
             return
@@ -956,6 +1152,7 @@ class SessionMachine:
             self._events.append(Chunk(sid, pending.request, data))
 
     def __repr__(self) -> str:
+        """Endpoint, state, load and TLS - what a hung-connection report needs."""
         return (
             f"SessionMachine({self.host}:{self.port}, state={self.state.name}, "
             f"in_flight={len(self._pending)}, tls={self.tls_active})"
@@ -979,7 +1176,13 @@ _HANDLERS: dict[int, _Handler] = {
 }
 
 
-def _server_error(info: rp.ErrorInfo, path: str) -> XRootDError:
+def server_error(info: rp.ErrorInfo, path: str = "") -> XRootDError:
+    """The exception a ``kXR_error`` body stands for, naming ``path`` if known.
+
+    The one place a server's refusal becomes an exception: the event path and
+    the bulk reader both come here, so a refusal reads the same whichever of
+    them took it off the wire.
+    """
     try:
         raise_for_status(info.code, info.message, path=path or None)
     except XRootDError as exc:

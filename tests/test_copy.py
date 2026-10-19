@@ -9,12 +9,16 @@ import threading
 import time
 
 import pytest
+from xrdcore.checksum import checksum_bytes
+from xrdcore.checksum import new as new_checksum
+from xrdcore.pipeline import pump
 
 import xrdclient
 from xrdclient.copy import engine
 from xrdclient.copy import tpc as engine_tpc
 from xrdclient.errors import ChecksumMismatchError, UnsupportedError, kXR_Unsupported
 from xrdclient.proto import constants as c
+from xrdclient.session.router import Router
 from xrdclient.testing import FakeDAVServer, FakeServer, error, frame
 from xrdclient.url import parse
 
@@ -43,7 +47,7 @@ def test_download_writes_the_local_file(server, tmp_path):
 
 
 def test_stream_destination_refuses_zero_progress(monkeypatch):
-    monkeypatch.setattr(engine.os, "write", lambda *_: 0)
+    monkeypatch.setattr(os, "write", lambda *_: 0)
     with pytest.raises(OSError) as caught:
         engine._write_descriptor(123, memoryview(b"payload"))
     assert caught.value.errno == errno.EIO
@@ -142,8 +146,9 @@ def test_a_missing_source_raises_the_usual_error(tmp_path, server):
 
 def test_the_checksum_is_taken_against_the_target_when_it_is_remote(src, server):
     result = xrdclient.copy(src, server.url / "v.bin")
+    assert result.checksum is not None
     assert result.checksum.algorithm == "adler32"
-    assert result.checksum.value == xrdclient.crypto.checksum_bytes("adler32", PAYLOAD)
+    assert result.checksum.value == checksum_bytes("adler32", PAYLOAD)
 
 
 def test_a_corrupted_transfer_is_caught(src, server, monkeypatch):
@@ -171,12 +176,14 @@ def test_a_server_that_cannot_checksum_degrades_quietly(src, server, monkeypatch
 
 def test_the_algorithm_is_configurable(src, server):
     result = xrdclient.copy(src, server.url / "md5.bin", algorithm="md5")
+    assert result.checksum is not None
     assert result.checksum.algorithm == "md5"
 
 
 def test_a_download_verifies_against_the_source(server, tmp_path):
     result = xrdclient.copy(server.url / "data/a.root", tmp_path / "d.root")
-    assert result.checksum.value == xrdclient.crypto.checksum_bytes("adler32", b"hello world")
+    assert result.checksum is not None
+    assert result.checksum.value == checksum_bytes("adler32", b"hello world")
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +247,7 @@ def tree(tmp_path):
     return tmp_path
 
 
-def copied(server, prefix):
+def copied(server: FakeServer, prefix: str) -> list[str]:
     """The names the server holds under ``prefix``, relative to it."""
     return sorted(p[len(prefix) :].lstrip("/") for p in server.files if p.startswith(prefix))
 
@@ -353,7 +360,9 @@ def test_a_probe_of_something_that_is_not_there_is_not_a_size(server, tmp_path):
     cfg = xrdclient.Config()
     assert engine._probe(xrdclient.parse(str(tmp_path / "absent")), cfg) is None
     assert engine._probe(server.url / "data/gone.root", cfg) is None
-    assert engine._probe(server.url / "data/a.root", cfg)[0] == 11
+    probed = engine._probe(server.url / "data/a.root", cfg)
+    assert probed is not None
+    assert probed[0] == 11
 
 
 # ---------------------------------------------------------------------------
@@ -421,9 +430,11 @@ def test_an_http_target_cannot_be_resumed(tmp_path):
     """A PUT replaces the whole resource, so a partial one can only be redone."""
     src_file = tmp_path / "s.bin"
     src_file.write_bytes(PAYLOAD)
-    with FakeDAVServer(files={"/d/part.bin": PAYLOAD[:512]}) as dav:
-        with pytest.raises(UnsupportedError, match="cannot resume a copy into http"):
-            xrdclient.copy(src_file, dav.url / "d/part.bin", resume=True)
+    with (
+        FakeDAVServer(files={"/d/part.bin": PAYLOAD[:512]}) as dav,
+        pytest.raises(UnsupportedError, match="cannot resume a copy into http"),
+    ):
+        xrdclient.copy(src_file, dav.url / "d/part.bin", resume=True)
 
 
 def test_progress_on_a_resumed_copy_counts_from_the_start_of_the_file(server, tmp_path):
@@ -447,7 +458,8 @@ def test_a_resumed_copy_verifies_by_comparing_the_two_files(server, tmp_path):
     target.write_bytes(b"hello ")
     result = xrdclient.copy(server.url / "data/a.root", target, resume=True)
     assert result.verified
-    assert result.checksum.value == xrdclient.crypto.checksum_bytes("adler32", b"hello world")
+    assert result.checksum is not None
+    assert result.checksum.value == checksum_bytes("adler32", b"hello world")
 
 
 def test_a_resumed_copy_that_carried_on_from_the_wrong_bytes_is_caught(server, tmp_path):
@@ -636,7 +648,8 @@ def test_a_parallel_transfer_verifies_by_comparing_the_two_files(server, tmp_pat
         config=xrdclient.Config(bulk=False),
     )
     assert result.verified
-    assert result.checksum.value == xrdclient.crypto.checksum_bytes("adler32", PAYLOAD)
+    assert result.checksum is not None
+    assert result.checksum.value == checksum_bytes("adler32", PAYLOAD)
 
 
 def test_one_stream_is_what_a_single_chunk_asks_for(src, server):
@@ -686,9 +699,8 @@ def test_progress_on_a_parallel_transfer_counts_the_whole_file(src, server):
 
 
 def test_a_parallel_transfer_still_refuses_to_clobber(src, server):
-    with FakeServer(files={"/taken.bin": b"x"}) as dst:
-        with pytest.raises(FileExistsError):
-            xrdclient.copy(src, dst.url / "taken.bin", chunk_size=1024, overwrite=False)
+    with FakeServer(files={"/taken.bin": b"x"}) as dst, pytest.raises(FileExistsError):
+        xrdclient.copy(src, dst.url / "taken.bin", chunk_size=1024, overwrite=False)
 
 
 def test_a_source_shorter_than_it_claimed_stops_at_its_end(server, tmp_path, monkeypatch):
@@ -737,7 +749,7 @@ def test_third_party_emits_the_stock_rendezvous(server):
     _assert_rendezvous_order(dst)
 
 
-def _assert_rendezvous_paths(server, dst):
+def _assert_rendezvous_paths(server: FakeServer, dst: FakeServer) -> None:
     # Destination first (it is the puller), then the source registers the key.
     (dst_open,) = [p for p in dst.opened if "tpc.key" in p]
     (src_open,) = [p for p in server.opened if "tpc.key" in p]
@@ -751,7 +763,7 @@ def _assert_rendezvous_paths(server, dst):
     assert src_open == f"/data/a.root?tpc.key={key}&tpc.dst={dst.address[0]}&tpc.stage=copy"
 
 
-def _assert_rendezvous_order(dst):
+def _assert_rendezvous_order(dst: FakeServer) -> None:
     # Arm, register, trigger: two syncs on the destination, one open between.
     assert dst.seen.count(c.kXR_sync) == 2
     assert dst.seen.index(c.kXR_open) < dst.seen.index(c.kXR_sync)
@@ -791,37 +803,40 @@ def test_third_party_dispatches_an_http_pair_to_the_copy_dialect():
 
 def test_third_party_refuses_to_mix_the_two_dialects(server):
     """Each dialect is one server asking another in a language it speaks."""
-    with FakeDAVServer(dirs=["/d"]) as dst:
-        with pytest.raises(ValueError, match="root:// and http://"):
-            xrdclient.third_party(server.url / "data/a.root", dst.url / "d/b.root", verify=False)
+    with (
+        FakeDAVServer(dirs=["/d"]) as dst,
+        pytest.raises(ValueError, match="root:// and http://"),
+    ):
+        xrdclient.third_party(server.url / "data/a.root", dst.url / "d/b.root", verify=False)
 
 
 def test_the_root_only_options_are_refused_rather_than_ignored():
     """``tpc.token_mode`` has no HTTP spelling, so silently dropping it would lie."""
-    with FakeDAVServer(files={"/d/a.root": b"x"}) as src, FakeDAVServer(dirs=["/d"]) as dst:
-        with pytest.raises(ValueError, match="Credential header"):
-            xrdclient.third_party(
-                src.url / "d/a.root",
-                dst.url / "d/b.root",
-                token_mode="delegate",
-                verify=False,
-            )
+    with (
+        FakeDAVServer(files={"/d/a.root": b"x"}) as src,
+        FakeDAVServer(dirs=["/d"]) as dst,
+        pytest.raises(ValueError, match="Credential header"),
+    ):
+        xrdclient.third_party(
+            src.url / "d/a.root",
+            dst.url / "d/b.root",
+            token_mode="delegate",
+            verify=False,
+        )
 
 
 def test_third_party_can_demand_an_exclusive_destination(server):
-    with FakeServer(files={"/taken.root": b"x"}) as dst:
-        with pytest.raises(FileExistsError):
-            xrdclient.third_party(
-                server.url / "data/a.root", dst.url / "taken.root", overwrite=False, verify=False
-            )
+    with FakeServer(files={"/taken.root": b"x"}) as dst, pytest.raises(FileExistsError):
+        xrdclient.third_party(
+            server.url / "data/a.root", dst.url / "taken.root", overwrite=False, verify=False
+        )
 
 
 def test_a_third_party_copy_takes_the_timeout_it_was_given(server, monkeypatch):
     """``timeout`` is the request timeout for both sides of the rendezvous."""
     seen: list[float] = []
-    original = engine_tpc.Router
 
-    class Recording(original):  # type: ignore[misc, valid-type]
+    class Recording(Router):
         def __init__(self, url, config=None, **kw):
             seen.append(config.request_timeout)
             super().__init__(url, config, **kw)
@@ -837,15 +852,31 @@ def test_a_third_party_copy_takes_the_timeout_it_was_given(server, monkeypatch):
     assert seen and set(seen) == {12.5}
 
 
-def test_a_third_party_copy_survives_a_source_that_will_not_close(server):
-    """The source close is a courtesy; failing it must not lose the copy."""
+def test_a_third_party_copy_fails_at_the_source_that_will_not_close(server):
+    """XrdCl closes both ends after the pull and fails the job if either close fails.
+
+    The source's close comes first; its failure is the job's, named as the
+    source's, and the destination is still closed after it.
+    """
     with FakeServer(dirs=["/"]) as dst:
         server.handlers[c.kXR_close] = lambda conn, sid, params, body: iter(
             [error(sid, 3012, "close refused")]
         )
-        result = xrdclient.third_party(server.url / "data/a.root", dst.url / "b.root", verify=False)
+        with pytest.raises(xrdclient.XRootDError, match="close refused") as caught:
+            xrdclient.third_party(server.url / "data/a.root", dst.url / "b.root", verify=False)
         assert c.kXR_close in server.seen  # it was tried, and it failed
-    assert result.size == 11
+        assert c.kXR_close in dst.seen  # and the destination was closed regardless
+    assert xrdclient.failed_end(caught.value) == "source"
+
+
+def test_a_destination_that_will_not_close_fails_the_copy_as_the_destinations(server):
+    with FakeServer(dirs=["/"]) as dst:
+        dst.handlers[c.kXR_close] = lambda conn, sid, params, body: iter(
+            [error(sid, 3012, "close refused")]
+        )
+        with pytest.raises(xrdclient.XRootDError, match="close refused") as caught:
+            xrdclient.third_party(server.url / "data/a.root", dst.url / "b.root", verify=False)
+    assert xrdclient.failed_end(caught.value) == "destination"
 
 
 def test_a_source_that_only_knows_how_to_read_is_still_copied(server):
@@ -854,10 +885,10 @@ def test_a_source_that_only_knows_how_to_read_is_still_copied(server):
     class ReadOnly:
         """Not an ``io`` object at all - just something with ``read``."""
 
-        def __init__(self, data):
+        def __init__(self, data: bytes) -> None:
             self._data = io.BytesIO(data)
 
-        def read(self, size=-1):
+        def read(self, size: int = -1) -> bytes:
             return self._data.read(size)
 
     xrdclient.copy(ReadOnly(b"minimal" * 100), server.url / "minimal.bin")
@@ -866,7 +897,9 @@ def test_a_source_that_only_knows_how_to_read_is_still_copied(server):
 
 def test_a_source_of_unknown_size_leaves_the_allocation_hint_out():
     """``oss.asize`` is a promise; a size nobody knows is not one to make."""
-    opaque = engine_tpc._dst_opaque("k" * 32, xrdclient.parse("root://s//f.root"), "s:1094", -1, "")
+    opaque = engine_tpc._dst_opaque(
+        "k" * 32, xrdclient.parse("root://s//f.root"), "s:1094", -1, engine_tpc._Options()
+    )
     assert "oss.asize" not in opaque
     assert opaque.endswith("&tpc.stage=copy")
 
@@ -921,7 +954,7 @@ class _Recorder(io.RawIOBase):
 def test_the_pump_moves_the_same_bytes_whatever_the_window(depth):
     payload = os.urandom(5000)
     target = _Recorder()
-    moved = engine._pump(io.BytesIO(payload), target, None, 1024, None, None, depth)
+    moved = pump(io.BytesIO(payload), target, None, 1024, None, None, depth)
     assert (moved, b"".join(target.chunks)) == (len(payload), payload)
 
 
@@ -949,7 +982,7 @@ def test_reading_ahead_overlaps_the_reads_with_the_writes(depth, ahead):
             time.sleep(0.05)
             return super().write(data)
 
-    engine._pump(reader, Writer(), None, 1024, None, None, depth)
+    pump(reader, Writer(), None, 1024, None, None, depth)
     assert (seen[1] > 2) is ahead  # without the window it is strictly one at a time
     assert seen == [1, 2, 3, 4] or ahead
 
@@ -965,7 +998,7 @@ def test_a_source_that_only_has_read_is_still_moved(tmp_path):
             return self._data.read(size)
 
     target = _Recorder()
-    assert engine._pump(ReadOnly(b"abcdef"), target, None, 4, None, None, 2) == 6
+    assert pump(ReadOnly(b"abcdef"), target, None, 4, None, None, 2) == 6
     assert b"".join(target.chunks) == b"abcdef"
 
 
@@ -977,7 +1010,7 @@ def test_a_source_that_fails_mid_stream_raises_where_the_caller_can_see_it():
             return super().readinto(buffer)
 
     with pytest.raises(OSError, match="the disk went away"):
-        engine._pump(Broken(b"y" * 4096, delay=0), _Recorder(), None, 1024, None, None, 3)
+        pump(Broken(b"y" * 4096, delay=0), _Recorder(), None, 1024, None, None, 3)
 
 
 def test_a_write_that_fails_stops_the_reader_rather_than_leaving_it_running():
@@ -988,22 +1021,22 @@ def test_a_write_that_fails_stops_the_reader_rather_than_leaving_it_running():
             raise OSError("no room")
 
     with pytest.raises(OSError, match="no room"):
-        engine._pump(reader, Failing(), None, 1024, None, None, 2)
+        pump(reader, Failing(), None, 1024, None, None, 2)
     alive = [t for t in threading.enumerate() if t.name == "xrd-readahead"]
     assert alive == []
 
 
 def test_progress_and_digests_still_see_the_file_in_order():
     payload = os.urandom(4096)
-    digest = xrdclient.crypto.new("adler32")
+    digest = new_checksum("adler32")
     steps: list[int] = []
 
     def report(done, _total):
         steps.append(done)
 
-    engine._pump(io.BytesIO(payload), _Recorder(), 4096, 1024, report, digest, 4)
+    pump(io.BytesIO(payload), _Recorder(), 4096, 1024, report, digest, 4)
     assert steps == [1024, 2048, 3072, 4096]
-    assert digest.hexdigest() == xrdclient.crypto.checksum_bytes("adler32", payload)
+    assert digest.hexdigest() == checksum_bytes("adler32", payload)
 
 
 def test_the_window_is_a_setting_and_a_flag(tmp_path):
@@ -1042,6 +1075,7 @@ def test_a_verified_third_party_copy_asks_both_ends_afterwards():
         result = xrdclient.third_party(
             src.url / "d/a.root", dst.url / "d/b.root", verify=True, algorithm="adler32"
         )
+    assert result.checksum is not None
     assert result.verified and result.checksum.algorithm == "adler32"
 
 
@@ -1049,7 +1083,9 @@ def test_an_unverified_third_party_copy_asks_nothing_more(server):
     with FakeServer(dirs=["/"]) as dst:
         result = xrdclient.third_party(server.url / "data/a.root", dst.url / "b.root", verify=False)
     assert not result.verified
-    assert c.kXR_query not in dst.seen
+    # One query, and it is XrdCl's CheckTPCLite before the pull, not a checksum.
+    assert dst.seen.count(c.kXR_query) == 1
+    assert dst.seen.index(c.kXR_query) < dst.seen.index(c.kXR_sync)
 
 
 def test_a_third_party_copy_is_verified_by_default_and_a_bad_one_removed(server):
@@ -1069,10 +1105,12 @@ def test_the_keyed_source_open_carries_the_redirects_capability():
     """EOS's disk servers refuse a TPC source open without the head node's ``cap.*``."""
     from xrdclient.copy import tpc
 
-    placed = "/eos/f.root?tpc.stage=placement&cap.sym=AQE&cap.msg=zz&mgm.id=7"
-    assert tpc._redirect_cgi(placed) == "cap.sym=AQE&cap.msg=zz&mgm.id=7"
-    assert tpc._redirect_cgi("/plain/f.root?tpc.stage=placement") == ""
-    assert tpc._redirect_cgi("/plain/f.root") == ""
+    sent = "/eos/f.root?authz=tok&tpc.stage=placement"
+    placed = "/eos/f.root?authz=tok&tpc.stage=placement&cap.sym=AQE&cap.msg=zz&mgm.id=7"
+    assert tpc._redirect_cgi(sent, placed) == "cap.sym=AQE&cap.msg=zz&mgm.id=7"
+    unmoved = "/plain/f.root?tpc.stage=placement"
+    assert tpc._redirect_cgi(unmoved, unmoved) == ""
+    assert tpc._redirect_cgi("/plain/f.root", "/plain/f.root") == ""
 
 
 # ---------------------------------------------------------------------------

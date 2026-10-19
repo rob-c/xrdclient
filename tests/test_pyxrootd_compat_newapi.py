@@ -57,7 +57,9 @@ def _test_config(monkeypatch):
     _channels.close_all()
 
 
-def status(code, ok=False, shellcode=0, message="error", errno=0):
+def status(
+    code: int, ok: bool = False, shellcode: int = 0, message: str = "error", errno: int = 0
+) -> XRootDStatus:
     return XRootDStatus(
         {
             "message": message,
@@ -194,7 +196,7 @@ def test_the_package_exports_the_exceptions_as_upstream_does():
 # -- the tape client: upstream tests/test_tape.py ------------------------------
 
 
-def _ok(ok=True):
+def _ok(ok: bool = True) -> XRootDStatus:
     return XRootDStatus(
         {
             "ok": ok,
@@ -209,7 +211,7 @@ def _ok(ok=True):
     )
 
 
-def _buffer(value):
+def _buffer(value: str) -> bytes:
     return value.encode("utf-8") + b"\0"
 
 
@@ -241,7 +243,7 @@ class FakeFileSystem:
         return (_ok(), answer(rest)) if answer else (_ok(False), "")
 
     @staticmethod
-    def _archive_info(rest):
+    def _archive_info(rest: str) -> bytes:
         results = [
             {"path": p, "error": "not found"}
             if "missing" in p
@@ -630,6 +632,7 @@ def test_tape_requests_over_http_take_callbacks_and_odd_arguments(dav, http):
     handler = AsyncResponseHandler()
     assert fs.prepare(["/d/a.root"], PrepareFlags.STAGE, callback=handler).ok
     status, handle, _ = handler.wait()
+    assert status is not None
     assert status.ok and handle.decode() in dav.staged
     # A cancel naming no request, and a delete naming none, reach the API as such.
     assert not fs.prepare([], PrepareFlags.CANCEL, timeout=5)[0].ok
@@ -677,7 +680,8 @@ def test_callback_wrapper_converts_raw_arguments():
     CallbackWrapper(lambda *args: got.append(args), None)(_status.OK, b"raw", typed)
     assert got[2][1:] == (b"raw", typed)
     with pytest.raises(TypeError):
-        CallbackWrapper("not callable", None)
+        # Deliberately not callable: the runtime check is what is under test.
+        CallbackWrapper("not callable", None)  # type: ignore[arg-type]
 
 
 def test_progress_handler_wrapper_converts_and_tolerates_no_handler():
@@ -725,7 +729,7 @@ def test_finalize_closes_open_files_and_the_shared_channels():
     assert client.finalize is finalize
 
 
-def _forget_xrootd(monkeypatch):
+def _forget_xrootd(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in [n for n in sys.modules if n.split(".")[0] == "XRootD"]:
         monkeypatch.delitem(sys.modules, name)
 
@@ -735,10 +739,11 @@ def test_install_maps_every_upstream_submodule(monkeypatch):
 
     _forget_xrootd(monkeypatch)
     compat.install()
-    from XRootD.client import finalize  # noqa: F401
+    from XRootD.client import finalize
     from XRootD.client import tape as installed_tape
     from XRootD.client._version import __version__
 
+    assert finalize is client.finalize
     assert installed_tape is tape and __version__ == xrdclient.__version__
     _forget_xrootd(monkeypatch)
 
@@ -748,14 +753,22 @@ def test_install_maps_every_upstream_submodule(monkeypatch):
 
 @pytest.fixture
 def official():
-    return pytest.importorskip("XRootD.client", reason="the official bindings are not installed")
+    return pytest.importorskip(
+        "XRootD.client", reason="environmental: the official XRootD bindings are not installed"
+    )
 
 
 @pytest.mark.parity
 def test_every_code_name_the_bindings_have_has_their_number(official):
     from XRootD.client.responses import XRootDStatus as Theirs
 
-    names = [n for n in vars(Theirs) if n[:3] in ("err", "suD", "suC", "suR", "suP", "suA", "suN")]
+    # The bindings also grew a ``error_name`` property beside the ``err*`` codes.
+    names = [
+        n
+        for n in vars(Theirs)
+        if n[:3] in ("err", "suD", "suC", "suR", "suP", "suA", "suN")
+        and isinstance(getattr(Theirs, n), int)
+    ]
     assert names and {n: getattr(XRootDStatus, n) for n in names} == {
         n: getattr(Theirs, n) for n in names
     }

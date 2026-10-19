@@ -90,6 +90,7 @@ def test_the_ambient_defaults_leave_what_is_not_a_default_alone():
         assert Shaped("u", "t").pool_size == 7
         assert Shaped("u", "t", pool_size=3).pool_size == 3
         with pytest.raises(TypeError):
+            # Leaving out a required field is the runtime refusal under test.
             Shaped("u")  # type: ignore[call-arg]
 
 
@@ -149,7 +150,7 @@ def test_a_verb_takes_a_path_object(server, config):
         assert xrdclient.size(path, config=config) == len(BODY)
 
 
-@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no named pipes here")
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="platform: os.mkfifo is POSIX-only")
 def test_a_local_stat_of_something_neither_file_nor_directory(tmp_path):
     pipe = tmp_path / "pipe"
     os.mkfifo(pipe)
@@ -158,7 +159,8 @@ def test_a_local_stat_of_something_neither_file_nor_directory(tmp_path):
 
 
 @pytest.mark.skipif(
-    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root can read and write anything"
+    not hasattr(os, "geteuid") or os.geteuid() == 0,
+    reason="environment: root (or a platform without POSIX uids) reads and writes anything",
 )
 def test_a_local_stat_reports_this_users_access_not_the_mode(tmp_path):
     write_only, read_only = tmp_path / "w", tmp_path / "r"

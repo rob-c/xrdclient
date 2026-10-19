@@ -11,6 +11,7 @@ checks that there is something there to behave.
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 
 import pytest
 
@@ -39,8 +40,8 @@ def _public(cls: type) -> set[str]:
     return {name for name in dir(cls) if not name.startswith("_")}
 
 
-def _parameters(func: object) -> list[str]:
-    return list(inspect.signature(func).parameters)  # type: ignore[arg-type]
+def _parameters(func: Callable[..., object]) -> list[str]:
+    return list(inspect.signature(func).parameters)
 
 
 def _is_method(cls: type, name: str) -> bool:
@@ -84,7 +85,7 @@ def test_every_module_level_verb_has_an_awaitable_twin(name):
     assert name in xrdclient.aio.__all__
     if name != "open":  # open is awaitable *and* an async context manager
         assert inspect.iscoroutinefunction(twin)
-    # The copy family forwards ``**kwargs`` whole, and open leaves out the
-    # internal ``router``; the easy verbs are small enough to spell out.
-    if name in easy.__all__:
-        assert _parameters(twin) == _parameters(getattr(xrdclient, name))
+    # Every twin spells its arguments out, so a type checker and the docs see
+    # them; only open leaves out the internal ``router``.
+    expected = [p for p in _parameters(getattr(xrdclient, name)) if p != "router"]
+    assert _parameters(twin) == expected

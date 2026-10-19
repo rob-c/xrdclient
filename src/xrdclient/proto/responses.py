@@ -3,6 +3,17 @@
 Each class decodes the bytes *after* the 8-byte ``ServerResponseHdr``. The
 header itself is handled by :mod:`xrdclient.proto.frames`; status dispatch is the
 :class:`~xrdclient.proto.machine.SessionMachine`'s job.
+
+Two kinds of decoder live here: the control-status bodies the machine needs
+to drive a stream (``kXR_error``, ``kXR_redirect``, ``kXR_wait*``,
+``kXR_attn``, ``kXR_status``), and the ``kXR_ok`` payloads of individual
+requests, which the client layer decodes once a request has completed. All of
+them read through :class:`~xrdclient.proto.buffer.Reader`, so a short or
+malformed body raises :class:`~xrdclient.errors.ProtocolError` rather than an
+``IndexError``; text replies (stat lines, ``kXR_Qspace`` CGI) are parsed
+leniently where real servers are known to vary and strictly where a wrong
+number would mislead the caller. Every decoder is a pure function of its
+bytes, so they are tested directly against captured server replies.
 """
 
 from __future__ import annotations
@@ -11,8 +22,7 @@ import json
 import re
 from dataclasses import dataclass, field
 
-from .._compat import SLOTS
-from ..errors import ProtocolError
+from ..errors import ProtocolError, UnsupportedError, kXR_Unsupported
 from ..flags import StatInfoFlags
 from ..types import (
     CheckpointInfo,
@@ -29,40 +39,40 @@ from . import constants as c
 from .buffer import Reader
 
 __all__ = [
-    "ErrorInfo",
-    "RedirectInfo",
-    "WaitInfo",
     "AttnInfo",
-    "StatusInfo",
-    "LoginInfo",
-    "ReadVSegment",
+    "ErrorInfo",
     "FattrItem",
     "FattrResult",
-    "parse_protocol",
-    "parse_login",
-    "parse_bind",
-    "parse_stat",
-    "parse_statvfs",
-    "parse_statx",
-    "parse_dirlist",
-    "parse_locate",
-    "parse_open",
-    "parse_checksum",
-    "parse_checkpoint",
-    "parse_readlink",
-    "parse_space",
-    "parse_prepare_status",
-    "parse_error",
-    "parse_redirect",
-    "parse_wait",
-    "parse_waitresp",
+    "LoginInfo",
+    "ReadVSegment",
+    "RedirectInfo",
+    "StatusInfo",
+    "WaitInfo",
     "parse_attn",
-    "parse_status",
-    "parse_pgwrite_cse",
-    "parse_readv",
+    "parse_bind",
+    "parse_checkpoint",
+    "parse_checksum",
+    "parse_dirlist",
+    "parse_error",
     "parse_fattr",
     "parse_fattr_list",
     "parse_fattr_tree",
+    "parse_locate",
+    "parse_login",
+    "parse_open",
+    "parse_pgwrite_cse",
+    "parse_prepare_status",
+    "parse_protocol",
+    "parse_readlink",
+    "parse_readv",
+    "parse_redirect",
+    "parse_space",
+    "parse_stat",
+    "parse_status",
+    "parse_statvfs",
+    "parse_statx",
+    "parse_wait",
+    "parse_waitresp",
 ]
 
 
@@ -71,7 +81,7 @@ __all__ = [
 # --------------------------------------------------------------------------
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class ErrorInfo:
     """Body of a ``kXR_error`` response."""
 
@@ -80,11 +90,16 @@ class ErrorInfo:
 
 
 def parse_error(data: bytes) -> ErrorInfo:
+    """``errnum[4] errmsg``: a ``kXR_*`` error code, then NUL-terminated text.
+
+    The code is what :func:`~xrdclient.errors.raise_for_status` maps to an
+    exception class; the message is the server's and is passed through.
+    """
     r = Reader(data, "kXR_error")
     return ErrorInfo(r.i32(), r.cstring())
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class RedirectInfo:
     """Body of a ``kXR_redirect`` response."""
 
@@ -131,7 +146,7 @@ def parse_redirect(data: bytes) -> RedirectInfo:
     return RedirectInfo(host, port, token.lstrip("?&") if sep else "")
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class WaitInfo:
     """Body of a ``kXR_wait`` or ``kXR_waitresp`` response."""
 
@@ -140,16 +155,22 @@ class WaitInfo:
 
 
 def parse_wait(data: bytes) -> WaitInfo:
+    """``seconds[4] infomsg``: how long to wait before resending, and why."""
     r = Reader(data, "kXR_wait")
     return WaitInfo(r.i32(), r.cstring())
 
 
 def parse_waitresp(data: bytes) -> WaitInfo:
+    """``seconds[4]``: how long the real answer (an ``kXR_attn``) may take.
+
+    Unlike ``kXR_wait`` the client resends nothing; the seconds are only a
+    hint for how long to keep the stream open.
+    """
     r = Reader(data, "kXR_waitresp")
     return WaitInfo(r.i32())
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class AttnInfo:
     """Body of an unsolicited ``kXR_attn`` response."""
 
@@ -158,15 +179,22 @@ class AttnInfo:
 
     @property
     def message(self) -> str:
+        """The text of a ``kXR_asyncms`` notice, up to its NUL."""
         return self.params.split(b"\x00", 1)[0].decode("utf-8", "replace")
 
 
 def parse_attn(data: bytes) -> AttnInfo:
+    """``actnum[4] parms``: the ``kXR_async*`` action code and its raw parameters.
+
+    For ``kXR_asynresp`` the parameters are four reserved bytes, then a whole
+    embedded response (header and body) for a stream that got
+    ``kXR_waitresp``; the machine unwraps that itself.
+    """
     r = Reader(data, "kXR_attn")
     return AttnInfo(r.i32(), r.rest())
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class StatusInfo:
     """Body of a ``kXR_status`` response.
 
@@ -184,6 +212,7 @@ class StatusInfo:
 
     @property
     def is_final(self) -> bool:
+        """``kXR_FinalResult``: no more frames follow on this stream."""
         return self.resptype == c.kXR_FinalResult
 
     @property
@@ -195,6 +224,13 @@ class StatusInfo:
 
 
 def parse_status(data: bytes) -> StatusInfo:
+    """``crc32c[4] streamid[2] requestid[1] resptype[1] reserved[4] dlen[4] info``.
+
+    ``requestid`` is sent relative to ``kXR_1stRequest`` (3000) to fit in a
+    byte; it is returned as the full opcode. The CRC is not checked here:
+    the callers that need integrity (paged I/O) check per-page CRCs, which
+    cover the data the status block only describes.
+    """
     r = Reader(data, "kXR_status")
     crc = r.u32()
     streamid = r.u16()
@@ -283,7 +319,7 @@ def parse_protocol(data: bytes) -> ProtocolInfo:
     )
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class LoginInfo:
     """``kXR_login`` - the session id plus the server's security continuation."""
 
@@ -299,6 +335,11 @@ class LoginInfo:
 
 
 def parse_login(data: bytes) -> LoginInfo:
+    """``sessid[16]`` then an optional NUL-terminated security token (``&P=...``).
+
+    A short body (no token, or a server that sends fewer than 16 id bytes)
+    is accepted: an empty ``sec`` means no authentication is required.
+    """
     r = Reader(data, "kXR_login")
     sessid = r.bytes(min(c.SESSION_ID_LEN, r.remaining))
     return LoginInfo(sessid, r.rest().split(b"\x00", 1)[0].decode("utf-8", "replace"))
@@ -329,6 +370,11 @@ _FLAGS: dict[int, StatInfoFlags] = {}
 
 
 def _flags(value: int) -> StatInfoFlags:
+    """The :class:`StatInfoFlags` for ``value``, memoised in :data:`_FLAGS`.
+
+    The cache stops growing at 256 entries so that a server sending
+    arbitrary flag words cannot grow it without limit.
+    """
     flags = _FLAGS.get(value)
     if flags is None:
         flags = StatInfoFlags(value)
@@ -338,6 +384,16 @@ def _flags(value: int) -> StatInfoFlags:
 
 
 def _stat_fields(text: str, path: str) -> StatInfo:
+    """:func:`_parse_stat_fields`, with a non-numeric field reported as the
+    :class:`ProtocolError` it is - a stat line inside a stat, open or dirlist
+    reply is the server's, so ``int()``'s ``ValueError`` must not escape."""
+    try:
+        return _parse_stat_fields(text, path)
+    except ValueError as exc:
+        raise ProtocolError(f"stat line has a non-numeric field: {text!r}") from exc
+
+
+def _parse_stat_fields(text: str, path: str) -> StatInfo:
     """One stat line: ``id size flags mtime``, then the protocol-5 extension.
 
     A version-5 server goes on to send ``ctime atime mode owner group``, with
@@ -349,9 +405,17 @@ def _stat_fields(text: str, path: str) -> StatInfo:
         ctime, atime, mode, owner, group = parts[4:9]
         mtime = int(parts[3])
         return StatInfo(
-            parts[0], int(parts[1]), _flags(int(parts[2])), mtime,
-            int(ctime), int(atime), path, mode, owner, group,
-        )  # fmt: skip
+            parts[0],
+            int(parts[1]),
+            _flags(int(parts[2])),
+            mtime,
+            int(ctime),
+            int(atime),
+            path,
+            mode,
+            owner,
+            group,
+        )
     if len(parts) < 4:
         raise ProtocolError(f"kXR_stat returned {len(parts)} fields, expected >= 4: {text!r}")
     mtime = int(parts[3])
@@ -360,23 +424,35 @@ def _stat_fields(text: str, path: str) -> StatInfo:
 
 
 def parse_stat(data: bytes, path: str = "") -> StatInfo:
-    """``kXR_stat`` - a space-separated ``id size flags modtime`` line."""
+    """``kXR_stat`` - a space-separated ``id size flags modtime`` line.
+
+    A field that is not a decimal number is the server's mistake, not a
+    caller's, so it surfaces as :class:`ProtocolError` like every other
+    malformed reply rather than as the ``ValueError`` ``int()`` raises.
+    """
     return _stat_fields(data.split(b"\x00", 1)[0].decode("utf-8", "replace"), path)
 
 
 def parse_statvfs(data: bytes) -> VFSInfo:
     """``kXR_stat`` with ``kXR_vfs``."""
     parts = data.split(b"\x00", 1)[0].decode("utf-8", "replace").split()
+    if len(parts) == 4 and all(part.isdigit() for part in parts[1:]):
+        # A server that does not do the vfs stat answers the request as a plain
+        # ``kXR_stat`` - the four-field ``id size flags modtime`` line of the
+        # directory itself. dCache does exactly this. That is the server saying
+        # it has no vfs figures, not a garbled vfs reply, so it reads as
+        # unsupported rather than as a protocol fault. Only a line that really
+        # is a stat line (the id may be any token; the other three are numbers)
+        # is read that way: four arbitrary words are still a garbled reply.
+        raise UnsupportedError(kXR_Unsupported, "server answered kXR_stat vfs with a plain stat")
     if len(parts) < 6:
         raise ProtocolError(f"kXR_stat vfs returned {len(parts)} fields, expected 6")
-    return VFSInfo(
-        nodes_rw=int(parts[0]),
-        free_rw=int(parts[1]),
-        utilization_rw=int(parts[2]),
-        nodes_staging=int(parts[3]),
-        free_staging=int(parts[4]),
-        utilization_staging=int(parts[5]),
-    )
+    try:
+        numbers = [int(part) for part in parts[:6]]
+    except ValueError as exc:
+        # The server's mistake, so a ProtocolError, as for a stat line.
+        raise ProtocolError(f"kXR_stat vfs has a non-numeric field: {parts!r}") from exc
+    return VFSInfo(*numbers)
 
 
 def parse_statx(data: bytes) -> tuple[StatInfoFlags, ...]:
@@ -437,7 +513,7 @@ def parse_dirlist(data: bytes, path: str = "", with_stat: bool = True) -> list[D
 
     entries: list[DirEntry] = []
     prefix = f"{path.rstrip('/')}/" if path else ""
-    for name, statline in zip(lines[::2], lines[1::2]):
+    for name, statline in zip(lines[::2], lines[1::2], strict=False):
         if name == ".":
             continue
         _checked(name, path)
@@ -544,6 +620,7 @@ def parse_space(data: bytes) -> SpaceInfo:
             fields[key.strip()] = value.strip()
 
     def number(key: str, default: int) -> int:
+        """``key``'s integer value; ``default`` when absent, an error when not a number."""
         raw = fields.get(key)
         if raw is None or raw == "":
             return default
@@ -581,7 +658,7 @@ def parse_readlink(data: bytes) -> str:
 # --------------------------------------------------------------------------
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class ReadVSegment:
     """One element of a ``kXR_readv`` response."""
 
@@ -609,7 +686,7 @@ def parse_readv(data: bytes) -> list[ReadVSegment]:
 # --------------------------------------------------------------------------
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class FattrItem:
     """One attribute in a ``kXR_fattr`` response."""
 
@@ -618,7 +695,7 @@ class FattrItem:
     value: bytes | None = None
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class FattrResult:
     """``kXR_fattr`` response body."""
 
@@ -626,10 +703,21 @@ class FattrResult:
     items: list[FattrItem] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, bytes]:
+        """Name to value for the attributes that came back with one.
+
+        Attributes that came back without a value - a list without
+        ``kXR_fattrAData``, a body that ended early - are left out rather
+        than mapped to ``None``.
+        """
         return {i.name: i.value for i in self.items if i.value is not None}
 
 
 def _read_name(r: Reader) -> str:
+    """A NUL-terminated attribute name; a missing NUL raises (truncated body).
+
+    Unlike :meth:`Reader.cstring`, which accepts an unterminated tail, a
+    name must end in NUL here because a value may follow it.
+    """
     raw = bytearray()
     while True:
         b = r.u8()

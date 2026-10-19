@@ -14,6 +14,7 @@ import hashlib
 import os
 import threading
 import time
+from collections.abc import Generator
 
 import pytest
 
@@ -124,36 +125,43 @@ def test_stream_hands_back_pieces_in_file_order(bulk_server, cfg):
 
 def test_stream_bounds_its_memory(bulk_server, cfg):
     """Whatever the file's length, the reader holds ``chunk * depth``."""
-    with _opened(bulk_server, cfg) as handle:
-        with handle.session.bulk(handle.handle, chunk=16 << 10, depth=3) as reader:
-            # Nothing is set aside until a stream needs somewhere to land.
-            assert reader._bufs == []
-            total = sum(len(view) for _, view in reader.stream(0, len(PAYLOAD)))
-            assert sum(len(b) for b in reader._bufs) == 3 * (16 << 10)
+    with (
+        _opened(bulk_server, cfg) as handle,
+        handle.session.bulk(handle.handle, chunk=16 << 10, depth=3) as reader,
+    ):
+        # Nothing is set aside until a stream needs somewhere to land.
+        assert reader._bufs == []
+        total = sum(len(view) for _, view in reader.stream(0, len(PAYLOAD)))
+        assert sum(len(b) for b in reader._bufs) == 3 * (16 << 10)
     assert total == len(PAYLOAD)
 
 
 def test_a_view_is_only_good_until_the_next_piece(bulk_server, cfg):
     """The buffers rotate, which is the contract the docstring promises."""
-    with _opened(bulk_server, cfg) as handle:
-        with handle.session.bulk(handle.handle, chunk=16 << 10, depth=2) as reader:
-            pieces = reader.stream(0, len(PAYLOAD))
-            _, first = next(pieces)
-            copied = bytes(first)
-            for _ in range(4):
-                next(pieces)
-            # The same slot has been reused by now; the copy is what survives.
-            assert copied == PAYLOAD[: len(copied)]
-            pieces.close()
+    with (
+        _opened(bulk_server, cfg) as handle,
+        handle.session.bulk(handle.handle, chunk=16 << 10, depth=2) as reader,
+    ):
+        pieces = reader.stream(0, len(PAYLOAD))
+        assert isinstance(pieces, Generator)
+        _, first = next(pieces)
+        copied = bytes(first)
+        for _ in range(4):
+            next(pieces)
+        # The same slot has been reused by now; the copy is what survives.
+        assert copied == PAYLOAD[: len(copied)]
+        pieces.close()
 
 
 def test_bulk_needs_an_idle_connection(bulk_server, cfg):
     """Two readers on one connection would take each other's replies."""
-    with _opened(bulk_server, cfg) as handle:
-        with handle.session.bulk(handle.handle, chunk=1024, depth=1):
-            with pytest.raises(XRootDError):
-                with handle.session.bulk(handle.handle, chunk=1024, depth=1):
-                    pass  # pragma: no cover - the entry is what raises
+    with (
+        _opened(bulk_server, cfg) as handle,
+        handle.session.bulk(handle.handle, chunk=1024, depth=1),
+        pytest.raises(XRootDError),
+        handle.session.bulk(handle.handle, chunk=1024, depth=1),
+    ):
+        pass  # never reached: entering the second reader is what raises
 
 
 def test_reader_rejects_impossible_geometry(bulk_server, cfg):
@@ -475,7 +483,7 @@ def test_regular_file_preallocation_preserves_enospc(tmp_path, monkeypatch):
         def full(_fd: int, _size: int) -> None:
             raise OSError(errno.ENOSPC, "filesystem nearly full")
 
-        monkeypatch.setattr(bulk_module.os, "ftruncate", full)
+        monkeypatch.setattr(os, "ftruncate", full)
         with pytest.raises(OSError) as caught:
             bulk_module._preallocate(fd, 1 << 20)
         assert caught.value.errno == errno.ENOSPC
@@ -490,7 +498,7 @@ def test_non_regular_destination_may_refuse_preallocation(monkeypatch):
         raise OSError(errno.EINVAL, "not a regular file")
 
     try:
-        monkeypatch.setattr(bulk_module.os, "ftruncate", unsupported)
+        monkeypatch.setattr(os, "ftruncate", unsupported)
         bulk_module._preallocate(write_fd, 1 << 20)
     finally:
         os.close(read_fd)
@@ -503,7 +511,7 @@ def test_preallocation_on_platform_without_enotsup(tmp_path, monkeypatch):
 
     with open(tmp_path / "data", "wb") as handle:
         monkeypatch.delattr(errno, "ENOTSUP", raising=False)
-        monkeypatch.setattr(bulk_module.os, "ftruncate", unsupported)
+        monkeypatch.setattr(os, "ftruncate", unsupported)
         bulk_module._preallocate(handle.fileno(), 1024)
 
 
@@ -515,17 +523,17 @@ def test_stream_write_retries_partial_progress_and_rejects_a_stall(monkeypatch):
         landed.extend(view[:count])
         return count
 
-    monkeypatch.setattr(bulk_module.os, "write", partial)
+    monkeypatch.setattr(os, "write", partial)
     bulk_module._write_all(123, memoryview(b"payload"))
     assert landed == b"payload"
-    monkeypatch.setattr(bulk_module.os, "write", lambda *_: 0)
+    monkeypatch.setattr(os, "write", lambda *_: 0)
     with pytest.raises(OSError) as caught:
         bulk_module._write_all(123, memoryview(b"payload"))
     assert caught.value.errno == errno.EIO
 
 
 def test_zero_progress_from_a_local_filesystem_is_eio(monkeypatch):
-    monkeypatch.setattr(bulk_module.os, "pwrite", lambda *_: 0)
+    monkeypatch.setattr(os, "pwrite", lambda *_: 0)
     with pytest.raises(OSError) as caught:
         bulk_module._pwrite_all(123, memoryview(b"payload"), 0)
     assert caught.value.errno == errno.EIO
@@ -602,10 +610,11 @@ def test_an_unverifiable_copy_does_not_digest_the_file(tmp_path, bulk_server, cf
     for that answer first is what lets the transfer skip the hashing entirely
     rather than do it and throw it away.
     """
+    from xrdcore.checksum import new as real  # what the engine calls new_checksum
+
     from xrdclient.copy import engine
 
     hashed = 0
-    real = engine.new_checksum
 
     class Counting:
         """A digest that reports how much was actually put through it."""
@@ -645,3 +654,35 @@ def test_a_verifiable_stream_is_still_digested(tmp_path, bulk_server, cfg):
     assert target.read_bytes() == PAYLOAD
     assert result.checksum is not None
     assert result.verified
+
+
+def test_a_worker_stops_at_its_next_piece_once_another_has_failed():
+    from xrdcore import fanout
+
+    from xrdclient.url import parse
+
+    transfer = bulk_module._Transfer(
+        parse("root://h//f"), Config(), bulk_module._Options(depth=1), total=2, chunk=1
+    )
+    pieces = iter([(0, memoryview(b"a")), (1, memoryview(b"b"))])
+    halted = transfer._unless_halted(pieces, 0)
+    assert next(halted)[0] == 0
+    transfer.halt.set()
+    with pytest.raises(fanout.Stopped, match="another worker failed"):
+        next(halted)
+
+
+def test_a_failed_ordered_write_stops_the_worker_waiting_its_turn(bulk_server, cfg):
+    """The writer's own error is the one raised; the waiter's echo is a note."""
+    calls = []
+
+    def writer(view):
+        calls.append(len(view))
+        time.sleep(0.3)  # long enough for the other worker to queue for its turn
+        raise OSError(errno.ENOSPC, "disk full")
+
+    with pytest.raises(OSError, match="disk full") as caught:
+        stream(_url(bulk_server), writer, config=cfg, workers=2)
+    assert len(calls) == 1
+    notes = " ".join(getattr(caught.value, "__notes__", []))
+    assert "another worker stopped" in notes

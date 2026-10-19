@@ -711,9 +711,8 @@ def test_reading_a_closed_handle_is_a_value_error(fs):
 
 def test_opening_twice_is_refused(fs):
     handle = File(fs.url.with_path("/data/a.root"), fs.config, router=fs._router)
-    with handle:
-        with pytest.raises(ValueError, match="already open"):
-            handle.open()
+    with handle, pytest.raises(ValueError, match="already open"):
+        handle.open()
 
 
 def test_a_writers_close_fails_loudly_when_the_server_is_gone(server, config):
@@ -739,18 +738,16 @@ def test_a_readers_close_forgives_a_server_that_is_gone(server, config):
 def test_a_failing_close_does_not_mask_the_bodys_exception(server, config):
     handle = File(server.url.with_path("/data/w2.bin"), config)
     handle.open(OpenFlags.UPDATE | OpenFlags.NEW, Access.OWNER_WRITE)
-    with pytest.raises(ZeroDivisionError):
-        with handle:
-            server.disconnect()
-            raise ZeroDivisionError("what the body was really doing")
+    with pytest.raises(ZeroDivisionError), handle:
+        server.disconnect()
+        raise ZeroDivisionError("what the body was really doing")
 
 
 def test_a_failing_close_surfaces_from_the_with_statement(server, config):
     handle = File(server.url.with_path("/data/w3.bin"), config)
     handle.open(OpenFlags.UPDATE | OpenFlags.NEW, Access.OWNER_WRITE)
-    with pytest.raises(TransientError):
-        with handle:
-            server.disconnect()
+    with pytest.raises(TransientError), handle:
+        server.disconnect()
 
 
 def test_close_is_idempotent(fs):
@@ -938,9 +935,8 @@ def test_cloning_across_two_connections_is_refused(source, opened, server):
 
 
 def test_a_clone_cannot_be_checkpointed(source, opened):
-    with opened.checkpoint():
-        with pytest.raises(UnsupportedError, match="cannot be checkpointed"):
-            opened.clone(source)
+    with opened.checkpoint(), pytest.raises(UnsupportedError, match="cannot be checkpointed"):
+        opened.clone(source)
 
 
 def test_a_clone_of_a_handle_the_server_never_opened_is_an_error(opened):
@@ -1105,10 +1101,9 @@ def test_a_checkpoint_rolls_back_and_re_raises(opened, server):
     from xrdclient.proto import constants as c
 
     opened.write(b"before")
-    with pytest.raises(RuntimeError):
-        with opened.checkpoint():
-            opened.write(b"doomed")
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), opened.checkpoint():
+        opened.write(b"doomed")
+        raise RuntimeError("boom")
     assert server.contents("/data/w.bin") == b"before"
     # begin, the write that went through it, and the rollback.
     assert server.seen.count(c.kXR_chkpoint) == 3
@@ -1227,13 +1222,15 @@ def test_a_writev_chunk_past_the_transfer_ceiling_lands_whole(opened, server):
 def test_a_double_star_inside_a_component_still_crosses_directories(config):
     """``**`` need not be a whole component; ``/d/**.root`` means what it says."""
     files = {"/d/a.root": b"", "/d/sub/b.root": b"", "/d/sub/deep/c.root": b"", "/d/n.txt": b""}
-    with FakeServer(files=files, dirs=["/d", "/d/sub", "/d/sub/deep"]) as srv:
-        with FileSystem(srv.url, config) as fs:
-            assert sorted(fs.glob("/d/**.root")) == [
-                "/d/a.root",
-                "/d/sub/b.root",
-                "/d/sub/deep/c.root",
-            ]
+    with (
+        FakeServer(files=files, dirs=["/d", "/d/sub", "/d/sub/deep"]) as srv,
+        FileSystem(srv.url, config) as fs,
+    ):
+        assert sorted(fs.glob("/d/**.root")) == [
+            "/d/a.root",
+            "/d/sub/b.root",
+            "/d/sub/deep/c.root",
+        ]
 
 
 def test_a_filesystem_is_os_pathlike(fs):
@@ -1268,17 +1265,15 @@ def test_rmtree_reports_what_it_could_not_delete(config, opcode):
     """Files, subdirectories and the root are all reported, not skipped."""
     with FakeServer(files={"/d/f.root": b"x"}, dirs=["/d", "/d/sub"]) as srv:
         srv.handlers[opcode] = _refuses()
-        with FileSystem(srv.url, config) as fs:
-            with pytest.raises(PermissionError):
-                fs.rmtree("/d")
+        with FileSystem(srv.url, config) as fs, pytest.raises(PermissionError):
+            fs.rmtree("/d")
 
 
 def test_rmtree_reports_a_root_it_cannot_remove(config):
     with FakeServer(dirs=["/e"]) as srv:
         srv.handlers[c.kXR_rmdir] = _refuses()
-        with FileSystem(srv.url, config) as fs:
-            with pytest.raises(PermissionError):
-                fs.rmtree("/e")
+        with FileSystem(srv.url, config) as fs, pytest.raises(PermissionError):
+            fs.rmtree("/e")
 
 
 @pytest.mark.parametrize("opcode", [c.kXR_rm, c.kXR_rmdir])
@@ -1448,11 +1443,10 @@ def test_a_write_inside_a_checkpoint_travels_as_one(opened, server):
 
 def test_a_checkpoint_undoes_a_truncate_as_well_as_a_write(opened, server):
     opened.write(b"0123456789")
-    with pytest.raises(RuntimeError):
-        with opened.checkpoint():
-            opened.truncate(2)
-            assert server.contents("/data/w.bin") == b"01"
-            raise RuntimeError("changed my mind")
+    with pytest.raises(RuntimeError), opened.checkpoint():
+        opened.truncate(2)
+        assert server.contents("/data/w.bin") == b"01"
+        raise RuntimeError("changed my mind")
     assert server.contents("/data/w.bin") == b"0123456789"
 
 
@@ -1476,18 +1470,22 @@ def test_a_checkpoint_says_which_file_it_belongs_to(opened):
 def test_checkpoints_do_not_nest(opened):
     from xrdclient.errors import UnsupportedError
 
-    with opened.checkpoint():
-        with pytest.raises(UnsupportedError, match="already has a checkpoint"):
-            with opened.checkpoint():
-                pass
+    with (
+        opened.checkpoint(),
+        pytest.raises(UnsupportedError, match="already has a checkpoint"),
+        opened.checkpoint(),
+    ):
+        pass
 
 
 def test_a_writev_cannot_be_checkpointed_and_says_so(opened):
     from xrdclient.errors import UnsupportedError
 
-    with opened.checkpoint():
-        with pytest.raises(UnsupportedError, match="write, pgwrite and truncate"):
-            opened.writev([WriteChunk(0, b"a")])
+    with (
+        opened.checkpoint(),
+        pytest.raises(UnsupportedError, match="write, pgwrite and truncate"),
+    ):
+        opened.writev([WriteChunk(0, b"a")])
 
 
 def test_a_pgwrite_inside_a_checkpoint_is_wrapped_too(opened, server):
@@ -1502,9 +1500,8 @@ def test_a_checkpoint_that_runs_out_of_room_raises(opened, monkeypatch):
     from xrdclient.testing import server as fake
 
     monkeypatch.setattr(fake, "CHECKPOINT_CAPACITY", 4)
-    with pytest.raises(NoSpaceError):
-        with opened.checkpoint():
-            opened.write(b"more than four bytes")
+    with pytest.raises(NoSpaceError), opened.checkpoint():
+        opened.write(b"more than four bytes")
 
 
 def test_only_a_write_or_a_truncate_can_be_checkpointed():
@@ -1518,9 +1515,11 @@ def test_a_server_asked_for_an_unknown_checkpoint_subcode_complains(opened):
     from xrdclient.errors import InvalidArgumentError
     from xrdclient.proto import requests as r
 
-    with opened.checkpoint():
-        with pytest.raises(InvalidArgumentError, match="unknown checkpoint subcode"):
-            opened._router.execute(r.ChkPoint(opened.handle, 99))
+    with (
+        opened.checkpoint(),
+        pytest.raises(InvalidArgumentError, match="unknown checkpoint subcode"),
+    ):
+        opened._router.execute(r.ChkPoint(opened.handle, 99))
 
 
 def test_a_checkpoint_operation_with_no_checkpoint_open_is_refused(opened):
@@ -1537,9 +1536,11 @@ def test_a_checkpoint_payload_that_is_not_a_request_header_is_refused(opened):
     from xrdclient.flags import ChkPointCode
     from xrdclient.proto import requests as r
 
-    with opened.checkpoint():
-        with pytest.raises(InvalidArgumentError, match="not one request header"):
-            opened._router.execute(r.ChkPoint(opened.handle, int(ChkPointCode.XEQ), b"short"))
+    with (
+        opened.checkpoint(),
+        pytest.raises(InvalidArgumentError, match="not one request header"),
+    ):
+        opened._router.execute(r.ChkPoint(opened.handle, int(ChkPointCode.XEQ), b"short"))
 
 
 def test_a_server_refuses_to_checkpoint_an_operation_that_is_not_one(opened):
@@ -1549,9 +1550,8 @@ def test_a_server_refuses_to_checkpoint_an_operation_that_is_not_one(opened):
     from xrdclient.proto.frames import encode
 
     header = encode(r.Read(opened.handle, 0, 4), 0)[: c.REQUEST_HDRLEN]
-    with opened.checkpoint():
-        with pytest.raises(UnsupportedError, match="not checkpointable"):
-            opened._router.execute(r.ChkPoint(opened.handle, int(ChkPointCode.XEQ), header))
+    with opened.checkpoint(), pytest.raises(UnsupportedError, match="not checkpointable"):
+        opened._router.execute(r.ChkPoint(opened.handle, int(ChkPointCode.XEQ), header))
 
 
 # ---------------------------------------------------------------------------
@@ -1616,9 +1616,8 @@ def test_a_server_without_the_link_extension_says_it_is_unsupported(server, conf
         yield error(sid, kXR_Unsupported, "kXR_symlink is not supported")
 
     server.handlers[c.kXR_symlink] = refuse
-    with FileSystem(server.url, config) as filesystem:
-        with pytest.raises(UnsupportedError):
-            filesystem.symlink("/data/a.root", "/data/link.root")
+    with FileSystem(server.url, config) as filesystem, pytest.raises(UnsupportedError):
+        filesystem.symlink("/data/a.root", "/data/link.root")
 
 
 # ---------------------------------------------------------------------------
@@ -1655,7 +1654,7 @@ def test_utime_refuses_to_guess_between_seconds_and_nanoseconds(fs):
     with pytest.raises(ValueError, match="not both"):
         fs.utime("/data/a.root", (1, 2), ns=(1, 2))
     with pytest.raises(TypeError, match="pair"):
-        fs.utime("/data/a.root", (1, 2, 3))  # type: ignore[arg-type]
+        fs.utime("/data/a.root", (1, 2, 3))
 
 
 def test_a_time_the_request_asks_to_omit_is_left_alone(fs, server):
@@ -1700,9 +1699,8 @@ def test_a_server_without_setattr_says_it_is_unsupported(server, config):
         yield error(sid, kXR_Unsupported, "kXR_setattr is not supported")
 
     server.handlers[c.kXR_setattr] = refuse
-    with FileSystem(server.url, config) as filesystem:
-        with pytest.raises(UnsupportedError):
-            filesystem.utime("/data/a.root")
+    with FileSystem(server.url, config) as filesystem, pytest.raises(UnsupportedError):
+        filesystem.utime("/data/a.root")
 
 
 def test_a_readers_close_on_a_broken_session_releases_the_handle_quietly(server, config):
@@ -1750,3 +1748,12 @@ def test_a_server_that_reports_an_errno_per_attribute_is_understood():
     with pytest.raises(IOError_):
         _fattr.check(FattrResult(1, [FattrItem("user.a", errno.EIO)]), "/f")
     _fattr.check(FattrResult(0, [FattrItem("user.a", 0)]), "/f")
+
+
+def test_reprs_redact_tokens_in_the_url():
+    """A repr is logged and printed in tracebacks, so CGI credentials must not show."""
+    fs = FileSystem("root://example.org//data?authz=SECRETTOKEN")
+    assert "SECRETTOKEN" not in repr(fs)
+    assert "<redacted>" in repr(fs)
+    handle = File("root://example.org//data/f?authz=SECRETTOKEN")
+    assert "SECRETTOKEN" not in repr(handle)

@@ -9,6 +9,7 @@ a person can read - that make the answers legible when they arrive.
 from __future__ import annotations
 
 import datetime
+from typing import Any
 
 import pytest
 
@@ -51,6 +52,74 @@ def test_a_connection_nobody_closed_goes_back_to_the_pool(server, config):
 def test_glob_matches_across_the_listing(server, config):
     found = xrdclient.glob(server.url.with_path("/data/*.root"), config=config)
     assert [path.name for path in found] == ["a.root"]
+
+
+def test_glob_question_mark_survives_url_parsing(config):
+    # '?' is also a URL's query delimiter, so a glob given as a string URL used
+    # to have its '?' - and everything after - swallowed as the query, leaving
+    # the literal prefix to match nothing. It is a single-character wildcard.
+    import fnmatch
+
+    files = {f"/data/{n}": b"x" for n in ("f00.dat", "f01.dat", "f40.dat", "ab.dat", "abc.dat")}
+    names = sorted(n.rsplit("/", 1)[-1] for n in files)
+    with FakeServer(files=files) as srv:
+        base = str(srv.url.with_path("/data"))
+        for pat in (
+            "f??.dat",
+            "f?.dat",
+            "??.dat",
+            "???.dat",
+            "f0?.dat",
+            "f00.da?",
+            "f[0-1]?.dat",
+            "*.dat",
+        ):
+            got = sorted(p.name for p in xrdclient.glob(f"{base}/{pat}", config=config))
+            assert got == sorted(n for n in names if fnmatch.fnmatch(n, pat)), pat
+        # A pattern handed over as an already-parsed path keeps its wildcards too.
+        parsed = xrdclient.XRootDPath(f"{base}/f??.dat", config)
+        assert sorted(p.name for p in xrdclient.glob(parsed, config=config)) == [
+            "f00.dat",
+            "f01.dat",
+            "f40.dat",
+        ]
+
+
+def test_glob_lists_through_a_query_clean_base(monkeypatch):
+    # The '?' wildcard also parses as the URL's query, so it lands in the
+    # FileSystem's base URL too. That base must be query-clean, or the stray
+    # opaque rides along on every listing the glob makes and a strict server
+    # (dCache) rejects it as "opaque information is missing a value".
+    import xrdclient.client as client
+
+    seen: dict[str, Any] = {}
+
+    class FakeFS:
+        def __init__(self, url, config=None):
+            seen["base"] = url
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def glob(self, target):
+            seen["target"] = target
+            return []
+
+    monkeypatch.setattr(client, "FileSystem", FakeFS)
+    xrdclient.glob("root://host//pnfs/x/many/f??.dat")
+    assert seen["target"] == "/pnfs/x/many/f??.dat"
+    assert seen["base"].cgi == ""
+
+
+def test_glob_pattern_rejoins_the_query_a_wildcard_was_parsed_into():
+    from xrdclient.url import parse
+
+    assert parse("root://h//d/f??.dat").glob_pattern() == "/d/f??.dat"
+    assert parse("https://h/d/f?.dat").glob_pattern() == "/d/f?.dat"
+    assert parse("root://h//d/*.dat").glob_pattern() == "/d/*.dat"
 
 
 def test_stat_exists_and_size_are_one_call_each(server, config):
@@ -200,7 +269,7 @@ def test_a_stat_with_no_time_says_so_rather_than_1970():
 
 def test_a_stat_knows_when_and_in_which_zone(server, config):
     when = xrdclient.stat(server.url.with_path("/data/a.root"), config=config).modified
-    assert when.tzinfo is datetime.timezone.utc
+    assert when.tzinfo is datetime.UTC
     assert when.year >= 2020
 
 

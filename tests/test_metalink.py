@@ -1,4 +1,10 @@
-"""Metalink virtual redirectors, from descriptor through replica copy."""
+"""Metalink virtual redirectors, from descriptor through replica copy.
+
+The parser itself - ranking, bounds, refusals, relative URLs, the davix
+reading - is xrdhttp's since 0.4.0 and tested there
+(``xrdhttp/tests/test_metalink.py``); this file tests the copy engine's use
+of it, and ``tests/test_public_modules.py`` the checksum-type adapter.
+"""
 
 from __future__ import annotations
 
@@ -7,11 +13,11 @@ import os
 from pathlib import Path
 
 import pytest
+from xrdcore.checksum import checksum_bytes
 
 import xrdclient
 from xrdclient.copy import engine
 from xrdclient.copy.replicas import NoMoreReplicasError
-from xrdclient.metalink import MAX_DESCRIPTOR_SIZE, MAX_REPLICAS, MetalinkError
 
 
 def meta4(name: str, urls: list[tuple[int, str]], body: bytes) -> bytes:
@@ -61,7 +67,7 @@ def test_a_corrupt_replica_is_replaced_by_the_next_one(server, tmp_path: Path) -
 
 def test_remote_metalink_3_uses_highest_preference_first(server, tmp_path: Path) -> None:
     body = b"remote descriptor"
-    adler32 = xrdclient.crypto.checksum_bytes("adler32", body)
+    adler32 = checksum_bytes("adler32", body)
     server.add_file("/r", body)
     descriptor = f"""<?xml version="1.0"?>
       <metalink version="3.0" xmlns="http://www.metalinker.org/">
@@ -217,80 +223,7 @@ def test_all_failed_replicas_report_the_last_failure(tmp_path: Path) -> None:
     assert isinstance(caught.value.__cause__, FileNotFoundError)
 
 
-def test_parser_accepts_relative_urls_deduplicates_and_ignores_unknown_hashes() -> None:
-    document = """<metalink xmlns="urn:ietf:params:xml:ns:metalink">
-      <file name="f"><size>not-a-number</size>
-        <hash type="unknown">xx</hash><hash type="md5">bad</hash>
-        <url priority="bad">../f</url><url>../f</url><url></url>
-      </file></metalink>"""
-
-    parsed = xrdclient.parse_metalink(document, base_url="root://host:1094//catalog/x.meta4")
-
-    assert parsed.replicas == ("root://host:1094//f",)
-    assert parsed.size is None and parsed.checksum is None
-
-    network = xrdclient.parse_metalink(
-        "<metalink><file name='f'><url>//mirror.example/f</url></file></metalink>",
-        base_url="root://origin.example//catalog/f.meta4",
-    )
-    assert network.replicas == ("root://mirror.example/f",)
-    triple_slash = xrdclient.parse_metalink(
-        "<metalink><file name='f'><url>../f</url></file></metalink>",
-        base_url="root://origin.example///catalog/f.meta4",
-    )
-    assert triple_slash.replicas == ("root://origin.example//f",)
-
-
-@pytest.mark.parametrize(
-    "document, message",
-    [
-        ("<not-metalink/>", "root"),
-        ("<metalink/>", "exactly one"),
-        ("<metalink><file/></metalink>", "no name"),
-        ("<metalink><file name='f'/></metalink>", "no usable"),
-        ("<metalink><file name='f'><url>relative</url></file></metalink>", "no usable"),
-        ("<metalink><file name='a'/><file name='b'/></metalink>", "exactly one"),
-        ("<metalink>", "Malformed"),
-        ("<!DOCTYPE x><metalink/>", "DOCTYPE"),
-    ],
-)
-def test_malformed_or_unusable_documents_are_rejected(document: str, message: str) -> None:
-    with pytest.raises(MetalinkError, match=message):
-        xrdclient.parse_metalink(document)
-
-
-def test_descriptor_and_replica_limits_are_enforced() -> None:
-    with pytest.raises(MetalinkError, match="limit"):
-        xrdclient.parse_metalink(b" " * (MAX_DESCRIPTOR_SIZE + 1))
-    urls = "".join(f"<url>file:///tmp/{index}</url>" for index in range(MAX_REPLICAS + 1))
-    with pytest.raises(MetalinkError, match="more than"):
-        xrdclient.parse_metalink(f"<metalink><file name='f'>{urls}</file></metalink>")
-
-
-def test_too_long_and_scheme_less_replicas_are_skipped() -> None:
-    too_long = "file:///" + "x" * 4097
-    document = (
-        "<metalink><file name='f'><url>relative</url>"
-        f"<url>{too_long}</url><url>file:///tmp/f</url></file></metalink>"
-    )
-    assert xrdclient.parse_metalink(document).replicas == ("file:///tmp/f",)
-
-
 def test_tls_metalink_upgrades_only_xrootd_protocols() -> None:
     assert engine._secure_metalink_url("root://host//f") == "roots://host:1094//f"
     assert engine._secure_metalink_url("xroot://host//f") == "xroots://host:1094//f"
     assert engine._secure_metalink_url("https://host/f") == "https://host/f"
-
-
-def test_streams_are_not_mistaken_for_descriptors() -> None:
-    class NamedStream:
-        def read(self) -> bytes:
-            return b""
-
-        def __str__(self) -> str:
-            return "looks.meta4"
-
-    from xrdclient.metalink import is_metalink
-
-    assert not is_metalink(NamedStream())
-    assert is_metalink("file:///tmp/UPPER.META4?token=x")

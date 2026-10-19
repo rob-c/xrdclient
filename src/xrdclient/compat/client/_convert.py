@@ -4,6 +4,13 @@ One function per response type, each taking what the native API returned and
 building the :class:`~.responses.Struct` the bindings would have built for the
 same answer - the same attribute names, the same types, and the same quirks
 where ported code will have come to depend on them.
+
+This module is on the hot path of a listing - a large directory converts tens
+of thousands of entries - which is why :func:`stat_info` and :func:`listing`
+assign ``__dict__`` directly and cache formatted strings instead of going
+through :class:`~.responses.Struct`'s constructor. The output must still be
+indistinguishable from a ``Struct`` built the slow way: same keys, same key
+order (it shows in ``repr`` and ``vars``).
 """
 
 from __future__ import annotations
@@ -35,12 +42,12 @@ from .url import URL
 __all__ = [
     "directory_list",
     "gathered",
-    "host_list",
     "hop_url",
+    "host_list",
     "listing",
-    "redirect_url",
     "location_info",
     "protocol_info",
+    "redirect_url",
     "stat_info",
     "stat_info_vfs",
     "vector_read_info",
@@ -48,12 +55,19 @@ __all__ = [
 
 S = TypeVar("S", bound=Struct)
 
-#: ``LocationInfo::LocationType`` for each letter ``kXR_locate`` answers with.
+#: ``LocationInfo::LocationType`` for each letter ``kXR_locate`` answers with:
+#: manager online/pending (``M``/``m``), server online/pending (``S``/``s``).
+#: An unknown letter reads as an online server, the most useful guess.
 _LOCATION_TYPES = {"M": 0, "m": 1, "S": 2, "s": 3}
 
 
 def stat_info(info: t.StatInfo) -> StatInfo:
-    """``kXR_stat``'s answer as ``XRootD.client.responses.StatInfo``."""
+    """``kXR_stat``'s answer as ``XRootD.client.responses.StatInfo``.
+
+    ``mtime`` and ``modtime`` are the same number twice and ``haschecksum``
+    is always ``False`` with an empty ``checksum``: that is what the bindings
+    report from a plain stat, and the field order below is theirs.
+    """
     mode = info.mode_str
     mtime = info.st_mtime
     text = _UTC.get(mtime)
@@ -73,6 +87,8 @@ def stat_info(info: t.StatInfo) -> StatInfo:
         "modeoctstr": _PERMISSIONS.get(mode) or _permissions(mode),
         "owner": info.owner,
         "group": info.group,
+        # A server that sends a mode sent the extended stat (owner, group,
+        # atime, ctime); one that predates it sends none of them.
         "extended": mode != "",
         "haschecksum": False,
         "checksum": "",
@@ -181,6 +197,7 @@ def gathered(parent: str, entries: Iterable[ListEntry]) -> DirectoryList:
 
 
 def _listing(parent: str, listed: list[ListEntry]) -> DirectoryList:
+    """Wrap converted entries in a ``DirectoryList``, ``parent`` with its trailing slash."""
     folder = parent if parent.endswith("/") else f"{parent}/"
     return _new(DirectoryList, {"size": len(listed), "parent": folder, "dirlist": listed})
 
@@ -191,6 +208,7 @@ def location_info(locations: Sequence[t.LocationInfo]) -> LocationInfo:
 
 
 def _location(location: t.LocationInfo) -> Location:
+    """One location; ``accesstype`` is XrdCl's ``Read`` (0) or ``ReadWrite`` (1)."""
     return Location(
         {
             "address": location.address,
@@ -215,6 +233,7 @@ def protocol_info(info: t.ProtocolInfo) -> ProtocolInfo:
 
 
 def _swapped(value: int) -> int:
+    """``value``'s low four bytes reversed - the bindings' byte-order quirk, kept."""
     return int.from_bytes((value & 0xFFFFFFFF).to_bytes(4, "big"), "little")
 
 
@@ -249,6 +268,8 @@ def hop_url(hop: Hop, first: str) -> str:
     if not hop.redirected:
         return first
     url = hop.url
+    # Spelled out rather than ``str(url)``: XrdCl always writes the port and
+    # names the path relative to the root, then appends the redirect's CGI.
     user = f"{url.username}@" if url.username else ""
     query = f"?{hop.token}" if hop.token else ""
     return f"{url.scheme}://{user}{url.host}:{url.port}/{hop.path}{query}"
@@ -261,6 +282,9 @@ def redirect_url(target: RedirectInfo) -> str:
     normalised as XrdCl's ``URL`` does - for one naming a URL, and then the
     redirect's CGI.
     """
+    # A negative port means the host field is already a whole URL, and zero
+    # that it names no port (:attr:`RedirectInfo.url`); either way the host
+    # goes to ``URL`` as it stands, to be normalised XrdCl's way.
     base = f"{target.host}:{target.port}/" if target.port > 0 else target.host
     query = f"?{target.token}" if target.token else ""
     return f"{URL(base)}{query}"
@@ -268,8 +292,10 @@ def redirect_url(target: RedirectInfo) -> str:
 
 def vector_read_info(ranges: Sequence[tuple[int, int]], data: Sequence[bytes]) -> VectorReadInfo:
     """``kXR_readv``'s answer: each chunk with the offset it was asked for."""
+    # ``length`` is what came back, not what was asked for: a range that
+    # runs past the end of the file comes back short.
     chunks = [
         ChunkInfo({"offset": offset, "length": len(buffer), "buffer": buffer})
-        for (offset, _), buffer in zip(ranges, data)
+        for (offset, _), buffer in zip(ranges, data, strict=False)
     ]
     return VectorReadInfo({"size": sum(len(buffer) for buffer in data), "chunks": chunks})

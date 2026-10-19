@@ -10,10 +10,20 @@ compat one, taught the plug-in's side over ``http(s)://`` and ``dav(s)://``
 using :mod:`xrdclient.http.tape`. A ``root://`` endpoint gets the plain
 compat filesystem: its ``kXR_prepare`` and ``kXR_query``, and whatever tape
 support the server has, exactly as with the bindings.
+
+Two halves, top and bottom: :class:`FileSystem` and the ``_tape_*`` helpers
+are the plug-in's side (decode the XrdCl-encoded request, call
+:mod:`xrdclient.http.tape`); :class:`TapeClient` is the bindings' side
+(encode the request XrdCl's way and send it through a ``FileSystem``).
+Keeping that split means a ``TapeClient`` call takes the same path as code
+that calls ``FileSystem.query``/``prepare`` by hand, so both stay in step.
+Every value that ends up in a newline-separated query is checked for line
+breaks first: one would let a caller splice extra lines into the request.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
@@ -36,11 +46,15 @@ from .responses import (
 
 __all__ = ["FileSystem", "TapeClient"]
 
+#: How XrdCl's HTTP plug-in marks a stage entry that carries options
+#: (``diskLifetime``, ``targetedMetadata``): this prefix, then a JSON object.
 _STRUCTURED_STAGE_PREFIX = "xrdclhttp.tape.stage:"
 
 #: The schemes whose URLs name a server rather than a file on this machine.
 _NATIVE = ("root", "roots", "xroot", "xroots")
+#: The schemes a ``FileSystem`` is opened on; ``dav(s)`` is mapped to these.
 _ENDPOINTS = (*_NATIVE, "http", "https")
+#: The schemes accepted in a file URL, rewritten to the endpoint's spelling.
 _OPERATIONS = (*_ENDPOINTS, "dav", "davs")
 
 
@@ -55,6 +69,8 @@ class FileSystem(_FileSystem):
     def query(self, querycode: int, arg: str, timeout: float = 0, callback: Callback = None) -> Any:
         """``(status, bytes)``; a tape query over HTTP answers with the API's JSON."""
         native = self.native
+        # Only an HTTP filesystem has the plug-in's side; a query that is not
+        # a tape verb falls through to the ordinary one even there.
         if isinstance(native, HTTPFileSystem):
             operation = _tape_query(native, int(querycode), str(arg))
             if operation is not None:
@@ -72,14 +88,18 @@ class FileSystem(_FileSystem):
         """``(status, bytes)``; over HTTP, stage, cancel or release through the API."""
         native = self.native
         wanted = _args.u16(flags, "flags")
+        # Checked for the bindings' ``OverflowError`` even though the Tape
+        # REST API has no priority to send it as.
         _args.u16(priority, "priority")
         entries = [str(entry) for entry in files]
         if isinstance(native, HTTPFileSystem):
-            operation: Callable[[], bytes] = lambda: _tape_prepare(native, entries, wanted)  # noqa: E731
+            operation: Callable[[], bytes] = functools.partial(
+                _tape_prepare, native, entries, wanted
+            )
         elif wanted & PrepareFlags.CANCEL:
             # The request id leads the list: native.cancel_prepare sends it as
             # the handle it is, where a plain prepare would take it for a path.
-            operation = lambda: _cancel_prepare(native, entries)  # noqa: E731
+            operation = functools.partial(_cancel_prepare, native, entries)
         else:
             # XrdCl sends a full URL in the list as it is, and the server
             # reads its path; the native request wants the path to begin with.
@@ -89,14 +109,17 @@ class FileSystem(_FileSystem):
 
 
 def _same(value: bytes) -> bytes:
+    """The ``convert`` for an answer that already is the bindings' response."""
     return value
 
 
 def _encoded(document: Any) -> bytes:
+    """A JSON answer as the bytes the plug-in's query returns."""
     return json.dumps(document).encode()
 
 
 def _cancel_prepare(native: Any, entries: list[str]) -> bytes:
+    """Cancel on ``root://``: the first entry is the request id, the rest ignored."""
     native.cancel_prepare(entries[0] if entries else "")
     return b""
 
@@ -116,15 +139,18 @@ def _path(native: HTTPFileSystem, entry: str) -> str:
 
 
 def _discover(native: HTTPFileSystem, lines: list[str]) -> bytes:
+    """``tape.discover``: the endpoint document from ``/.well-known/wlcg-tape-rest-api``."""
     return _encoded(rest.discover(native.client, native.url))
 
 
 def _archive_info(native: HTTPFileSystem, lines: list[str]) -> bytes:
+    """``tape.archiveinfo``: one URL or path per line, answered with the API's JSON list."""
     paths = [_path(native, line) for line in lines]
     return _encoded(rest.archive_entries(native.client, native.url, paths))
 
 
 def _stage_delete(native: HTTPFileSystem, lines: list[str]) -> bytes:
+    """``tape.stage_delete``: drop the whole request named on the first line."""
     rest.cancel(native.client, native.url, "".join(lines[:1]))
     return b""
 
@@ -140,6 +166,8 @@ _OPAQUE: dict[str, Callable[[HTTPFileSystem, list[str]], bytes]] = {
 def _tape_query(native: HTTPFileSystem, code: int, arg: str) -> Callable[[], bytes] | None:
     """The tape call ``query(code, arg)`` stands for, or ``None`` if it is not one."""
     first, _, tail = arg.partition("\n")
+    # A ``PREPARE`` query is the stage status of the request id it names;
+    # an ``OPAQUE`` one is a tape call if its first line is one of the verbs.
     if code == QueryCode.PREPARE:
         return lambda: _encoded(rest.request_status(native.client, native.url, first))
     handler = _OPAQUE.get(first) if code == QueryCode.OPAQUE else None
@@ -152,6 +180,7 @@ def _tape_query(native: HTTPFileSystem, code: int, arg: str) -> Callable[[], byt
 def _tape_prepare(native: HTTPFileSystem, files: list[str], flags: int) -> bytes:
     """Stage ``files``, or cancel or release the paths after a request id."""
     if flags & (PrepareFlags.CANCEL | PrepareFlags.EVICT):
+        # XrdCl's convention for both: the request id first, then the files.
         handle, *paths = files or [""]
         act = rest.cancel_files if flags & PrepareFlags.CANCEL else rest.release
         act(native.client, native.url, handle, [_path(native, p) for p in paths])
@@ -173,20 +202,32 @@ def _stage_spec(native: HTTPFileSystem, entry: str) -> dict[str, Any]:
 
 
 def _response_text(response: str | bytes) -> str:
+    """An answer as text; ``kXR_prepare`` answers carry a trailing NUL, which goes."""
     if isinstance(response, bytes):
         response = response.decode("utf-8")
     return response.rstrip("\0")
 
 
 def _reject_line_breaks(value: str, name: str) -> None:
+    """``ValueError`` if ``value`` would split into more than one line of a request.
+
+    Requests to the plug-in are newline-separated lists, so a request id or
+    URL holding ``\n`` would smuggle in another entry - a cancel aimed at a
+    file the caller never named.
+    """
     if "\n" in value or "\r" in value:
         raise ValueError(f"{name} must not contain line breaks")
 
 
 def _normalize_disk_lifetime(value: object) -> str | None:
-    """Seconds as ``PT<n>S``, an ISO 8601 duration as it is, ``None`` as ``None``."""
+    """Seconds as ``PT<n>S``, an ISO 8601 duration as it is, ``None`` as ``None``.
+
+    The duration string is passed on unparsed: the site validates it, and
+    what it accepts is the site's to decide.
+    """
     if value is None:
         return None
+    # ``bool`` is an ``int`` subclass; ``True`` seconds is a caller's mistake.
     if isinstance(value, bool):
         raise ValueError("diskLifetime must be an ISO-8601 duration or seconds")
     if isinstance(value, int):
@@ -199,6 +240,7 @@ def _normalize_disk_lifetime(value: object) -> str | None:
 
 
 def _normalize_targeted_metadata(targeted_metadata: object) -> dict[str, Any] | None:
+    """Targeted metadata as a dict: given as one, or as its JSON text; else ``ValueError``."""
     if targeted_metadata is None:
         return None
     if isinstance(targeted_metadata, str):
@@ -219,6 +261,7 @@ def _url_list(urls: str | Iterable[str]) -> list[str]:
 
 
 def _is_url(value: str) -> bool:
+    """Whether ``value`` is a full URL (scheme and host) rather than a bare path."""
     parsed = urlparse(value)
     return bool(parsed.scheme and parsed.netloc)
 
@@ -230,9 +273,15 @@ class TapeClient:
     """
 
     def __init__(self, timeout: int = 0) -> None:
+        """Remember ``timeout``; every call makes its own :class:`FileSystem`."""
         self.timeout = timeout
 
     def _filesystem_url(self, url: str) -> str:
+        """The endpoint a file URL is served from: scheme and host, ``dav(s)`` as ``http(s)``.
+
+        Anything that is not a server URL is returned untouched, so the
+        :class:`FileSystem` built on it reports it invalid the bindings' way.
+        """
         parsed = urlparse(url)
         scheme = {"davs": "https", "dav": "http"}.get(parsed.scheme.lower(), parsed.scheme.lower())
         if scheme in _ENDPOINTS and parsed.netloc:
@@ -240,6 +289,7 @@ class TapeClient:
         return url
 
     def _operation_url(self, url: str) -> str:
+        """A file URL rewritten onto its endpoint's scheme, path kept."""
         parsed = urlparse(url)
         if parsed.scheme.lower() not in _OPERATIONS or not parsed.netloc:
             return url
@@ -247,11 +297,16 @@ class TapeClient:
         return self._filesystem_url(url) + (parsed.path or "/")
 
     def _filesystem(self, url: str) -> Any:
+        """A tape-aware :class:`FileSystem` for ``url``'s endpoint."""
         return FileSystem(self._filesystem_url(url))
 
     def _stage_entry(
         self, entry: str, disk_lifetime: object = None, targeted_metadata: object = None
     ) -> str:
+        """A structured stage entry: the prefix and sorted JSON, the plug-in's format.
+
+        Sorted keys make the same request produce the same bytes every time.
+        """
         payload: dict[str, Any] = {}
         if _is_url(entry):
             payload["url"] = self._operation_url(entry)
@@ -282,6 +337,12 @@ class TapeClient:
         disk_lifetime: object = None,
         targeted_metadata: object = None,
     ) -> list[str]:
+        """The prepare list for a stage call: one line per file.
+
+        A file with no options goes as its plain URL or path; one with a
+        lifetime or metadata goes as a structured entry, the only form that
+        can carry them.
+        """
         normalized = []
         targeted_metadata = _normalize_targeted_metadata(targeted_metadata)
         for item in files:
@@ -294,6 +355,7 @@ class TapeClient:
         return normalized
 
     def _derive_url(self, files: Sequence[str | Mapping[str, Any]]) -> str:
+        """The endpoint URL implied by a file list: its first entry's URL, or ``""``."""
         if not files:
             return ""
         first = files[0]
@@ -304,19 +366,23 @@ class TapeClient:
     def _prepare_paths(
         self, url: str, request_id: str, paths: str | Iterable[str], flags: int
     ) -> XRootDStatus:
+        """A cancel or release: ``prepare`` with the request id leading the list."""
         _reject_line_breaks(request_id, "request_id")
         if isinstance(paths, str):
             paths = [paths]
         files = [request_id]
         files.extend(self._operation_url(path) if _is_url(path) else path for path in paths)
+        status: XRootDStatus
         status, _ = self._filesystem(url).prepare(files, flags, timeout=self.timeout)
-        return status  # type: ignore[no-any-return]
+        return status
 
     def discover(self, url: str) -> tuple[XRootDStatus, Any]:
         """``(status, TapeEndpoint)``: the Tape REST API endpoint serving ``url``."""
         status, endpoint = self._filesystem(url).query(
             QueryCode.OPAQUE, "tape.discover", self.timeout
         )
+        # Two checks, because an empty JSON document (``{}``) is no endpoint
+        # either; both leave the bindings' falsy response in place.
         if endpoint:
             endpoint = json.loads(_response_text(endpoint))
         if endpoint:
@@ -371,10 +437,11 @@ class TapeClient:
     def stage_delete(self, url: str, request_id: str) -> XRootDStatus:
         """Withdraw stage request ``request_id`` altogether."""
         _reject_line_breaks(request_id, "request_id")
+        status: XRootDStatus
         status, _ = self._filesystem(url).query(
             QueryCode.OPAQUE, f"tape.stage_delete\n{request_id}", self.timeout
         )
-        return status  # type: ignore[no-any-return]
+        return status
 
     def release(self, url: str, request_id: str, paths: str | Iterable[str]) -> XRootDStatus:
         """Say ``paths`` of request ``request_id`` no longer need to stay on disk."""
@@ -388,6 +455,9 @@ class TapeClient:
             QueryCode.OPAQUE, "tape.archiveinfo\n{}".format("\n".join(operation_urls)), self.timeout
         )
         results = json.loads(_response_text(results)) if results else []
-        for original, result in zip(urls, results):
+        # The site answers with paths; callers look results up by the URL
+        # they asked about. ``strict=False`` because a failed query answers
+        # with fewer entries (none) than were asked about.
+        for original, result in zip(urls, results, strict=False):
             result["url"] = original
         return status, [TapeArchiveInfo(r) for r in results]

@@ -167,6 +167,11 @@ def _find_eocd(tail: bytes) -> int:
 
 
 def _eocd(tail: bytes, at: int) -> _Directory:
+    """The central directory's location from the classic EOCD record at ``tail[at:]``.
+
+    Rejects a record whose declared comment runs past the bytes read: that
+    is a truncated or forged archive, not one whose comment we failed to fetch.
+    """
     fields = _EOCD.unpack_from(tail, at)
     count, cd_size, cd_offset, comment = fields[4:]
     if _EOCD.size + comment > len(tail) - at:
@@ -180,11 +185,8 @@ def _zip64(read: Reader, tail: bytes, start: int, at: int) -> _Directory | None:
     if locator <= 0 or tail[locator : locator + 4] != _LOCATOR_SIG:
         return None
     offset = _LOCATOR.unpack_from(tail, locator)[2]
-    if start > offset:
-        # The record is further back than the first read went.
-        record = read(offset, _EOCD64.size)
-    else:
-        record = tail[offset - start :]
+    # The record may be further back than the first read went.
+    record = read(offset, _EOCD64.size) if start > offset else tail[offset - start :]
     if len(record) < _EOCD64.size or record[:4] != _EOCD64_SIG:
         raise ZipArchiveError(_NO_EOCD64)
     fields = _EOCD64.unpack_from(record)
@@ -248,8 +250,8 @@ def _wide_values(
     Only the values the header overflowed are in it, in the order the format
     lays them out: uncompressed size, compressed size, offset, then disk.
     """
-    present = [value == limit for value, limit in zip(narrow, _LIMITS)]
-    expected = sum(width for width, there in zip(_WIDTHS, present) if there)
+    present = [value == limit for value, limit in zip(narrow, _LIMITS, strict=False)]
+    expected = sum(width for width, there in zip(_WIDTHS, present, strict=False) if there)
     field = _find_field(extra) if expected else None
     if field is None:
         return None
@@ -264,7 +266,7 @@ def _replace_wide(
     """Replace the overflow sentinels in one central-directory record."""
     resolved = list(narrow)
     pos = 0
-    for index, (there, width) in enumerate(zip(present, _WIDTHS)):
+    for index, (there, width) in enumerate(zip(present, _WIDTHS, strict=False)):
         if there:
             resolved[index] = int.from_bytes(field[pos : pos + width], "little")
             pos += width

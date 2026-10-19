@@ -17,6 +17,7 @@ from xrdclient.config import Config
 from xrdclient.errors import TimeoutError as XRDTimeoutError
 from xrdclient.http import HTTPClient, third_party
 from xrdclient.testing import FakeDAVServer
+from xrdclient.url import XRootDURL
 
 BODY = b"hello world"
 
@@ -43,9 +44,10 @@ def slow(dav):
     return dav
 
 
-def _read(url, config):
+def _read(url: str | XRootDURL, config: Config) -> bytes:
     with xrdclient.FileSystem(url, config=config) as fs, fs.open("/d/a.root", "rb") as handle:
-        return handle.read()
+        data: bytes = handle.read()
+        return data
 
 
 def test_a_slow_answer_waits_for_the_request_timeout_not_the_connect_one(slow):
@@ -93,7 +95,7 @@ def test_a_copy_timeout_applies_to_a_borrowed_client_and_only_to_the_copy(dav, e
                 dav.url / "d/a.root", elsewhere.url / "d/b.root", client=client, timeout=SHORT
             )
         # The copy's connection, markers still pending on it, was let go.
-        assert not client._pool
+        assert client.idle_count() == 0
         # The next request on the client waits as long as its own config says.
         elsewhere.handlers["HEAD"] = lambda method, path, headers: time.sleep(2 * SHORT)
         assert client.request("HEAD", elsewhere.url / "d").status == 200

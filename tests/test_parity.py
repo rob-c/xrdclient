@@ -14,24 +14,27 @@ from __future__ import annotations
 
 import socket
 import zlib
+from typing import Any
 
 import pytest
 
 import xrdclient
-from conftest import _REAL_CONFIG
+from tests.conftest import _REAL_CONFIG
 from xrdclient.client.file import File
+from xrdclient.errors import NotFoundError
 from xrdclient.flags import OpenFlags
 
-client = pytest.importorskip("XRootD.client", reason="the official bindings are not installed")
-from XRootD.client.flags import DirListFlags, MkDirFlags, QueryCode  # noqa: E402
-from XRootD.client.flags import OpenFlags as TheirFlags  # noqa: E402
+pytest.importorskip("XRootD.client", reason="optional dependency: the official bindings are absent")
+from XRootD import client
+from XRootD.client.flags import DirListFlags, MkDirFlags, QueryCode
+from XRootD.client.flags import OpenFlags as TheirFlags
 
 pytestmark = [pytest.mark.interop, pytest.mark.parity]
 
 BLOB = bytes(range(256)) * 64
 
 
-def check(status, result=None):
+def check(status: Any, result: object = None) -> Any:
     """Unwrap the bindings' ``(status, result)`` pair, loudly."""
     assert status.ok, status.message
     return result
@@ -84,7 +87,7 @@ def test_a_missing_file_fails_on_both_sides(ours, theirs, sandbox):
     missing = f"{sandbox}/missing.root"
     status, _ = theirs.stat(missing)
     assert not status.ok and status.errno
-    with pytest.raises(FileNotFoundError) as caught:
+    with pytest.raises(NotFoundError) as caught:
         ours.stat(missing)
     # Same error number, one as an attribute and one as an exception.
     assert caught.value.code == status.errno or status.code

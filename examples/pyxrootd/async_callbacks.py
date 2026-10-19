@@ -54,10 +54,14 @@ for f, handler, n in opened:
 
 # The function form: any callable taking (status, response, hostlist).
 done = threading.Event()
-seen = []
+seen: list[object] = []
 
 
-def listed(status, response, hostlist):
+def listed(
+    status: client.responses.XRootDStatus,
+    response: client.responses.DirectoryList,
+    hostlist: client.responses.HostList,
+) -> None:
     seen.append(sorted(entry.name for entry in response) if status.ok else status.errno)
     done.set()
 

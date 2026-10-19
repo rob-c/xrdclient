@@ -1,5 +1,11 @@
 """Byte transports: a real socket, and an in-memory pipe for tests.
 
+Start with :mod:`.base`, which holds the :class:`Transport` contract every
+session drives and the cached TLS context builder; :mod:`.sync` is the TCP/TLS
+implementation and :mod:`._dial` the RFC 8305 connector behind it. Nothing
+above this package touches a socket, which is what lets the protocol state
+machine run unchanged over an in-memory pipe.
+
 The in-memory pipe is imported only when it is asked for: it exists for the
 test suite, and a program that opens a socket should not pay to load it.
 """
@@ -14,10 +20,15 @@ from .sync import SocketTransport
 if TYPE_CHECKING:
     from .memory import MemoryTransport, pipe
 
-__all__ = ["Transport", "SocketTransport", "MemoryTransport", "pipe", "tls_context"]
+__all__ = ["MemoryTransport", "SocketTransport", "Transport", "pipe", "tls_context"]
 
 
 def __getattr__(name: str) -> object:
+    """Load :mod:`.memory` on first use of one of its names (PEP 562).
+
+    The value is cached in the module's globals, so the import happens once
+    and later lookups never reach this hook.
+    """
     if name in ("MemoryTransport", "pipe"):
         import importlib
 

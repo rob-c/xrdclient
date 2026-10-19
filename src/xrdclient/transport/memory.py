@@ -18,9 +18,14 @@ __all__ = ["MemoryTransport", "pipe"]
 class MemoryTransport(Transport):
     """One end of an in-memory byte pipe."""
 
-    __slots__ = ("_rx", "_tx", "_closed", "tls_started", "host", "port")
+    __slots__ = ("_closed", "_rx", "_tx", "host", "port", "tls_started")
 
     def __init__(self, rx: deque[bytes], tx: deque[bytes], host: str = "memory", port: int = 0):
+        """Wrap the two queues; ``rx`` is the peer's ``tx`` (see :func:`pipe`).
+
+        ``host``/``port`` exist only so code that names its peer in messages
+        and in redirect checks finds something there.
+        """
         self._rx = rx
         self._tx = tx
         self._closed = False
@@ -30,15 +35,28 @@ class MemoryTransport(Transport):
 
     @property
     def closed(self) -> bool:
+        """Whether *this* end was closed; the peer's end is independent."""
         return self._closed
 
     def send(self, data: bytes) -> None:
+        """Queue ``data`` for the peer as one chunk; empty sends are dropped.
+
+        Raises :class:`~xrdclient.errors.ConnectionError` after :meth:`close`,
+        as a socket would, so tests see the same failure a closed link gives.
+        """
         if self._closed:
             raise XrdConnectionError("transport is closed")
         if data:
             self._tx.append(data)
 
     def receive(self, size: int = 65536) -> bytes:
+        """The next queued chunk, at most ``size`` bytes of it.
+
+        Never blocks: an empty queue reads as ``b""``, end of stream, which is
+        how a scripted fake server "hangs up". A chunk longer than ``size`` is
+        split and its remainder put back at the front, so short reads -
+        which the frame parser must tolerate on a real socket - happen here too.
+        """
         if not self._rx:
             return b""
         chunk = self._rx.popleft()
@@ -48,12 +66,14 @@ class MemoryTransport(Transport):
         return chunk
 
     def start_tls(self, hostname: str, config: Config) -> None:
+        """Record that the upgrade was asked for; the bytes stay plaintext."""
         self.tls_started = True
 
     def settimeout(self, timeout: float | None) -> None:
         """Nothing to bound: a receive here returns whatever is queued."""
 
     def close(self) -> None:
+        """Refuse further sends; already queued bytes can still be read."""
         self._closed = True
 
     # -- test helpers ---------------------------------------------------
@@ -69,6 +89,7 @@ class MemoryTransport(Transport):
         return out
 
     def __repr__(self) -> str:
+        """Queue depths in chunks, which is what a failing test wants to see."""
         return f"MemoryTransport(rx={len(self._rx)}, tx={len(self._tx)}, closed={self._closed})"
 
 

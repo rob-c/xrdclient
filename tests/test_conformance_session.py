@@ -16,7 +16,7 @@ from collections import deque
 
 import pytest
 
-from conftest import handshake_reply, login_body, ok, protocol_body
+from tests.conftest import handshake_reply, login_body, ok, protocol_body
 from xrdclient.config import Config
 from xrdclient.errors import ConnectionError as XrdConnectionError
 from xrdclient.proto import constants as c
@@ -163,29 +163,33 @@ def test_closing_a_session_whose_connection_already_died_is_not_an_error(config)
 
 def test_one_session_serialises_the_threads_that_share_it(config):
     """Every answer reaches the caller that asked for it, under contention."""
-    with FakeServer(files={f"/f{i}": bytes([i]) * (i + 1) for i in range(8)}) as srv:
-        with Session.connect(srv.url, config=config) as session:
-            wrong: list[str] = []
+    with (
+        FakeServer(files={f"/f{i}": bytes([i]) * (i + 1) for i in range(8)}) as srv,
+        Session.connect(srv.url, config=config) as session,
+    ):
+        wrong: list[str] = []
 
-            def ask(index: int) -> None:
-                for _ in range(10):
-                    got = session.execute(r.Stat(f"/f{index}"), path=f"/f{index}")
-                    size = int(got.data.split()[1])
-                    if size != index + 1:
-                        wrong.append(f"/f{index} -> {size}")
+        def ask(index: int) -> None:
+            for _ in range(10):
+                got = session.execute(r.Stat(f"/f{index}"), path=f"/f{index}")
+                size = int(got.data.split()[1])
+                if size != index + 1:
+                    wrong.append(f"/f{index} -> {size}")
 
-            threads = [threading.Thread(target=ask, args=(i,)) for i in range(8)]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=30)
-            assert not wrong
-            assert srv.seen.count(c.kXR_stat) == 80
+        threads = [threading.Thread(target=ask, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        assert not wrong
+        assert srv.seen.count(c.kXR_stat) == 80
 
 
 def test_a_config_with_no_wait_budget_still_answers_the_first_time(config):
     """``redirect_limit=0`` bounds waits, not ordinary requests."""
     strict = Config(username="tester", auth_order=("host",), require_tls=False, redirect_limit=0)
-    with FakeServer(files={"/f": b"x"}) as srv:
-        with Session.connect(srv.url, config=strict) as session:
-            assert session.execute(r.Stat("/f"), path="/f").data
+    with (
+        FakeServer(files={"/f": b"x"}) as srv,
+        Session.connect(srv.url, config=strict) as session,
+    ):
+        assert session.execute(r.Stat("/f"), path="/f").data

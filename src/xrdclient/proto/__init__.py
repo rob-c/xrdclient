@@ -12,14 +12,14 @@ from .buffer import Reader, Writer
 from .frames import HANDSHAKE, Request, ResponseHeader, decode_header, encode
 
 __all__ = [
-    "constants",
-    "requests",
-    "responses",
+    "HANDSHAKE",
     "Reader",
-    "Writer",
     "Request",
     "ResponseHeader",
-    "HANDSHAKE",
-    "encode",
+    "Writer",
+    "constants",
     "decode_header",
+    "encode",
+    "requests",
+    "responses",
 ]

@@ -15,11 +15,16 @@ the one place that knows them:
 
 The host list a callback gets is every server the request passed through -
 see :func:`~xrdclient.session.router.trace`.
+
+Callers (``file.py``, ``filesystem.py``, ``tape.py``) hand over a zero-argument
+``operation`` and a ``convert``; they never touch threads, deadlines or
+exception mapping themselves. :func:`quick`/:func:`now` are the fast path a
+plain blocking call takes without building a closure or entering a deadline,
+which is what a loop of ``stat`` calls pays for per call.
 """
 
 from __future__ import annotations
 
-import concurrent.futures
 import contextlib
 import queue
 import threading
@@ -27,13 +32,15 @@ import time
 from collections.abc import Callable, Iterator
 from typing import Any, TypeVar
 
+from xrdcore.fanout import Pool
+
 from ...session.deadline import deadline, expiring_at
 from ...session.router import Hop, trace
 from . import env
 from ._status import OK, errInvalidArgs, failure, from_exception, guard, status, stOK, suContinue
 from .responses import HostList, XRootDStatus
 
-__all__ = ["CONTINUE", "call", "no_answer", "now", "quick", "stream", "Hosts"]
+__all__ = ["CONTINUE", "Hosts", "call", "no_answer", "now", "quick", "stream"]
 
 T = TypeVar("T")
 
@@ -46,7 +53,10 @@ CONTINUE = status(suContinue, level=stOK)
 #: Where callbacks run. Threads rather than asyncio because the bindings'
 #: callbacks run on threads, and code written for them takes locks
 #: accordingly.
-_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="xrd-compat")
+#: Eight workers bound how many callback calls run at once; the rest queue
+#: in submission order. Made on first use, so importing the bindings starts
+#: no thread, and again in a forked child, where the parent's has none.
+_POOL = Pool("xrd-compat", 8)
 
 
 def no_answer(value: object) -> None:
@@ -55,6 +65,7 @@ def no_answer(value: object) -> None:
 
 
 def _no_hosts(hops: list[Hop]) -> HostList:
+    """The ``hosts`` of a caller with no servers to name: an empty ``HostList``."""
     del hops
     return HostList({"hosts": []})
 
@@ -65,6 +76,8 @@ def quick(timeout: object, callback: object) -> bool:
     No callback, and no time limit - neither the call's own ``timeout`` nor
     the ``RequestTimeout`` every call gets once it has been put.
     """
+    # ``timeout.__class__ is int`` rather than ``isinstance``: a float or bool
+    # timeout must go the slow way, where ``_args.u16`` rejects it.
     return (
         callback is None and timeout.__class__ is int and not timeout and not env.request_timeout()
     )
@@ -101,6 +114,8 @@ def call(
     """
     timeout = timeout or env.request_timeout()
     if callback is not None:
+        # The expiry is fixed now, at the call: time spent queued for a
+        # worker counts against it, as it does for XrdCl's requests.
         _submit(callback, _deliver, (operation, convert, callback, hosts, _expiry(timeout)))
         return OK
     if not timeout:
@@ -182,6 +197,8 @@ def _deliver(
     """Run ``operation`` on a worker and hand its outcome to ``callback``."""
     with trace() as hops, _within(expiry):
         status, response = _outcome(lambda: convert(operation()))
+    # Outside the deadline and the trace: the user's callback is not part of
+    # the request, and a call it makes must not inherit either.
     callback(status, response, hosts(hops))
 
 
@@ -211,6 +228,7 @@ def _produce(
     with trace() as hops, _within(expiry):
 
         def part(response: Any) -> None:
+            """Queue one partial answer, naming the servers seen so far."""
             parts.put((CONTINUE, response, hosts(hops)))
 
         status, response = _outcome(lambda: operation(part))

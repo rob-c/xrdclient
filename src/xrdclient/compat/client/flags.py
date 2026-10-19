@@ -11,6 +11,11 @@ matched and a number that did not would be the worst of both: here both match.
 Each namespace is a plain class of ``int`` attributes with a
 ``reverse_mapping``, which is exactly what the bindings' own ``enum()`` helper
 builds, so ``OpenFlags.reverse_mapping[16]`` is ``"READ"`` in either library.
+
+Values are copied from XrdCl's headers (``XrdClFileSystem.hh``,
+``XrdClFile.hh``, ``XrdClXRootDResponses.hh``) and the bindings' ``enum()``
+calls; ``tests/test_pyxrootd_compat.py`` compares them against the bindings
+where both are installed. Never renumber one to match the native enums.
 """
 
 from __future__ import annotations
@@ -47,6 +52,11 @@ class _Namespace:
     reverse_mapping: ClassVar[dict[int, str]] = {}
 
     def __init_subclass__(cls) -> None:
+        """Build the subclass's ``reverse_mapping`` from its public ``int`` attributes.
+
+        Where two names share a value the later one wins, as with the
+        bindings' dict comprehension.
+        """
         super().__init_subclass__()
         cls.reverse_mapping = {
             value: name
@@ -56,7 +66,12 @@ class _Namespace:
 
 
 class OpenFlags(_Namespace):
-    """``XrdCl::OpenFlags``: how :meth:`File.open` opens."""
+    """``XrdCl::OpenFlags``: how :meth:`File.open` opens.
+
+    The low 16 bits are ``kXR_open``'s options word as sent; ``NONE`` is
+    read-only, which :meth:`File.open` spells ``READ`` before sending. Bit 64
+    (``kXR_async``) is absent because XrdCl sets it on every open itself.
+    """
 
     NONE = 0
     DELETE = 2
@@ -71,6 +86,8 @@ class OpenFlags(_Namespace):
     NOWAIT = 8192
     SEQIO = 16384
     WRITE = 32768
+    # Above the 16 bits of ``kXR_open``'s options: these select a templated
+    # open (``openusingtemplate``) and travel in the request's other field.
     DUP = 65536
     SAMEFS = 131072
 
@@ -110,7 +127,11 @@ class DirListFlags(_Namespace):
 
 
 class PrepareFlags(_Namespace):
-    """``XrdCl::PrepareFlags``."""
+    """``XrdCl::PrepareFlags``: ``kXR_prepare``'s option bits.
+
+    ``EVICT`` is 256 - one bit past the protocol's 8-bit options byte - so it
+    is sent in the extended ``optionX`` field; 128 is ``kXR_usetcp``.
+    """
 
     CANCEL = 1
     STAGE = 8
@@ -121,7 +142,7 @@ class PrepareFlags(_Namespace):
 
 
 class QueryCode(_Namespace):
-    """``XrdCl::QueryCode``."""
+    """``XrdCl::QueryCode``: ``kXR_query``'s ``infotype``, numbered as on the wire."""
 
     STATS = 1
     PREPARE = 2
@@ -136,7 +157,7 @@ class QueryCode(_Namespace):
 
 
 class StatInfoFlags(_Namespace):
-    """``XrdCl::StatInfo::Flags``."""
+    """``XrdCl::StatInfo::Flags``: the ``kXR_stat`` flags word, bit for bit."""
 
     X_BIT_SET = 1
     IS_DIR = 2

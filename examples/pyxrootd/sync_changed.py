@@ -42,6 +42,8 @@ def put(name: str, data: bytes) -> None:
 
 def remote_checksum(path: str) -> str:
     """The server's adler32 for ``path``, as 8 hex digits."""
+    status: client.responses.XRootDStatus
+    response: bytes
     status, response = fs.query(QueryCode.CHECKSUM, path)
     if not status.ok:
         raise SystemExit(f"no checksum for {path}: {status.message}")

@@ -10,16 +10,19 @@ calls through ``XRootD.client`` and through this package against one real
 
 from __future__ import annotations
 
+import errno
 import functools
 import gc
 import os
 import sys
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 import pytest
 
+from xrdclient.client.file import File as NativeFile
 from xrdclient.compat import client
 from xrdclient.compat.client import _channels, _status, env
 from xrdclient.compat.client.flags import (
@@ -33,6 +36,7 @@ from xrdclient.compat.client.flags import (
 )
 from xrdclient.compat.client.responses import StatInfo, XRootDStatus
 from xrdclient.config import Config
+from xrdclient.copy import engine as copy_engine
 from xrdclient.testing import FakeServer
 
 CONFIG = Config(username="tester", auth_order=("host",), require_tls=False, data_streams=0)
@@ -299,7 +303,12 @@ def test_a_path_ending_in_zip_is_listed_inside_unless_there_is_a_callback(fs, sr
     assert [e.name for e in ok(fs.dirlist("/d/a.zip", timeout=5))] == ["x.txt"]
     done = threading.Event()
     got = []
-    fs.dirlist("/d/a.zip", callback=lambda st, resp, hosts: (got.append(st), done.set()))
+
+    def heard(st, resp, hosts):
+        got.append(st)
+        done.set()
+
+    fs.dirlist("/d/a.zip", callback=heard)
     assert done.wait(10)
     assert got[0].code == 400
 
@@ -446,6 +455,7 @@ def test_a_callback_gets_status_response_and_hosts(fs):
     handler = client.utils.AsyncResponseHandler()
     assert fs.stat("/d/l.txt", callback=handler).ok
     status, info, hosts = handler.wait()
+    assert status is not None and hosts is not None
     assert status.ok and info.size == len(TEXT)
     (host,) = list(hosts)
     assert isinstance(host.url, client.URL) and host.load_balancer is False
@@ -454,7 +464,9 @@ def test_a_callback_gets_status_response_and_hosts(fs):
 def test_a_callback_hears_about_a_failure_too(fs):
     handler = client.utils.AsyncResponseHandler()
     fs.stat("/nope", callback=handler)
-    assert handler.wait()[0].errno == 3011
+    status = handler.wait()[0]
+    assert status is not None
+    assert status.errno == 3011
 
 
 def test_a_callback_hears_about_a_bad_argument_as_a_status(fs, monkeypatch):
@@ -464,7 +476,9 @@ def test_a_callback_hears_about_a_bad_argument_as_a_status(fs, monkeypatch):
     monkeypatch.setattr(fs.native, "truncate", refuse)
     handler = client.utils.AsyncResponseHandler()
     fs.truncate("/d/l.txt", 1, callback=handler)
-    assert handler.wait()[0].code == 9
+    status = handler.wait()[0]
+    assert status is not None
+    assert status.code == 9
 
 
 def test_a_callback_must_be_callable(fs):
@@ -555,7 +569,7 @@ def test_modtimestr_is_the_utc_time_to_the_second(seconds):
 
     from xrdclient.compat.client import _convert
 
-    when = datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc)
+    when = datetime.datetime.fromtimestamp(seconds, datetime.UTC)
     assert _convert._utc(seconds) == when.strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -669,7 +683,9 @@ def test_open_with_a_callback(root):
     f = client.File()
     handler = client.utils.AsyncResponseHandler()
     assert f.open(root + "/d/l.txt", callback=handler).ok
-    assert handler.wait()[0].ok and f.is_open()
+    status = handler.wait()[0]
+    assert status is not None and handler.hostlist is not None
+    assert status.ok and f.is_open()
     assert list(handler.hostlist)
     f.close()
 
@@ -680,17 +696,19 @@ def test_a_file_whose_open_failed_through_a_callback_is_finished_too(root):
     handler = client.utils.AsyncResponseHandler()
     assert f.open(root + "/nope", callback=handler).ok
     failed = handler.wait()[0]
+    assert failed is not None
     assert failed.errno == 3011 and not f.is_open()
     assert f.open(root + "/d/l.txt")[0] == failed
     assert f.close()[0] == failed
 
 
-def _slow_opens(monkeypatch):
+def _slow_opens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[threading.Event, threading.Event, list[NativeFile]]:
     """Native opens that wait for ``gate``; returns it, and the files they closed."""
-    from xrdclient.compat.client import file as compat_file
-
-    gate, done, closed = threading.Event(), threading.Event(), []
-    real_open, real_close = compat_file.NativeFile.open, compat_file.NativeFile.close
+    gate, done = threading.Event(), threading.Event()
+    closed: list[NativeFile] = []
+    real_open, real_close = NativeFile.open, NativeFile.close
 
     def slow_open(self, *args, **kwargs):
         gate.wait(30)
@@ -703,8 +721,8 @@ def _slow_opens(monkeypatch):
         closed.append(self)
         return real_close(self)
 
-    monkeypatch.setattr(compat_file.NativeFile, "open", slow_open)
-    monkeypatch.setattr(compat_file.NativeFile, "close", close)
+    monkeypatch.setattr(NativeFile, "open", slow_open)
+    monkeypatch.setattr(NativeFile, "close", close)
     return gate, done, closed
 
 
@@ -745,7 +763,9 @@ def test_an_open_that_expires_leaves_the_file_failed(root, srv):
 def test_a_callback_on_an_unopened_file_has_no_hosts():
     from xrdclient.compat.client.file import File
 
-    assert list(File()._File__hosts([])) == []  # type: ignore[attr-defined]
+    # Name-mangled, so reached through the class dictionary.
+    hosts = vars(File)["_File__hosts"]
+    assert list(hosts(File(), [])) == []
 
 
 def test_fcntl_is_the_servers_to_answer(fh, srv):
@@ -789,8 +809,9 @@ def test_a_template_must_be_open_and_the_file_not(fh, root):
     assert "Template file not open" in status.message
     status, _ = fh.openusingtemplate(fh, root + "/d/x", colocated)
     assert (status.code, status.message) == (3, "[ERROR] Invalid operation")
+    not_a_file: Any = "not a file"  # typed Any so the call reaches the runtime check
     with pytest.raises(AttributeError):
-        client.File().openusingtemplate("not a file", root + "/d/x", OpenFlags.NEW)
+        client.File().openusingtemplate(not_a_file, root + "/d/x", OpenFlags.NEW)
     with pytest.raises(OverflowError):
         client.File().openusingtemplate(fh, root + "/d/x", 1 << 32)
 
@@ -807,11 +828,13 @@ def test_a_template_open_can_answer_a_callback(fh, root, srv):
     done = threading.Event()
     got = []
     new = client.File()
+
+    def heard(st, resp, hosts):
+        got.append((st, resp))
+        done.set()
+
     status = new.openusingtemplate(
-        fh,
-        root + "/d/cb",
-        OpenFlags.NEW | OpenFlags.SAMEFS,
-        callback=lambda st, resp, hosts: (got.append((st, resp)), done.set()),
+        fh, root + "/d/cb", OpenFlags.NEW | OpenFlags.SAMEFS, callback=heard
     )
     assert status.ok and done.wait(10)
     assert got[0][0].ok and got[0][1] is None
@@ -935,13 +958,12 @@ def test_a_checksum_preset_that_disagrees_fails_the_job(root, tmp_path):
 
 def test_a_bad_checksum_can_remove_the_target(root, tmp_path, monkeypatch):
     from xrdclient import errors
-    from xrdclient.compat.client import copyprocess
 
     def mismatched(*args, **kwargs):
         (tmp_path / "bad").write_bytes(b"x")
         raise errors.ChecksumMismatchError("adler32", "a", "b")
 
-    monkeypatch.setattr(copyprocess, "_copy_file", mismatched)
+    monkeypatch.setattr("xrdclient.compat.client.copyprocess._copy_file", mismatched)
     process = client.CopyProcess()
     process.add_job(root + "/d/l.txt", str(tmp_path / "bad"), rmBadCksum=True)
     status, _ = process.run()
@@ -950,12 +972,11 @@ def test_a_bad_checksum_can_remove_the_target(root, tmp_path, monkeypatch):
 
 def test_removing_a_bad_remote_target(root, srv, monkeypatch):
     from xrdclient import errors
-    from xrdclient.compat.client import copyprocess
 
     def mismatched(*args, **kwargs):
         raise errors.ChecksumMismatchError("adler32", "a", "b")
 
-    monkeypatch.setattr(copyprocess, "_copy_file", mismatched)
+    monkeypatch.setattr("xrdclient.compat.client.copyprocess._copy_file", mismatched)
     process = client.CopyProcess()
     process.add_job(root + "/d/sub/g", root + "/d/l.txt", rmBadCksum=True)
     process.add_job(root + "/d/sub/g", root + "/d/missing", rmBadCksum=True)
@@ -965,9 +986,8 @@ def test_removing_a_bad_remote_target(root, srv, monkeypatch):
 
 def test_a_transient_failure_is_retried(root, tmp_path, monkeypatch):
     from xrdclient import errors
-    from xrdclient.compat.client import copyprocess
 
-    real, calls = copyprocess._copy_file, []
+    real, calls = copy_engine.copy, []
 
     def flaky(*args, **kwargs):
         calls.append(kwargs["resume"])
@@ -975,7 +995,7 @@ def test_a_transient_failure_is_retried(root, tmp_path, monkeypatch):
             raise errors.TransientError("dropped")
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(copyprocess, "_copy_file", flaky)
+    monkeypatch.setattr("xrdclient.compat.client.copyprocess._copy_file", flaky)
     process = client.CopyProcess()
     process.add_job(root + "/d/l.txt", str(tmp_path / "r"), retry=2, rtrplc="continue")
     assert process.run()[0].ok
@@ -989,9 +1009,8 @@ def test_a_transient_failure_is_retried(root, tmp_path, monkeypatch):
 def test_a_force_retry_overwrites_what_the_failure_left(root, tmp_path, monkeypatch):
     """XrdCl's default CpRetryPolicy: retry with force, so a partial target is no obstacle."""
     from xrdclient import errors
-    from xrdclient.compat.client import copyprocess
 
-    real, calls = copyprocess._copy_file, []
+    real, calls = copy_engine.copy, []
 
     def flaky(source, target, **kwargs):
         calls.append((kwargs["overwrite"], kwargs["resume"]))
@@ -1001,7 +1020,7 @@ def test_a_force_retry_overwrites_what_the_failure_left(root, tmp_path, monkeypa
             raise errors.TransientError("connection reset mid-transfer")
         return real(source, target, **kwargs)
 
-    monkeypatch.setattr(copyprocess, "_copy_file", flaky)
+    monkeypatch.setattr("xrdclient.compat.client.copyprocess._copy_file", flaky)
     process = client.CopyProcess()
     process.add_job(root + "/d/l.txt", str(tmp_path / "x"), retry=2)
     status, _ = process.run()
@@ -1041,12 +1060,10 @@ def test_a_target_that_exists_is_a_local_error_as_in_xrdcl(root, tmp_path):
 def test_a_local_error_without_an_errno_the_protocol_names(root, tmp_path, monkeypatch):
     import errno as errnos
 
-    from xrdclient.compat.client import copyprocess
-
     def refuse(*args, **kwargs):
         raise OSError(errnos.EBUSY, "Resource busy")
 
-    monkeypatch.setattr(copyprocess, "_copy_file", refuse)
+    monkeypatch.setattr("xrdclient.compat.client.copyprocess._copy_file", refuse)
     process = client.CopyProcess()
     process.add_job(root + "/d/l.txt", str(tmp_path / "busy"))
     status = process.run()[0]
@@ -1064,7 +1081,7 @@ def test_a_missing_source_leaves_no_target(root, tmp_path):
     assert (tmp_path / "kept").read_bytes() == b"precious"
 
 
-def _no_checksums(srv):
+def _no_checksums(srv: FakeServer) -> None:
     """The server a stock xrootd is without a checksum plugin: kXR_Qcksum is refused."""
     from xrdclient.proto import constants as c
     from xrdclient.testing import error
@@ -1193,13 +1210,12 @@ def test_prepare_refuses_a_job_it_cannot_run(source, target, extra):
 
 
 def test_a_job_that_cannot_run_is_a_status(root, tmp_path, monkeypatch):
-    from xrdclient.compat.client import copyprocess
 
-    monkeypatch.setattr(copyprocess, "_copy_file", lambda *a, **k: 1 / 0)
+    monkeypatch.setattr("xrdclient.compat.client.copyprocess._copy_file", lambda *a, **k: 1 / 0)
     process = client.CopyProcess()
     process.add_job(root + "/d/l.txt", str(tmp_path / "z"))
     assert process.run()[0].code == 2
-    monkeypatch.setattr(copyprocess, "_copy_file", lambda *a, **k: int("x"))
+    monkeypatch.setattr("xrdclient.compat.client.copyprocess._copy_file", lambda *a, **k: int("x"))
     assert process.run()[0].code == 9
 
 
@@ -1212,15 +1228,17 @@ def test_a_handler_needs_none_of_the_methods(root, tmp_path):
 def test_files_on_one_server_share_a_channel_and_others_do_not(root, tmp_path):
     first = _channels.router_for(root + "/d/l.txt", CONFIG)
     second = _channels.router_for(root + "/d/sub/g", CONFIG)
-    assert first is not None and first._lender is second._lender
+    assert first is not None and second is not None
+    assert first._lender is second._lender
     assert _channels.router_for(str(tmp_path / "local"), CONFIG) is None
 
 
 def test_the_base_progress_handler_does_nothing():
     handler = client.utils.CopyProgressHandler()
     url = client.URL("root://h//x")
-    assert handler.begin(1, 1, url, url) is None
-    assert handler.update(1, 0, 0) is None and handler.end(1, {}) is None
+    handler.begin(1, 1, url, url)
+    handler.update(1, 0, 0)
+    handler.end(1, {})
     assert handler.should_cancel(1) is False
 
 
@@ -1313,7 +1331,7 @@ def test_set_log_level(monkeypatch):
     assert logger.level == logging.DEBUG
     with pytest.raises(ValueError, match="unknown log level"):
         client.SetLogLevel("Chatty")
-    assert client.SetLogMask("Debug", "All") is None
+    client.SetLogMask("Debug", "All")  # accepted, and nothing to configure
 
 
 def test_glob_expands_on_the_server(root):
@@ -1365,7 +1383,9 @@ def test_set_xattr_adler32_on_this_platform(tmp_path):
     try:
         client.setXAttrAdler32(str(target), "062c0215")
     except OSError as exc:  # a filesystem without xattrs, e.g. some tmpfs
-        pytest.skip(f"no extended attributes here: {exc}")
+        if exc.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+            raise
+        pytest.skip(f"environment: this filesystem has no extended attributes ({exc})")
 
 
 def test_set_xattr_adler32_reports_a_failure(tmp_path):
@@ -1379,7 +1399,7 @@ def test_setting_an_xattr_the_system_refuses_raises_its_errno(tmp_path):
 
     from xrdclient.compat.client import xattr
 
-    expected = errno.ENOENT
+    expected: int | None = errno.ENOENT
     if hasattr(os, "setxattr"):
         with pytest.raises(OSError) as system_error:
             os.setxattr(str(tmp_path / "missing"), "user.XrdCks.adler32", b"v")
@@ -1430,11 +1450,15 @@ def test_a_file_that_never_opened_leaves_its_with_block_quietly():
 
 
 def test_a_file_dropped_while_open_is_closed(root):
+    from xrdclient import _abandoned
+
     f = client.File()
     ok(f.open(root + "/d/l.txt"))
     native = f.native
     del f
     gc.collect()
+    # Closed off the collector's thread: by the next compat call, or the reaper.
+    _abandoned.reap()
     assert native is not None and not native.is_open
 
 
@@ -1457,13 +1481,12 @@ def test_a_url_with_a_bad_port_is_refused_on_use_not_on_construction():
 
 def test_a_bad_checksum_without_rmbadcksum_keeps_the_target(root, tmp_path, monkeypatch):
     from xrdclient import errors
-    from xrdclient.compat.client import copyprocess
 
     def mismatched(*args, **kwargs):
         (tmp_path / "bad").write_bytes(b"x")
         raise errors.ChecksumMismatchError("adler32", "a", "b")
 
-    monkeypatch.setattr(copyprocess, "_copy_file", mismatched)
+    monkeypatch.setattr("xrdclient.compat.client.copyprocess._copy_file", mismatched)
     process = client.CopyProcess()
     process.add_job(root + "/d/l.txt", str(tmp_path / "bad"))
     status, _ = process.run()
@@ -1535,7 +1558,7 @@ def official():
 @pytest.fixture
 def two_sandboxes(real_server, sandbox, monkeypatch):
     """One directory for each client, so their changes cannot meet."""
-    from conftest import _REAL_CONFIG
+    from tests.conftest import _REAL_CONFIG
 
     monkeypatch.setattr(env, "config", lambda: _REAL_CONFIG)
     fs = client.FileSystem(real_server.url)
@@ -1642,7 +1665,16 @@ def test_a_file_session_goes_as_it_does_with_the_bindings(official, two_sandboxe
     ["root://u:p@h:1234//p?a=1", "root://h/rel", "/local/f", "garbage", "notaurl://", "file:///x"],
 )
 def test_a_url_parses_as_the_bindings_parse_it(official, text):
-    names = "hostid protocol username password hostname port path path_with_params".split()
+    names = [
+        "hostid",
+        "protocol",
+        "username",
+        "password",
+        "hostname",
+        "port",
+        "path",
+        "path_with_params",
+    ]
     mine, want = client.URL(text), official.URL(text)
     assert [getattr(mine, n) for n in names] == [getattr(want, n) for n in names]
     assert (str(mine), mine.is_valid()) == (str(want), want.is_valid())
@@ -1733,8 +1765,9 @@ def test_a_bad_argument_raises_as_the_bindings_c_parser_does(fh, call, error):
 def test_open_checks_its_flags_and_mode(root):
     with pytest.raises(OverflowError):
         client.File().open(root + "/d/l.txt", 1 << 16)
+    bad_mode: Any = "rw"  # typed Any so the call reaches the runtime check
     with pytest.raises(TypeError):
-        client.File().open(root + "/d/l.txt", 0, "rw")
+        client.File().open(root + "/d/l.txt", 0, bad_mode)
 
 
 @pytest.mark.parametrize(
@@ -1823,7 +1856,8 @@ def test_a_callback_after_the_pool_has_shut_down_still_arrives(fs, monkeypatch):
     monkeypatch.setattr(_dispatch._POOL, "submit", refuse)
     handler = client.utils.AsyncResponseHandler()
     assert fs.ping(callback=handler).ok
-    assert handler.wait()[0].ok
+    status = handler.wait()[0]
+    assert status is not None and status.ok
 
 
 # -- parity: fcntl, template opens, ZIP listings ------------------------------
@@ -1842,7 +1876,7 @@ def test_a_zip_listing_is_the_bindings_listing(official, two_sandboxes):
     )
     (here / "empty.zip").write_bytes(b"")
     (here / "not.zip").write_bytes(b"abc")
-    steps = [
+    steps: list[Callable[[Any], Any]] = [
         lambda fs: fs.dirlist(f"{sandbox}/a.zip", DirListFlags.ZIP),
         lambda fs: fs.dirlist(f"{sandbox}/a.zip"),
         lambda fs: fs.dirlist(f"{sandbox}/a.zip", DirListFlags.ZIP | DirListFlags.STAT),

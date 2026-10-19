@@ -36,15 +36,21 @@ It is a Python library first and an XRootD binding second.
 $ pip install xrdclient                 # portable base install
 ```
 
-Requires Python 3.9.2+. Runtime dependencies are `botocore`, `PyJWT[crypto]`,
-`urllib3`, `asn1crypto` and `cryptography`.
+Requires Python 3.11+. Runtime dependencies are `botocore`,
+`cryptography`, and this project's own `xrdcore` and `xrdsec` libraries
+(xrdsec brings `asn1crypto`).
 XML and binary record parsing use local standard-library helpers.
 Native Kerberos bindings are optional:
-`pip install 'xrdclient[krb5]'` installs python-gssapi and pykrb5. macOS has
+`pip install 'xrdclient[krb5]'` installs python-gssapi. macOS has
 wheels; Linux source installs need Kerberos development headers and a compiler.
 CI checks base dependency wheels for Intel/ARM64 macOS, glibc and musl Linux.
 
-The maintained libraries own AWS signing, JWT claim decoding, DER primitives,
+Paged reads/writes and `crc32c` checksums want `pip install 'xrdclient[fast]'`
+(google-crc32c, wheels for CPython 3.11-3.14 on Linux x86_64/aarch64 and
+macOS); without it a pure-Python CRC-32C runs at a few MB/s. `xrd-fs doctor`
+says which is in use.
+
+The maintained libraries own AWS signing, DER primitives,
 cipher/curve operations and connection setup/TLS. Protocol-specific GSI,
 RFC 3820/VOMS policy, redirects and upload handshakes remain thin client adapters.
 
@@ -92,10 +98,10 @@ S3, the copy engine, the bulk data plane, the CLI and the fsspec bindings are
 implemented and tested. The great majority of tests need no network, no KDC
 and no `openssl`, plus [interoperability and parity suites](interop.md) that run
 against a real `xrootd` daemon and the official bindings side by side.
-Coverage is 100% of statements and branches across the package, and `proto/`,
-`crypto/`, `client/` and `s3/` are gated at 100%;
-`ruff` and `mypy --strict` pass clean over the package, which ships
-`py.typed` ([Typing](typing.md)).
+Coverage is 100% of statements and branches across the whole package, and
+gated there; `ruff` and `mypy --strict` pass clean over the package, its tests,
+tools, benchmarks and examples, with no suppression comments to get there, and
+the package ships `py.typed` ([Typing](typing.md)).
 
 Third-party copy works in both dialects from one call: `xrdclient.third_party` sends
 the `XrdOucTPC` rendezvous to a `root://` pair and the WLCG `COPY` dialect to

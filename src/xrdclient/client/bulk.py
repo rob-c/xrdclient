@@ -28,25 +28,30 @@ pipe or a socket that cannot seek.
 from __future__ import annotations
 
 import errno
+import functools
 import os
 import stat
 import threading
 import time
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 
-from .._compat import SLOTS
-from .._log import get_logger
+from xrdcore import cancel as _cancel
+from xrdcore import fanout
+from xrdcore import retry as _retry
+
 from ..config import Config
+from ..errors import AbortedError, TransientError, XRootDError
 from ..errors import ConnectionError as XrdConnectionError
 from ..errors import TimeoutError as XrdTimeoutError
-from ..errors import TransientError, XRootDError
+from ..flags import OpenFlags
+from ..log import get_logger
 from ..session.bulk import BulkUnsupported
 from ..url import XRootDURL, parse
 from .file import File
 
-__all__ = ["download", "stream", "BulkResult", "BulkUnsupported"]
+__all__ = ["BulkResult", "BulkUnsupported", "download", "stream", "upload"]
 
 _log = get_logger(__name__)
 
@@ -63,7 +68,27 @@ _TRANSIENT = (XrdConnectionError, XrdTimeoutError, TransientError)
 Progress = Callable[[int, "int | None"], None]
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
+class _Options:
+    """The keyword options of one :func:`download` or :func:`stream` call.
+
+    Carried as one value from the public entry point to :func:`_start` and
+    :class:`_Transfer`, so the two entry points cannot drift apart in how
+    they size and plan a fan-out. Every field is exactly the public
+    argument of the same name, unresolved: ``None`` still means "the
+    configured default", which :func:`_plan` and :class:`_Transfer` apply.
+    """
+
+    progress: Progress | None = None
+    workers: int | None = None
+    chunk: int | None = None
+    depth: int | None = None
+    #: The file's length, when the caller already knows it; saves the open.
+    size: int | None = None
+    cancel: _cancel.Cancel | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class BulkResult:
     """What one bulk transfer moved."""
 
@@ -80,6 +105,7 @@ class BulkResult:
         return self.size / self.seconds if self.seconds > 0 else 0.0
 
     def __str__(self) -> str:
+        """One summary line for a log: size, time, MiB/s, connections and any restarts."""
         speed = self.rate / (1 << 20)
         tail = f", {self.restarts} restart(s)" if self.restarts else ""
         return (
@@ -118,57 +144,137 @@ def _opened(url: XRootDURL, config: Config) -> Iterator[File]:
     try:
         yield handle
     finally:
-        try:
+        # A dead connection has nothing left to close.
+        with suppress(OSError):
             handle.close()
-        except OSError:  # pragma: no cover - a dead connection has nothing to close
-            pass
 
 
 class _Transfer:
     """The shared state of one fan-out: progress, restarts, and first error."""
 
     __slots__ = (
-        "config",
-        "url",
-        "chunk",
-        "depth",
-        "moved",
-        "restarts",
+        "_files",
         "_lock",
         "_progress",
+        "aborted",
+        "cancel",
+        "chunk",
+        "config",
+        "depth",
+        "halt",
+        "moved",
+        "restarts",
         "total",
+        "url",
     )
 
     def __init__(
         self,
         url: XRootDURL,
         config: Config,
+        options: _Options,
         *,
-        chunk: int,
-        depth: int,
         total: int,
-        progress: Progress | None,
+        chunk: int,
     ) -> None:
+        """State for moving ``total`` bytes of ``url`` in ``chunk``-byte reads.
+
+        ``chunk`` is the planned request size (see :func:`_plan`), not the
+        caller's raw option, which may have been ``None``; the pipeline depth
+        and the cancel hook are resolved here from ``options``.
+        """
         self.url = url
         self.config = config
         self.chunk = chunk
-        self.depth = depth
+        self.depth = options.depth or config.bulk_depth
         self.total = total
         self.moved = 0
         self.restarts = 0
+        #: Set when any worker of this transfer has failed: the others stop
+        #: at their next piece rather than finish spans nobody will use.
+        self.halt = threading.Event()
         self._lock = threading.Lock()
-        self._progress = progress
+        self._progress = options.progress
+        #: The caller's cancel hook, asked between pieces (see :mod:`xrdcore.cancel`).
+        self.cancel = _cancel.as_check(options.cancel)
+        #: Set once the transfer has been cancelled: every worker stops, and
+        #: none of them treats the connection it lost as a reason to resume.
+        self.aborted = False
+        #: The handles open right now, for a cancel to wake.
+        self._files: set[File] = set()
+
+    def track(self, handle: File) -> File:
+        """Note ``handle`` as open, so that a cancel reaches it; aborted at once if too late."""
+        with self._lock:
+            self._files.add(handle)
+            late = self.aborted
+        if late:
+            handle.abort()
+        return handle
+
+    def untrack(self, handle: File) -> None:
+        """Forget ``handle`` once its worker has closed it; a later cancel leaves it alone."""
+        with self._lock:
+            self._files.discard(handle)
+
+    def stop_now(self) -> None:
+        """Cancel: stop every worker and wake any blocked on the network.
+
+        Called from the watcher thread, or from a worker that saw the hook
+        itself. Aborting a handle shuts its connection down, which wakes a
+        worker blocked in a receive at once rather than at its timeout.
+        """
+        with self._lock:
+            self.aborted = True
+            handles = list(self._files)
+        self.halt.set()
+        for handle in handles:
+            handle.abort()
+
+    @contextmanager
+    def opened(self) -> Iterator[File]:
+        """:func:`_opened`, tracked for the length of the block."""
+        with _opened(self.url, self.config) as handle:
+            self.track(handle)
+            try:
+                yield handle
+            finally:
+                self.untrack(handle)
 
     def advance(self, count: int) -> None:
+        """Count ``count`` more bytes landed and report progress.
+
+        Called from every worker thread; the lock makes the running total and
+        the callback order agree, so a progress hook sees totals that only grow.
+        """
         with self._lock:
             self.moved += count
             if self._progress is not None:
                 self._progress(self.moved, self.total)
 
     def restarted(self) -> int:
+        """Count one resume after a lost connection; returns the new total for the log line."""
         with self._lock:
             self.restarts += 1
             return self.restarts
+
+    def _unless_halted(
+        self, pieces: Iterator[tuple[int, memoryview]], start: int
+    ) -> Iterator[tuple[int, memoryview]]:
+        """``pieces``, until another worker of this transfer has failed.
+
+        Checked between pieces, which is as often as a worker can look up:
+        the transfer is lost, and finishing this span would only spend the
+        bandwidth and the time before the caller hears about it.
+        """
+        for piece in pieces:
+            if self.cancel is not None and not self.aborted and self.cancel():
+                self.stop_now()
+            if self.aborted:
+                raise AbortedError(f"the transfer of {self.url} was cancelled")
+            if self.halt.is_set():
+                raise fanout.Stopped(f"span at {start} stopped: another worker failed")
+            yield piece
 
     def span(
         self,
@@ -196,16 +302,14 @@ class _Transfer:
             try:
                 borrowed, opened = opened, None
                 with (
-                    (
-                        nullcontext(borrowed)
-                        if borrowed is not None
-                        else _opened(self.url, self.config)
-                    ) as handle,
+                    nullcontext(borrowed) if borrowed is not None else self.opened() as handle,
                     handle.session.bulk(
                         handle.handle, chunk=recovery.chunk, depth=self.depth
                     ) as reader,
                 ):
-                    for offset, view in reader.stream(start + done, length - done):
+                    for offset, view in self._unless_halted(
+                        reader.stream(start + done, length - done), start
+                    ):
                         consume(offset, view)
                         done += len(view)
                         self.advance(len(view))
@@ -214,6 +318,10 @@ class _Transfer:
                 # span is either complete or the file stopped short of it.
                 return done
             except _TRANSIENT as exc:
+                if self.aborted:
+                    # The cancel shut the connection down; that is not a
+                    # server to wait for.
+                    raise AbortedError(f"the transfer of {self.url} was cancelled") from exc
                 waiting = recovery.pause(made_progress=done > attempt_start)
                 if waiting is None:
                     raise
@@ -247,6 +355,11 @@ class _Recovery:
     __slots__ = ("_backoff", "_budget", "_expires", "_floor", "_tries", "chunk")
 
     def __init__(self, config: Config, chunk: int) -> None:
+        """Start the clock: ``config`` supplies the budget, ``chunk`` the first request size.
+
+        ``_floor`` caps how small :meth:`pause` may shrink the chunk, and never
+        exceeds the starting chunk, so a small transfer does not grow on retry.
+        """
         self._budget = config.bulk_recovery
         self._backoff = config.retry_backoff
         self._expires = time.monotonic() + self._budget
@@ -267,7 +380,7 @@ class _Recovery:
         left = self._expires - time.monotonic()
         if left <= 0:
             return None
-        return min(self._backoff * (2 ** (self._tries - 1)), _MAX_BACKOFF, left), left
+        return _retry.delay(self._tries, self._backoff, _MAX_BACKOFF, remaining=left), left
 
 
 def _seekable(fd: int) -> bool:
@@ -280,6 +393,11 @@ def _seekable(fd: int) -> bool:
 
 
 def _write_all(fd: int, view: memoryview) -> None:
+    """``os.write`` all of ``view`` to ``fd``, looping over short writes.
+
+    A pipe or socket may accept fewer bytes than offered; a zero-byte write
+    is reported as ``EIO`` rather than looped on forever.
+    """
     written = 0
     while written < len(view):
         count = os.write(fd, view[written:])
@@ -335,61 +453,65 @@ def _begin(
     return int(handle.stat().size), handle
 
 
+def _start(
+    target: XRootDURL, config: Config, options: _Options, stack: ExitStack
+) -> tuple[_Transfer, int, File | None]:
+    """Size and plan a fan-out: its shared state, worker count, and first handle.
+
+    The common opening of :func:`download` and :func:`stream`. The handle the
+    length was read from (if one had to be opened) is tracked at once, so a
+    cancel that arrives before the workers start still reaches it; ``stack``
+    owns closing it.
+    """
+    total, first = _begin(target, config, options.size, stack)
+    count, span_chunk = _plan(total, config, options.workers, options.chunk)
+    transfer = _Transfer(target, config, options, total=total, chunk=span_chunk)
+    if first is not None:
+        transfer.track(first)
+    return transfer, count, first
+
+
 def _jobs(
     transfer: _Transfer,
     total: int,
     count: int,
     consume: Callable[[int, memoryview], None],
     first: File | None,
-) -> list[Callable[[], None]]:
+) -> list[Callable[[], object]]:
     """One job per span, the first of them reusing the already-open handle."""
     spans = [(start, length) for start, length in _spans(total, count) if length]
     return [
-        (
-            lambda s=start, n=length, h=(first if i == 0 else None): (  # type: ignore[misc]
-                transfer.span(s, n, consume, h)
-            )
-        )
+        functools.partial(transfer.span, start, length, consume, first if i == 0 else None)
         for i, (start, length) in enumerate(spans)
     ]
 
 
-def _run(jobs: list[Callable[[], None]], on_failure: Callable[[], None] | None = None) -> None:
+def _run(
+    jobs: list[Callable[[], object]],
+    transfer: _Transfer,
+    on_failure: Callable[[], None] | None = None,
+) -> None:
     """Run every job, one thread each, and re-raise the first failure.
 
     ``on_failure`` is called as soon as any job raises, before the others are
     joined. An ordered stream needs it: its workers wait their turn to write,
     and a worker that died is a turn that will never come, so the rest would
-    wait on it forever.
+    wait on it forever. Failures after the first are listed in a note on it
+    (see :func:`xrdcore.fanout.run_all`).
+
+    While they run, the transfer's cancel hook is watched (see
+    :mod:`xrdcore.cancel`), and whatever a cancelled transfer ends with
+    is reported as the :class:`~xrdclient.errors.AbortedError` it is.
     """
-    if len(jobs) == 1:
-        jobs[0]()
-        return
-    errors: list[BaseException] = []
-    lock = threading.Lock()
-
-    def guarded(job: Callable[[], None]) -> Callable[[], None]:
-        def run() -> None:
-            try:
-                job()
-            except BaseException as exc:  # re-raised on the main thread
-                with lock:
-                    errors.append(exc)
-                if on_failure is not None:
-                    on_failure()
-
-        return run
-
-    threads = [
-        threading.Thread(target=guarded(job), name=f"xrd-bulk-{i}", daemon=True)
-        for i, job in enumerate(jobs)
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    if errors:
-        raise errors[0]
+    try:
+        with _cancel.watching(transfer.cancel, transfer.stop_now, name="xrd-bulk-cancel"):
+            fanout.run_all(jobs, name="xrd-bulk", stop=transfer.halt, on_failure=on_failure)
+    except AbortedError:
+        raise
+    except Exception as exc:
+        if transfer.aborted:
+            raise AbortedError(f"the transfer of {transfer.url} was cancelled") from exc
+        raise
 
 
 def download(
@@ -402,6 +524,7 @@ def download(
     chunk: int | None = None,
     depth: int | None = None,
     size: int | None = None,
+    cancel: _cancel.Cancel | None = None,
 ) -> BulkResult:
     """Copy a ``root://`` file to a local file, several connections at once.
 
@@ -412,20 +535,20 @@ def download(
 
     Raises if the transfer ends short of ``size`` bytes, so a caller never has
     to check the length itself.
+
+    ``cancel`` is a :class:`threading.Event` or a callable answering whether
+    to stop. It is asked between pieces by every worker, and watched while
+    they wait on the network: once it says stop, the handles in flight are
+    aborted (:meth:`~xrdclient.File.abort`), every worker stops within a
+    piece, and the call raises :class:`~xrdclient.errors.AbortedError`. What
+    already landed in ``dest`` stays there.
     """
     cfg = config or Config()
     target = parse(url)
+    options = _Options(progress, workers, chunk, depth, size, cancel)
     with ExitStack() as stack:
-        total, first = _begin(target, cfg, size, stack)
-        count, span_chunk = _plan(total, cfg, workers, chunk)
-        transfer = _Transfer(
-            target,
-            cfg,
-            chunk=span_chunk,
-            depth=depth or cfg.bulk_depth,
-            total=total,
-            progress=progress,
-        )
+        transfer, count, first = _start(target, cfg, options, stack)
+        total = transfer.total
         if isinstance(dest, int):
             fd = dest
         else:
@@ -443,13 +566,15 @@ def download(
                 chunk=chunk,
                 depth=depth,
                 size=total,
+                cancel=cancel,
             )
         _preallocate(fd, total)  # one allocation, not a growing file per worker
 
         started = time.monotonic()
         _run(
             _jobs(transfer, total, count, lambda o, v: _pwrite_all(fd, v, o), first)
-            or [lambda: None]
+            or [lambda: None],
+            transfer,
         )
         elapsed = time.monotonic() - started
 
@@ -471,6 +596,7 @@ def stream(
     chunk: int | None = None,
     depth: int | None = None,
     size: int | None = None,
+    cancel: _cancel.Cancel | None = None,
 ) -> BulkResult:
     """Read a ``root://`` file in order, handing each piece to ``writer``.
 
@@ -479,38 +605,40 @@ def stream(
     read in parallel; a cursor lets exactly one of them write at a time, and
     only when its piece is the next one. ``writer`` is therefore called from
     one thread at a time, in file order, with a view valid until it returns.
+    ``cancel`` is as for :func:`download`.
     """
     cfg = config or Config()
     target = parse(url)
-    stack = ExitStack()
-    with stack:
-        total, first = _begin(target, cfg, size, stack)
-        count, span_chunk = _plan(total, cfg, workers, chunk)
-        transfer = _Transfer(
-            target,
-            cfg,
-            chunk=span_chunk,
-            depth=depth or cfg.bulk_depth,
-            total=total,
-            progress=progress,
-        )
-        return _ordered_run(transfer, writer, total, count, first, target)
+    options = _Options(progress, workers, chunk, depth, size, cancel)
+    with ExitStack() as stack:
+        transfer, count, first = _start(target, cfg, options, stack)
+        return _ordered_run(transfer, writer, count, first)
 
 
 def _ordered_run(
     transfer: _Transfer,
     writer: Callable[[memoryview], None],
-    total: int,
     count: int,
     first: File | None,
-    target: XRootDURL,
 ) -> BulkResult:
-    """Run the workers with exactly one of them writing at a time, in order."""
+    """Run the workers with exactly one of them writing at a time, in order.
+
+    ``count`` workers share ``transfer``; ``first`` is the handle the length
+    was read from, reused by the first span. The file and its length are
+    the transfer's own (``transfer.url``, ``transfer.total``).
+    """
+    target, total = transfer.url, transfer.total
     cursor = 0
     abandoned = False
     turn = threading.Condition()
 
     def ordered(offset: int, view: memoryview) -> None:
+        """Write ``view`` once every byte before ``offset`` has been written.
+
+        Workers fetch in parallel but block here for their turn, which is what
+        lets a non-seekable destination (a pipe) receive the file in order. A
+        worker whose predecessor gave up raises instead of waiting forever.
+        """
         nonlocal cursor
         with turn:
             turn.wait_for(lambda: cursor == offset or abandoned)
@@ -524,16 +652,168 @@ def _ordered_run(
             turn.notify_all()
 
     def abandon() -> None:
+        """Release every worker waiting for its turn; they raise rather than write out of order."""
         nonlocal abandoned
         with turn:
             abandoned = True
             turn.notify_all()
 
     started = time.monotonic()
-    _run(_jobs(transfer, total, count, ordered, first) or [lambda: None], abandon)
+    _run(
+        _jobs(transfer, total, count, ordered, first) or [lambda: None],
+        transfer,
+        abandon,
+    )
     elapsed = time.monotonic() - started
     if transfer.moved != total:
         raise XRootDError(
             f"{target}: stream ended with {transfer.moved} of {total} bytes; the file is incomplete"
         )
     return BulkResult(transfer.moved, elapsed, count, transfer.restarts)
+
+
+def upload(
+    source: str | os.PathLike[str] | int,
+    url: str | XRootDURL,
+    *,
+    config: Config | None = None,
+    progress: Progress | None = None,
+    chunk: int | None = None,
+    depth: int | None = None,
+    overwrite: bool = True,
+    posc: bool = False,
+    mode: int = 0o644,
+    cancel: _cancel.Cancel | None = None,
+) -> BulkResult:
+    """Copy a local file to ``root://``, pipelined over one connection.
+
+    ``source`` is a path or an open descriptor, read from where it stands to
+    its end, ``chunk`` (``config.chunk_size``) bytes a request with ``depth``
+    (``config.bulk_depth``) in flight - see :meth:`File.write_pieces`, which
+    this drives. The destination is created, or replaced only with
+    ``overwrite``, and with ``posc`` it exists under its name only once the
+    close has committed it. ``progress(done, total)`` counts acknowledged
+    bytes; ``total`` is the source's size when it has one.
+
+    A piece the server answers ``kXR_wait`` is sent again once the stream
+    has settled, read back from the source - which needs a source that can
+    seek; from a pipe, such an answer fails the upload instead.
+
+    ``cancel`` is as for :func:`download`: asked after every piece, and
+    watched while the upload waits on the network. Once it says stop the
+    destination's handle is aborted, which wakes the upload at once and
+    leaves the server to drop the half-written file (``posc``) or keep what
+    it already has, and the call raises :class:`~xrdclient.errors.AbortedError`.
+    """
+    cfg = config or Config()
+    target = parse(url)
+    check = _cancel.as_check(cancel)
+    with ExitStack() as stack:
+        fd = source if isinstance(source, int) else _read_fd(source, stack)
+        total = _source_size(fd)
+        start = os.lseek(fd, 0, os.SEEK_CUR) if _seekable(fd) else 0
+        local = _Source(fd, start, chunk or cfg.chunk_size)
+        handle = File(target, cfg)
+        flags = OpenFlags.UPDATE | (OpenFlags.DELETE if overwrite else OpenFlags.NEW)
+        handle.open(flags | OpenFlags.POSC if posc else flags, mode)
+        stack.callback(handle.close)
+        moved = _Moved(progress, total)
+        started = time.monotonic()
+        with _cancel.watching(check, handle.abort, name="xrd-upload-cancel"):
+            again = _send(handle, local, depth, moved, check)
+            for at, length in again:
+                handle.write(local.reread(at, length), at)
+                moved(at, length)
+        elapsed = time.monotonic() - started
+    return BulkResult(moved.done, elapsed, 1, 0)
+
+
+class _Moved:
+    """An upload's running total of acknowledged bytes, reported as it grows."""
+
+    __slots__ = ("_progress", "_total", "done")
+
+    def __init__(self, progress: Progress | None, total: int | None) -> None:
+        """Start at zero; ``total`` is ``None`` for a source of unknown length (a pipe)."""
+        self.done = 0
+        self._progress = progress
+        self._total = total
+
+    def __call__(self, at: int, count: int) -> None:
+        """Add ``count`` acknowledged bytes (``at`` is unused: this is the write hook signature)."""
+        self.done += count
+        if self._progress is not None:
+            self._progress(self.done, self._total)
+
+
+@dataclass(frozen=True, slots=True)
+class _Source:
+    """Where an upload's bytes come from: a local descriptor, read in order.
+
+    ``start`` is where the descriptor stood when the upload began; offsets
+    on the destination count from there, so a resend of destination range
+    ``(at, length)`` is a ``pread`` at ``start + at`` of the same source.
+    """
+
+    fd: int
+    start: int
+    #: Bytes per ``os.read``, which is also bytes per ``kXR_write``.
+    chunk: int
+
+    def pieces(self) -> Iterator[bytes]:
+        """The rest of the source, ``chunk`` bytes at a time, until end of file."""
+        while piece := os.read(self.fd, self.chunk):
+            yield piece
+
+    def reread(self, at: int, length: int) -> bytes:
+        """Destination range ``(at, length)`` read again, for a resend."""
+        return os.pread(self.fd, length, self.start + at)
+
+
+def _read_fd(path: str | os.PathLike[str], stack: ExitStack) -> int:
+    fd = os.open(os.fspath(path), os.O_RDONLY)
+    stack.callback(os.close, fd)
+    return fd
+
+
+def _source_size(fd: int) -> int | None:
+    """The size of a regular file behind ``fd``; ``None`` for a pipe or a device."""
+    info = os.fstat(fd)
+    return info.st_size if stat.S_ISREG(info.st_mode) else None
+
+
+def _send(
+    handle: File,
+    source: _Source,
+    depth: int | None,
+    moved: _Moved,
+    check: Callable[[], bool] | None,
+) -> list[tuple[int, int]]:
+    """Stream ``source`` into ``handle``; the ranges a ``kXR_wait`` sent back, for resending.
+
+    Waited ranges are collected only from a source that can seek: from a
+    pipe there is no way to read them again, so :meth:`File.write_pieces`
+    is left to fail on the first ``kXR_wait`` instead.
+    """
+    again: list[tuple[int, int]] = []
+    seekable = _seekable(source.fd)
+
+    def stop() -> None:
+        """The between-writes cancel check: raise :class:`AbortedError` if the hook says stop."""
+        if check is not None and check():
+            raise AbortedError(f"the upload to {handle.url} was cancelled")
+
+    try:
+        handle.write_pieces(
+            source.pieces(),
+            0,
+            depth=depth,
+            acknowledged=moved,
+            waited=(lambda at, count: again.append((at, count))) if seekable else None,
+            check=stop,
+        )
+    except XRootDError as exc:
+        if not isinstance(exc, AbortedError) and check is not None and check():
+            raise AbortedError(f"the upload to {handle.url} was cancelled") from exc
+        raise
+    return again

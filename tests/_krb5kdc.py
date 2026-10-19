@@ -1,6 +1,6 @@
 """A throwaway MIT Kerberos realm, and an ``xrootd`` that authenticates against it.
 
-The Kerberos client in :mod:`xrdclient.auth.kerberos` is only as good as the
+The Kerberos client in :mod:`xrdsec.krb5` is only as good as the
 proof that the genuine article accepts what it builds. So where MIT krb5 is
 installed (Homebrew puts it in ``/usr/local/opt/krb5``; Linux distributions
 in ``/usr/sbin`` and ``/usr/bin``), :class:`MitRealm` creates a realm in a
@@ -17,15 +17,17 @@ Kerberos configuration: every MIT program is pointed at the realm through
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import socket
 import struct
 import subprocess
+import threading
 import time
 from pathlib import Path
 
-from _xrootd import XROOTD, RealServer
+from tests._xrootd import XROOTD, RealServer
 
 
 def _free_port() -> int:
@@ -316,10 +318,8 @@ class KerberizedXrootd(RealServer):
 # -- fixtures captured from MIT, for the unit tests ---------------------------
 
 
-def _udp_relay(target_port: int, seen: list[tuple[bytes, bytes]]) -> tuple[int, object]:
+def _udp_relay(target_port: int, seen: list[tuple[bytes, bytes]]) -> tuple[int, threading.Thread]:
     """A one-shot UDP relay to the KDC that records the request and the reply."""
-    import threading
-
     relay = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     relay.bind(("127.0.0.1", 0))
 
@@ -338,10 +338,8 @@ def _udp_relay(target_port: int, seen: list[tuple[bytes, bytes]]) -> tuple[int, 
     return relay.getsockname()[1], thread
 
 
-def _tcp_relay(target_port: int, upstream: bytearray) -> tuple[int, object]:
+def _tcp_relay(target_port: int, upstream: bytearray) -> tuple[int, threading.Thread]:
     """A one-connection TCP relay that records what the client sent."""
-    import threading
-
     listener = socket.create_server(("127.0.0.1", 0))
 
     def pipe(source: socket.socket, sink: socket.socket, record: bytearray | None) -> None:
@@ -355,10 +353,8 @@ def _tcp_relay(target_port: int, upstream: bytearray) -> tuple[int, object]:
             if record is not None:
                 record.extend(data)
             sink.sendall(data)
-        try:
+        with contextlib.suppress(OSError):
             sink.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
 
     def relay() -> None:
         client, _ = listener.accept()
@@ -394,14 +390,16 @@ def capture(base: Path, enctype: str) -> dict[str, str]:
     MIT ``kinit``'s cache; MIT ``kvno``'s TGS-REQ; this client's TGS-REQ and
     the real KDC's reply to it (nonce and clock fixed so it replays); and the
     AP-REQ and KRB-CRED the official ``xrdcp`` sent a real ``-exptkn`` xrootd.
-    Every value is hex. Run ``python tests/_krb5kdc.py`` to regenerate
+    Every value is hex. The unit tests that replay them are xrdsec's, with
+    the client: run ``python -m tests._krb5kdc`` here (it needs ``xrootd``
+    and ``xrdcp`` as well as MIT krb5) to regenerate xrdsec's
     ``tests/_krb5_mit.py``.
     """
-    from xrdclient.auth.kerberos import tgs
-    from xrdclient.auth.kerberos.ccache import read_ccache
-    from xrdclient.auth.kerberos.kdc import exchange
-    from xrdclient.auth.kerberos.model import parse_principal
-    from xrdclient.auth.kerberos.profile import Profile
+    from xrdsec.krb5 import tgs
+    from xrdsec.krb5.ccache import read_ccache
+    from xrdsec.krb5.kdc import exchange
+    from xrdsec.krb5.model import parse_principal
+    from xrdsec.krb5.profile import Profile
 
     out: dict[str, str] = {}
     realm = MitRealm(base, enctypes=(enctype,))
@@ -419,14 +417,11 @@ def capture(base: Path, enctype: str) -> dict[str, str]:
             return reply
 
         clock = int(time.time()) + 0.25  # must be now: the KDC checks the skew
-        tgs.request_ticket(
+        tgs.tgs_exchange(
             found[0],
-            parse_principal(realm.service),
+            tgs.TgsRequest(parse_principal(realm.service), (found[0].enctype,)),
             profile,
-            etypes=[found[0].enctype],
-            clock=lambda: clock,
-            send=send,
-            nonce=12345678,
+            tgs.TgsHooks(clock=lambda: clock, send=send, nonce=12345678),
         )
         out["our_tgs_req"], out["kdc_tgs_rep"] = ours[0].hex(), ours[1].hex()
         out["our_clock"] = repr(clock)
@@ -436,7 +431,7 @@ def capture(base: Path, enctype: str) -> dict[str, str]:
         original = realm.krb5_conf.read_text()
         realm.krb5_conf.write_text(original.replace(f":{realm.port}", f":{port}"))
         realm.kvno(realm.service)
-        thread.join(10)  # type: ignore[attr-defined]
+        thread.join(10)
         realm.krb5_conf.write_text(original)
         out["mit_tgs_req"] = seen[0][0].hex()
 
@@ -453,7 +448,7 @@ def capture(base: Path, enctype: str) -> dict[str, str]:
                 check=True,
                 timeout=60,
             )
-            thread.join(10)  # type: ignore[attr-defined]
+            thread.join(10)
         out["xrdcp_ap_req"], out["xrdcp_krb_cred"] = (
             b.hex() for b in _credential_blobs(bytes(upstream))
         )
@@ -463,31 +458,55 @@ def capture(base: Path, enctype: str) -> dict[str, str]:
     return out
 
 
-if __name__ == "__main__":  # pragma: no cover - a maintenance script
-    import json
-    import sys
-    import tempfile
+#: How many hex digits go on one line of the generated module; with its
+#: indentation and quotes a line stays inside the 100-column limit.
+_HEX_PER_LINE = 80
 
-    sys.path[:0] = [str(Path(__file__).parent), str(Path(__file__).parent.parent / "src")]
-    captured = {}
-    for number, name in ((18, "aes256-cts-hmac-sha1-96"), (20, "aes256-cts-hmac-sha384-192")):
-        with tempfile.TemporaryDirectory(prefix="krb5cap", dir="/tmp") as scratch:
-            captured[number] = capture(Path(scratch), name)
-    target = Path(__file__).with_name("_krb5_mit.py")
+
+def _value_lines(key: str, value: str) -> list[str]:
+    """One ``"key": value,`` entry of the generated module, split into short lines."""
+    if len(value) <= _HEX_PER_LINE:
+        return [f"        {key!r}: {value!r},".replace("'", '"')]
+    chunks = [value[i : i + _HEX_PER_LINE] for i in range(0, len(value), _HEX_PER_LINE)]
+    return [f'        "{key}": (', *(f'            "{chunk}"' for chunk in chunks), "        ),"]
+
+
+def render(captured: dict[str, dict[str, str]]) -> str:
+    """xrdsec's ``tests/_krb5_mit.py`` for ``captured``, as ``ruff format`` keeps it."""
     lines = [
         '"""Kerberos messages captured from MIT krb5 and XRootD, for replay in unit tests.',
         "",
-        "Generated by ``python tests/_krb5kdc.py`` against a throwaway realm (see",
-        ":func:`_krb5kdc.capture` for what each value is). The realm, its passwords",
-        "and its keys existed for a few seconds on loopback; nothing here is secret.",
+        "Generated by ``python -m tests._krb5kdc`` in an xrdclient checkout, against a",
+        "throwaway realm and a real ``xrootd`` (see ``capture`` there for what each value",
+        "is). The realm, its passwords and its keys existed for a few seconds on",
+        "loopback; nothing here is secret. Each hex dump is split into short adjacent",
+        "string literals.",
         '"""',
         "",
-        f"USER_PASSWORD = {USER_PASSWORD!r}",
-        f"SERVICE_PASSWORD = {SERVICE_PASSWORD!r}",
+        f'USER_PASSWORD = "{USER_PASSWORD}"',
+        f'SERVICE_PASSWORD = "{SERVICE_PASSWORD}"',
         "",
-        "# ruff: noqa: E501 - hex dumps are one long line each, by design",
-        "CAPTURED = " + json.dumps(captured, indent=4, sort_keys=True),
-        "",
+        "CAPTURED = {",
     ]
-    target.write_text("\n".join(lines))
+    for number in sorted(captured):
+        lines.append(f'    "{number}": {{')
+        for key in sorted(captured[number]):
+            lines.extend(_value_lines(key, captured[number][key]))
+        lines.append("    },")
+    lines += ["}", ""]
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    import sys
+    import tempfile
+
+    captured = {}
+    for number, name in ((18, "aes256-cts-hmac-sha1-96"), (20, "aes256-cts-hmac-sha384-192")):
+        with tempfile.TemporaryDirectory(prefix="krb5cap", dir="/tmp") as scratch:
+            captured[str(number)] = capture(Path(scratch), name)
+    # The replaying tests are xrdsec's: by default, the sibling checkout's.
+    sibling = Path(__file__).resolve().parents[2] / "xrdsec" / "tests" / "_krb5_mit.py"
+    target = Path(sys.argv[1]) if len(sys.argv) > 1 else sibling
+    target.write_text(render(captured))
     print(f"wrote {target}")

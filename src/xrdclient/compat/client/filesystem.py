@@ -4,15 +4,24 @@ Each method is one native call wrapped by :func:`._dispatch.call`, which turns
 an exception into a status and supplies the ``timeout=`` and ``callback=``
 behaviour every method of the bindings has. The native object underneath is
 reachable as :attr:`FileSystem.native` for code partway through a port.
+
+Most of the file is that one-line wrapping. The parts with real logic are
+:meth:`FileSystem.dirlist` - XrdCl's flag combinations (``STAT``,
+``RECURSIVE``, ``MERGE``, ``LOCATE``, ``CHUNKED``, ``ZIP``) each change the
+shape of the answer, and the synchronous and callback forms differ on
+purpose because XrdCl's do - and :meth:`FileSystem.prepare`/``sendinfo``,
+which build the request themselves so the bytes on the wire match XrdCl's.
+The merge rules at the bottom (``_key``, ``_PartMerge``) are XrdCl's
+``DirectoryList`` merge, ordering included; tests pin them.
 """
 
 from __future__ import annotations
 
-import contextlib
 import sys
 from collections.abc import Callable, Iterable, Sequence
-from typing import Any, Optional, TypeVar
+from typing import Any, TypeVar
 
+from ... import _abandoned
 from ...client.filesystem import FileSystem as NativeFileSystem
 from ...errors import ServerError
 from ...flags import LocateFlags
@@ -43,7 +52,7 @@ __all__ = ["FileSystem"]
 T = TypeVar("T")
 
 #: A callback, as the bindings take one: ``callback(status, response, hostlist)``.
-Callback = Optional[Callable[[XRootDStatus, Any, HostList], object]]
+Callback = Callable[[XRootDStatus, Any, HostList], object] | None
 
 #: What :meth:`FileSystem.mkdir` creates with when no mode is given: rwxr-x---.
 _DEFAULT_DIR_MODE = AccessMode.UR | AccessMode.UW | AccessMode.UX | AccessMode.GR | AccessMode.GX
@@ -60,9 +69,20 @@ class FileSystem:
     """Filesystem operations on one server, in the bindings' shape.
 
     ``FileSystem("root://host")`` connects on first use, like the bindings'.
+
+    The bindings have no ``close``: a filesystem lets its connection go when
+    it is collected, and so does this one. Not from inside the garbage
+    collector, though, where a close could wait on the session pool's lock
+    while the very thread collecting holds it: the native filesystem is
+    queued, and closed on an ordinary thread (see :mod:`xrdclient._abandoned`).
     """
 
     def __init__(self, url: str) -> None:
+        """Bind to the server ``url`` names; no connection is made until a call.
+
+        An invalid URL is accepted here and fails every operation with
+        ``errNotSupported`` later, because that is when XrdCl reports it.
+        """
         self.__url = str(url)
         parsed = URL(self.__url)
         # XrdCl takes a URL it cannot parse without complaint and refuses
@@ -71,6 +91,8 @@ class FileSystem:
         self.__valid = parsed.is_valid()
         target = str(parsed) if self.__valid else "root://invalid/"
         self.native = NativeFileSystem(target, env.config())
+        _abandoned.on_collect(self, _abandoned.adopt, self.native)
+        _abandoned.ensure_reaper()
         #: How XrdCl spells where this filesystem's requests start.
         self.__origin = target if self.__valid else ""
         self.__properties = dict(_PROPERTIES)
@@ -87,6 +109,12 @@ class FileSystem:
         timeout: float = 0,
         callback: Callback = None,
     ) -> Any:
+        """Run ``operation`` the bindings' way; the one funnel every method shares.
+
+        A filesystem with an invalid URL swaps the operation for one that
+        raises :class:`UnsupportedURLError`, so even a callback call reports
+        the bad URL through the callback, as XrdCl does.
+        """
         if not self.__valid:
             operation = _unsupported
         return call(
@@ -98,6 +126,7 @@ class FileSystem:
         return self.__valid and quick(timeout, callback)
 
     def __hosts(self, hops: list[Hop]) -> HostList:
+        """The ``HostList`` a callback receives, from the hops the request took."""
         return _convert.host_list(hops, self.__origin)
 
     def __answerer(self, hops: list[Hop]) -> str:
@@ -164,6 +193,12 @@ class FileSystem:
         return self.__run(lambda: self.__list(path, wanted), _same, timeout, callback)
 
     def __list(self, path: str, flags: int) -> DirectoryList:
+        """One server's listing of ``path`` under ``flags``, merged if ``MERGE`` asks.
+
+        The answering host is only known once the requests are done, so the
+        listing is built in two steps: :meth:`__listed` fetches, and the
+        callable it returns is given the host from the trace.
+        """
         with trace() as hops:
             listed = self.__listed(path, flags)
         listing = listed(self.__answerer(hops))
@@ -198,6 +233,7 @@ class FileSystem:
         with trace() as hops:
 
             def arrived(entries: list[DirEntry]) -> None:
+                """One ``kXR_oksofar`` part: pass the previous part on, hold this one."""
                 if held:
                     part(held.pop())
                 listing = _convert.listing(path, entries, self.__answerer(hops))
@@ -210,6 +246,7 @@ class FileSystem:
         """XrdCl's synchronous ``DirList`` with ``Locate``: every server's listing, together."""
         found, servers = call(lambda: self.__servers(path), _same, timeout=timeout)
         rest = flags & ~DirListFlags.LOCATE
+        # The locate's own failure is the answer: there is nothing to list.
         if not found.ok:
             return found, None
         if servers is None:
@@ -228,6 +265,9 @@ class FileSystem:
         if not self.__valid:
             raise UnsupportedURLError
         router = getattr(self.native, "_router", None)
+        # No router means an HTTP filesystem (no ``kXR_locate`` at all); a
+        # data server answers ``kXR_isServer`` in its protocol response. Both
+        # list themselves rather than fanning out.
         if router is None or getattr(router.session.protocol, "flags", 0) & c.kXR_isServer:
             return None
         located = self.native._deep_locate(path, create=True, flags=_LOCATE_FOR_LISTING)
@@ -241,6 +281,9 @@ class FileSystem:
         entries: list[Any] = []
         failed: XRootDStatus | None = None
         failures = 0
+        # Sequential, as XrdCl's synchronous DirList is, and each through a
+        # compat FileSystem so a server's failure is a status, not an
+        # exception that would lose the other servers' entries.
         for server in servers:
             outcome, listing = FileSystem(f"{scheme}://{server}/").dirlist(path, flags, timeout)
             if not outcome.ok:
@@ -280,7 +323,11 @@ class FileSystem:
         timeout: float = 0,
         callback: Callback = None,
     ) -> Any:
-        """Create a directory; ``MkDirFlags.MAKEPATH`` creates its parents too."""
+        """Create a directory; ``MkDirFlags.MAKEPATH`` creates its parents too.
+
+        ``mode=0`` is "not given" and becomes ``rwxr-x---``, XrdCl's default
+        for ``MkDir`` - not an unreadable ``0o000`` directory.
+        """
         permissions = _args.u16(mode, "mode") or _DEFAULT_DIR_MODE
         parents = bool(_args.u16(flags, "flags") & MkDirFlags.MAKEPATH)
         return self.__run(
@@ -322,6 +369,8 @@ class FileSystem:
         understands - ``REFRESH``, ``NOWAIT`` and ``MAKEPATH``'s bit, which the
         protocol reads as "prefer names" - are passed on.
         """
+        # ``REFRESH`` (128), ``MAKEPATH``'s bit (256, which ``kXR_locate``
+        # reads as ``kXR_prefname``) and ``NOWAIT`` (8192); XrdCl drops the rest.
         wanted = _args.u16(flags, "flags") & (128 | 256 | 8192)
         return self.__run(
             lambda: self.native.locate(path, flags=wanted),
@@ -383,16 +432,22 @@ class FileSystem:
         router = getattr(self.native, "_router", None)
         if router is None:
             return str(self.native.prepare(entries, flags=flags, priority=priority)).encode()
+        # ``PrepareFlags`` spans 16 bits but ``kXR_prepare`` has an 8-bit
+        # options byte; the high bits (``kXR_evict``) go in the later
+        # ``optionX`` field. The answer is the request id, NUL-terminated.
         request = r.Prepare(entries, flags & 0xFF, priority, extended=flags >> 8)
         return bytes(router.execute(request).data).split(b"\x00", 1)[0]
 
     def sendinfo(self, info: str, timeout: float = 0, callback: Callback = None) -> Any:
         """``(status, bytes)``: tell the server's monitoring about this client."""
+        # XrdCl's limit, checked before anything is sent, so an oversized
+        # string is ``errInvalidArgs`` here exactly as it is there.
         if len(info) > 1024:
             return failure(errInvalidArgs, "info is limited to 1024 characters"), None
         return self.__run(lambda: self.__monitor(info), _same, timeout, callback)
 
     def __monitor(self, info: str) -> bytes:
+        """``kXR_set`` with ``monitor info ...``: how XrdCl's ``SendInfo`` reaches monitoring."""
         router = getattr(self.native, "_router", None)
         if router is None:
             raise NotImplementedError("sendinfo needs a root:// server")
@@ -411,6 +466,7 @@ class FileSystem:
         values = {name: _raw(value) for name, value in attrs}
 
         def one(name: str) -> None:
+            """Set one attribute; a refusal becomes that name's status."""
             self.native.setxattr(path, name, values[name])
 
         return self.__run(lambda: _statuses(list(values), one), _same, timeout, callback)
@@ -422,6 +478,7 @@ class FileSystem:
         names = list(attrs)
 
         def one(name: str) -> bytes:
+            """Fetch one attribute's value."""
             return self.native.getxattr(path, name)
 
         return self.__run(lambda: _values(names, one), _same, timeout, callback)
@@ -433,6 +490,7 @@ class FileSystem:
         names = list(attrs)
 
         def one(name: str) -> None:
+            """Remove one attribute."""
             self.native.removexattr(path, name)
 
         return self.__run(lambda: _statuses(names, one), _same, timeout, callback)
@@ -455,15 +513,19 @@ class FileSystem:
 
     def cat(self, path: str) -> XRootDStatus:
         """Write ``path``'s contents to standard output; returns the status alone."""
+        # Without a callback, ``call`` answers ``(status, response)``.
+        status: XRootDStatus
         status, data = call(lambda: self.native.read_bytes(path), _same)
         if status.ok:
+            # Bytes go to the binary buffer untouched; a replaced ``stdout``
+            # (a test's ``StringIO``, a notebook) only takes text.
             out = getattr(sys.stdout, "buffer", None)
             if out is not None:
                 out.write(data)
             else:
                 sys.stdout.write(data.decode("utf-8", "replace"))
             sys.stdout.flush()
-        return status  # type: ignore[no-any-return]
+        return status
 
     # -- properties ----------------------------------------------------------
 
@@ -487,16 +549,8 @@ class FileSystem:
             router.follow_redirects = follow
         return True
 
-    def __del__(self) -> None:
-        # The bindings have no ``close``: a filesystem lets its connection go
-        # when it is collected, so this one hands its own back to the pool
-        # then too, rather than leaving the socket for the interpreter.
-        native = getattr(self, "native", None)
-        if native is not None:
-            with contextlib.suppress(Exception):
-                native.close()
-
     def __repr__(self) -> str:
+        """Name the URL as given, so a bad one is recognisable in a traceback."""
         return f"<XRootD.client.FileSystem {self.__url!r}>"
 
 
@@ -542,9 +596,11 @@ class _PartMerge:
     """XrdCl's ``MergeChunked``: each part merged, less what earlier parts had."""
 
     def __init__(self) -> None:
+        """Start a chunked listing with nothing seen."""
         self._seen: set[tuple[str, int, int, int]] = set()
 
     def __call__(self, listing: DirectoryList) -> DirectoryList:
+        """This part sorted and de-duplicated, without anything an earlier part held."""
         unique = _unique(listing.dirlist)
         fresh = sorted(key for key in unique if key not in self._seen)
         self._seen.update(fresh)
@@ -558,10 +614,12 @@ def _unsupported() -> None:
 
 
 def _raw(value: str | bytes) -> bytes:
+    """An attribute value for the wire; text as UTF-8, lone surrogates kept."""
     return value if isinstance(value, bytes) else str(value).encode("utf-8", "surrogateescape")
 
 
 def _text(value: bytes) -> str:
+    """An attribute value as the bindings hand it back: ``str``, any bytes preserved."""
     return value.decode("utf-8", "surrogateescape")
 
 
@@ -582,12 +640,14 @@ def _item(action: Callable[[str], T], name: str) -> tuple[T | None, dict[str, An
 def _statuses(
     names: Sequence[str], action: Callable[[str], None]
 ) -> list[tuple[str, dict[str, Any]]]:
+    """``(name, status)`` per name: the shape ``set_xattr``/``del_xattr`` answer in."""
     return [(name, _item(action, name)[1]) for name in names]
 
 
 def _values(
     names: Sequence[str], fetch: Callable[[str], bytes]
 ) -> list[tuple[str, str, dict[str, Any]]]:
+    """``(name, value, status)`` per name; a refused name has ``""`` and its status."""
     out = []
     for name in names:
         value, status = _item(fetch, name)
@@ -596,4 +656,5 @@ def _values(
 
 
 def _listed(attrs: dict[str, bytes]) -> list[tuple[str, str, dict[str, Any]]]:
+    """``list_xattr``'s answer: every attribute, each with an ``ok`` status."""
     return [(name, _text(value), dict(vars(OK))) for name, value in attrs.items()]

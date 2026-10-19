@@ -1,67 +1,33 @@
 """Crypto primitives, pinned to published vectors.
 
 These have no second implementation to fall back on, so every one is checked
-against a value from the standard that defines it.
+against a value from the standard that defines it. The CRCs and checksum
+algorithms moved to xrdcore in 0.4.0 and are tested there
+(``xrdcore/tests/test_crc.py``, ``test_checksum.py``); what is left here is
+XRootD's own: the paged-I/O framing, SSS's Blowfish and ``kXR_sigver``. The
+CA-directory name hashes moved to xrdsec with the rest of the X.509 code and
+are pinned against OpenSSL in ``xrdsec/tests/test_x509.py``.
 """
 
 from __future__ import annotations
 
 import hashlib
-import zlib
 
 import pytest
 
 from xrdclient.crypto.aes import BLOCK_SIZE, cbc_encrypt
 from xrdclient.crypto.blowfish import Blowfish
-from xrdclient.crypto.checksum import algorithms, checksum_bytes, checksum_file, new
+from xrdclient.crypto.checksum import new
 from xrdclient.crypto.crc32c import (
     PAGE_SIZE,
-    _crc32c_py,
-    crc32c,
     pack_pages,
     page_span,
     unpack_pages,
 )
-from xrdclient.crypto.crc64 import crc64, crc64nvme
 from xrdclient.crypto.sigver import Signer, is_signed, sigver_hash, sigver_sign, sigver_verify
 from xrdclient.proto import constants as c
 from xrdclient.proto import requests as r
 from xrdclient.proto.frames import encode
-
-# --------------------------------------------------------------------------
-# CRC32C (Castagnoli) - RFC 3720 appendix B
-# --------------------------------------------------------------------------
-
-
-def test_crc32c_check_value():
-    assert crc32c(b"123456789") == 0xE3069283
-
-
-def test_crc32c_of_nothing_is_zero():
-    assert crc32c(b"") == 0
-
-
-@pytest.mark.parametrize(
-    "data, expected",
-    [
-        (bytes(32), 0x8A9136AA),
-        (b"\xff" * 32, 0x62A8AB43),
-        (bytes(range(32)), 0x46DD794E),
-    ],
-)
-def test_crc32c_rfc3720_vectors(data, expected):
-    assert crc32c(data) == expected
-
-
-def test_crc32c_is_chainable():
-    whole = crc32c(b"123456789")
-    piecewise = crc32c(b"56789", crc32c(b"1234"))
-    assert piecewise == whole
-
-
-def test_crc32c_is_not_the_ieee_crc32():
-    assert crc32c(b"123456789") != zlib.crc32(b"123456789")
-
 
 # --------------------------------------------------------------------------
 # Paged I/O framing
@@ -113,50 +79,29 @@ def test_a_flipped_bit_is_reported_by_offset():
     assert len(back) == len(data)
 
 
-def test_accelerated_and_pure_python_agree():
-    payload = bytes(range(256)) * 7
-    assert _crc32c_py(payload, 0) == crc32c(payload)
+# --------------------------------------------------------------------------
+# Blowfish - CFB64, the one mode SSS uses
+# --------------------------------------------------------------------------
 
 
-# --------------------------------------------------------------------------
-# Blowfish - Schneier's published test vectors
-# --------------------------------------------------------------------------
+def test_blowfish_cfb64_vector():
+    """Eric Young's ``bftest.c`` CFB64 vector, the one OpenSSL's tests carry."""
+    cipher = Blowfish(bytes.fromhex("0123456789ABCDEFF0E1D2C3B4A59687"))
+    iv = bytes.fromhex("FEDCBA9876543210")
+    plain = b"7654321 Now is the time for \0"
+    expected = "E73214A2822139CAF26ECF6D2EB9E76E3DA3DE04D1517200519D57A6C3"
+    assert cipher.encrypt_cfb64(iv, plain).hex().upper() == expected
+    assert cipher.decrypt_cfb64(iv, bytes.fromhex(expected)) == plain
 
 
 @pytest.mark.parametrize(
-    "key, plaintext, ciphertext",
-    [
-        ("0000000000000000", "0000000000000000", "4EF997456198DD78"),
-        ("FFFFFFFFFFFFFFFF", "FFFFFFFFFFFFFFFF", "51866FD5B85ECB8A"),
-        ("3000000000000000", "1000000000000001", "7D856F9A613063F2"),
-        ("1111111111111111", "1111111111111111", "2466DD878B963C9D"),
-        ("0123456789ABCDEF", "1111111111111111", "61F9C3802281B096"),
-        ("FEDCBA9876543210", "0123456789ABCDEF", "0ACEAB0FC6A0A28D"),
-        ("7CA110454A1A6E57", "01A1D6D039776742", "59C68245EB05282B"),
-    ],
+    ("short", "repeated"), [(b"k", b"kkkk"), (b"ab", b"abab"), (b"xyz", b"xyzxyz")]
 )
-def test_blowfish_ecb_vectors(key, plaintext, ciphertext):
-    cipher = Blowfish(bytes.fromhex(key))
-    assert cipher.encrypt_ecb(bytes.fromhex(plaintext)).hex().upper() == ciphertext
-
-
-def test_blowfish_decrypt_inverts_encrypt():
-    cipher = Blowfish(b"a secret key")
-    assert cipher.decrypt_block(*cipher.encrypt_block(0x01234567, 0x89ABCDEF)) == (
-        0x01234567,
-        0x89ABCDEF,
+def test_blowfish_short_keys_are_repeated_to_the_minimum(short, repeated):
+    """The key schedule cycles its key, so repeating it changes nothing; OpenSSL wants 4 bytes."""
+    assert Blowfish(short).encrypt_cfb64(bytes(8), b"data") == Blowfish(repeated).encrypt_cfb64(
+        bytes(8), b"data"
     )
-    assert cipher.decrypt_ecb(cipher.encrypt_ecb(b"12345678")) == b"12345678"
-
-
-def test_blowfish_ecb_needs_whole_blocks():
-    with pytest.raises(ValueError, match="multiple of 8"):
-        Blowfish(b"k").encrypt_ecb(b"1234567")
-
-
-def test_blowfish_decrypt_ecb_needs_whole_blocks_too():
-    with pytest.raises(ValueError, match="multiple of 8"):
-        Blowfish(b"k").decrypt_ecb(b"123456789")
 
 
 @pytest.mark.parametrize(
@@ -190,98 +135,6 @@ def test_blowfish_repr_hides_the_key():
 def test_the_cfb64_iv_must_be_eight_bytes():
     with pytest.raises(ValueError, match="IV must be 8 bytes"):
         Blowfish(b"k").encrypt_cfb64(b"short", b"data")
-
-
-# --------------------------------------------------------------------------
-# Checksums
-# --------------------------------------------------------------------------
-
-
-def test_the_advertised_algorithms_all_work():
-    for name in algorithms():
-        assert checksum_bytes(name, b"abc")
-
-
-@pytest.mark.parametrize(
-    "name, expected",
-    [
-        ("adler32", f"{zlib.adler32(b'123456789'):08x}"),
-        ("crc32", f"{zlib.crc32(b'123456789'):08x}"),
-        ("crc32c", "e3069283"),
-        ("crc64", "995dc9bbdf1939fa"),
-        ("crc64nvme", "ae8b14860a799888"),
-        ("md5", hashlib.md5(b"123456789").hexdigest()),
-        ("sha256", hashlib.sha256(b"123456789").hexdigest()),
-    ],
-)
-def test_checksum_values(name, expected):
-    assert checksum_bytes(name, b"123456789") == expected
-
-
-def test_crc64_xz_answers_to_both_of_its_names():
-    """A server registers ``crc64xz`` as an alias of ``crc64``; the digest
-    reports the canonical one whichever was asked for."""
-    h = new("CRC64-XZ")
-    h.update(b"123456789")
-    assert h.name == "crc64"
-    assert h.hexdigest() == checksum_bytes("crc64", b"123456789")
-
-
-def test_the_two_crc64s_are_different_checksums():
-    """``crc64nvme`` is a distinct registered name, never a spelling of the
-    other: they share their seed and their width and nothing else."""
-    assert checksum_bytes("crc64", b"abc") != checksum_bytes("crc64nvme", b"abc")
-
-
-def test_crc64_is_chainable():
-    assert crc64(b"56789", crc64(b"1234")) == crc64(b"123456789")
-    assert crc64nvme(b"56789", crc64nvme(b"1234")) == crc64nvme(b"123456789")
-
-
-def test_crc64_of_nothing_is_zero():
-    """Seed and final xor are both all ones, so they cancel over no bytes."""
-    assert crc64(b"") == 0
-    assert crc64nvme(b"") == 0
-
-
-def test_a_crc64_digest_is_eight_bytes():
-    h = new("crc64")
-    h.update(b"123456789")
-    assert h.value == 0x995DC9BBDF1939FA
-    assert h.digest() == (0x995DC9BBDF1939FA).to_bytes(8, "big")
-
-
-def test_checksum_names_are_case_insensitive():
-    assert checksum_bytes("ADLER32", b"x") == checksum_bytes("adler32", b"x")
-
-
-def test_an_unknown_algorithm_is_a_value_error():
-    with pytest.raises(ValueError, match="unknown checksum algorithm"):
-        new("md17")
-
-
-def test_incremental_updates_match_a_single_shot():
-    h = new("adler32")
-    h.update(b"1234")
-    h.update(b"56789")
-    assert h.hexdigest() == checksum_bytes("adler32", b"123456789")
-
-
-def test_checksum_file_consumes_an_iterable_of_chunks():
-    assert checksum_file("sha1", [b"123", b"456789"]) == hashlib.sha1(b"123456789").hexdigest()
-
-
-def test_digest_and_value_agree_for_native_checksums():
-    h = new("crc32c")
-    h.update(b"123456789")
-    assert h.value == 0xE3069283
-    assert h.digest() == (0xE3069283).to_bytes(4, "big")
-
-
-def test_checksums_accept_memoryviews():
-    h = new("crc32c")
-    h.update(memoryview(bytearray(b"123456789")))
-    assert h.value == 0xE3069283
 
 
 # --------------------------------------------------------------------------
@@ -374,6 +227,13 @@ def test_signer_increments_the_sequence_number():
     assert second[0] == first[0] + 1
 
 
+def _signed(signer: Signer, frame: bytes) -> tuple[int, bytes, bool]:
+    """``signer``'s signature of ``frame``, which must be one it signs."""
+    signed = signer.sign(frame)
+    assert signed is not None
+    return signed
+
+
 def test_signer_leaves_unsigned_requests_alone():
     signer = Signer(b"k" * 32, c.kXR_secStandard, {})
     assert signer.sign(encode(r.Read(b"H", 0, 1), 5)) is None
@@ -383,7 +243,7 @@ def test_signer_covers_the_header_and_the_payload():
     key = b"k" * 32
     signer = Signer(key, c.kXR_secStandard, {})
     frame = encode(r.Rm("/store/f.root"), 5)
-    seqno, signature, nodata = signer.sign(frame)
+    seqno, signature, nodata = _signed(signer, frame)
     assert nodata is False
     assert signature == sigver_sign(key, seqno, frame[:24], frame[24:])
 
@@ -394,7 +254,7 @@ def test_a_write_travels_outside_its_own_signature():
     key = b"k" * 32
     signer = Signer(key, c.kXR_secStandard, {})
     frame = encode(r.Write(b"HDL0", 0, b"payload"), 5)
-    seqno, signature, nodata = signer.sign(frame)
+    seqno, signature, nodata = _signed(signer, frame)
     assert nodata is True
     assert signature == sigver_sign(key, seqno, frame[:24], b"", nodata=True)
 
@@ -403,7 +263,7 @@ def test_secodata_pulls_the_payload_back_into_the_signature():
     key = b"k" * 32
     signer = Signer(key, c.kXR_secStandard, {}, secodata=True)
     frame = encode(r.Write(b"HDL0", 0, b"payload"), 5)
-    seqno, signature, nodata = signer.sign(frame)
+    seqno, signature, nodata = _signed(signer, frame)
     assert nodata is False
     assert signature == sigver_sign(key, seqno, frame[:24], frame[24:])
 
@@ -412,7 +272,7 @@ def test_an_embedded_iv_signer_draws_a_fresh_iv_per_signature():
     key = b"k" * 32
     signer = Signer(key, c.kXR_secStandard, {}, embedded_iv=True)
     frame = encode(r.Rm("/store/f.root"), 5)
-    seqno, signature, _ = signer.sign(frame)
+    seqno, signature, _ = _signed(signer, frame)
     assert len(signature) == BLOCK_SIZE + 48
     assert sigver_verify(key, signature, seqno, frame[:24], frame[24:], embedded_iv=True)
 
@@ -421,7 +281,7 @@ def test_the_signature_covers_only_what_dlen_declares():
     """Bytes appended after the request are the next request, not payload."""
     key = b"k" * 32
     frame = encode(r.Rm("/store/f.root"), 5)
-    seqno, signature, _ = Signer(key, c.kXR_secStandard, {}).sign(frame + b"trailing")
+    seqno, signature, _ = _signed(Signer(key, c.kXR_secStandard, {}), frame + b"trailing")
     assert signature == sigver_sign(key, seqno, frame[:24], frame[24:])
 
 
@@ -455,64 +315,3 @@ def test_a_fresh_signer_starts_its_sequence_at_zero():
     assert signer.seqno == 0
     signer.sign(encode(r.Write(b"H", 0, b"a"), 5))
     assert signer.seqno == 1
-
-
-# -- CA-directory names ---------------------------------------------------------
-#
-# Each vector was checked against ``openssl x509 -subject_hash
-# -subject_hash_old``; GSI names the client's CA by them, and a server looks
-# the CA up in its certificate directory under exactly these file names.
-
-
-@pytest.mark.parametrize(
-    ("der_hex", "new", "old"),
-    [
-        # DC=org, CN=example ca - UTF8String, already canonical
-        (
-            "302a31133011060a0992268993f22c6401190c036f72673113301106035504030c0a"
-            "6578616d706c65206361",
-            "33027a7e",
-            "b67780a4",
-        ),
-        # DC=ORG (IA5String), CN="  Example \t  CA  " (PrintableString): the same
-        # name once canonical - lower case, trimmed, inner space runs folded -
-        # so the same new hash, while the old one hashes the DER as written
-        (
-            "303131133011060a0992268993f22c64011916034f5247311a301806035504031311"
-            "20204578616d706c652009202043412020",
-            "33027a7e",
-            "3a47d1e6",
-        ),
-        # a multi-valued RDN, whose entries are re-sorted as DER sorts a SET
-        (
-            "301c311a300a06035504030c035a6564300c060355040a0c05416c706861",
-            "ea43f420",
-            "12bce3ca",
-        ),
-        # a NumericString serial is not a type OpenSSL folds: hashed as written
-        (
-            "3028310e300c0603550405120531322033343116301406035504030c0d53657269616c20486f6c646572",
-            "71ca461e",
-            "e517d4ed",
-        ),
-        # bytes above 0x7F are left alone; only the double space is folded
-        (
-            "301a3118301606035504030c0fc3856e67737472c3b66d20204c6162",
-            "f46cadc2",
-            "0ecc1048",
-        ),
-    ],
-)
-def test_name_hashes_are_the_ones_openssl_gives(der_hex, new, old):
-    from xrdclient.crypto.x509 import name_hashes
-
-    assert name_hashes(bytes.fromhex(der_hex)) == (new, old)
-
-
-def test_the_issuer_hashes_of_a_certificate_name_its_ca():
-    from _pki import proxy_chain, throwaway_key
-    from xrdclient.crypto.x509 import issuer_hashes, load_certificates
-
-    _proxy, user, ca = load_certificates(proxy_chain(throwaway_key(0)))
-    assert issuer_hashes(user) == ("33027a7e", "b5f5da31")
-    assert issuer_hashes(ca) == issuer_hashes(user)  # a CA signs itself

@@ -11,7 +11,13 @@ import pytest
 
 from xrdclient.config import Config
 from xrdclient.errors import ConnectionError as XrdConnectionError
-from xrdclient.errors import NoMechanismError, ProtocolError, RedirectLimitError, TransientError
+from xrdclient.errors import (
+    NoMechanismError,
+    ProtocolError,
+    RedirectLimitError,
+    ServerError,
+    TransientError,
+)
 from xrdclient.proto import constants as c
 from xrdclient.proto import machine
 from xrdclient.proto import requests as r
@@ -194,7 +200,7 @@ def test_a_redirect_without_a_token_leaves_the_path_alone():
     assert request.path == "/data/a.root"
 
 
-class _Sticky(dict):
+class _Sticky(dict[int, tuple[str, int, str]]):
     """A redirect table that re-arms itself, so the loop never ends."""
 
     def pop(self, key, default=None):
@@ -205,9 +211,8 @@ def test_a_redirect_loop_is_cut_off(config):
     tight = Config(username="tester", auth_order=("host",), redirect_limit=2)
     with FakeServer() as srv:
         srv.redirects = _Sticky({c.kXR_stat: (*srv.address, "tok=1")})
-        with Router(srv.url, tight) as router:
-            with pytest.raises(RedirectLimitError):
-                router.execute(r.Stat("/f"), path="/f")
+        with Router(srv.url, tight) as router, pytest.raises(RedirectLimitError):
+            router.execute(r.Stat("/f"), path="/f")
 
 
 def test_a_pinned_router_shares_the_connection_and_stays_put(server, config):
@@ -262,15 +267,18 @@ def test_repr_says_whether_it_is_connected(server, config):
 # ---------------------------------------------------------------------------
 
 
-def scripted(session, *batches):
+def scripted(
+    monkeypatch: pytest.MonkeyPatch, session: Session, *batches: list[machine.Event]
+) -> None:
     """Replace the session's I/O turn with a fixed script of event batches."""
     turns = iter(batches)
-    session._pump = lambda pathid=0, deadline=None, expires=None: next(turns)
+    monkeypatch.setattr(session, "_pump", lambda pathid=0, deadline=None, expires=None: next(turns))
 
 
-def test_events_for_another_stream_are_kept_until_that_stream_asks(server, config):
+def test_events_for_another_stream_are_kept_until_that_stream_asks(server, config, monkeypatch):
     with Session.connect(server.url, config=config) as session:
         scripted(
+            monkeypatch,
             session,
             [
                 machine.Ready(b"\x11" * 16),  # no stream of its own: nothing to keep
@@ -282,22 +290,28 @@ def test_events_for_another_stream_are_kept_until_that_stream_asks(server, confi
         assert bytes(session._await(9, None)) == b"theirs"  # from the inbox, no pump
 
 
-def test_a_failure_that_belongs_to_no_stream_reaches_whoever_is_waiting(server, config):
+def test_a_failure_that_belongs_to_no_stream_reaches_whoever_is_waiting(
+    server, config, monkeypatch
+):
     """A session-wide failure has nobody else to go to."""
     with Session.connect(server.url, config=config) as session:
-        scripted(session, [machine.Failed(None, None, ProtocolError("the session is done for"))])
+        scripted(
+            monkeypatch,
+            session,
+            [machine.Failed(None, None, ProtocolError("the session is done for"))],
+        )
         with pytest.raises(ProtocolError, match="the session is done for"):
             session._await(7, None)
 
 
-def test_an_event_this_version_does_not_know_is_passed_over(server, config):
+def test_an_event_this_version_does_not_know_is_passed_over(server, config, monkeypatch):
     """Forward compatibility: an unrecognised event is not a reason to fail."""
 
     class Curious(machine.Event):
         streamid = 7
 
     with Session.connect(server.url, config=config) as session:
-        scripted(session, [Curious()], [machine.Completed(7, r.Ping(), b"done")])
+        scripted(monkeypatch, session, [Curious()], [machine.Completed(7, r.Ping(), b"done")])
         assert bytes(session._await(7, None)) == b"done"
 
 
@@ -322,20 +336,27 @@ def test_a_refusal_after_falling_back_to_unix_says_why_the_proxy_was_not_used(
             with pytest.raises(PermissionError) as caught:
                 session.execute(r.Stat("/eos/x"), path="/eos/x")
     refused = caught.value
+    assert isinstance(refused, ServerError)
     assert refused.message == "unauthorized identity used"  # the server's words, untouched
     assert f"logged in as unix: gsi was not used - there is no file at {missing}" in str(refused)
 
 
 def test_other_errors_and_identified_logins_get_no_explanation(monkeypatch, tmp_path):
     monkeypatch.setenv("X509_USER_PROXY", str(tmp_path / "absent"))
-    with FakeServer(sec="&P=gsi&P=unix") as srv:
-        with Session.connect(srv.url, config=Config(prompt=False)) as session:
-            with pytest.raises(FileNotFoundError) as caught:
-                session.execute(r.Stat("/nope"), path="/nope")
-    assert caught.value.hint == ""
+    with (
+        FakeServer(sec="&P=gsi&P=unix") as srv,
+        Session.connect(srv.url, config=Config(prompt=False)) as session,
+        pytest.raises(FileNotFoundError) as missing,
+    ):
+        session.execute(r.Stat("/nope"), path="/nope")
+    assert isinstance(missing.value, ServerError)
+    assert missing.value.hint == ""
     with FakeServer(sec="&P=host") as srv:
         srv.handlers[c.kXR_stat] = _refuse_everything
-        with Session.connect(srv.url, config=Config(auth_order=("host",))) as session:
-            with pytest.raises(PermissionError) as caught:
-                session.execute(r.Stat("/x"), path="/x")
+        with (
+            Session.connect(srv.url, config=Config(auth_order=("host",))) as session,
+            pytest.raises(PermissionError) as caught,
+        ):
+            session.execute(r.Stat("/x"), path="/x")
+    assert isinstance(caught.value, ServerError)
     assert caught.value.hint == ""  # nothing identifying was offered, so nothing was skipped

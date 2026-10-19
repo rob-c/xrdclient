@@ -46,11 +46,11 @@ def tokened(srv):
         fs.close()
 
 
-def arguments(srv, opcode=None):
+def arguments(srv: FakeServer, opcode: int | None = None) -> list[str]:
     return [arg for op, arg in srv.arguments if opcode in (None, op)]
 
 
-def carried(srv):
+def carried(srv: FakeServer) -> bool:
     """Every request that named a path carried the token.
 
     Not every request names one - the sub-stream probe is a ``kXR_Qconfig``

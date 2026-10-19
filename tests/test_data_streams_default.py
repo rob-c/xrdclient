@@ -21,17 +21,18 @@ path, which is what a BriX gateway does.
 from __future__ import annotations
 
 import struct
+from collections.abc import Iterator
 
 import pytest
 
 import xrdclient
-from conftest import handshake_reply, login_body, ok, protocol_body
+from tests.conftest import handshake_reply, login_body, ok, protocol_body
 from xrdclient.config import Config
 from xrdclient.flags import OpenFlags
 from xrdclient.proto import constants as c
 from xrdclient.proto import machine as m
 from xrdclient.proto import requests as r
-from xrdclient.testing import error
+from xrdclient.testing import FakeServer, error
 
 
 @pytest.fixture
@@ -42,8 +43,6 @@ def arrival_server():
     only bulk replies back down it; this one is asked *on* it, and the request
     it answers is the one it read there.
     """
-    from xrdclient.testing import FakeServer
-
     with FakeServer(files={"/data/a.root": b"hello world"}) as srv:
         srv.serves_arrivals = True
         yield srv
@@ -133,7 +132,7 @@ def _fast_multistream() -> Config:
     )
 
 
-def _mute_config_queries(server):
+def _mute_config_queries(server: FakeServer) -> None:
     """Leave the arrival question unanswerable, so the trial decides.
 
     The session first *asks* whether arrivals are served (``kXR_Qconfig
@@ -142,7 +141,7 @@ def _mute_config_queries(server):
     which settles nothing.
     """
 
-    def refuse(conn, sid, params, body):
+    def refuse(conn: object, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
         yield error(sid, 3006, "queries not served here")
 
     server.handlers[c.kXR_query] = refuse

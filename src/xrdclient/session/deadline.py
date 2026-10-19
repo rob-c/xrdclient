@@ -30,7 +30,7 @@ from contextlib import contextmanager
 
 from ..errors import TimeoutError as XrdTimeoutError
 
-__all__ = ["OperationExpiredError", "deadline", "expiring_at", "remaining", "check"]
+__all__ = ["OperationExpiredError", "check", "deadline", "expiring_at", "remaining"]
 
 
 class OperationExpiredError(XrdTimeoutError):
@@ -43,6 +43,7 @@ class OperationExpiredError(XrdTimeoutError):
     """
 
     def __init__(self, message: str = "operation expired") -> None:
+        """Default message so ``raise OperationExpiredError()`` reads sensibly."""
         super().__init__(message)
 
 

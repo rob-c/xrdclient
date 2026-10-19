@@ -4,13 +4,15 @@
     >>> print(xrdclient.diagnose("root://eos.example.org//store/user/me"))  # doctest: +SKIP
     ok  python        3.13.5 on linux
     ok  extras        fsspec (absent: google-crc32c)
+    ??  crc32c        pure Python, a few MB/s: paged reads and crc32c checks are CPU-bound
+                      -> pip install 'xrdclient[fast]' (google-crc32c)
     ok  settings      connect 30s, request 300s, TLS verified
     !!  auth:gsi      no proxy file at /tmp/x509up_u1000
                       -> voms-proxy-init -voms lhcb
     ok  auth:ztn      a bearer token from $BEARER_TOKEN_FILE
     ok  dns           eos.example.org -> 128.142.x.x
     ok  connect       1094/tcp answered in 41 ms
-    ok  server        XRootD 5.6.3, a data server
+    ok  server        protocol 5.2.0, a data server, TLS offered
     !!  path          /store/user/me: no such file or directory
                       -> /store/user exists; check the spelling of the last part
 
@@ -23,6 +25,15 @@ thing to fix, and everything after it is a consequence.
 Nothing here changes anything: it opens connections, asks the questions a
 read would ask, and prints. It never prompts, because a diagnosis that stops
 for a password is not one you can put in a bug report.
+
+Where it fits: :func:`diagnose` is exported as ``xrdclient.diagnose`` and is
+what ``xrd-fs doctor`` runs. The checks are plain functions over a mutable
+:class:`_Run` that each append one or more :class:`Check` lines; the order
+of the calls in :func:`diagnose` and :func:`_endpoint` *is* the order of the
+report, which is part of what makes it readable, so keep new checks in the
+place where their failure would first bite. Credential checks call the same
+``available``/``missing`` hooks :func:`xrdclient.auth.select` uses, so a
+line here says exactly what a real login would find.
 """
 
 from __future__ import annotations
@@ -34,7 +45,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from importlib.util import find_spec
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, overload
 
 from . import auth
 from .config import Config, current
@@ -74,7 +85,9 @@ class Check:
     hint: str = ""
 
     def __str__(self) -> str:
+        """The mark, the name in a 13-column field, the detail, and a ``->`` hint line."""
         line = f"{MARKS[self.state]}  {self.name:<13} {self.detail}"
+        # The hint is indented to sit under the detail (2 + 2 + 13 columns).
         return f"{line}\n{'':<17} -> {self.hint}" if self.hint else line
 
 
@@ -91,12 +104,19 @@ class Report(Sequence[Check]):
     url: str = ""
 
     def __len__(self) -> int:
+        """How many checks were made."""
         return len(self.checks)
 
-    def __getitem__(self, index: int) -> Check:  # type: ignore[override]
+    @overload
+    def __getitem__(self, index: int) -> Check: ...
+    @overload
+    def __getitem__(self, index: slice) -> tuple[Check, ...]: ...
+    def __getitem__(self, index: int | slice) -> Check | tuple[Check, ...]:
+        """The ``index``-th check, in the order they were made (a slice, several)."""
         return self.checks[index]
 
     def __str__(self) -> str:
+        """The report as the aligned block shown in the module docstring."""
         return "\n".join(str(check) for check in self.checks)
 
     @property
@@ -119,7 +139,12 @@ class Report(Sequence[Check]):
 
 @dataclass
 class _Run:
-    """The state a diagnosis carries from one check to the next."""
+    """The state a diagnosis carries from one check to the next.
+
+    Mutable on purpose, unlike the :class:`Report` it becomes: :func:`_url`
+    fills in the host, port, path and scheme that the later network checks
+    read, and every check appends to :attr:`checks`.
+    """
 
     config: Config
     url: str = ""
@@ -130,6 +155,7 @@ class _Run:
     checks: list[Check] = field(default_factory=list)
 
     def add(self, name: str, state: str, detail: str, hint: str = "") -> None:
+        """Append one line to the report; ``state`` is a key of :data:`MARKS`."""
         self.checks.append(Check(name, state, detail, hint))
 
 
@@ -139,6 +165,7 @@ class _Run:
 
 
 def _python(run: _Run) -> None:
+    """The interpreter version and OS: the first thing any bug report needs."""
     version = ".".join(str(n) for n in sys.version_info[:3])
     run.add("python", "ok", f"{version} on {platform.system().lower()}")
 
@@ -148,6 +175,7 @@ def _extras(run: _Run) -> None:
     here: list[str] = []
     absent: list[str] = []
     for module, package in EXTRAS.items():
+        # find_spec, not import: asking must not pay for loading them.
         (here if find_spec(module) is not None else absent).append(package)
     detail = "; ".join(here) if here else "none"
     if absent:
@@ -155,7 +183,31 @@ def _extras(run: _Run) -> None:
     run.add("extras", "ok", detail)
 
 
+def _crc32c(run: _Run) -> None:
+    """Whether CRC-32C - every paged read, every ``crc32c`` checksum - runs in C.
+
+    Not a failure either way, but the pure-Python fallback is a few MB/s,
+    which on a fast link is the bottleneck, and the fix is one install.
+    """
+    from xrdcore.crc32c import IS_ACCELERATED
+
+    if IS_ACCELERATED:
+        run.add("crc32c", "ok", "accelerated (google-crc32c)")
+        return
+    run.add(
+        "crc32c",
+        "warn",
+        "pure Python, a few MB/s: paged reads and crc32c checks are CPU-bound",
+        "pip install 'xrdclient[fast]' (google-crc32c)",
+    )
+
+
 def _settings(run: _Run) -> None:
+    """The timeouts and TLS verification in force; unverified TLS is a warning.
+
+    Timeouts are shown because "it hangs" and "it gives up too soon" are both
+    settings questions, and the answer depends on which file or variable won.
+    """
     config = run.config
     detail = (
         f"connect {config.connect_timeout:g}s, request {config.request_timeout:g}s, "
@@ -188,7 +240,7 @@ def _credentials(run: _Run) -> None:
     ready: list[str] = []
     for name in run.config.auth_order:
         cls = auth.registry().get(name)
-        if cls is None:  # pragma: no cover - the registry is filled at import
+        if cls is None:  # a name in auth_order no mechanism registered
             continue
         if _credential_ready(run, name, cls):
             ready.append(name)
@@ -196,6 +248,12 @@ def _credentials(run: _Run) -> None:
 
 
 def _credential_ready(run: _Run, name: str, cls: type[auth.Credential]) -> bool:
+    """Whether mechanism ``name`` could log in now, with a line saying so.
+
+    The offer is a bare one (no server parameters), since no server has been
+    asked yet: a mechanism whose readiness depends on what the server offers
+    (Kerberos's service principal, say) is judged by its defaults.
+    """
     offer = auth.Offer(name)
     try:
         cred = cls.available(offer, run.config, username=run.config.username, host=run.host)
@@ -212,6 +270,11 @@ def _credential_ready(run: _Run, name: str, cls: type[auth.Credential]) -> bool:
 def _missing_credential(
     run: _Run, name: str, cls: type[auth.Credential], offer: auth.Offer
 ) -> None:
+    """Warn about an unready mechanism, with its own account of what is absent.
+
+    ``missing`` is the hook a credential prompt opens with, so the reason and
+    hint here are the same sentence an interactive login would have asked.
+    """
     try:
         ask = cls.missing(offer, run.config, username=run.config.username, host=run.host)
     except Exception as exc:
@@ -224,6 +287,12 @@ def _missing_credential(
 
 
 def _credential_summary(run: _Run, ready: list[str]) -> None:
+    """The one ``auth`` line that can fail: is anything able to prove identity?
+
+    ``unix`` and ``host`` are always ready and prove nothing - the server
+    takes the claimed name on trust - so having only those is a warning, and
+    having nothing at all is the only hard failure.
+    """
     proving = [name for name in ready if name in IDENTIFYING]
     if proving:
         run.add("auth", "ok", f"{', '.join(proving)} can prove who you are")
@@ -277,6 +346,11 @@ def _url(run: _Run) -> bool:
 
 
 def _dns(run: _Run) -> bool:
+    """Resolve the host; ``False`` stops the network checks after it.
+
+    At most three addresses are shown: a round-robin alias can have dozens,
+    and the point is only that it resolved, and roughly to where.
+    """
     try:
         found = socket.getaddrinfo(run.host, run.port, type=socket.SOCK_STREAM)
     except OSError as exc:
@@ -338,7 +412,9 @@ def _server(run: _Run) -> FileSystem | None:
         detail = f"protocol {info.version_str}, {kind}"
         if info.has_tls:
             detail += ", TLS offered"
-    except (XRootDError, OSError, AssertionError):  # HTTP has no such question
+    # HTTP has no kXR_protocol to ask, and the filesystem says so by raising;
+    # the ping above has already shown the endpoint is answering.
+    except (XRootDError, OSError, AssertionError):
         detail = "answered"
     run.add("server", "ok", detail)
     return filesystem
@@ -361,6 +437,8 @@ def _path(run: _Run, filesystem: FileSystem) -> None:
 def _nearest(run: _Run, filesystem: FileSystem) -> str:
     """How much of the path does exist, which is the part worth being told."""
     parts = [part for part in run.path.split("/") if part]
+    # Deepest parent first: the longest prefix that exists is the useful one,
+    # and it usually takes one or two stats to find.
     for depth in range(len(parts) - 1, 0, -1):
         parent = "/" + "/".join(parts[:depth])
         try:
@@ -409,6 +487,7 @@ def diagnose(url: str = "", *, config: Config | None = None) -> Report:
     run = _Run(config or current(), url=url)
     _python(run)
     _extras(run)
+    _crc32c(run)
     _settings(run)
     _credentials(run)
     if url:

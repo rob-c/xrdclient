@@ -106,6 +106,7 @@ def test_posc_is_opt_in_and_only_for_writing():
 
 def test_the_raw_object_declares_its_capabilities(raw):
     assert isinstance(raw, io.RawIOBase)
+    assert isinstance(raw, XRootDRawIO)
     assert raw.readable()
     assert not raw.writable()
     assert raw.seekable()
@@ -156,9 +157,8 @@ def test_writing_to_a_reader_is_unsupported(raw):
 
 def test_reading_from_a_writer_is_unsupported(fs):
     handle = File(fs.url.with_path("/data/wo.bin"), fs.config, router=fs._router)
-    with XRootDRawIO(handle, "wb") as stream:
-        with pytest.raises(io.UnsupportedOperation):
-            stream.read(1)
+    with XRootDRawIO(handle, "wb") as stream, pytest.raises(io.UnsupportedOperation):
+        stream.read(1)
 
 
 def test_operating_on_a_closed_raw_object_is_a_value_error(raw):
@@ -262,10 +262,12 @@ def test_binary_reading_gives_a_buffered_reader(server, config):
 
 
 def test_text_reading_gives_a_text_wrapper_that_iterates_lines(server, config):
-    with FakeServer(files={"/lines.txt": b"one\ntwo\n"}) as srv:
-        with open_url(srv.url / "lines.txt", "r", config=config) as fh:
-            assert isinstance(fh, io.TextIOWrapper)
-            assert list(fh) == ["one\n", "two\n"]
+    with (
+        FakeServer(files={"/lines.txt": b"one\ntwo\n"}) as srv,
+        open_url(srv.url / "lines.txt", "r", config=config) as fh,
+    ):
+        assert isinstance(fh, io.TextIOWrapper)
+        assert list(fh) == ["one\n", "two\n"]
 
 
 def test_binary_writing_gives_a_buffered_writer(server, config):

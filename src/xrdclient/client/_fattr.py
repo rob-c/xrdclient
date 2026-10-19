@@ -43,7 +43,7 @@ _ERRNO: dict[int, tuple[type[ServerError], int]] = {
 _FIRST_KXR = 3000
 
 
-class MissingAttributeError(AttrNotFoundError, KeyError):  # type: ignore[misc, valid-type]
+class MissingAttributeError(AttrNotFoundError, KeyError):
     """An attribute that is not there: an ``OSError`` like every other failure.
 
     Also a :class:`KeyError`, which is what :meth:`File.getxattr` raised before
@@ -52,6 +52,7 @@ class MissingAttributeError(AttrNotFoundError, KeyError):  # type: ignore[misc, 
     """
 
     def __init__(self, code: int, message: str, *, path: str | None = None) -> None:
+        """Initialise only the ``AttrNotFoundError`` side; ``KeyError`` needs no state."""
         AttrNotFoundError.__init__(self, code, message, path=path)
 
 

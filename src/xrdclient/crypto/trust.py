@@ -1,155 +1,26 @@
-"""Is this GSI server who it says it is? Asked before handing it a proxy.
+"""Is this GSI server who it says it is, before a proxy is delegated to it.
 
-A GSI login proves the *client* to the server. Delegation reverses the stakes:
-the client is about to sign a credential for whoever is at the other end, so
-it must first know who that is. This is the check the stock client makes:
+:mod:`xrdsec.trust`, by xrdclient's name.
 
-* the server's certificate chains, signature by signature, to a CA in the
-  certificate directory (``$X509_CERT_DIR``, then the conventional Linux or
-  Homebrew grid-security location) - the anchors are the ones on disk, never
-  ones that arrived over the wire;
-* every certificate on the way is inside its validity period;
-* the certificate names the host the client dialled: its ``CN`` is the host
-  or ``<service>/<host>``, or a ``subjectAltName`` DNS name (``*.`` matching
-  one label) or IP address is.
+The implementation moved to xrdsec in 0.4.0, so that xrdclient, xgfalclient
+and xrdarc share one copy of the grid's security code. This module replaces
+itself in ``sys.modules`` with :mod:`xrdsec.trust`, so
+``xrdclient.crypto.trust is xrdsec.trust``: a class is the same class
+whichever name it was imported under, an ``except`` written against this name
+catches what xrdsec raises, and a test that patches a name here patches what
+xrdsec calls.
 
-Revocation lists are not consulted; a GSI server configured with ``-crl:0``
-does not consult them either, and CRL freshness is its operator's policy.
-"""
+New code imports :mod:`xrdsec.trust`; this name is kept through 0.x. The
+explicit re-exports are for type checkers, which do not see the swap."""
 
-from __future__ import annotations
-
-import ipaddress
-import os
 import sys
-import time
 
-from .der import parse
-from .x509 import Certificate, extensions_of, load_certificates, verify_signed
+from xrdsec import trust as _sec
+from xrdsec.trust import DEFAULT_CA_PATH as DEFAULT_CA_PATH
+from xrdsec.trust import TrustError as TrustError
+from xrdsec.trust import __all__ as __all__
+from xrdsec.trust import anchors as anchors
+from xrdsec.trust import names_host as names_host
+from xrdsec.trust import verify_server as verify_server
 
-__all__ = ["TrustError", "DEFAULT_CA_PATH", "verify_server", "names_host", "anchors"]
-
-DEFAULT_CA_PATH = "/etc/grid-security/certificates"
-SUBJECT_ALT_NAME_OID = "2.5.29.17"
-#: Longest CA path followed before giving up: grid PKIs are two or three deep.
-MAX_DEPTH = 8
-
-_DNS_NAME = 0x82
-_IP_ADDRESS = 0x87
-
-
-class TrustError(ValueError):
-    """The server's certificate does not establish who the server is."""
-
-
-def _default_ca_path() -> str:
-    configured = os.environ.get("X509_CERT_DIR")
-    if configured:
-        return configured
-    candidates = [DEFAULT_CA_PATH]
-    if sys.platform == "darwin":
-        candidates.extend(
-            (
-                "/opt/homebrew/etc/grid-security/certificates",
-                "/usr/local/etc/grid-security/certificates",
-            )
-        )
-    return next((path for path in candidates if os.path.isdir(path)), DEFAULT_CA_PATH)
-
-
-def anchors(ca_path: str | None) -> list[Certificate]:
-    """Every CA certificate in the directory, from its ``<hash>.<n>`` files.
-
-    The same files OpenSSL and XrdCrypto look CAs up by; signing policies,
-    CRLs and namespaces files beside them are passed over.
-    """
-    directory = ca_path or _default_ca_path()
-    try:
-        names = sorted(os.listdir(directory))
-    except OSError as exc:
-        raise TrustError(f"cannot read the CA directory {directory}: {exc}") from exc
-    found: list[Certificate] = []
-    for name in names:
-        stem, dot, index = name.partition(".")
-        if not (dot and index.isdigit() and len(stem) == 8):
-            continue
-        try:
-            with open(os.path.join(directory, name), "rb") as handle:
-                found.extend(load_certificates(handle.read()))
-        except OSError:
-            continue
-    return found
-
-
-def names_host(certificate: Certificate, host: str) -> bool:
-    """Whether ``certificate`` is for ``host``, the way XrdSecgsi decides."""
-    wanted = host.strip("[]").lower().rstrip(".")
-    common = certificate.subject.cn.lower()
-    if common == wanted or common.endswith("/" + wanted):
-        return True
-    return any(_alt_name_matches(kind, value, wanted) for kind, value in _alt_names(certificate))
-
-
-def _alt_names(certificate: Certificate) -> list[tuple[int, bytes]]:
-    for extension in extensions_of(certificate.der):
-        if extension.oid == SUBJECT_ALT_NAME_OID:
-            return [(name.tag, name.value) for name in parse(extension.value)[0].children()]
-    return []
-
-
-def _alt_name_matches(kind: int, value: bytes, wanted: str) -> bool:
-    if kind == _IP_ADDRESS:
-        try:
-            return ipaddress.ip_address(value) == ipaddress.ip_address(wanted)
-        except ValueError:
-            return False
-    if kind != _DNS_NAME:
-        return False
-    pattern = value.decode("ascii", "replace").lower().rstrip(".")
-    if pattern.startswith("*."):
-        head, _, tail = wanted.partition(".")
-        return bool(head) and tail == pattern[2:]
-    return pattern == wanted
-
-
-def _current(certificate: Certificate, moment: float) -> None:
-    if not certificate.not_before <= moment < certificate.not_after:
-        raise TrustError(f"{certificate.subject} is outside its validity period")
-
-
-def _issuer_of(certificate: Certificate, trusted: list[Certificate]) -> Certificate:
-    for candidate in trusted:
-        key = candidate.public_key
-        if candidate.subject == certificate.issuer and key and verify_signed(certificate.der, key):
-            return candidate
-    raise TrustError(f"no CA in the certificate directory signed {certificate.subject}")
-
-
-def verify_server(
-    chain_pem: bytes,
-    host: str,
-    ca_path: str | None = None,
-    *,
-    now: float | None = None,
-) -> Certificate:
-    """The server's certificate, once it is shown to be a CA-issued one for ``host``.
-
-    Raises :class:`TrustError` saying which check failed.
-    """
-    moment = time.time() if now is None else now
-    certificates = load_certificates(chain_pem)
-    if not certificates:
-        raise TrustError("the server sent no certificate")
-    server = certificates[0]
-    if not names_host(server, host):
-        raise TrustError(f"the server certificate {server.subject} is not for {host}")
-    trusted = anchors(ca_path)
-    link = server
-    for _ in range(MAX_DEPTH):
-        _current(link, moment)
-        issuer = _issuer_of(link, trusted)
-        if issuer.is_anchor:
-            _current(issuer, moment)
-            return server
-        link = issuer
-    raise TrustError(f"the CA path from {server.subject} is longer than {MAX_DEPTH}")
+sys.modules[__name__] = _sec

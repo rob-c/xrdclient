@@ -1,12 +1,16 @@
-"""The fsspec bindings, when the optional extra is installed."""
+"""The fsspec bindings.
+
+fsspec is optional for users but a test dependency (the dev extra, and every
+CI and packaging test environment, install it as they install hypothesis), so
+it is imported, not skipped.
+"""
 
 from __future__ import annotations
 
+import fsspec
 import pytest
 
-fsspec = pytest.importorskip("fsspec")
-
-from xrdclient.fsspec_impl import HTTPXRootDFileSystem, XRootDFileSystem  # noqa: E402
+from xrdclient.fsspec_impl import HTTPXRootDFileSystem, XRootDFileSystem, register_fsspec
 
 BODY = b"hello world"
 
@@ -26,6 +30,29 @@ def xfs(server):
 def test_the_protocols_are_registered_by_entry_point():
     assert fsspec.get_filesystem_class("root") is XRootDFileSystem
     assert fsspec.get_filesystem_class("davs") is HTTPXRootDFileSystem
+
+
+def test_register_fsspec_wins_over_another_packages_root(monkeypatch):
+    """fsspec-xrootd (here, a stand-in) holding ``root`` loses to an explicit registration."""
+    from importlib import metadata
+    from types import SimpleNamespace
+
+    class Other(fsspec.AbstractFileSystem):
+        protocol = "root"
+
+    fsspec.register_implementation("root", Other, clobber=True)
+    assert fsspec.get_filesystem_class("root") is Other
+    ours = list(metadata.entry_points(group="fsspec.specs"))
+    # Another package's entry point in the same group is not ours to force.
+    foreign = SimpleNamespace(name="other", value="other_pkg.fs:OtherFS")
+    monkeypatch.setattr(metadata, "entry_points", lambda group: [*ours, foreign])
+    registered = register_fsspec()
+    assert registered == sorted(registered)
+    assert {"root", "roots", "xroot", "dav", "davs", "webdav"} <= set(registered)
+    assert "other" not in registered and "s3" not in registered
+    assert fsspec.get_filesystem_class("root") is XRootDFileSystem
+    assert fsspec.get_filesystem_class("davs") is HTTPXRootDFileSystem
+    assert register_fsspec() == registered  # idempotent
 
 
 def test_a_url_is_split_into_endpoint_and_path():
@@ -172,7 +199,7 @@ def test_cat_ranges_takes_the_same_bounds_and_scalar_ones(xfs):
     starts = [None, -3, 2, -20, 6]
     ends = [-2, None, -2, 5, 2]
     chunks = xfs.cat_ranges(["/data/a.root"] * len(starts), starts, ends)
-    assert chunks == [BODY[s:e] for s, e in zip(starts, ends)]
+    assert chunks == [BODY[s:e] for s, e in zip(starts, ends, strict=False)]
     assert xfs.cat_ranges(["/data/a.root"] * 2, -5, None) == [b"world"] * 2
 
 

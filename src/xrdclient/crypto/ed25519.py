@@ -1,28 +1,24 @@
-"""Ed25519 signing and verification backed by cryptography."""
+"""Ed25519 signatures, for xgfalclient's SSH transport: :mod:`xrdsec.ed25519`, by xrdclient's name.
 
-from __future__ import annotations
+The implementation moved to xrdsec in 0.4.0, so that xrdclient, xgfalclient
+and xrdarc share one copy of the grid's security code. This module replaces
+itself in ``sys.modules`` with :mod:`xrdsec.ed25519`, so
+``xrdclient.crypto.ed25519 is xrdsec.ed25519``: a class is the same class
+whichever name it was imported under, an ``except`` written against this name
+catches what xrdsec raises, and a test that patches a name here patches what
+xrdsec calls.
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+New code imports :mod:`xrdsec.ed25519`; this name is kept through 0.x. The
+explicit re-exports are for type checkers, which do not see the swap.
+"""
 
-__all__ = ["sign", "verify", "public_key", "L"]
+import sys
 
-L = 2**252 + 27742317777372353535851937790883648493
+from xrdsec import ed25519 as _sec
+from xrdsec.ed25519 import L as L
+from xrdsec.ed25519 import __all__ as __all__
+from xrdsec.ed25519 import public_key as public_key
+from xrdsec.ed25519 import sign as sign
+from xrdsec.ed25519 import verify as verify
 
-
-def public_key(secret: bytes) -> bytes:
-    """Return the raw public key for a 32-byte secret seed."""
-    return Ed25519PrivateKey.from_private_bytes(secret).public_key().public_bytes_raw()
-
-
-def sign(secret: bytes, message: bytes) -> bytes:
-    return Ed25519PrivateKey.from_private_bytes(secret).sign(message)
-
-
-def verify(public: bytes, message: bytes, signature: bytes) -> bool:
-    """Check a signature, treating malformed keys/signatures as invalid."""
-    try:
-        Ed25519PublicKey.from_public_bytes(public).verify(signature, message)
-    except (InvalidSignature, ValueError):
-        return False
-    return True
+sys.modules[__name__] = _sec

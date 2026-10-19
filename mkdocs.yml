@@ -1,5 +1,5 @@
 site_name: xrdclient
-site_description: A pure-Python, Pythonic client for XRootD and HEP WebDAV
+site_description: A Python 3, Pythonic client for XRootD (root://, roots://) and HEP WebDAV
 site_url: https://rob-c.github.io/xrdclient/
 repo_url: https://github.com/rob-c/xrdclient
 copyright: LGPL-3.0-or-later
@@ -36,12 +36,14 @@ nav:
       - Namespaces: filesystem.md
       - Copying: copying.md
       - Authentication: auth.md
+      - Proxies and VOMS: proxy.md
       - Asynchronous use: async.md
       - HTTP and WebDAV: http.md
       - S3 object storage: s3.md
       - fsspec: fsspec.md
       - Command line: cli.md
       - JSON and XML output: output.md
+      - Building a tool on xrdclient: building-tools.md
       - Safety: safety.md
   - Coming from pyxrootd:
       - Compatibility layer: compat.md
@@ -60,6 +62,7 @@ nav:
       - Testing and fault injection: testing.md
       - Platforms and packages: platforms.md
       - Maintainability metrics: maintainability.md
+      - Module map: architecture.md
       - Interoperability and parity: interop.md
       - Security: security.md
       - Releasing: releasing.md
@@ -87,6 +90,10 @@ plugins:
         python:
           paths: [src]
           options:
+            # Some public names are the libraries' own objects (xrdclient.ChecksumInfo
+            # is xrdcore.checksum.ChecksumInfo); preloading the libraries lets the
+            # reference page document them where xrdclient exports them.
+            preload_modules: [xrdcore, xrdhttp, xrdsec]
             docstring_style: google
             show_source: false
             show_root_heading: true

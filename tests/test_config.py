@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import dataclasses
+import os
+import sys
+from pathlib import Path
 
 import pytest
+from xrdsec import credentials
 
 from xrdclient import config as cfgmod
 from xrdclient.config import Config, configure, current, override
@@ -25,9 +29,10 @@ def test_env_names_match_the_official_client(monkeypatch):
 
 
 def test_unparseable_env_falls_back_to_the_default(monkeypatch):
+    monkeypatch.delenv("XRD_REDIRECTLIMIT", raising=False)
+    default = Config().redirect_limit
     monkeypatch.setenv("XRD_REDIRECTLIMIT", "not-a-number")
-    default = Config.__dataclass_fields__["redirect_limit"].default_factory
-    assert Config().redirect_limit == default()
+    assert Config().redirect_limit == default
 
 
 def test_bearer_token_file_is_picked_up(monkeypatch):
@@ -37,14 +42,24 @@ def test_bearer_token_file_is_picked_up(monkeypatch):
 
 def test_grid_ca_directory_discovers_homebrew(monkeypatch):
     monkeypatch.delenv("X509_CERT_DIR", raising=False)
-    monkeypatch.setattr(cfgmod.sys, "platform", "linux")
-    monkeypatch.setattr(cfgmod.os.path, "isdir", lambda _path: False)
+    monkeypatch.setattr("xrdsec.credentials.GRID_SECURITY_DIRS", None)  # the platform's own
+    # xrdsec reads the process-wide ``sys.platform`` and ``os.path``.
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os.path, "isdir", lambda _path: False)
     assert Config().ca_path is None
-    monkeypatch.setattr(cfgmod.sys, "platform", "darwin")
-    monkeypatch.setattr(cfgmod.os.path, "isdir", lambda path: path.startswith("/opt/homebrew"))
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(os.path, "isdir", lambda path: path.startswith("/opt/homebrew"))
     assert Config().ca_path == "/opt/homebrew/etc/grid-security/certificates"
     monkeypatch.setenv("X509_CERT_DIR", "/grid/cas")
     assert Config().ca_path == "/grid/cas"
+
+
+def test_a_blank_ca_directory_variable_counts_as_unset(monkeypatch):
+    """``X509_CERT_DIR=`` in a profile is not "the current directory"."""
+    monkeypatch.setattr(os.path, "isdir", lambda _path: False)
+    monkeypatch.setenv("X509_CERT_DIR", "  ")
+    assert Config().ca_path is None
+    assert credentials.default_ca_path() == credentials.DEFAULT_CA_PATH
 
 
 def test_evolve_is_a_copy():
@@ -54,9 +69,10 @@ def test_evolve_is_a_copy():
     assert base is not other
 
 
-def test_config_is_frozen():
+@pytest.mark.parametrize("name", ["username", "token", "redirect_limit"])
+def test_config_is_frozen(name):
     with pytest.raises(dataclasses.FrozenInstanceError):
-        Config().username = "x"  # type: ignore[misc]
+        setattr(Config(), name, "x")
 
 
 def test_repr_redacts_the_token():
@@ -204,7 +220,7 @@ def test_a_machine_with_no_name_for_its_user_still_gets_a_config(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def write_config(tmp_path, text):
+def write_config(tmp_path: Path, text: str) -> str:
     path = tmp_path / "config.ini"
     path.write_text(text)
     return str(path)
@@ -333,3 +349,77 @@ def test_cp_parallel_chunks_means_chunks_in_flight_as_in_xrdcl(monkeypatch):
     monkeypatch.setenv("XRD_CPINFLIGHT", "3")
     monkeypatch.setenv("XRD_CPPARALLELSPANS", "2")
     assert (Config().in_flight, Config().parallel_chunks) == (3, 2)
+
+
+# -- malformed variables, new settings, the retired one --------------------------------
+
+
+@pytest.fixture
+def fresh_warnings(monkeypatch):
+    from xrdclient import config as config_module
+
+    monkeypatch.setattr(config_module, "_WARNED", set())
+
+
+def test_a_malformed_number_is_reported_once_with_the_default_used(
+    monkeypatch, caplog, fresh_warnings
+):
+    monkeypatch.setenv("XRD_REQUESTTIMEOUT", "5m")
+    monkeypatch.setenv("XRD_POOLSIZE", "lots")
+    with caplog.at_level("WARNING", logger="xrdclient.config"):
+        assert Config().request_timeout == 300.0
+        assert Config().pool_size == 8
+        Config()
+    lines = [r.getMessage() for r in caplog.records]
+    assert (
+        lines.count(
+            "ignoring $XRD_REQUESTTIMEOUT='5m': not a number of seconds; using the default 300.0"
+        )
+        == 1
+    )
+    assert sum("$XRD_POOLSIZE='lots'" in line and "default 8" in line for line in lines) == 1
+
+
+def test_network_stack_reads_xrdcl_names_in_any_case(monkeypatch, caplog, fresh_warnings):
+    assert Config().network_stack == "IPAuto"
+    monkeypatch.setenv("XRD_NETWORKSTACK", "ipv4mapped6")
+    assert Config().network_stack == "IPv4Mapped6"
+    monkeypatch.setenv("XRD_NETWORKSTACK", "IPv5")
+    with caplog.at_level("WARNING", logger="xrdclient.config"):
+        assert Config().network_stack == "IPAuto"
+    assert "one of IPAuto, IPv4, IPv6, IPv4Mapped6" in caplog.text
+    monkeypatch.setenv("XRD_NETWORKSTACK", " ")
+    assert Config().network_stack == "IPAuto"
+
+
+def test_keepalive_local_redirect_and_aio_workers_read_the_environment(monkeypatch):
+    assert (Config().keepalive_interval, Config().local_redirect, Config().aio_workers) == (
+        60.0,
+        "local",
+        32,
+    )
+    monkeypatch.setenv("XRD_TCPKEEPALIVETIME", "15")
+    monkeypatch.setenv("XRD_LOCALREDIRECT", "NEVER")
+    monkeypatch.setenv("XRD_AIOWORKERS", "4")
+    assert (Config().keepalive_interval, Config().local_redirect, Config().aio_workers) == (
+        15.0,
+        "never",
+        4,
+    )
+
+
+def test_the_removed_stream_timeout_is_not_a_setting(tmp_path):
+    """It never had an effect; a file that still names it is told so."""
+    assert "stream_timeout" not in {f.name for f in dataclasses.fields(Config)}
+    path = tmp_path / "config.ini"
+    path.write_text("[defaults]\nstream_timeout = 30\n")
+    with pytest.raises(ValueError, match="unknown setting 'stream_timeout'"):
+        Config.from_file(path)
+
+
+def test_the_third_party_pull_has_a_time_limit_of_its_own(monkeypatch):
+    """XrdCl's ``CPTPCTimeout``: 1800 s by default, ``$XRD_CPTPCTIMEOUT`` to change it."""
+    monkeypatch.delenv("XRD_CPTPCTIMEOUT", raising=False)
+    assert Config().tpc_timeout == 1800.0
+    monkeypatch.setenv("XRD_CPTPCTIMEOUT", "7200")
+    assert Config().tpc_timeout == 7200.0

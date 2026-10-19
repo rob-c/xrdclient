@@ -1,87 +1,35 @@
-"""Castagnoli CRC-32C (poly 0x1EDC6F41, reflected 0x82F63B78).
+"""XRootD's paged-I/O framing over CRC-32C; the CRC itself is :mod:`xrdcore.crc32c`.
 
-Used by XRootD paged I/O and by the ``crc32c`` checksum type. Not the same
-polynomial as ``zlib.crc32`` (IEEE), which SSS uses - never share a table.
+Every ``kXR_pgread``/``kXR_pgwrite`` page carries a CRC-32C (Castagnoli, not
+``zlib.crc32``'s IEEE polynomial, which SSS uses). The checksum moved to
+xrdcore in 0.4.0, with the ``crc32c`` checksum type it also serves; what stays
+here is XRootD's own framing of it - :func:`pack_pages`, :func:`unpack_pages`
+and :func:`page_span` - which no other protocol on the stack uses.
 
-A C implementation is used when ``google-crc32c`` is installed (the ``fast``
-extra); otherwise a slice-by-eight pure-Python fallback runs, which is about
-five times faster than the naive per-byte loop.
+With the ``fast`` extra (``pip install 'xrdclient[fast]'``, which pulls in
+``xrdcore[fast]`` and so ``google-crc32c``) the hardware-assisted C
+implementation is used - gigabytes per second. Without it a pure-Python
+slice-by-eight fallback runs, a few MB/s: correct, but it is what bounds a
+paged read. ``xrd-doctor`` (:func:`xrdclient.diagnose`) says which one is in
+use, and :data:`IS_ACCELERATED` says so to a program.
+
+:func:`crc32c`, :func:`crc32c_py` and :data:`IS_ACCELERATED` are re-exported,
+the same objects as xrdcore's.
 """
 
 from __future__ import annotations
 
-__all__ = ["crc32c", "pack_pages", "unpack_pages", "page_span", "IS_ACCELERATED"]
+from xrdcore.crc32c import IS_ACCELERATED, crc32c, crc32c_py
 
-_POLY = 0x82F63B78
-_MASK = 0xFFFFFFFF
-
-
-def _build_tables() -> list[list[int]]:
-    first = []
-    for n in range(256):
-        crc = n
-        for _ in range(8):
-            crc = (crc >> 1) ^ _POLY if crc & 1 else crc >> 1
-        first.append(crc)
-    tables = [first]
-    for k in range(1, 8):
-        prev = tables[k - 1]
-        tables.append([(v >> 8) ^ first[v & 0xFF] for v in prev])
-    return tables
-
-
-_T = _build_tables()
-_T0, _T1, _T2, _T3, _T4, _T5, _T6, _T7 = _T
-
-
-def _crc32c_py(data: bytes | bytearray | memoryview, crc: int = 0) -> int:
-    """Slice-by-eight software CRC-32C."""
-    view = memoryview(data).cast("B")
-    n = len(view)
-    c = (crc ^ _MASK) & _MASK
-    i = 0
-    limit = n - (n % 8)
-    while i < limit:
-        c = _eight_bytes(view, i, c)
-        i += 8
-    while i < n:
-        c = _T0[(c ^ view[i]) & 0xFF] ^ (c >> 8)
-        i += 1
-    return c ^ _MASK
-
-
-def _eight_bytes(view: memoryview, index: int, crc: int) -> int:
-    crc ^= int.from_bytes(view[index : index + 4], "little")
-    b4, b5, b6, b7 = view[index + 4], view[index + 5], view[index + 6], view[index + 7]
-    return (
-        _T7[crc & 0xFF]
-        ^ _T6[(crc >> 8) & 0xFF]
-        ^ _T5[(crc >> 16) & 0xFF]
-        ^ _T4[crc >> 24]
-        ^ _T3[b4]
-        ^ _T2[b5]
-        ^ _T1[b6]
-        ^ _T0[b7]
-    )
-
-
-try:  # pragma: no cover - depends on an optional extra
-    from google_crc32c import extend as _extend
-
-    def crc32c(data: bytes | bytearray | memoryview, crc: int = 0) -> int:
-        """CRC-32C of ``data``, chained onto ``crc``."""
-        return int(_extend(crc, bytes(data)))
-
-    IS_ACCELERATED = True
-except ImportError:  # pragma: no cover - the common path
-    crc32c = _crc32c_py
-    IS_ACCELERATED = False
+__all__ = ["IS_ACCELERATED", "crc32c", "crc32c_py", "pack_pages", "page_span", "unpack_pages"]
 
 
 # --------------------------------------------------------------------------
 # Paged-I/O helpers
 # --------------------------------------------------------------------------
 
+#: XRootD's page for paged I/O (``XrdProto::kXR_pgPageSZ``): 4 KiB, each
+#: preceded on the wire by its 4-byte big-endian CRC-32C.
 PAGE_SIZE = 4096
 
 
@@ -124,6 +72,9 @@ def unpack_pages(data: bytes, offset: int = 0) -> tuple[bytes, tuple[int, ...]]:
     corrupt: list[int] = []
     pos = 0
     at = offset
+    # A truncated final page (fewer than 4 + head bytes) is still checked,
+    # against the bytes that are there: a short read at end of file is
+    # legitimate, and its CRC covers exactly what was sent.
     while pos < len(view):
         want = int.from_bytes(view[pos : pos + 4], "big")
         page = view[pos + 4 : pos + 4 + head]

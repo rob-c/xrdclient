@@ -11,6 +11,20 @@ request - ``kXR_write``, ``kXR_pgwrite`` - is hashed *without* its payload
 unless the server negotiated ``kXR_secOData``, and the frame says so with
 ``kXR_nodata_sig``. Conformant servers answer the signature frame only when
 it fails to verify.
+
+The frame itself (:class:`~xrdclient.proto.requests.Sigver`) is an ordinary
+24-byte request header on the *same stream id* as the request it covers:
+``expectrid`` (the covered opcode, u16), a version byte, the flags byte
+(``kXR_nodata_sig``), the 64-bit sequence number and the crypto type
+(``kXR_SHA256_sig``), with the signature as its payload. What is hashed is
+the covered request's 24-byte header exactly as sent - stream id included -
+so a signature cannot be replayed onto another request or another stream,
+and the strictly increasing sequence number stops it being replayed at all.
+
+This module only computes and checks signatures; :class:`Signer` holds the
+per-connection state, and the protocol machine (:mod:`xrdclient.proto.machine`)
+decides where frames go. :func:`sigver_verify` is the server's half of the
+check, for tests and tools that judge what a client signed.
 """
 
 from __future__ import annotations
@@ -20,12 +34,13 @@ import hmac
 import os
 import struct
 
+from xrdsec.aes import BLOCK_SIZE, cbc_decrypt, cbc_encrypt
+
 from ..proto import constants as c
-from .aes import BLOCK_SIZE, cbc_decrypt, cbc_encrypt
 
 __all__ = [
-    "SIGNED_OPCODES",
     "LEVEL_OPCODES",
+    "SIGNED_OPCODES",
     "Signer",
     "is_signed",
     "sigver_hash",
@@ -154,7 +169,7 @@ class Signer:
     shape, a fresh IV drawn and prepended per signature.
     """
 
-    __slots__ = ("key", "level", "overrides", "secodata", "embedded_iv", "_seqno")
+    __slots__ = ("_seqno", "embedded_iv", "key", "level", "overrides", "secodata")
 
     def __init__(
         self,
@@ -165,6 +180,11 @@ class Signer:
         secodata: bool = False,
         embedded_iv: bool = False,
     ) -> None:
+        """Sign under ``key`` at security ``level``, with the server's per-opcode ``overrides``.
+
+        An empty ``key`` (no session key was negotiated) makes every
+        :meth:`required` answer ``False``: there is nothing to sign with.
+        """
         self.key = key
         self.level = level
         self.overrides = overrides or {}
@@ -174,9 +194,11 @@ class Signer:
 
     @property
     def seqno(self) -> int:
+        """The sequence number of the last signature made; ``0`` before the first."""
         return self._seqno
 
     def required(self, opcode: int) -> bool:
+        """Whether a request with ``opcode`` must be preceded by a signature frame."""
         return bool(self.key) and is_signed(opcode, self.level, self.overrides)
 
     def sign(self, frame: bytes) -> tuple[int, bytes, bool] | None:
@@ -203,4 +225,5 @@ class Signer:
         return self._seqno, signature, nodata
 
     def __repr__(self) -> str:
+        """Level and position only: the session key never reaches a log."""
         return f"Signer(level={self.level}, seqno={self._seqno}, key=<redacted>)"

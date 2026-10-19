@@ -34,9 +34,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import json
 import math
 import os
+import queue
 import shutil
 import socket
 import statistics
@@ -48,23 +50,32 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import ModuleType
+from typing import Any, Protocol, TypeVar
 
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-import xrdclient  # noqa: E402
-from xrdclient.client.file import File  # noqa: E402
-from xrdclient.compat import client as compat  # noqa: E402
-from xrdclient.compat.client import env as compat_env  # noqa: E402
-from xrdclient.config import Config  # noqa: E402
+import xrdclient
+from xrdclient.client.file import File
+from xrdclient.compat import client as compat
+from xrdclient.compat.client import env as compat_env
+from xrdclient.config import Config
 
 try:
     from XRootD import client as official
-except ImportError:  # pragma: no cover - the bindings are optional
+except ImportError:  # the official bindings are optional
     official = None
 
+HERE = Path(__file__).resolve().parent
+_T = TypeVar("_T")
+
 CONFIG = Config(auth_order=("unix", "host"))
-compat_env.config = lambda: CONFIG  # compat objects use the same settings
+
+
+def _same_settings() -> Config:
+    """What the compat objects run with: the harness's own settings."""
+    return CONFIG
+
 
 MiB = 1 << 20
 
@@ -141,26 +152,9 @@ class Relay:
                 threading.Thread(target=self._pump, args=(a, b), daemon=True).start()
 
     def _pump(self, src: socket.socket, dst: socket.socket) -> None:
-        import queue
-
+        """Read ``src`` into a queue of chunks, each due ``delay`` from now."""
         pending: queue.Queue[tuple[float, bytes]] = queue.Queue()
-
-        def sender() -> None:
-            while True:
-                due, data = pending.get()
-                if not data:
-                    with contextlib.suppress(OSError):
-                        dst.shutdown(socket.SHUT_WR)
-                    return
-                wait = due - time.monotonic()
-                if wait > 0:
-                    time.sleep(wait)
-                try:
-                    dst.sendall(data)
-                except OSError:
-                    return
-
-        threading.Thread(target=sender, daemon=True).start()
+        threading.Thread(target=self._send_due, args=(pending, dst), daemon=True).start()
         while True:
             try:
                 data = src.recv(1 << 20)
@@ -168,6 +162,23 @@ class Relay:
                 data = b""
             pending.put((time.monotonic() + self.delay, data))
             if not data:
+                return
+
+    @staticmethod
+    def _send_due(pending: queue.Queue[tuple[float, bytes]], dst: socket.socket) -> None:
+        """Write each queued chunk to ``dst`` once it is due; an empty one ends it."""
+        while True:
+            due, data = pending.get()
+            if not data:
+                with contextlib.suppress(OSError):
+                    dst.shutdown(socket.SHUT_WR)
+                return
+            wait = due - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                dst.sendall(data)
+            except OSError:
                 return
 
     def close(self) -> None:
@@ -190,10 +201,18 @@ class Case:
     ops: int = 1
 
 
-def _ok(pair: tuple[object, object]) -> object:
+class _Status(Protocol):
+    """The part of a bindings status this harness reads."""
+
+    ok: bool
+    message: str
+
+
+def _ok(pair: tuple[_Status, _T]) -> _T:
+    """The response of a bindings ``(status, response)`` pair, which must be OK."""
     status, response = pair
-    if not status.ok:  # type: ignore[attr-defined]
-        raise RuntimeError(status.message)  # type: ignore[attr-defined]
+    if not status.ok:
+        raise RuntimeError(status.message)
     return response
 
 
@@ -204,10 +223,10 @@ def _repeat(fn: Callable[[], object], count: int) -> int:
     return 0
 
 
-def _repeat_ok(fn: Callable[[], object], count: int) -> int:
+def _repeat_ok(fn: Callable[[], tuple[_Status, object]], count: int) -> int:
     """``_repeat`` for the bindings, whose calls answer ``(status, response)``."""
     for _ in range(count):
-        _ok(fn())  # type: ignore[arg-type]
+        _ok(fn())
     return 0
 
 
@@ -228,7 +247,8 @@ def _latency_cases(url: str) -> list[Case]:
     small, many = f"{url}//bench/small.bin", "/bench/many"
     fs = xrdclient.FileSystem(url, CONFIG)
     cfs = compat.FileSystem(url)
-    ofs = official.FileSystem(url) if official else None
+    # Without the bindings this is None, and _case drops every contender using it.
+    ofs: Any = official.FileSystem(url) if official else None
     n, m = 200, 50
     return [
         _case(
@@ -292,9 +312,9 @@ def _read_cases(url: str, size: int) -> list[Case]:
             _case(
                 f"{count} x {chunk >> 10}KiB reads",
                 "throughput",
-                xrdclient=lambda c=chunk, k=count: _reads_native(big, c, k),
-                compat=lambda c=chunk, k=count: _reads_bindings(compat, big, c, k),
-                official=lambda c=chunk, k=count: _reads_bindings(official, big, c, k),
+                xrdclient=functools.partial(_reads_native, big, chunk, count),
+                compat=functools.partial(_reads_bindings, compat, big, chunk, count),
+                official=functools.partial(_reads_bindings, official, big, chunk, count),
             )
         )
     ranges = [(i * (size // 1024), 4096) for i in range(1024)]
@@ -350,8 +370,8 @@ def _open_close_native(url: str) -> None:
     handle.close()
 
 
-def _open_close_bindings(module: object, url: str) -> None:
-    handle = module.File()  # type: ignore[attr-defined]
+def _open_close_bindings(module: ModuleType, url: str) -> None:
+    handle = module.File()
     _ok(handle.open(url))
     handle.close()
 
@@ -361,12 +381,12 @@ def _reads_native(url: str, chunk: int, count: int) -> int:
         return sum(len(handle.read(chunk, (i * chunk) % max(handle.size, 1))) for i in range(count))
 
 
-def _reads_bindings(module: object, url: str, chunk: int, count: int) -> int:
-    handle = module.File()  # type: ignore[attr-defined]
+def _reads_bindings(module: ModuleType, url: str, chunk: int, count: int) -> int:
+    handle = module.File()
     _ok(handle.open(url))
     try:
-        size = _ok(handle.stat()).size  # type: ignore[attr-defined]
-        return sum(len(_ok(handle.read((i * chunk) % max(size, 1), chunk))) for i in range(count))  # type: ignore[arg-type]
+        size = _ok(handle.stat()).size
+        return sum(len(_ok(handle.read((i * chunk) % max(size, 1), chunk))) for i in range(count))
     finally:
         handle.close()
 
@@ -376,11 +396,11 @@ def _read_all_native(url: str) -> int:
         return len(fh.read())
 
 
-def _read_all_bindings(module: object, url: str) -> int:
-    handle = module.File()  # type: ignore[attr-defined]
+def _read_all_bindings(module: ModuleType, url: str) -> int:
+    handle = module.File()
     _ok(handle.open(url))
     try:
-        return len(_ok(handle.read()))  # type: ignore[arg-type]
+        return len(_ok(handle.read()))
     finally:
         handle.close()
 
@@ -390,11 +410,11 @@ def _readv_native(url: str, ranges: list[tuple[int, int]]) -> int:
         return sum(len(piece) for piece in handle.readv(ranges))
 
 
-def _readv_bindings(module: object, url: str, ranges: list[tuple[int, int]]) -> int:
-    handle = module.File()  # type: ignore[attr-defined]
+def _readv_bindings(module: ModuleType, url: str, ranges: list[tuple[int, int]]) -> int:
+    handle = module.File()
     _ok(handle.open(url))
     try:
-        return int(_ok(handle.vector_read(ranges)).size)  # type: ignore[attr-defined]
+        return int(_ok(handle.vector_read(ranges)).size)
     finally:
         handle.close()
 
@@ -417,9 +437,9 @@ def _write_stream_native(url: str, payload: bytes) -> int:
     return len(payload)
 
 
-def _write_bindings(module: object, url: str, payload: bytes) -> int:
-    flags = module.flags.OpenFlags  # type: ignore[attr-defined]
-    handle = module.File()  # type: ignore[attr-defined]
+def _write_bindings(module: ModuleType, url: str, payload: bytes) -> int:
+    flags = module.flags.OpenFlags
+    handle = module.File()
     _ok(handle.open(url, flags.DELETE | flags.UPDATE))
     try:
         _ok(handle.write(payload))
@@ -428,9 +448,9 @@ def _write_bindings(module: object, url: str, payload: bytes) -> int:
     return len(payload)
 
 
-def _write_chunks_bindings(module: object, url: str, payload: bytes) -> int:
-    flags = module.flags.OpenFlags  # type: ignore[attr-defined]
-    handle = module.File()  # type: ignore[attr-defined]
+def _write_chunks_bindings(module: ModuleType, url: str, payload: bytes) -> int:
+    flags = module.flags.OpenFlags
+    handle = module.File()
     _ok(handle.open(url, flags.DELETE | flags.UPDATE))
     try:
         for offset in range(0, len(payload), MiB):
@@ -440,8 +460,8 @@ def _write_chunks_bindings(module: object, url: str, payload: bytes) -> int:
     return len(payload)
 
 
-def _copy_bindings(module: object, source: str, target: str, size: int) -> int:
-    process = module.CopyProcess()  # type: ignore[attr-defined]
+def _copy_bindings(module: ModuleType, source: str, target: str, size: int) -> int:
+    process = module.CopyProcess()
     process.add_job(source, target, force=True)
     _ok((process.prepare(), None))
     status, _ = process.run()
@@ -462,7 +482,7 @@ class Outcome:
     samples: dict[str, list[float]]
 
     def median(self, who: str) -> float:
-        return statistics.median(self.samples[who])
+        return float(statistics.median(self.samples[who]))
 
     def rate(self, who: str, moved: int) -> str:
         seconds = self.median(who)
@@ -473,14 +493,14 @@ class Outcome:
     def wins(self, who: str, alpha: float) -> tuple[bool, float]:
         """Whether ``who`` beats ``official``: a lower median and a sign test."""
         ours, theirs = self.samples[who], self.samples["official"]
-        better = sum(a < b for a, b in zip(ours, theirs))
+        better = sum(a < b for a, b in zip(ours, theirs, strict=False))
         p = _sign_test(better, len(ours))
         return self.median(who) < self.median("official") and p <= alpha, p
 
 
 def _sign_test(successes: int, trials: int) -> float:
     """One-sided p-value of ``successes`` or more wins in ``trials`` fair coin flips."""
-    return sum(math.comb(trials, k) for k in range(successes, trials + 1)) / 2**trials
+    return sum(math.comb(trials, k) for k in range(successes, trials + 1)) / (1 << trials)
 
 
 def measure(case: Case, rounds: int, moved: dict[str, int]) -> Outcome:
@@ -558,6 +578,8 @@ def _run_case(case: Case, rounds: int, alpha: float, lost: list[str]) -> dict[st
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    # Set here, not at import: the test suite imports this module.
+    compat_env.config = _same_settings
     if official is None:
         sys.exit("the official XRootD bindings are not installed: nothing to compare with")
 

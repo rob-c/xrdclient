@@ -4,6 +4,17 @@ A :class:`Credential` is pure state: it turns the server's security trailer
 into bytes and consumes challenges. It never does I/O at exchange time - any
 file or keyring access happens in :meth:`available`, at construction - which
 is what lets the same objects drive the blocking and the asyncio sessions.
+
+The contract every mechanism keeps, and the ladder in :mod:`xrdclient.auth`
+relies on:
+
+* :meth:`Credential.available` returns ``None`` for "not configured here" and
+  raises only for "configured, but broken" - an expired ticket, an oversized
+  token - so the ladder can say *why* a mechanism was passed over.
+* :meth:`Credential.missing` and :meth:`Credential.using` come as a pair: the
+  first describes what a person could type, the second turns the answer into
+  a :class:`~xrdclient.config.Config` that :meth:`available` will accept.
+* ``repr()`` never shows secret material; it ends up in debug logs.
 """
 
 from __future__ import annotations
@@ -12,16 +23,18 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from .._compat import SLOTS
 from ..config import Config
 from .prompt import Ask
 
 __all__ = ["Credential", "Offer", "parse_security_trailer"]
 
+#: One ``&P=`` clause, up to the next ``&``. Anything in the trailer that is
+#: not such a clause is skipped; a mechanism's parameters are comma-separated
+#: and never hold ``&``.
 _OFFER_RE = re.compile(r"&P=([^&]+)")
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class Offer:
     """One ``&P=name,params`` clause of a ``kXR_login`` security trailer."""
 
@@ -29,7 +42,12 @@ class Offer:
     params: str = ""
 
     def options(self) -> dict[str, str]:
-        """``params`` split on commas into ``key:value`` pairs."""
+        """``params`` split on commas into ``key:value`` pairs.
+
+        Positional parameters without a colon - ``krb5``'s service principal -
+        are left out, and a mechanism with a positional format of its own
+        (``ztn``'s ``<expiry>:<maxtsz>:``) parses :attr:`params` itself.
+        """
         out: dict[str, str] = {}
         for part in self.params.split(","):
             key, sep, value = part.partition(":")
@@ -38,11 +56,17 @@ class Offer:
         return out
 
     def __str__(self) -> str:
+        """The clause as the server wrote it after ``&P=``, for messages."""
         return f"{self.name},{self.params}" if self.params else self.name
 
 
 def parse_security_trailer(sec: str) -> list[Offer]:
-    """Parse ``"&P=ztn,ver:1&P=unix"`` into ordered :class:`Offer` objects."""
+    """Parse ``"&P=ztn,ver:1&P=unix"`` into ordered :class:`Offer` objects.
+
+    Order is preserved because it is the server's preference, which the
+    ladder falls back on for mechanisms ``auth_order`` does not rank. A
+    trailer with no ``&P=`` clause yields ``[]``.
+    """
     offers: list[Offer] = []
     for clause in _OFFER_RE.findall(sec):
         name, _, params = clause.partition(",")
@@ -51,7 +75,14 @@ def parse_security_trailer(sec: str) -> list[Offer]:
 
 
 class Credential(ABC):
-    """One authentication mechanism, ready to run."""
+    """One authentication mechanism, ready to run.
+
+    A subclass is both a factory (the class methods, which may read files and
+    the environment) and one login's state (the instance, which must not).
+    Instances are made per login attempt and must not be shared between
+    sessions: multi-round mechanisms such as ``gsi`` keep the exchange's secrets on
+    ``self`` between :meth:`initial` and :meth:`step`.
+    """
 
     #: Wire name, at most four bytes (``kXR_auth``'s ``credtype``).
     name: str = ""
@@ -104,4 +135,5 @@ class Credential(ABC):
         raise NotImplementedError(f"{cls.name or cls.__name__} cannot be supplied by hand")
 
     def __repr__(self) -> str:
+        """The class and wire name only - nothing a subclass adds, which may be secret."""
         return f"{type(self).__name__}(name={self.name!r})"

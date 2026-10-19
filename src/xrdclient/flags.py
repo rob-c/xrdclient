@@ -24,25 +24,23 @@ import re
 from enum import IntEnum, IntFlag
 from typing import TYPE_CHECKING, Any, cast
 
-from ._compat import flag_members, zip_strict
-
 __all__ = [
-    "OpenFlags",
     "Access",
-    "DirListFlags",
-    "QueryCode",
-    "MkDirFlags",
-    "StatInfoFlags",
-    "PrepareFlags",
-    "LocateFlags",
-    "FattrCode",
     "ChkPointCode",
-    "permissions",
-    "parse_mode",
-    "flags_for_mode",
-    "open_flags",
+    "DirListFlags",
+    "FattrCode",
+    "LocateFlags",
+    "MkDirFlags",
+    "OpenFlags",
+    "PrepareFlags",
+    "QueryCode",
+    "StatInfoFlags",
     "dirlist_flags",
+    "flags_for_mode",
     "locate_flags",
+    "open_flags",
+    "parse_mode",
+    "permissions",
     "prepare_flags",
 ]
 
@@ -60,6 +58,11 @@ class _Words:
 
     @classmethod
     def _missing_(cls, value: object) -> Any:
+        """Enum's hook for a value no member has: here, a string of member names.
+
+        Raises :class:`ValueError` naming the nearest real member, rather than
+        the enum's bare ``0 is not a valid ...``.
+        """
         if not isinstance(value, str):
             # Composing two flags with ``|`` arrives here with the combined
             # int, and it is the base class that knows how to make one.
@@ -82,8 +85,10 @@ class _Words:
         flag = cast(Any, self)
         if flag._name_ is not None:
             return str(flag._name_).lower()
-        parts = flag_members(flag)
-        return "|".join(str(part._name_).lower() for part in parts) or str(int(flag))
+        # Iterating a flag yields the named single bits it is made of, in
+        # declaration order; a bit nobody named is left out, which is why an
+        # unnamed-only value falls back to its integer.
+        return "|".join(str(part._name_).lower() for part in flag) or str(int(flag))
 
 
 def _no_such(enum: Any, word: str) -> str:
@@ -95,11 +100,13 @@ def _no_such(enum: Any, word: str) -> str:
 
 
 def _words(value: str) -> list[str]:
+    """Split ``value`` into member-name spellings: upper case, ``-`` read as ``_``."""
     normalized = value.strip().upper().replace("-", "_")
     return [word for word in _SEPARATORS.split(normalized) if word]
 
 
 def _validate_words(enum: Any, words: list[str], many: bool, value: str) -> None:
+    """Refuse an empty string, and several names for an enum that holds one."""
     if not words:
         raise ValueError(f"{enum.__name__} needs a name: it was given {value!r}")
     if len(words) > 1 and not many:
@@ -107,6 +114,7 @@ def _validate_words(enum: Any, words: list[str], many: bool, value: str) -> None
 
 
 def _word_bits(enum: Any, words: list[str]) -> int:
+    """OR together the members ``words`` name; an unknown one raises with a hint."""
     bits = 0
     for word in words:
         member = enum.__members__.get(word)
@@ -120,11 +128,16 @@ class OpenFlags(_Words, IntFlag):
     """``kXR_open`` options."""
 
     if TYPE_CHECKING:
-        # ``_missing_`` accepts the member names as well as the bits, and a
-        # type checker cannot see that from the members alone: without this
-        # declaration ``OpenFlags("new makepath")`` runs but does not check.
-        # The block does not exist at runtime.
-        def __new__(cls, value: object = 0) -> OpenFlags: ...
+
+        def __new__(cls, value: object = 0) -> OpenFlags:
+            """Typing only: member names are accepted as well as bits.
+
+            ``_missing_`` accepts the member names as well as the bits, and a
+            type checker cannot see that from the members alone: without this
+            declaration ``OpenFlags("new makepath")`` runs but does not check.
+            The block does not exist at runtime; the other enums here repeat
+            it for the same reason.
+            """
 
     NONE = 0
     COMPRESS = 0x0001
@@ -152,9 +165,10 @@ class Access(_Words, IntFlag):
     ``Access("750")`` is what ``chmod`` takes, and both are ``0o750``.
     """
 
-    if TYPE_CHECKING:  # words as well as bits - see OpenFlags
+    if TYPE_CHECKING:
 
-        def __new__(cls, value: object = 0) -> Access: ...
+        def __new__(cls, value: object = 0) -> Access:
+            """Typing only: accept member names as well as bits (see OpenFlags)."""
 
     NONE = 0
     OTHER_EXEC = 0o001
@@ -169,11 +183,17 @@ class Access(_Words, IntFlag):
 
     @classmethod
     def _missing_(cls, value: object) -> Any:
+        """Read ``"rwxr-x---"`` or octal digits (``"750"``) before trying member names.
+
+        A nine-character ``rwx-`` string is a mode as ``ls -l`` prints it; an
+        all-digit string is octal, as ``chmod`` reads it. Anything else falls
+        through to the word handling every enum here shares.
+        """
         if isinstance(value, str):
             text = value.strip()
             if len(text) == 9 and set(text) <= set("rwx-"):
                 bits = 0
-                for character, bit in zip_strict(text, _RWX):
+                for character, bit in zip(text, _RWX, strict=True):
                     bits |= bit if character != "-" else 0
                 return cls(bits)
             if text.isdigit():
@@ -333,9 +353,19 @@ def flags_for_mode(mode: str, *, posc: bool = False, makepath: bool = True) -> O
 
 
 class DirListFlags(_Words, IntFlag):
-    if TYPE_CHECKING:  # words as well as bits - see OpenFlags
+    """``kXR_dirlist`` options.
 
-        def __new__(cls, value: object = 0) -> DirListFlags: ...
+    ``ONLINE`` lists only files on disk (not on tape); ``STAT`` (``kXR_dstat``)
+    has the server send a stat line after each name, saving one ``kXR_stat``
+    round trip per entry; ``CKSUM`` (``kXR_dcksm``) adds a digest and implies
+    ``STAT``. ``RECURSIVE`` is this client's own bit, never sent: the
+    filesystem layer walks the tree and masks it off each request.
+    """
+
+    if TYPE_CHECKING:
+
+        def __new__(cls, value: object = 0) -> DirListFlags:
+            """Typing only: accept member names as well as bits (see OpenFlags)."""
 
     NONE = 0
     ONLINE = 0x01
@@ -345,18 +375,29 @@ class DirListFlags(_Words, IntFlag):
 
 
 class MkDirFlags(_Words, IntFlag):
-    if TYPE_CHECKING:  # words as well as bits - see OpenFlags
+    """``kXR_mkdir`` options: ``MAKEPATH`` (``kXR_mkdirpath``) is ``mkdir -p``."""
 
-        def __new__(cls, value: object = 0) -> MkDirFlags: ...
+    if TYPE_CHECKING:
+
+        def __new__(cls, value: object = 0) -> MkDirFlags:
+            """Typing only: accept member names as well as bits (see OpenFlags)."""
 
     NONE = 0
     MAKEPATH = 0x01
 
 
 class QueryCode(_Words, IntEnum):
-    if TYPE_CHECKING:  # words as well as bits - see OpenFlags
+    """``kXR_query`` ``infotype`` values: which question a query asks.
 
-        def __new__(cls, value: object = 0) -> QueryCode: ...
+    ``OPAQUE``, ``OPAQUE_FILE`` and ``OPAQUE_GROUP`` (``kXR_Qopaque``,
+    ``kXR_Qopaquf``, ``kXR_Qopaqug``) hand the argument to the server's plug-in
+    unparsed, so their answers are site-defined text.
+    """
+
+    if TYPE_CHECKING:
+
+        def __new__(cls, value: object = 0) -> QueryCode:
+            """Typing only: accept member names as well as bits (see OpenFlags)."""
 
     STATS = 1
     PREPARE = 2
@@ -372,9 +413,17 @@ class QueryCode(_Words, IntEnum):
 
 
 class StatInfoFlags(_Words, IntFlag):
-    if TYPE_CHECKING:  # words as well as bits - see OpenFlags
+    """The flags field of a ``kXR_stat`` reply (``kXR_isDir``, ``kXR_offline`` ...).
 
-        def __new__(cls, value: object = 0) -> StatInfoFlags: ...
+    ``IS_READABLE``/``IS_WRITABLE`` describe what *this client* may do, not the
+    file's mode; ``POSC_PENDING`` marks a persist-on-close file still being
+    written, which other readers should not trust yet.
+    """
+
+    if TYPE_CHECKING:
+
+        def __new__(cls, value: object = 0) -> StatInfoFlags:
+            """Typing only: accept member names as well as bits (see OpenFlags)."""
 
     NONE = 0
     X_SET = 0x01
@@ -398,9 +447,10 @@ class PrepareFlags(_Words, IntFlag):
         fs.prepare(paths, flags=PrepareFlags.EVICT | PrepareFlags.NOTIFY)
     """
 
-    if TYPE_CHECKING:  # words as well as bits - see OpenFlags
+    if TYPE_CHECKING:
 
-        def __new__(cls, value: object = 0) -> PrepareFlags: ...
+        def __new__(cls, value: object = 0) -> PrepareFlags:
+            """Typing only: accept member names as well as bits (see OpenFlags)."""
 
     NONE = 0
     CANCEL = 1
@@ -415,9 +465,17 @@ class PrepareFlags(_Words, IntFlag):
 
 
 class LocateFlags(_Words, IntFlag):
-    if TYPE_CHECKING:  # words as well as bits - see OpenFlags
+    """``kXR_locate`` options.
 
-        def __new__(cls, value: object = 0) -> LocateFlags: ...
+    ``REFRESH`` (``kXR_refresh``) makes a redirector ask its servers again
+    instead of answering from its cache; ``NO_WAIT`` (``kXR_nowait``) returns
+    what is known now rather than waiting for slow servers to reply.
+    """
+
+    if TYPE_CHECKING:
+
+        def __new__(cls, value: object = 0) -> LocateFlags:
+            """Typing only: accept member names as well as bits (see OpenFlags)."""
 
     NONE = 0
     ADD_PEERS = 1 << 0
@@ -431,9 +489,12 @@ class LocateFlags(_Words, IntFlag):
 
 
 class FattrCode(_Words, IntEnum):
-    if TYPE_CHECKING:  # words as well as bits - see OpenFlags
+    """``kXR_fattr`` sub-codes: which extended-attribute operation a request is."""
 
-        def __new__(cls, value: object = 0) -> FattrCode: ...
+    if TYPE_CHECKING:
+
+        def __new__(cls, value: object = 0) -> FattrCode:
+            """Typing only: accept member names as well as bits (see OpenFlags)."""
 
     DEL = 0
     GET = 1
@@ -442,9 +503,17 @@ class FattrCode(_Words, IntEnum):
 
 
 class ChkPointCode(_Words, IntEnum):
-    if TYPE_CHECKING:  # words as well as bits - see OpenFlags
+    """``kXR_chkpoint`` sub-codes for the server-side write checkpoint.
 
-        def __new__(cls, value: object = 0) -> ChkPointCode: ...
+    ``BEGIN`` snapshots the file, ``COMMIT`` keeps the writes since, ``ROLLBACK``
+    restores the snapshot, ``QUERY`` reports the space left and ``XEQ`` wraps
+    one write so it is checkpointed on its own.
+    """
+
+    if TYPE_CHECKING:
+
+        def __new__(cls, value: object = 0) -> ChkPointCode:
+            """Typing only: accept member names as well as bits (see OpenFlags)."""
 
     BEGIN = 0
     COMMIT = 1

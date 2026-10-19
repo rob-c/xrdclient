@@ -3,6 +3,14 @@
 Handles the XRootD double-slash convention (``root://host//abs/path``), the
 ``user@host:port`` authority, IPv6 literals, and CGI round-tripping (the
 ``?authz=`` and ``tpc.*`` parameters ride here).
+
+Start at :func:`parse` and :class:`XRootDURL`. Every other module takes a
+parsed URL and never re-splits a string, so scheme, host and path handling
+lives here only. What must not break: the CGI is kept *as written*
+(``_raw_query``) and only edited fields are re-rendered - servers and URL
+signatures compare those bytes, so "normalising" the query would break
+signed redirects and token-bearing URLs; and ``parse``/``str`` must stay
+inverses for HTTP paths (``quote_path``/``unquote_path``).
 """
 
 from __future__ import annotations
@@ -13,10 +21,9 @@ import re
 import urllib.parse
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field, replace
+from typing import Any
 
-from ._compat import SLOTS
-
-__all__ = ["XRootDURL", "parse", "DEFAULT_PORT", "ROOT_SCHEMES", "HTTP_SCHEMES", "S3_SCHEMES"]
+__all__ = ["DEFAULT_PORT", "HTTP_SCHEMES", "ROOT_SCHEMES", "S3_SCHEMES", "XRootDURL", "parse"]
 
 DEFAULT_PORT = 1094
 ROOT_SCHEMES = frozenset({"root", "roots", "xroot", "xroots", "xrootd"})
@@ -34,7 +41,7 @@ _TLS_SCHEMES = frozenset({"roots", "xroots", "https", "davs", "s3"})
 _CGI_SAFE = ":/@,;=!$'()*~"
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class XRootDURL:
     """A parsed storage URL.
 
@@ -59,6 +66,13 @@ class XRootDURL:
     _raw_query: str = field(default="", repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        """Normalise case and keep :attr:`cgi` in step with an edited ``query``.
+
+        Scheme and host are case-insensitive (RFC 3986 section 3.1/3.2.2), so they
+        are lowered once here and every connection-pool key compares equal.
+        The raw query is only re-rendered when it no longer decodes to ``query``,
+        which is what keeps untouched fields byte-identical.
+        """
         object.__setattr__(self, "scheme", self.scheme.lower())
         object.__setattr__(self, "host", self.host.lower())
         if _decode(self._raw_query) != self.query:
@@ -68,26 +82,36 @@ class XRootDURL:
 
     @property
     def is_root(self) -> bool:
+        """An XRootD-protocol URL (``root``, ``roots``...), handled by :mod:`xrdclient.client`."""
         return self.scheme in ROOT_SCHEMES
 
     @property
     def is_http(self) -> bool:
+        """A WebDAV/HTTP URL, served by :mod:`xrdclient.http`."""
         return self.scheme in HTTP_SCHEMES
 
     @property
     def is_s3(self) -> bool:
+        """An ``s3://bucket/key`` URL, served by :mod:`xrdclient.s3`."""
         return self.scheme in S3_SCHEMES
 
     @property
     def is_local(self) -> bool:
+        """A ``file://`` URL or bare path: the local filesystem, no server involved."""
         return self.scheme == "file"
 
     @property
     def use_tls(self) -> bool:
+        """Whether the scheme itself demands TLS (``roots``, ``https``, ``davs``, ``s3``).
+
+        For XRootD this is the client's demand; a plain ``root://`` session can
+        still be upgraded when the server's ``kXR_protocol`` reply insists.
+        """
         return self.scheme in _TLS_SCHEMES
 
     @property
     def netloc(self) -> str:
+        """``host:port`` with an IPv6 literal bracketed, as a socket address or URL needs it."""
         host = f"[{self.host}]" if ":" in self.host else self.host
         return f"{host}:{self.port}"
 
@@ -98,26 +122,34 @@ class XRootDURL:
 
     @property
     def name(self) -> str:
+        """The last path component, ignoring a trailing slash (``/a/b/`` gives ``b``)."""
         return posixpath.basename(self.path.rstrip("/"))
 
     @property
     def parent(self) -> XRootDURL:
+        """The containing directory's URL; the root's parent is the root, as in :mod:`pathlib`."""
         return self.with_path(posixpath.dirname(self.path.rstrip("/")) or "/")
 
     # -- derivation ----------------------------------------------------
 
-    def evolve(self, **changes: object) -> XRootDURL:
+    def evolve(self, **changes: Any) -> XRootDURL:
         """A copy with ``changes`` applied.
 
         A changed ``query`` keeps the written spelling of every field it did
         not change; see :attr:`cgi`.
         """
-        return replace(self, **changes)  # type: ignore[arg-type]
+        return replace(self, **changes)
 
     def with_path(self, path: str) -> XRootDURL:
+        """A copy pointing at ``path`` (normalised), with the same endpoint and CGI."""
         return replace(self, path=_normalize(path))
 
     def join(self, *parts: str) -> XRootDURL:
+        """A copy with ``parts`` appended to the path, :func:`posixpath.join` style.
+
+        An absolute part replaces what came before it, exactly as
+        ``posixpath.join`` does; the CGI is carried over unchanged.
+        """
         return self.with_path(posixpath.join(self.path, *parts))
 
     def __truediv__(self, part: str | os.PathLike[str]) -> XRootDURL:
@@ -125,12 +157,31 @@ class XRootDURL:
         return self.join(os.fspath(part))
 
     def with_query(self, **params: str) -> XRootDURL:
+        """A copy with ``params`` merged into the CGI; a ``None`` value is skipped.
+
+        Fields already present keep their written spelling unless their value
+        changes (see :attr:`cgi`).
+        """
         merged = dict(self.query)
         merged.update({k: v for k, v in params.items() if v is not None})
         return replace(self, query=merged)
 
     def without_query(self) -> XRootDURL:
+        """A copy with no CGI at all: the plain URL, e.g. for a cache key or a log line."""
         return replace(self, query={}, _raw_query="")
+
+    def glob_pattern(self) -> str:
+        """This path read as a glob pattern, ``?`` wildcards and all.
+
+        A ``?`` in a pattern like ``.../f??.dat`` is also the URL's
+        query-string delimiter, so parsing moved the tail into the query and
+        left ``path`` ending at the first ``?``. Globbing the path alone would
+        match the literal name ``f``; joining the raw query back on restores
+        the wildcards. A pattern with no ``?`` has an empty query and is
+        returned unchanged. The text is :attr:`path_with_cgi`'s; the separate
+        name says which reading the caller means.
+        """
+        return self.path_with_cgi
 
     # -- formatting ----------------------------------------------------
 
@@ -157,6 +208,12 @@ class XRootDURL:
         return f"{self.path}?{self._raw_query}"
 
     def __str__(self) -> str:
+        """The URL as a user would write it, credentials and CGI included.
+
+        ``root://`` URLs get the protocol's double slash before an absolute path;
+        HTTP paths are percent-encoded. Use ``repr`` for anything that may be
+        logged: ``str`` does not redact.
+        """
         if self.is_local:
             return f"file://{self.path}"
         auth = ""
@@ -176,17 +233,35 @@ class XRootDURL:
         return base
 
     def __hash__(self) -> int:
-        # The generated hash would choke on ``query`` being a dict.
+        """Hash by endpoint, path, user and the decoded query.
+
+        Written by hand because the generated hash would choke on ``query`` being
+        a dict; consistent with ``__eq__``, which ignores the raw spelling too.
+        """
         return hash((self.endpoint, self.path, self.username, tuple(sorted(self.query.items()))))
 
     def __repr__(self) -> str:
+        """A log-safe form: password, ``authz`` and other known secrets redacted.
+
+        Imported lazily: the URL type is on every cheap import path, and only a
+        repr - a log line, a traceback - needs the redaction patterns.
+        """
+        from .log import redact
+
         redacted = self
         if self.password or "authz" in self.query:
             q = {k: ("<redacted>" if k == "authz" else v) for k, v in self.query.items()}
             redacted = replace(self, password="<redacted>" if self.password else "", query=q)
-        return f"XRootDURL({str(redacted)!r})"
+        # The log patterns cover the rest: pre-signed S3 signatures, EOS
+        # capabilities, ``access_token`` and the like.
+        return f"XRootDURL({redact(str(redacted))!r})"
 
     def __fspath__(self) -> str:
+        """The local path, so ``open(url)`` works for a ``file://`` URL.
+
+        Raises :class:`TypeError` for a remote URL, which is what ``os.fspath``
+        callers expect from an object that is not a path.
+        """
         if not self.is_local:
             raise TypeError(f"{self!r} is not a local path")
         return self.path
@@ -247,6 +322,7 @@ def _fields(raw: str) -> list[str]:
 
 
 def _field_name(raw_field: str) -> str:
+    """The decoded name of one raw ``name=value`` field, to match against edits."""
     return urllib.parse.unquote_plus(raw_field.partition("=")[0])
 
 
@@ -323,10 +399,16 @@ def parse(url: str | os.PathLike[str] | XRootDURL) -> XRootDURL:
 
 
 def _file_url(path: str) -> XRootDURL:
+    """A ``file`` URL for a local path; port 0 because there is no endpoint."""
     return XRootDURL(scheme="file", host="", port=0, path=path)
 
 
 def _authority(authority: str) -> tuple[str, str, str]:
+    """Split ``user:password@host:port`` into ``(user, password, host:port)``.
+
+    Splits on the *last* ``@`` so a username that is itself an e-mail address
+    still parses; user and password are percent-decoded once.
+    """
     userinfo, marker, hostport = authority.rpartition("@")
     if not marker:
         return "", "", authority
@@ -335,6 +417,7 @@ def _authority(authority: str) -> tuple[str, str, str]:
 
 
 def _host_port(hostport: str) -> tuple[str, str]:
+    """Split ``host:port``, honouring a bracketed IPv6 literal (``[::1]:1094``)."""
     if hostport.startswith("["):
         host, _, port = hostport[1:].partition("]")
         return host, port.lstrip(":")
@@ -343,6 +426,7 @@ def _host_port(hostport: str) -> tuple[str, str]:
 
 
 def _default_port(scheme: str) -> int:
+    """The scheme's registered port: 443/80 for HTTP(S) and S3, 1094 for XRootD."""
     if scheme in ("https", "davs", "webdav", "s3"):
         return 443
     if scheme in ("http", "dav"):
@@ -351,6 +435,7 @@ def _default_port(scheme: str) -> int:
 
 
 def _port(value: str, scheme: str, text: str) -> int:
+    """The port as an int, the scheme's default when absent; a non-number is a ValueError."""
     try:
         return int(value) if value else _default_port(scheme)
     except ValueError as exc:
@@ -358,6 +443,10 @@ def _port(value: str, scheme: str, text: str) -> int:
 
 
 def _path_query(separator: str, tail: str) -> tuple[str, str, dict[str, str]]:
+    """Split what follows the authority into ``(path, raw CGI, decoded CGI)``.
+
+    No slash after the host (``root://host``) means the root directory.
+    """
     path_and_cgi = (separator + tail) if separator else "/"
     path, _, cgi = path_and_cgi.partition("?")
     return path, cgi, _decode(cgi)

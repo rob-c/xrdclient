@@ -8,6 +8,10 @@ Two commands, `xrd-fs` and `xrd-cp`, both taking whole URLs. Both understand
 failure, `2` a usage error. A third, `xrd-datasets`, is installed by a package
 above this one and shares the same flags - see below.
 
+`xrd-proxy` makes, inspects and removes X.509 proxies in `voms-proxy-*`
+spellings (`xrd-proxy init -voms atlas`, `xrd-proxy info -all`,
+`xrd-proxy destroy`); it is described in [Proxies and VOMS](proxy.md).
+
 `xrd-cp --version` and `xrd-fs --version` report the installed distribution
 version without opening a configuration file or a network connection.
 
@@ -18,7 +22,9 @@ Common options on every subcommand:
 | `--json` | machine-readable output, so a script never parses columns |
 | `-q`, `--quiet` | say nothing on success |
 | `-v`, `-vv`, `-vvv` | warnings, info, the wire itself |
-| `--token TOKEN` | bearer token to present |
+| `--token-file PATH` | read the bearer token from this file (mode `0600`) |
+| `--token -` | read the bearer token from standard input |
+| `--token TOKEN` | bearer token to present - visible to other users in `ps`, so it warns once; prefer the two above |
 | `--user NAME` | username to authenticate as |
 | `--no-verify-tls` | do not verify the server certificate |
 | `--prompt` | ask for missing credentials even when this is not a terminal |
@@ -27,6 +33,22 @@ Common options on every subcommand:
 | `--alias NAME` | the `[alias NAME]` section of that file to overlay |
 
 See [Configuration](config.md#the-settings-file) for the file itself.
+
+A token typed after `--token` sits in the process list, `/proc/<pid>/cmdline`
+and your shell history for anyone on the machine to read, so the tools
+still accept it but print a warning. Pass a file instead, or the token on
+standard input:
+
+```console
+$ xrd-fs ls --token-file ~/.tokens/eos.jwt davs://eos.example.org//eos/user/me
+$ oidc-token wlcg | xrd-cp --token - davs://dav.example.org/f.root .
+```
+
+With no flag at all the token is found the WLCG way - `$BEARER_TOKEN`,
+`$BEARER_TOKEN_FILE`, then `bt_u<uid>` in `$XDG_RUNTIME_DIR` and `/tmp` (see
+[Authentication](auth.md#ztn-bearer-tokens-wlcg-scitokens-macaroons)). Error
+messages are redacted like log lines, so a token in a URL is not echoed
+back to the terminal.
 
 ## `xrd-fs`
 

@@ -6,6 +6,9 @@ import argparse
 import io
 import json
 import re
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -13,9 +16,11 @@ from xrdclient import cli
 from xrdclient.cli import Endpoints, config_from, dumps, size_arg
 from xrdclient.cli import cp as cp_cli
 from xrdclient.cli import fs as fs_cli
+from xrdclient.config import Config
+from xrdclient.copy import copy
 from xrdclient.errors import XRootDError
 from xrdclient.testing import FakeDAVServer, FakeS3Server, FakeServer
-from xrdclient.types import ChecksumInfo, StatInfo
+from xrdclient.types import ChecksumInfo, StatInfo, human_bytes
 from xrdclient.url import parse
 
 BODY = b"hello world"
@@ -33,7 +38,7 @@ def dav():
         yield running
 
 
-def run(argv, capsys):
+def run(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str, str]:
     """Run ``xrd-fs`` and hand back ``(exit code, stdout, stderr)``."""
     code = fs_cli.main(argv)
     captured = capsys.readouterr()
@@ -85,6 +90,7 @@ def test_json_output_covers_the_types_the_library_returns():
 def test_the_command_line_carries_the_configuration():
     args = argparse.Namespace(
         token="t",
+        token_file=None,
         user="me",
         no_verify_tls=True,
         verbose=0,
@@ -96,6 +102,70 @@ def test_the_command_line_carries_the_configuration():
     config = config_from(args)
     assert (config.token, config.username, config.verify_tls) == ("t", "me", False)
     assert config.prompt is False
+
+
+# ---------------------------------------------------------------------------
+# Tokens off the command line
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def unwarned(monkeypatch):
+    """Each test sees the literal-token warning as a fresh process would."""
+    monkeypatch.setattr(cli, "_warned_literal_token", False)
+
+
+def _parsed(*argv: str) -> argparse.Namespace:
+    return fs_cli._parser().parse_args(["ping", *argv, "root://h"])
+
+
+def test_a_literal_token_works_and_warns_once(unwarned, capsys):
+    assert config_from(_parsed("--token", "t0k")).token == "t0k"
+    assert config_from(_parsed("--token", "t0k")).token == "t0k"
+    err = capsys.readouterr().err
+    assert err.count("visible to other users in the process list") == 1
+    assert "--token-file PATH" in err and "t0k" not in err
+
+
+def test_a_token_can_come_from_standard_input(unwarned, monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", io.StringIO("  from-stdin \nnext line\n"))
+    assert config_from(_parsed("--token", "-")).token == "from-stdin"
+    assert capsys.readouterr().err == ""  # nothing to warn about
+
+
+def test_an_empty_standard_input_is_a_usage_error(unwarned, monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    with pytest.raises(SystemExit) as stopped:
+        config_from(_parsed("--token", "-"))
+    assert stopped.value.code == cli.USAGE
+    assert "standard input held no token" in capsys.readouterr().err
+
+
+def test_a_token_file_is_handed_to_discovery(unwarned, monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    token = tmp_path / "bt"
+    token.write_text("from-the-file\n")
+    token.chmod(0o600)
+    config = config_from(_parsed("--token-file", "~/bt"))
+    assert (config.token, config.token_file) == (None, str(token))
+    from xrdclient.auth import discover_token
+
+    assert discover_token(config) == "from-the-file"
+    assert capsys.readouterr().err == ""
+
+
+def test_a_token_and_a_token_file_are_one_or_the_other(capsys):
+    with pytest.raises(SystemExit) as stopped:
+        _parsed("--token", "t", "--token-file", "f")
+    assert stopped.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_an_error_message_never_prints_a_token(capsys):
+    error = XRootDError("GET https://h/f?authz=s3cr3t&X-Amz-Signature=abc failed")
+    assert cli.fail("xrd-fs", error) == cli.ERROR
+    err = capsys.readouterr().err
+    assert "s3cr3t" not in err and "abc" not in err and "<redacted>" in err
 
 
 @pytest.mark.parametrize("parser", [cp_cli._parser, fs_cli._parser])
@@ -492,7 +562,7 @@ def test_the_bar_copes_with_a_source_of_unknown_size():
     ("size", "text"), [(0, "0 B"), (999, "999 B"), (1024, "1.0 KiB"), (5 << 20, "5.0 MiB")]
 )
 def test_byte_counts_are_human_readable(size, text):
-    assert cp_cli._human(size) == text
+    assert human_bytes(size) == text
 
 
 def test_progress_is_off_when_stdout_is_not_a_terminal(url, tmp_path, capsys):
@@ -504,22 +574,28 @@ def test_progress_is_off_when_stdout_is_not_a_terminal(url, tmp_path, capsys):
 
 
 @pytest.mark.parametrize(("verbosity", "level"), [(1, "WARNING"), (2, "INFO"), (3, "DEBUG")])
-def test_verbosity_flags_choose_a_logging_level(verbosity, level, monkeypatch):
+def test_verbosity_flags_choose_a_logging_level(verbosity, level, capsys):
     import logging
 
-    chosen: dict[str, object] = {}
-    monkeypatch.setattr(logging, "basicConfig", lambda **kw: chosen.update(kw))
-    cli.configure_logging(verbosity)
-    assert logging.getLevelName(chosen["level"]) == level
+    configured = cli.configure_logging(verbosity)
+    assert configured is not None
+    try:
+        root = logging.getLogger()
+        assert logging.getLevelName(root.level) == level
+        logging.getLogger("xrdclient.test").warning("see https://h/f?authz=s3cr3t")
+        assert capsys.readouterr().err == (
+            "WARNING xrdclient.test: see https://h/f?authz=<redacted>\n"
+        )
+    finally:
+        configured.close()
 
 
-def test_no_verbosity_flag_leaves_logging_alone(monkeypatch):
+def test_no_verbosity_flag_leaves_logging_alone():
     import logging
 
-    monkeypatch.setattr(
-        logging, "basicConfig", lambda **kw: pytest.fail("logging was configured anyway")
-    )
-    cli.configure_logging(0)
+    handlers = list(logging.getLogger().handlers)
+    assert cli.configure_logging(0) is None
+    assert logging.getLogger().handlers == handlers
 
 
 def test_the_json_encoder_refuses_what_it_cannot_render():
@@ -547,7 +623,7 @@ def test_ping_can_be_asked_to_say_nothing(url, capsys):
 
 def test_a_trailing_slash_is_a_directory_without_asking(url):
     """``cp f d/`` means *into* ``d`` even before anyone has looked."""
-    assert cp_cli._is_dir(parse(url + "data/"), Endpoints(cli.Config())) is True
+    assert cp_cli._is_dir(parse(url + "data/"), Endpoints(Config())) is True
 
 
 def test_a_destination_the_server_will_not_discuss_is_not_a_directory():
@@ -557,7 +633,7 @@ def test_a_destination_the_server_will_not_discuss_is_not_a_directory():
         def isdir(self, _path):
             raise XRootDError("no")
 
-    class Only:
+    class Only(Endpoints):
         def at(self, _url):
             return Grumpy(), "/d"
 
@@ -600,35 +676,39 @@ def test_tail_reading_only_the_end_drops_the_partial_line_it_landed_in(lines, ca
 
 def test_tail_follow_prints_what_is_appended(server, capsys):
     server.add_file("/data/grow.txt", b"first\n")
-    filesystem, path = Endpoints(cli.Config()).at(str(server.url) + "data/grow.txt")
+    filesystem, path = Endpoints(Config()).at(str(server.url) + "data/grow.txt")
     out = io.BytesIO()
     server.add_file("/data/grow.txt", b"first\nsecond\n")
     with filesystem:
         # Long enough to come round again after printing: the print itself is a
         # whole open-and-read, and a follow that stopped there would never have
         # been asked the only question that matters - "anything more?"
-        fs_cli._follow(out, filesystem, path, 6, 0.01, deadline=_soon(2.0))
+        fs_cli._follow(out, fs_cli._Followed(filesystem, path, 0.01), 6, deadline=_soon(2.0))
     assert out.getvalue() == b"second\n"
 
 
 def test_tail_follow_stops_when_the_file_goes_away(server):
-    filesystem, path = Endpoints(cli.Config()).at(str(server.url) + "data/a.root")
+    filesystem, path = Endpoints(Config()).at(str(server.url) + "data/a.root")
     del server.files["/data/a.root"]
     with filesystem:
-        fs_cli._follow(io.BytesIO(), filesystem, path, 0, 0.01, deadline=_soon(10.0))
+        fs_cli._follow(
+            io.BytesIO(), fs_cli._Followed(filesystem, path, 0.01), 0, deadline=_soon(10.0)
+        )
 
 
 def test_tail_follow_stops_when_the_file_shrinks(server):
     """A shorter file is a different file; the next byte would not follow on."""
-    filesystem, path = Endpoints(cli.Config()).at(str(server.url) + "data/a.root")
+    filesystem, path = Endpoints(Config()).at(str(server.url) + "data/a.root")
     with filesystem:
-        fs_cli._follow(io.BytesIO(), filesystem, path, 99, 0.01, deadline=_soon(10.0))
+        fs_cli._follow(
+            io.BytesIO(), fs_cli._Followed(filesystem, path, 0.01), 99, deadline=_soon(10.0)
+        )
 
 
 def test_tail_follow_from_the_command_line_stops_on_an_interrupt(server, capsys, monkeypatch):
     """Ctrl-C ends ``tail -f`` quietly - that is what a user presses to stop it."""
 
-    def interrupted(out, filesystem, path, size, interval, **kwargs):
+    def interrupted(out, followed, offset, **kwargs):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(fs_cli, "_follow", interrupted)
@@ -668,7 +748,7 @@ def test_du_adds_up_what_the_listing_does_not_carry(server, capsys):
     assert out.split()[0] == str(len(BODY) + 5)
 
 
-def _plain_listing(conn, sid, params, body):
+def _plain_listing(conn: Any, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
     """A ``kXR_dirlist`` reply with names only - no stat lines attached."""
     from xrdclient.proto import constants as c
     from xrdclient.testing import frame
@@ -906,13 +986,13 @@ def test_parallel_is_a_count_of_files_so_zero_is_a_usage_error(local_tree, url, 
 
 def test_the_in_flight_window_reaches_the_copy(url, tmp_path, capsys, monkeypatch):
     seen = []
-    real = cp_cli.copy
+    real = copy
 
     def spy(*args, config, **options):
         seen.append(config.in_flight)
         return real(*args, config=config, **options)
 
-    monkeypatch.setattr(cp_cli, "copy", spy)
+    monkeypatch.setattr("xrdclient.cli.cp.copy", spy)
     target = tmp_path / "f"
     assert cp_cli.main(["--in-flight", "5", "-q", url + "data/a.root", str(target)]) == 0
     assert (seen, target.read_bytes()) == ([5], BODY)
@@ -927,13 +1007,13 @@ def test_the_stripe_count_reaches_the_copy(url, tmp_path, capsys, monkeypatch):
     """The engine has always been able to move one file over several
     connections; this is the flag that asks it to."""
     seen = []
-    real = cp_cli.copy
+    real = copy
 
     def spy(*args, config, **options):
         seen.append(config.parallel_chunks)
         return real(*args, config=config, **options)
 
-    monkeypatch.setattr(cp_cli, "copy", spy)
+    monkeypatch.setattr("xrdclient.cli.cp.copy", spy)
     target = tmp_path / "f"
     assert cp_cli.main(["--stripes", "3", "-q", url + "data/a.root", str(target)]) == 0
     assert (seen, target.read_bytes()) == ([3], BODY)
@@ -948,13 +1028,13 @@ def test_the_stream_count_reaches_the_copy(url, tmp_path, capsys, monkeypatch):
     """Stripes and streams are different questions: one is how many spans of
     the file move at once, the other how many connections each one rides."""
     seen = []
-    real = cp_cli.copy
+    real = copy
 
     def spy(*args, config, **options):
         seen.append(config.data_streams)
         return real(*args, config=config, **options)
 
-    monkeypatch.setattr(cp_cli, "copy", spy)
+    monkeypatch.setattr("xrdclient.cli.cp.copy", spy)
     target = tmp_path / "f"
     assert cp_cli.main(["--streams", "3", "-q", url + "data/a.root", str(target)]) == 0
     assert (seen, target.read_bytes()) == ([3], BODY)
@@ -964,13 +1044,13 @@ def test_no_extra_streams_is_a_request_rather_than_a_mistake(url, tmp_path, monk
     """Unlike the counts above, nought means something here - the control link
     on its own - so it has to reach the copy instead of being refused."""
     seen = []
-    real = cp_cli.copy
+    real = copy
 
     def spy(*args, config, **options):
         seen.append(config.data_streams)
         return real(*args, config=config, **options)
 
-    monkeypatch.setattr(cp_cli, "copy", spy)
+    monkeypatch.setattr("xrdclient.cli.cp.copy", spy)
     target = tmp_path / "f"
     assert cp_cli.main(["--streams", "0", "-q", url + "data/a.root", str(target)]) == 0
     assert (seen, target.read_bytes()) == ([0], BODY)
@@ -1007,11 +1087,11 @@ def test_a_third_party_copy_cannot_pretend(url, tmp_path, capsys, flag):
 # ---------------------------------------------------------------------------
 
 
-def _files_under(root):
+def _files_under(root: Path) -> list[str]:
     return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
 
 
-def _copied(capsys):
+def _copied(capsys: pytest.CaptureFixture[str]) -> list[str]:
     return [record["target"] for record in json.loads(capsys.readouterr().out)]
 
 
@@ -1074,13 +1154,25 @@ def test_the_help_explains_the_trailing_slash(capsys):
 # ---------------------------------------------------------------------------
 
 
-def _answer_checksum(srv, value):
+def _answer_checksum(srv: FakeServer, value: str) -> None:
+    """Answer ``srv``'s checksum queries with ``value``; every other query as usual.
+
+    The others include the third-party copy's capability check, which must
+    still hear that the destination does third-party copy.
+    """
+    import struct
+
     from xrdclient.proto import constants as c
     from xrdclient.testing import frame
+    from xrdclient.testing import server as fake
 
-    srv.handlers[c.kXR_query] = lambda conn, sid, params, body: iter(
-        [frame(sid, c.kXR_ok, f"adler32 {value}\x00".encode())]
-    )
+    def handler(conn, sid, params, body):
+        if struct.unpack(">H", params[:2])[0] != c.kXR_Qcksum:
+            yield from fake._h_query_fctl(conn, sid, params, body)
+            return
+        yield frame(sid, c.kXR_ok, f"adler32 {value}\x00".encode())
+
+    srv.handlers[c.kXR_query] = handler
 
 
 def test_a_verified_third_party_copy_compares_both_ends(url, capsys):

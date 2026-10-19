@@ -26,6 +26,10 @@ xrdclient.stat("root://host//store/f.root")        # size, times, permissions
 xrdclient.checksum("root://host//store/f.root")    # the digest the server already has
 ```
 
+A `?` in a `glob` pattern is the one-character wildcard, even though a URL
+would read it as the start of a query: `glob("root://host//store/f??.root")`
+matches `f01.root`.
+
 `ls` and `glob` hand back paths, not strings, so the answer to one question
 is the input to the next. A stat prints as the line `ls -l` would have
 printed:

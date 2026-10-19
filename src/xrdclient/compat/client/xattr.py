@@ -43,7 +43,7 @@ def _setxattr(path: str, name: str, value: bytes) -> None:
         # which XrdSys prefixes for itself.
         os.setxattr(path, f"user.{name}", value)
         return
-    if sys.platform != "darwin":  # pragma: no cover - neither Linux nor macOS
+    if sys.platform != "darwin":  # neither Linux nor macOS
         raise NotImplementedError("extended attributes are not supported on this platform")
     libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
     # macOS: setxattr(path, name, value, size, position, options).

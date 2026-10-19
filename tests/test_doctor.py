@@ -8,8 +8,10 @@ while being asked what it wants.
 
 from __future__ import annotations
 
+import importlib
 import socket
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -20,6 +22,11 @@ from xrdclient.doctor import Check, Report, _nearest
 from xrdclient.errors import ConnectionError as XrdConnectionError
 from xrdclient.testing import FakeDAVServer
 
+if TYPE_CHECKING:
+    from xrdclient.client import FileSystem
+    from xrdclient.doctor import _Run
+    from xrdclient.testing import FakeServer
+
 BODY = b"hello world"
 
 
@@ -29,7 +36,7 @@ def dav():
         yield running
 
 
-def named(report, name):
+def named(report: Report, name: str) -> Check:
     """The one check that went by this name."""
     return next(check for check in report if check.name == name)
 
@@ -48,7 +55,7 @@ def free_port() -> int:
 
 def test_with_no_url_it_checks_the_machine_and_stops_there():
     report = diagnose()
-    assert [check.name for check in report[:3]] == ["python", "extras", "settings"]
+    assert [check.name for check in list(report)[:4]] == ["python", "extras", "crc32c", "settings"]
     assert report.url == ""
     assert not any(check.name in ("url", "dns", "connect") for check in report)
     assert len(report) == len(report.to_dict()) == len(list(report))
@@ -246,13 +253,13 @@ def test_a_login_that_fails_outright_is_a_line_rather_than_an_exception(server, 
 # -- helpers for the two checks that need the pieces rather than the whole ---
 
 
-def _fs(server):
+def _fs(server: FakeServer) -> FileSystem:
     from xrdclient.client import FileSystem
 
     return FileSystem(str(server.url))
 
 
-def _run_over(server, path):
+def _run_over(server: FakeServer, path: str) -> _Run:
     from xrdclient.doctor import _Run
 
     run = _Run(Config())
@@ -265,6 +272,16 @@ def test_every_mechanism_the_config_names_gets_a_line_of_its_own():
     report = diagnose(config=replace(Config(), auth_order=order))
     assert {f"auth:{name}" for name in order} <= {check.name for check in report}
     assert all(Offer(name) for name in order)
+
+
+@pytest.mark.parametrize("accelerated", [True, False])
+def test_it_says_whether_crc32c_runs_in_c(monkeypatch, accelerated):
+    module = importlib.import_module("xrdcore.crc32c")  # the CRC lives there since 0.4.0
+    monkeypatch.setattr(module, "IS_ACCELERATED", accelerated)
+    check = named(diagnose(), "crc32c")
+    assert check.state == ("ok" if accelerated else "warn")
+    assert ("google-crc32c" in check.detail) is accelerated
+    assert ("xrdclient[fast]" in check.hint) is not accelerated
 
 
 def test_the_optional_packages_are_listed_however_many_there_are(monkeypatch):

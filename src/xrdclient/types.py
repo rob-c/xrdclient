@@ -2,6 +2,16 @@
 
 All frozen and slotted. ``StatInfo`` deliberately mirrors ``os.stat_result``
 field names so code that inspects a local stat works unchanged on a remote one.
+
+These are what the protocol parsers in :mod:`xrdclient.proto.responses`
+build and what every scheme (``root://``, WebDAV, S3) returns, so a field
+here is a promise all three keep. The ``kXR_*`` names in the docstrings are
+the XRootD protocol's own, for looking a flag up in ``XProtocol.hh``. The
+pyxrootd-compatible shapes live in :mod:`xrdclient.compat` and are converted
+from these; adding a field here never changes them. :class:`ChecksumInfo` is
+:class:`xrdcore.checksum.ChecksumInfo` itself, the one checksum type xrdhttp
+(Metalink, WebDAV) and this package share, so checksums from any protocol
+compare equal.
 """
 
 from __future__ import annotations
@@ -10,24 +20,25 @@ import datetime
 import stat as _stat
 from dataclasses import dataclass, field
 
-from ._compat import SLOTS
+from xrdcore.checksum import ChecksumInfo
+
 from .flags import StatInfoFlags
 
 __all__ = [
-    "human_bytes",
-    "StatInfo",
-    "DirEntry",
-    "VFSInfo",
-    "SpaceInfo",
-    "PrepareStatus",
-    "LocationInfo",
-    "ProtocolInfo",
-    "ChecksumInfo",
     "CheckpointInfo",
-    "ReadRange",
-    "WriteChunk",
+    "ChecksumInfo",
     "CloneRange",
+    "DirEntry",
+    "LocationInfo",
     "PageResult",
+    "PrepareStatus",
+    "ProtocolInfo",
+    "ReadRange",
+    "SpaceInfo",
+    "StatInfo",
+    "VFSInfo",
+    "WriteChunk",
+    "human_bytes",
 ]
 
 
@@ -39,14 +50,16 @@ def human_bytes(size: float) -> str:
     running off the end.
     """
     value = float(size)
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
-        if abs(value) < 1024 or unit == "PiB":
-            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+    if abs(value) < 1024:
+        return f"{value:.0f} B"
+    for unit in ("KiB", "MiB", "GiB", "TiB"):
         value /= 1024
-    raise AssertionError("unreachable")  # pragma: no cover
+        if abs(value) < 1024:
+            return f"{value:.1f} {unit}"
+    return f"{value / 1024:.1f} PiB"
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class StatInfo:
     """Result of a ``stat``. ``st_*`` names match ``os.stat_result``.
 
@@ -69,10 +82,12 @@ class StatInfo:
 
     @property
     def size(self) -> int:
+        """Alias of :attr:`st_size`, the name pyxrootd's ``StatInfo`` used."""
         return self.st_size
 
     @property
     def modtime(self) -> int:
+        """Alias of :attr:`st_mtime` (seconds since the epoch), pyxrootd's name for it."""
         return self.st_mtime
 
     @property
@@ -83,7 +98,7 @@ class StatInfo:
         so this is aware rather than naive: ``.astimezone()`` puts it in
         yours, and printing it says which one it is.
         """
-        return datetime.datetime.fromtimestamp(self.st_mtime, datetime.timezone.utc)
+        return datetime.datetime.fromtimestamp(self.st_mtime, datetime.UTC)
 
     def __str__(self) -> str:
         """The line ``ls -l`` would print for it."""
@@ -112,22 +127,36 @@ class StatInfo:
         return mode
 
     def is_dir(self) -> bool:
+        """``True`` when the server set ``kXR_isDir`` for this path."""
         return bool(self.flags & StatInfoFlags.IS_DIR)
 
     def is_file(self) -> bool:
+        """A regular file: neither a directory nor ``kXR_other``.
+
+        ``kXR_other`` covers whatever the server could not classify (a FIFO, a
+        device, a dangling link on some back ends); those are reported as neither
+        file nor directory, as ``os.path.isfile`` would.
+        """
         return not (self.flags & (StatInfoFlags.IS_DIR | StatInfoFlags.OTHER))
 
     def is_offline(self) -> bool:
+        """``kXR_offline``: the bytes are on tape or another slow tier.
+
+        Opening it will either stage it (slowly) or fail, depending on the site;
+        see :meth:`~xrdclient.FileSystem.prepare` to stage ahead of time.
+        """
         return bool(self.flags & StatInfoFlags.OFFLINE)
 
     def is_readable(self) -> bool:
+        """``kXR_readable``: this client's identity may read it (not the POSIX mode)."""
         return bool(self.flags & StatInfoFlags.IS_READABLE)
 
     def is_writable(self) -> bool:
+        """``kXR_writable``: this client's identity may write it (not the POSIX mode)."""
         return bool(self.flags & StatInfoFlags.IS_WRITABLE)
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class DirEntry:
     """One entry of a directory listing."""
 
@@ -143,9 +172,11 @@ class DirEntry:
         return f"{self.parent.rstrip('/')}/{self.name}" if self.parent else self.name
 
     def is_dir(self) -> bool:
+        """``True`` for a directory; ``False`` when the listing carried no stat at all."""
         return self.stat is not None and self.stat.is_dir()
 
     def is_file(self) -> bool:
+        """``True`` for a regular file; ``False`` when the listing carried no stat at all."""
         return self.stat is not None and self.stat.is_file()
 
     def __str__(self) -> str:
@@ -153,10 +184,11 @@ class DirEntry:
         return self.path
 
     def __fspath__(self) -> str:
+        """Lets ``os.fspath`` and ``open``-style APIs take an entry as its path."""
         return self.path
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class VFSInfo:
     """Result of a ``statvfs`` (``kXR_stat`` with ``kXR_vfs``)."""
 
@@ -169,10 +201,15 @@ class VFSInfo:
 
     @property
     def f_bavail(self) -> int:
+        """``os.statvfs_result``-style alias of :attr:`free_rw`.
+
+        Note the unit: ``kXR_vfs`` reports free space in **megabytes**, not in
+        blocks, so this is not interchangeable with a local ``f_bavail * f_frsize``.
+        """
         return self.free_rw
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class SpaceInfo:
     """Result of ``kXR_query`` with ``kXR_Qspace``.
 
@@ -197,10 +234,11 @@ class SpaceInfo:
         return self.quota < 0
 
     def __str__(self) -> str:
+        """A one-line summary for logs and the CLI's ``spaceinfo``."""
         return f"{self.name or 'default'}: {self.free} of {self.total} bytes free"
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class PrepareStatus:
     """What a staging query (``kXR_query`` with ``kXR_QPrep``) says of one file.
 
@@ -231,11 +269,12 @@ class PrepareStatus:
         return self.online
 
     def __str__(self) -> str:
+        """``path: online``, ``path: on tape`` or ``path: nowhere``, with any server error."""
         where = "online" if self.online else ("on tape" if self.on_tape else "nowhere")
         return f"{self.path}: {where}{f' ({self.error})' if self.error else ''}"
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class LocationInfo:
     """One entry of a ``locate`` result."""
 
@@ -251,6 +290,7 @@ class LocationInfo:
 
     @property
     def port(self) -> int:
+        """The port in :attr:`address`, or 1094 (the XRootD default) when it has none."""
         _, sep, port = self.address.rpartition(":")
         return int(port) if sep and port.isdigit() else 1094
 
@@ -261,10 +301,12 @@ class LocationInfo:
 
     @property
     def is_manager(self) -> bool:
+        """A redirector (``M``, or ``m`` while pending): following it yields more locations."""
         return self.type in "Mm"
 
     @property
     def is_server(self) -> bool:
+        """A data server (``S``, or ``s`` while pending): it holds the bytes."""
         return self.type in "Ss"
 
     @property
@@ -274,13 +316,15 @@ class LocationInfo:
 
     @property
     def is_writable(self) -> bool:
+        """The server granted ``w`` access, so the file can be opened for update there."""
         return self.access == "w"
 
     def __str__(self) -> str:
+        """The ``host:port`` address, as ``xrdfs locate`` prints it."""
         return self.address
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class ProtocolInfo:
     """Result of ``kXR_protocol``."""
 
@@ -293,18 +337,27 @@ class ProtocolInfo:
 
     @property
     def version_str(self) -> str:
+        """The binary-coded version as dotted text: ``0x520`` becomes ``"5.2.0"``.
+
+        ``kXR_protocol`` packs one version digit per nibble rather than sending
+        an integer, so ``hex()`` of :attr:`version` reads naturally but ``str()``
+        does not.
+        """
         return f"{(self.version >> 8) & 0xF}.{(self.version >> 4) & 0xF}.{self.version & 0xF}"
 
     @property
     def has_tls(self) -> bool:
+        """``kXR_haveTLS``: the server can switch this connection to TLS."""
         return bool(self.flags & 0x80000000)
 
     @property
     def is_manager(self) -> bool:
+        """``kXR_isManager``: a redirector (cmsd manager), not a data server."""
         return bool(self.flags & 0x00000002)
 
     @property
     def is_server(self) -> bool:
+        """``kXR_isServer``: a data server that holds files itself."""
         return bool(self.flags & 0x00000001)
 
     @property
@@ -314,14 +367,17 @@ class ProtocolInfo:
 
     @property
     def is_proxy(self) -> bool:
+        """``kXR_attrProxy``: an XCache or forwarding proxy in front of another site."""
         return bool(self.flags & 0x00000200)  # kXR_attrProxy
 
     @property
     def is_supervisor(self) -> bool:
+        """``kXR_attrSuper``: a sub-manager in a large cluster's redirector tree."""
         return bool(self.flags & 0x00000400)  # kXR_attrSuper
 
     @property
     def is_cache(self) -> bool:
+        """``kXR_attrCache``: a caching server; reads may be served from a copy."""
         return bool(self.flags & 0x00000080)  # kXR_attrCache
 
     @property
@@ -336,10 +392,12 @@ class ProtocolInfo:
 
     @property
     def supports_gpfile(self) -> bool:
+        """``kXR_supgpf``: the server implements ``kXR_gpfile`` (server-driven get/put)."""
         return bool(self.flags & 0x00400000)  # kXR_supgpf
 
     @property
     def allows_anonymous_gpfile(self) -> bool:
+        """``kXR_anongpf``: ``kXR_gpfile`` is permitted without authentication."""
         return bool(self.flags & 0x00800000)  # kXR_anongpf
 
     @property
@@ -348,18 +406,7 @@ class ProtocolInfo:
         return bool(self.flags & 0x01000000)  # kXR_tlsData
 
 
-@dataclass(frozen=True, **SLOTS)
-class ChecksumInfo:
-    """A server-computed checksum."""
-
-    algorithm: str
-    value: str
-
-    def __str__(self) -> str:
-        return f"{self.algorithm}:{self.value}"
-
-
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class CheckpointInfo:
     """How much room the open checkpoint has left, in bytes."""
 
@@ -372,10 +419,11 @@ class CheckpointInfo:
         return max(0, self.capacity - self.used)
 
     def __str__(self) -> str:
+        """``used/capacity bytes used``, for logs."""
         return f"{self.used}/{self.capacity} bytes used"
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class ReadRange:
     """One element of a vector read."""
 
@@ -383,7 +431,7 @@ class ReadRange:
     length: int
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class WriteChunk:
     """One element of a vector write."""
 
@@ -391,7 +439,7 @@ class WriteChunk:
     data: bytes
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class CloneRange:
     """One range of a server-side copy.
 
@@ -409,7 +457,7 @@ class CloneRange:
         return self.offset if self.target_offset is None else self.target_offset
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class PageResult:
     """Result of a ``pgread``: the data plus any pages that failed CRC."""
 
@@ -419,7 +467,9 @@ class PageResult:
 
     @property
     def ok(self) -> bool:
+        """``True`` when every page passed its CRC32C check."""
         return not self.corrupt_pages
 
     def __len__(self) -> int:
+        """The number of bytes read, so a result can stand in for the ``bytes`` it holds."""
         return len(self.data)

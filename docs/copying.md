@@ -186,6 +186,17 @@ is why `1` is worth asking for between two local files, where there is no
 latency to hide. The chunks are written in the order they were read, so the
 digest a verified copy computes is still the file's.
 
+The buffers are reused: once a chunk has been written its buffer goes back to
+the reader, so a transfer of any size allocates `in_flight` of them and no
+more. The one exception is a destination stream you pass in yourself
+(`copy(src, my_stream)`), which might keep the view it is handed rather than
+copy it, and so gets a fresh buffer per chunk. When a copy ends early - its
+writer failed, or it was cancelled - the reading thread is stopped and waited
+for a bounded time; one blocked in a read from a server that has stopped
+answering is unblocked by closing the source, and abandoned (with a warning)
+if even that does not free it, rather than holding the copy open until the
+stall deadline.
+
 ## Several connections at once
 
 A copy big enough to be worth it is moved by more than one connection: the
@@ -198,6 +209,16 @@ together if there are two sessions to put them on.
 xrdclient.copy(src, dst, config=xrdclient.Config(parallel_chunks=8))   # eight spans
 xrdclient.copy(src, dst, config=xrdclient.Config(parallel_chunks=1))   # one stream
 ```
+
+When one span fails, the copy fails with that span's error - its own type, so
+an `except NotFoundError` still catches it - and the other spans stop at their
+next chunk instead of finishing work nobody will use. Any failures that
+followed the first are listed in a note on it (`BaseException.add_note`, shown
+by every traceback). The same holds for the spans of a
+[bulk download](performance.md) and for the readers of a
+[multi-source copy](#several-sources-at-once). Workers run in a copy of the
+caller's context, so a `deadline()` or `config.override()` around the copy
+reaches every one of them.
 
 From the command line that is `xrd-cp --stripes 8`. Its neighbour
 `--streams` answers a different question — not how many spans of the file
@@ -297,9 +318,13 @@ results = xrdclient.copy_tree("root://a//store/run7", "/scratch/run7")
 print(sum(r.size for r in results))
 ```
 
-Local destination directories are created as needed; remote ones come for
-free, because a remote write asks for `kXR_mkpath`. Extra keyword arguments
-are handed to `copy()` for each file.
+Destination directories are created as needed, wherever the destination is:
+a local copy calls `os.makedirs`, a `root://` write asks for `kXR_mkpath`, and
+a WebDAV tree has all of its collections made once, up front, over one
+connection, since a `PUT` makes no parents. (A single `copy()` into WebDAV
+makes its target's parent collections first too: on EOS a `PUT` that failed
+for want of one leaves the path unusable.) Extra keyword arguments are handed
+to `copy()` for each file.
 
 ### Several files at once
 
@@ -381,20 +406,86 @@ pair raises, and `copy()` is the answer - it streams through this process,
 which is what a mixed pair needs anyway.
 
 Over `root://` the rendezvous names the servers that actually hold each end,
-as `XrdCl` does: `tpc.src` is the data server the source stat was redirected
-to, and `tpc.dst` is the host the destination open landed on - not the
-redirector in either URL, which the source would not recognise as the host
-pulling from it.
+as `XrdCl` does: `tpc.src` is the data server the source's placement open was
+redirected to, and `tpc.dst` is the host the destination open landed on - not
+the redirector in either URL, which the source would not recognise as the
+host pulling from it.
+
+Each URL's own CGI - an `authz=` token, a `svcClass` space token, `XRD.*`
+options - goes on every open of that end (the placement, the keyed source
+open, the destination open), with the rendezvous's `tpc.*` fields added after
+it; a `tpc.*` field the rendezvous sets wins over the URL's, and this
+client's `xrdcl.*` directives never go on the wire. Before the pull, the
+destination is asked `tpc tpcdlg` and - for a classic copy - the source's
+data server `tpc`, as XrdCl's `CheckTPCLite` and `CheckTPC` do; a server that
+says no is refused with `UnsupportedError` ("Destination does not support
+third-party-copy.", "Source does not support third-party-copy").
+
+The pull is one `kXR_sync` that answers only when the whole file has moved,
+and the destination is silent until then. It is bounded by
+`Config.tpc_timeout` (`$XRD_CPTPCTIMEOUT`, XrdCl's `CPTPCTimeout`, 1800 s by
+default) - or by the call's `timeout=` when given - rather than by
+`request_timeout`, `stall_deadline` or `wait_budget`, which the destination's
+connection is given at least that long for; running out of it raises
+`OperationExpiredError`.
+
+When a copy fails, a destination it opened and left empty is removed (with
+the destination's settings), since an empty file there passes for a finished
+copy of an empty one. A destination that was already there and refused the
+copy - `overwrite=False` meeting an existing file - is never touched, over
+`root://` or HTTP. `cleanup=False` (gfal2's `transfer_cleanup` off) leaves
+whatever a failed copy wrote to the caller, a checksum mismatch included.
+
+Over `root://` the destination is created with mode 0644, as XrdCl creates
+it, and once the pull is done both ends are closed - the source first - and
+a close that fails fails the copy, named for its end as XrdCl names it.
 
 `verify=True` (with an optional `algorithm=`) asks both servers for their
 checksum once the transfer is done, since no byte passed through here to be
 digested, and raises `ChecksumMismatchError` if they differ - or the server's
 error if either end cannot answer.
 
+### Watching, cancelling and delegating a pull
+
+```python
+stop = threading.Event()                    # set it - from a signal handler, a GUI -
+xrdclient.third_party(src, dst,             # and the pull is called off
+                      cancel=stop,
+                      progress=lambda done, total: print(done, total),
+                      delegate=True, streams=4)
+```
+
+`cancel` (an event, or a callable answering "stop now?") is asked between the
+steps of the set-up and watched throughout the pull. Once it says stop, the
+destination is sent what XrdCl's progress handler sends it -
+`File::Fcntl("ofs.tpc cancel")`, which kills the pull and answers the waiting
+`kXR_sync` - and if it does not answer within a minute the connection is shut
+down under the wait. Both handles are closed, an empty destination is
+removed, and `AbortedError` (`ECANCELED`) is raised, chained to the
+destination's own answer. `progress(done, total)` hears about once a second
+how many bytes the destination holds (`total` is the source's size, when the
+placement learned it). Over HTTP, `cancel` is asked at each performance
+marker.
+
+`delegate=True` is XrdCl's delegated copy: the destination's login delegates
+your proxy, the source's CGI (an `authz` token, say) travels to it as
+`tpc.scgi`, and a destination that answers `tpc tpcdlg` in its configuration
+pulls on its own with that credential - *TPC lite*, where the source is never
+opened with a key from here and need not even be reachable from here. A
+destination without third-party copy is refused before the pull with
+`UnsupportedError`. `streams=n` asks the destination for `n` parallel streams
+(`tpc.str`, XrdCl's `SubStreamsPerChannel`). Which end refused a failed copy -
+the bracketed `(source)`/`(destination)` XrdCl prints - is
+`xrdclient.failed_end(exc)` (also `from xrdclient.copy import failed_end`):
+`"source"` for the keyed source open, `"destination"` for the destination's
+open, first sync and close, and `""` where XrdCl names none - the placement
+open, a capability refusal, the pull itself.
+
 `root://` takes `token_mode` (the delegation style), `posc`, `coerce`, and
-two timeouts: `timeout` for the transfer itself and `init_timeout` for
-everything before it - opening both ends and arming the pull, each step
-checked as XrdCl's `initTimeout` is, raising `CopyTimeoutError`. HTTP takes
+two timeouts: `timeout` for the transfer itself (in place of
+`Config.tpc_timeout`) and `init_timeout` for everything before it - opening
+both ends, the capability checks and arming the pull, each step checked as
+XrdCl's `initTimeout` is, raising `CopyTimeoutError`. HTTP takes
 rather more, because the header set is the protocol:
 
 ```python
@@ -417,12 +508,21 @@ xrdclient.http.third_party(src, dst, mode="pull", overwrite=True, delegate=False
 
   The token is stripped from the URL the far side is given, since it belongs
   in the header the transfer authorises rather than in the other endpoint's
-  request log.
+  request log. Then comes `remote_token`. With neither, and an `https` far
+  end, a short-lived macaroon scoped to the one file is minted there with
+  this client's own credential - its proxy, or its ambient bearer token - and
+  that is what is sent: an identity-mapped token (DiracX) that the far end
+  accepts for a direct read is still refused on the server-to-server leg.
+  `mint_token=False` skips the mint, and a far end that cannot mint gets the
+  ambient token as it is.
 - **`delegate=False`** sends `Credential: none`, which is what stops a server
   that supports X.509 delegation from waiting for a credential a
   token-authenticated transfer will never send.
-- **`verify`** sets `RequireChecksumVerification`; left as `None` it says
-  nothing and the server's own policy stands.
+- **`verify`** sets `RequireChecksumVerification`; left as `None` it is sent
+  as `false`, as gfal2 sends it. A destination that verifies in band asks the
+  source for a digest in a `HEAD`, and a source that answers checksum queries
+  but puts none there (CNAF's StoRM) would fail the copy; `xrdclient.third_party`
+  compares the two ends' checksums itself once the copy is done.
 - **`progress`** is called with the running byte count from the performance
   markers, so a long transfer can be watched even though nothing is
   streaming through here.

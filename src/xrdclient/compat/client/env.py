@@ -21,6 +21,11 @@ why it does nothing.
 ``SetLogLevel`` and ``SetLogMask`` drive the ``xrdclient`` logger hierarchy:
 each XrdCl topic is a set of this package's loggers (:data:`TOPICS`), and a
 mask mutes the rest at that level.
+
+State is process-wide, as XrdCl's ``DefaultEnv`` is a singleton: the put
+values live in two module dicts behind one lock, and :func:`config` builds a
+fresh :class:`Config` from them for every compat object, so a put takes
+effect for objects created after it, not for ones already connected.
 """
 
 from __future__ import annotations
@@ -30,7 +35,7 @@ import os
 import threading
 from typing import Any
 
-from ... import _log
+from ... import log
 from ...config import Config
 
 __all__ = [
@@ -50,7 +55,10 @@ __all__ = [
 ]
 
 #: The integer settings XrdCl registers, with its defaults (``DefaultEnv``).
+#: The order and spelling are XrdCl's, so a diff against ``XrdClConstants.hh``
+#: stays readable when a release adds a key. Sizes are bytes, times seconds.
 _INTS: dict[str, int] = {
+    # Connections and requests.
     "ConnectionWindow": 120,
     "ConnectionRetry": 5,
     "RequestTimeout": 1800,
@@ -61,6 +69,7 @@ _INTS: dict[str, int] = {
     "RunForkHandler": 1,
     "RedirectLimit": 16,
     "WorkerThreads": 3,
+    # Copies: 8 MiB chunks, four in flight.
     "CPChunkSize": 8388608,
     "CPParallelChunks": 4,
     "DataServerTTL": 300,
@@ -68,6 +77,7 @@ _INTS: dict[str, int] = {
     "CPInitTimeout": 600,
     "CPTPCTimeout": 1800,
     "CPTimeout": 0,
+    # TCP keepalive, off by default upstream: two hours idle, then probes.
     "TCPKeepAlive": 0,
     "TCPKeepAliveTime": 7200,
     "TCPKeepAliveInterval": 75,
@@ -116,6 +126,8 @@ _STRINGS: dict[str, str] = {
 #: the registered set - it spells one key differently, leaves three of the
 #: copy settings out, and has four strings nothing registers.
 _DEFAULTS: dict[str, str] = {
+    # ``TCPKeepProbes`` is ``TCPKeepAliveProbes`` there; ``CpRetry`` and
+    # ``CpUsePgWrtRd`` are absent, so ``EnvGetDefault`` answers ``None``.
     **{
         key.lower(): str(value)
         for key, value in _INTS.items()
@@ -152,6 +164,10 @@ _FIELDS: dict[str, tuple[str, Any]] = {
     "tlsmetalink": ("tls_metalink", lambda value: bool(int(value))),
     "maxmetalinkwait": ("max_metalink_wait", float),
     "zipmtlncksum": ("zip_metalink_checksum", lambda value: bool(int(value))),
+    "networkstack": ("network_stack", str),
+    # XrdCl's idle time before the first probe; the native setting also
+    # paces the probes from it (a third of it apart, three of them).
+    "tcpkeepalivetime": ("keepalive_interval", float),
 }
 
 #: What each key XrdCl registers does here. The ones with a native equivalent
@@ -173,20 +189,22 @@ EFFECTS: dict[str, str] = {
     "XRateThreshold": "CopyProcess.add_job's xrateThreshold default",
     "CpRetry": "CopyProcess.add_job's retry default",
     "CpRetryPolicy": "CopyProcess.add_job's retryPolicy default",
+    # The keys below change nothing here. They are still accepted and stored,
+    # because pyxrootd code sets them unconditionally and must not fail.
     "TimeoutResolution": "none: deadlines are exact here, not checked on a timer tick",
     "StreamErrorWindow": "none: a failed connection is not remembered as failed",
     "LoadBalancerTTL": "none: the pool keeps managers and data servers alike",
     "WorkerThreads": "none: there are no worker threads to size",
     "ParallelEvtLoop": "none: there is no event loop to run in parallel",
     "RunForkHandler": "none: there is no fork handler",
-    "TCPKeepAlive": "none: TCP keepalive is always on",
-    "TCPKeepAliveTime": "none: the operating system's keepalive timing applies",
-    "TCPKeepAliveInterval": "none: the operating system's keepalive timing applies",
-    "TCPKeepProbes": "none: the operating system's keepalive timing applies",
+    "TCPKeepAlive": "none: TCP keepalive is on unless Config.keepalive_interval is 0",
+    "TCPKeepAliveTime": "Config.keepalive_interval, the idle time before the first probe",
+    "TCPKeepAliveInterval": "none: probes go a third of Config.keepalive_interval apart",
+    "TCPKeepProbes": "none: three unanswered probes drop the connection",
     "NoDelay": "none: TCP_NODELAY is always set",
-    "NetworkStack": "none: connections take whichever address the resolver gives first",
-    "PreferIPv4": "none: connections take whichever address the resolver gives first",
-    "IPNoShuffle": "none: addresses are tried in the resolver's order",
+    "NetworkStack": "Config.network_stack: IPAuto, IPv4, IPv6 or IPv4Mapped6",
+    "PreferIPv4": "none: under IPAuto the family the resolver lists first is tried first",
+    "IPNoShuffle": "none: addresses are raced in the resolver's order, families interleaved",
     "MultiProtocol": "none: every connection negotiates its own protocol",
     "MetalinkProcessing": "Config.metalink_processing",
     "LocalMetalinkFile": "none: metalinks are not supported",
@@ -195,7 +213,10 @@ EFFECTS: dict[str, str] = {
     "ZipMtlnCksum": "Config.zip_metalink_checksum",
     "XCpBlockSize": "none: extreme copy is not supported",
     "AioSignal": "none: there is no POSIX AIO",
-    "PreserveLocateTried": "none: a redirect's tried= CGI is not kept",
+    # tried= is added, accumulated across attempts, whenever a request or a
+    # re-open goes back to a manager after a data server failed it - never
+    # carried over from a locate's answer, which is what this key governs.
+    "PreserveLocateTried": "none: tried= is sent on the way back to a manager, not after a locate",
     "NotAuthorizedRetryLimit": "none: a refusal is not retried",
     "RetryWrtAtLBLimit": "none: a failed write is not retried at the manager",
     "PreserveXAttrs": "none: copies do not carry extended attributes",
@@ -205,7 +226,7 @@ EFFECTS: dict[str, str] = {
     "WantTlsOnNoPgrw": "none: TLS is used when the URL or server asks for it",
     "TlsDbgLvl": "none: TLS is logged under the TlsMsg topic",
     "WriteRecovery": "none: a file open for writing is never re-opened",
-    "OpenRecovery": "none: a failed open is not retried elsewhere",
+    "OpenRecovery": "none: a read-only open a data server fails goes back to its manager",
     "ClientMonitor": "none: there are no monitoring plug-ins",
     "ClientMonitorParam": "none: there are no monitoring plug-ins",
     "PlugIn": "none: there are no client plug-ins",
@@ -214,7 +235,10 @@ EFFECTS: dict[str, str] = {
     "CpTarget": "none: copy targets are given per job",
 }
 
+#: Guards :data:`_ints` and :data:`_strings`; puts can race with the worker
+#: threads that build a :func:`config` for a callback-driven call.
 _lock = threading.Lock()
+#: The values put, by lower-cased key: XrdCl's lookups ignore case.
 _ints: dict[str, int] = {}
 _strings: dict[str, str] = {}
 
@@ -224,6 +248,7 @@ _request_timeout = 0
 
 
 def _key(key: str) -> str:
+    """The storage key for ``key``: XrdCl's ``Env`` is case-insensitive."""
     return key.lower()
 
 
@@ -240,6 +265,7 @@ def _from_shell(key: str, table: dict[str, Any]) -> str | None:
 
 
 def _shell_int(key: str) -> int | None:
+    """``XRD_<KEY>`` as an integer, or ``None`` if unset, unregistered or not a number."""
     raw = _from_shell(key, _INTS)
     if raw is None:
         return None
@@ -255,6 +281,8 @@ def EnvPutInt(key: str, value: int) -> bool:
         return False
     with _lock:
         _ints[_key(key)] = int(value)
+    # Only integers feed the cached call deadline, so only the int put and
+    # delete functions need to refresh it.
     _settle()
     return True
 
@@ -339,6 +367,8 @@ def _settle() -> None:
 
 def _build_config() -> Config:
     """Build a native configuration without going through the patchable API hook."""
+    # Snapshot under the lock, convert outside it, so the critical section
+    # is a dict copy and ``Config``'s validation runs unlocked.
     with _lock:
         put: dict[str, Any] = {**_strings, **_ints}
     changes = {
@@ -367,6 +397,9 @@ _LEVELS = {
 #: do that topic's work. A topic with no loggers has no counterpart here -
 #: there is no poller, task manager or job manager - and masking it changes
 #: nothing. ``ZipMsg`` is left out as XrdCl's own mask parser leaves it out.
+#: Each value is (XrdCl's mask bit, logger names). Loggers are matched by
+#: prefix in the ``logging`` hierarchy, so ``xrdclient.http.dav`` covers its
+#: children; keep this table current when a new subpackage starts logging.
 TOPICS: dict[str, tuple[int, tuple[str, ...]]] = {
     "AppMsg": (
         0x1,
@@ -432,6 +465,8 @@ def SetLogMask(level: str, mask: str) -> None:
     ``level`` is ``Error``, ``Warning``, ``Info``, ``Debug``, ``Dump`` or
     ``All``; any other is ignored, as XrdCl ignores it.
     """
+    # Muting is per band, so a mask set at ``Debug`` leaves every topic's
+    # warnings and errors through.
     if level == "All":
         bands = list(_BANDS.values())
     elif level in _BANDS:
@@ -441,7 +476,7 @@ def SetLogMask(level: str, mask: str) -> None:
     enabled = _translate(mask)
     muted = [logger for bit, loggers in TOPICS.values() if not enabled & bit for logger in loggers]
     for low, high in bands:
-        _log.mute(low, high, muted)
+        log.mute(low, high, muted)
 
 
 def _translate(mask: str) -> int:
@@ -450,6 +485,8 @@ def _translate(mask: str) -> int:
         return _ALL
     result = 0
     for word in str(mask).split("|"):
+        # Words apply left to right, so ``"All|^PollerMsg"`` is every topic
+        # but one and ``"FileMsg|None"`` is none.
         if word in ("All", "None"):
             result = _ALL if word == "All" else 0
             continue
@@ -461,4 +498,6 @@ def _translate(mask: str) -> int:
     return result
 
 
+# ``XRD_REQUESTTIMEOUT`` in the environment applies from import, before any
+# put; the put functions keep it current afterwards.
 _settle()

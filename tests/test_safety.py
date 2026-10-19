@@ -20,7 +20,7 @@ from xrdclient.testing import FakeDAVServer, FakeServer
 BODY = b"hello world"
 
 
-def run(argv, capsys):
+def run(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str, str]:
     code = fs_cli.main(argv)
     captured = capsys.readouterr()
     return code, captured.out, captured.err
@@ -88,10 +88,12 @@ def test_a_ceiling_survives_being_pickled_like_every_other_error():
 
 def test_an_unbounded_read_of_something_that_fits_is_left_alone():
     """Under the ceiling nothing changes, including the empty file."""
-    with FakeServer(files={"/e.bin": b"", "/tiny": b"ab"}) as srv:
-        with xrdclient.FileSystem(srv.url, Config(max_read_size=4, auth_order=("host",))) as fs:
-            assert fs.read_bytes("/e.bin") == b""
-            assert fs.read_bytes("/tiny") == b"ab"
+    with (
+        FakeServer(files={"/e.bin": b"", "/tiny": b"ab"}) as srv,
+        xrdclient.FileSystem(srv.url, Config(max_read_size=4, auth_order=("host",))) as fs,
+    ):
+        assert fs.read_bytes("/e.bin") == b""
+        assert fs.read_bytes("/tiny") == b"ab"
 
 
 # ---------------------------------------------------------------------------

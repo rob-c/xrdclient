@@ -6,6 +6,7 @@ import io
 import os
 import zipfile
 from datetime import datetime
+from typing import Any
 
 import pytest
 
@@ -66,6 +67,7 @@ def test_remote_append_preserves_existing_records_comment_and_prefix(config, tmp
 
     _assert_appended_archive(updated, original, source.read_bytes())
     assert progress[-1] == (source.stat().st_size, source.stat().st_size)
+    assert result.checksum is not None
     assert (result.size, result.verified, result.checksum.algorithm) == (70_000, True, "zcrc32")
 
 
@@ -132,7 +134,7 @@ def test_remote_failed_appends_roll_back_existing_and_new_archives(config):
 
 def test_append_from_current_stream_position_and_remove_source(tmp_path):
     stream = io.BytesIO(b"skip-member-data")
-    stream.name = "stream.bin"  # type: ignore[attr-defined]
+    stream.name = "stream.bin"
     stream.seek(5)
     target = tmp_path / "stream.zip"
     result = xrdclient.append_zip(stream, target)
@@ -203,7 +205,7 @@ def test_append_validates_target_name_size_and_chunk(tmp_path):
 
 def test_non_seekable_unnamed_stream_requires_size_information(tmp_path):
     class Stream:
-        def read(self, size=-1):  # type: ignore[no-untyped-def]
+        def read(self, size=-1):
             return b"x"
 
     with pytest.raises(ValueError, match="known size or be seekable"):
@@ -211,16 +213,18 @@ def test_non_seekable_unnamed_stream_requires_size_information(tmp_path):
     with pytest.raises(ValueError, match="member="):
         xrdclient.append_zip(io.BytesIO(b"x"), tmp_path / "a.zip")
     numbered = io.BytesIO(b"x")
-    numbered.name = 3  # type: ignore[attr-defined]
+    numbered.name = 3
     with pytest.raises(ValueError, match="member="):
         xrdclient.append_zip(numbered, tmp_path / "a.zip")
+    # Not a path at all: typed Any so the call reaches the runtime check.
+    not_a_path: Any = io.BytesIO()
     with pytest.raises(ValueError, match="path or URL"):
-        xrdclient.append_zip(io.BytesIO(b"x"), io.BytesIO(), member="a")
+        xrdclient.append_zip(io.BytesIO(b"x"), not_a_path, member="a")
 
 
 def test_a_source_that_overreturns_is_limited_to_the_declared_size(tmp_path):
     class Overread(io.BytesIO):
-        def read(self, size=-1):  # type: ignore[no-untyped-def]
+        def read(self, size=-1):
             return super().read()  # deliberately violates BinaryIO.read(size)
 
     target = tmp_path / "limited.zip"
@@ -235,14 +239,14 @@ def test_zip64_header_builders_cover_large_member_offset_and_directory():
     local = zipio._local_header(b"large", zipio._U32, 1, stamp)
     central = zipio._central_header(b"large", zipio._U32, 1, zipio._U32, stamp)
     ending = zipio._end_records(zipio._U16, zipio._U32, zipio._U32, b"comment")
-    assert b"PK\x03\x04" == local[:4] and b"PK\x01\x02" == central[:4]
+    assert local[:4] == b"PK\x03\x04" and central[:4] == b"PK\x01\x02"
     assert b"PK\x06\x06" in ending and ending.endswith(b"comment")
     assert zipio._zip64_extra([(False, 1, 8)]) == b""
 
 
 def test_write_all_handles_partial_and_stalled_writers():
     class Partial(io.BytesIO):
-        def write(self, data):  # type: ignore[no-untyped-def]
+        def write(self, data):
             return super().write(data[:2])
 
     partial = Partial()
@@ -250,21 +254,21 @@ def test_write_all_handles_partial_and_stalled_writers():
     assert partial.getvalue() == b"abcdef"
 
     class Stalled(io.BytesIO):
-        def write(self, data):  # type: ignore[no-untyped-def]
+        def write(self, data):
             return 0
 
     with pytest.raises(OSError, match="no progress"):
         zipio._write_all(Stalled(), b"x")
 
     class Backwards(io.BytesIO):
-        def write(self, data):  # type: ignore[no-untyped-def]
+        def write(self, data):
             return -1
 
     with pytest.raises(OSError, match="no progress"):
         zipio._write_all(Backwards(), b"x")
 
     class Broken(io.BytesIO):
-        def seek(self, *args):  # type: ignore[no-untyped-def]
+        def seek(self, *args):
             raise OSError("gone")
 
     zipio._restore(Broken(), 0, b"tail", 4)  # rollback is deliberately best-effort

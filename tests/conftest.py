@@ -1,13 +1,30 @@
-"""Shared fixtures: hand-built server frames and a scripted peer."""
+"""Shared fixtures: hand-built server frames and a scripted peer.
+
+The hermetic environment - no proxy, token, Kerberos cache, CA directory or
+``$HOME`` of the developer's - is :mod:`xrdsec.testing.fixtures`, the plugin
+every suite on the stack loads; :func:`pytest_xrdsec_hermetic` adds
+xrdclient's own inputs to it.
+"""
 
 from __future__ import annotations
 
 import struct
+from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import pytest
 
 from xrdclient.config import Config
 from xrdclient.proto import constants as c
+
+if TYPE_CHECKING:
+    from xrdsec.testing.fixtures import Hermetic
+
+    from tests._xrootd import RealServer
+    from xrdclient import FileSystem
+    from xrdclient.testing import FakeServer
+
+pytest_plugins = ["xrdsec.testing.fixtures"]
 
 _RESP = struct.Struct(">HHI")
 
@@ -55,41 +72,51 @@ def stat_line(size: int = 1024, flags: int = 0, mtime: int = 1_700_000_000) -> b
     return f"id0 {size} {flags} {mtime}".encode() + b"\x00"
 
 
-@pytest.fixture(autouse=True)
-def _no_native_cache_backend(monkeypatch):
-    """Use portable caches unless the test explicitly selects native handling."""
-    monkeypatch.delenv("XRD_KRB5_BACKEND", raising=False)
+class _Ceiling:
+    """A jitter source that always picks the top of the window."""
+
+    @staticmethod
+    def uniform(a: float, b: float) -> float:
+        return b
 
 
 @pytest.fixture(autouse=True)
-def _no_dotfile(tmp_path_factory, monkeypatch):
-    """Keep whoever is running the tests out of them.
+def _no_jitter() -> Iterator[None]:
+    """Make every retry wait exactly its exponential ceiling.
 
-    ``Config.from_file`` reads ``~/.xrdrc`` when nothing says otherwise, so a
-    developer with one would get different results from CI. Pointing
-    ``$XRD_CONFIG`` at an empty file is the same as having no file at all,
-    and a test about the search order just sets the variable itself.
+    The library jitters its backoff (:mod:`xrdcore.retry`); the suite
+    asserts on the waits, so it pins them. ``tests/test_retry.py`` covers
+    the jitter itself with a seeded source.
     """
-    empty = tmp_path_factory.mktemp("dotfile") / "config.ini"
+    from xrdcore import retry as _retry
+
+    previous = _retry.use_rng(_Ceiling())
+    yield
+    _retry.use_rng(previous)
+
+
+def pytest_xrdsec_hermetic(hermetic: Hermetic) -> None:
+    """xrdclient's own inputs, on top of xrdsec's hermetic environment.
+
+    ``Config.from_file`` reads ``~/.xrdrc`` when nothing says otherwise (the
+    plugin's empty ``$HOME`` has none, but ``$XRD_CONFIG`` would name one):
+    pointing ``$XRD_CONFIG`` at an empty file is the same as having no file
+    at all, and a test about the search order sets the variable itself.
+
+    The Kerberos backend is the portable reader unless a test selects
+    another: the default, ``auto``, asks the system library first whenever
+    python-gssapi is installed - as it is in the development environment -
+    and a unit test's fabricated cache is not something to hand the real
+    library.
+    """
+    empty = hermetic.directory("dotfile") / "config.ini"
     empty.write_text("")
-    monkeypatch.setenv("XRD_CONFIG", str(empty))
+    hermetic.monkeypatch.setenv("XRD_CONFIG", str(empty))
+    hermetic.monkeypatch.setenv("XRD_KRB5_BACKEND", "portable")
 
 
 @pytest.fixture(autouse=True)
-def _no_ambient_proxy(tmp_path_factory, monkeypatch):
-    """Keep the developer's own grid proxy out of every TLS handshake.
-
-    With nothing configured, :func:`~xrdclient.transport.base.tls_context`
-    presents ``/tmp/x509up_u<uid>`` as gfal2 and XrdCl do, so on a grid login
-    node the suite would otherwise run with a real certificate in hand. A
-    test about that discovery points it somewhere of its own.
-    """
-    absent = str(tmp_path_factory.mktemp("noproxy") / "x509up_absent")
-    monkeypatch.setattr("xrdclient.transport.base.default_proxy_path", lambda: absent)
-
-
-@pytest.fixture(autouse=True)
-def _a_short_data_stream_probe(monkeypatch):
+def _a_short_data_stream_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     """Do not spend the suite's time learning what the fake server is.
 
     A file asks its server once per connection whether it serves a request
@@ -103,7 +130,7 @@ def _a_short_data_stream_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_pooled_connections():
+def _no_pooled_connections() -> Iterator[None]:
     """Never let one test's connection be handed to the next.
 
     Every :class:`~xrdclient.testing.FakeServer` gets an ephemeral port, and the
@@ -121,7 +148,7 @@ def _no_pooled_connections():
 
 
 @pytest.fixture(autouse=True)
-def _no_configured_defaults():
+def _no_configured_defaults() -> Iterator[None]:
     """Put the process-wide configuration back after every test.
 
     :func:`~xrdclient.configure` changes what every later ``Config()`` in the
@@ -148,7 +175,7 @@ def config() -> Config:
 
 
 @pytest.fixture
-def server():
+def server() -> Iterator[FakeServer]:
     """A running :class:`~xrdclient.testing.FakeServer` on loopback.
 
     Pre-populated so the common case - "read a file, list a directory" - needs
@@ -161,23 +188,23 @@ def server():
 
 
 @pytest.fixture(scope="session")
-def real_server(tmp_path_factory):
+def real_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[RealServer]:
     """A genuine ``xrootd`` daemon, or a skip where none is installed.
 
     Session-scoped because starting one costs a second and every interop test
     wants the same daemon; :func:`sandbox` gives each test its own directory
     inside it so they still cannot collide.
     """
-    import _xrootd
+    from tests import _xrootd
 
     if not _xrootd.available():
-        pytest.skip("no xrootd binary on PATH")
+        pytest.skip("environment: no xrootd binary on PATH")
     with _xrootd.RealServer(tmp_path_factory.mktemp("export")) as srv:
         yield srv
 
 
 @pytest.fixture
-def sandbox(real_server, request):
+def sandbox(real_server: RealServer, request: pytest.FixtureRequest) -> str:
     """A fresh directory in the real server's export, named for the test."""
     path = f"{real_server.path()}/{request.node.name[:80]}"
     from xrdclient import FileSystem
@@ -195,7 +222,7 @@ _REAL_CONFIG = Config(auth_order=("unix", "host"), request_timeout=10.0, connect
 
 
 @pytest.fixture
-def fs(server, config):
+def fs(server: FakeServer, config: Config) -> Iterator[FileSystem]:
     """A :class:`~xrdclient.FileSystem` pointed at the ``server`` fixture."""
     from xrdclient import FileSystem
 
@@ -213,4 +240,5 @@ def closed_port() -> tuple[str, int]:
 
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()
+        host, port = sock.getsockname()
+        return str(host), int(port)

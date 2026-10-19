@@ -20,6 +20,7 @@ import pytest
 
 import xrdclient
 from xrdclient import File, FileSystem
+from xrdclient.config import Config
 from xrdclient.errors import TimeoutError as XrdTimeoutError
 from xrdclient.proto import constants as c
 from xrdclient.session import SESSIONS
@@ -44,6 +45,13 @@ def _elapsed(start: float) -> float:
     return time.monotonic() - start
 
 
+def _left() -> float:
+    """What the enclosing deadline has left; the test is inside one."""
+    left = dl.remaining()
+    assert left is not None
+    return left
+
+
 # -- the helper itself ---------------------------------------------------------
 
 
@@ -54,8 +62,8 @@ def test_outside_every_block_there_is_no_deadline():
 
 def test_a_deadline_counts_down_and_then_has_passed():
     with xrdclient.deadline(0.05) as when:
-        assert 0 < dl.remaining() <= 0.05
-        assert when == pytest.approx(time.monotonic() + dl.remaining(), abs=0.01)
+        assert 0 < _left() <= 0.05
+        assert when == pytest.approx(time.monotonic() + _left(), abs=0.01)
         time.sleep(0.06)
         with pytest.raises(xrdclient.OperationExpiredError, match="Stat expired"):
             dl.check("Stat")
@@ -65,10 +73,10 @@ def test_a_deadline_counts_down_and_then_has_passed():
 def test_an_inner_deadline_shortens_but_never_extends():
     with xrdclient.deadline(5):
         with xrdclient.deadline(60):
-            assert dl.remaining() <= 5
+            assert _left() <= 5
         with xrdclient.deadline(0.5):
-            assert dl.remaining() <= 0.5
-        assert dl.remaining() > 1
+            assert _left() <= 0.5
+        assert _left() > 1
 
 
 def test_an_expired_request_is_a_timeout_and_this_packages_error():
@@ -216,13 +224,13 @@ def test_connecting_is_bounded_by_the_deadline(config):
 
 def test_a_connect_timeout_is_cut_to_the_deadline(config, monkeypatch):
     seen = []
-    from xrdclient.session import sync
+    from xrdclient.transport.sync import SocketTransport
 
     def connect(host, port, cfg):
         seen.append(cfg.connect_timeout)
         raise XrdTimeoutError("connecting timed out")
 
-    monkeypatch.setattr(sync.SocketTransport, "connect", connect)
+    monkeypatch.setattr(SocketTransport, "connect", connect)
     with xrdclient.deadline(0.5), pytest.raises(XrdTimeoutError):
         Session.connect("root://127.0.0.1:1", config=config)
     assert seen and seen[0] <= 0.5
@@ -262,7 +270,7 @@ def test_a_failure_after_the_deadline_is_the_expiry(config, monkeypatch):
 
 
 def test_a_retry_pause_is_cut_to_the_deadline(monkeypatch, config):
-    slept = []
+    slept: list[float] = []
     monkeypatch.setattr(time, "sleep", slept.append)
     router = Router("root://127.0.0.1:1", config.evolve(retry_backoff=10.0))
     with xrdclient.deadline(1):
@@ -281,7 +289,7 @@ def big():
         yield srv, payload
 
 
-def _plane_config(config):
+def _plane_config(config: Config) -> Config:
     return config.evolve(bulk=True, bulk_chunk=64 << 10, bulk_depth=4)
 
 
@@ -320,9 +328,8 @@ def test_a_bulk_read_that_expires_mid_frame_breaks_its_connection(big, config):
 
 def test_a_deadline_longer_than_the_link_timeout_leaves_it_alone(big, config):
     srv, payload = big
-    with File(srv.url.with_path("/big"), _plane_config(config)) as fh:
-        with xrdclient.deadline(3600):
-            assert fh.read(len(payload), 0) == payload
+    with File(srv.url.with_path("/big"), _plane_config(config)) as fh, xrdclient.deadline(3600):
+        assert fh.read(len(payload), 0) == payload
 
 
 def test_a_bulk_read_whose_deadline_has_passed_takes_nothing_off_the_wire():
@@ -341,6 +348,9 @@ def test_a_bulk_read_whose_deadline_has_passed_takes_nothing_off_the_wire():
 
         def mark_broken(self) -> None:
             self.broken = True
+
+        def note(self, info: object) -> None:
+            raise AssertionError(f"no notice expected: {info!r}")
 
     lent = Lent()
     with xrdclient.deadline(0):

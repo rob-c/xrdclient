@@ -6,6 +6,11 @@ on the server. A trailing ``?key=value`` is the URL's parameters, not a
 wildcard, and is carried onto every result; a trailing ``/`` matches
 directories only. ``raise_error=False`` skips a directory that cannot be
 listed instead of raising :class:`RuntimeError`.
+
+Each listing opens a compat :class:`~.filesystem.FileSystem` and closes its
+native connection straight after, rather than leaving it for the collector:
+a deep pattern lists many directories and should not hold a connection per
+level until garbage collection runs.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ __all__ = ["extract_url_params", "glob", "iglob", "split_url", "xrootd_iglob"]
 
 
 def split_url(url: str) -> tuple[str, str]:
+    """``("scheme://host/", path)``: the server to list on, and where."""
     parsed = urlparse(url)
     return f"{parsed.scheme}://{parsed.netloc}/", parsed.path
 
@@ -39,6 +45,8 @@ def iglob(pathname: str, raise_error: bool = True) -> Iterator[str]:
     """Each path matching ``pathname``, one at a time."""
     pattern, params = extract_url_params(pathname)
     local = _glob.iglob(pattern)
+    # Peek one result: the bindings decide local versus remote by whether a
+    # local glob finds anything, so ``root://`` patterns fall through here.
     first = next(local, None)
     if first is not None:
         yield first + params
@@ -63,6 +71,12 @@ def xrootd_iglob(pathname: str, url_params: str, raise_error: bool) -> Iterator[
 def _matches(
     dirname: str, basename: str, params: str, only_dirs: bool, raise_error: bool
 ) -> Iterator[str]:
+    """The entries of the directory ``dirname`` whose names match ``basename``.
+
+    ``STAT`` is only asked for when directories alone are wanted - it costs
+    the server a stat per entry. ``fnmatchcase`` because a remote filesystem
+    is case-sensitive whatever this machine is.
+    """
     host, path = split_url(dirname)
     flags = DirListFlags.STAT if only_dirs else DirListFlags.NONE
     filesystem = FileSystem(host)

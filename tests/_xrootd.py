@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from typing import Self
 
 XROOTD = shutil.which("xrootd")
 
@@ -61,7 +62,7 @@ class RealServer:
     """
 
     def __init__(self, root: str | os.PathLike[str], *, timeout: float = 20.0) -> None:
-        if XROOTD is None:  # pragma: no cover - guarded by available()
+        if XROOTD is None:  # callers check available() first
             raise RuntimeError("no xrootd binary on PATH")
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
@@ -96,7 +97,7 @@ class RealServer:
 
     # ------------------------------------------------------------------
 
-    def start(self) -> RealServer:
+    def start(self) -> Self:
         self._config.write_text(CONFIG.format(port=self.port, root=self.root, admin=self._admin))
         with self._log.open("wb") as handle:
             self._proc = subprocess.Popen(
@@ -130,7 +131,7 @@ class RealServer:
             proc.terminate()
             try:
                 proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:  # pragma: no cover - a wedged daemon
+            except subprocess.TimeoutExpired:  # a wedged daemon
                 proc.kill()
                 proc.wait(timeout=5)
         self._tail = self.log()
@@ -142,7 +143,7 @@ class RealServer:
             return self._log.read_text(errors="replace")
         return self._tail
 
-    def __enter__(self) -> RealServer:
+    def __enter__(self) -> Self:
         return self.start()
 
     def __exit__(self, *exc: object) -> None:

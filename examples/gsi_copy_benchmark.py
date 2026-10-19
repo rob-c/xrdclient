@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import os
 import shutil
 import socket
@@ -31,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import xrdclient
@@ -85,13 +87,15 @@ subjectAltName = DNS:{host}, DNS:localhost, IP:127.0.0.1
 """
 
 
-def run(*argv: str, quiet: bool = True, **kwargs: object) -> subprocess.CompletedProcess:
+def run(
+    *argv: str, quiet: bool = True, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     """One command, with its output kept unless it fails."""
     done = subprocess.run(  # the check is two lines below
         argv,
         capture_output=quiet,
         text=True,
-        **kwargs,  # type: ignore[call-overload]
+        env=env,
     )
     if done.returncode != 0:
         if quiet:
@@ -259,8 +263,8 @@ def server(
     local: bool,
     keep: bool,
     image: str | None = None,
-):
-    """The daemon, in a container or on this machine, and its URL."""
+) -> Iterator[tuple[str, Path | str]]:
+    """The daemon, in a container or on this machine: its URL, and its log or container."""
     config = root / "demo.cfg"
     if local:
         libdir = _plugin_dir()
@@ -420,7 +424,7 @@ def others(brix: str) -> list[tuple[str, tuple[str, ...]]]:
     milliseconds against a few seconds, and saying so is cheaper than pretending
     the harness is perfect.
     """
-    found = []
+    found: list[tuple[str, tuple[str, ...]]] = []
     official = shutil.which("xrdcp")
     if official:
         found.append((f"xrdcp, official C++ ({_version(official)})", (official,)))
@@ -439,7 +443,7 @@ def _version(binary: str) -> str:
     return "?"
 
 
-def bindings(remote: str, target: Path, env: dict, repeat: int):
+def bindings(remote: str, target: Path, env: dict[str, str], repeat: int) -> Iterator[float]:
     """The official Python bindings, if this machine has them.
 
     They are not importable from the virtual environment this package is
@@ -462,7 +466,7 @@ print("ELAPSED", time.perf_counter() - start, bool(status.ok))
         done = subprocess.run(
             ["python3", "-c", script], capture_output=True, text=True, check=False, env=env
         )
-        line = [l for l in done.stdout.splitlines() if l.startswith("ELAPSED")]
+        line = [text for text in done.stdout.splitlines() if text.startswith("ELAPSED")]
         if not line:
             return  # no bindings here, or they refused; the others still stand
         _, seconds, ok = line[0].split()
@@ -472,7 +476,7 @@ print("ELAPSED", time.perf_counter() - start, bool(status.ok))
         yield float(seconds)
 
 
-def timed(what: str, size: int, fn) -> float:
+def timed(what: str, size: int, fn: Callable[[], None]) -> float:
     """Run it, and say how fast it moved the bytes."""
     start = time.perf_counter()
     fn()
@@ -498,7 +502,7 @@ def arguments(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def median_of(label: str, size: int, repeat: int, once) -> None:
+def median_of(label: str, size: int, repeat: int, once: Callable[[], None]) -> None:
     """Run one client ``repeat`` times and say what the middle run managed."""
     rates = []
     for _ in range(repeat):
@@ -507,7 +511,26 @@ def median_of(label: str, size: int, repeat: int, once) -> None:
     print(f"  {'-> median':<34} {'':6}     {statistics.median(rates):7.1f} MiB/s\n")
 
 
-def measure(remote: str, size: int, settings, root: Path, env: dict, args) -> None:
+def _ours(remote: str, target: Path, config: xrdclient.Config) -> None:
+    """One copy with this client, then the target removed for the next run."""
+    xrdclient.copy(remote, str(target), config=config, verify=False, overwrite=True)
+    target.unlink(missing_ok=True)
+
+
+def _theirs(command: tuple[str, ...], remote: str, target: Path, env: dict[str, str]) -> None:
+    """One copy with another command-line client, then the target removed."""
+    run(*command, "-f", remote, str(target), env=env)
+    target.unlink(missing_ok=True)
+
+
+def measure(
+    remote: str,
+    size: int,
+    settings: xrdclient.Config,
+    root: Path,
+    env: dict[str, str],
+    args: argparse.Namespace,
+) -> None:
     """Every client this machine has, over the same file, in the same conditions."""
     for label, config in (
         ("xrdclient, bulk data plane", settings),
@@ -515,20 +538,14 @@ def measure(remote: str, size: int, settings, root: Path, env: dict, args) -> No
     ):
         target = root / "downloaded.bin"
 
-        def once(c=config, d=target) -> None:
-            xrdclient.copy(remote, str(d), config=c, verify=False, overwrite=True)
-            d.unlink(missing_ok=True)
-
-        median_of(label, size, args.repeat, once)
+        median_of(label, size, args.repeat, functools.partial(_ours, remote, target, config))
 
     for label, command in others(args.brix):
         target = root / "other.bin"
 
-        def once(a=command, d=target) -> None:
-            run(*a, "-f", remote, str(d), env=env)
-            d.unlink(missing_ok=True)
-
-        median_of(label, size, args.repeat, once)
+        median_of(
+            label, size, args.repeat, functools.partial(_theirs, command, remote, target, env)
+        )
 
     rates = []
     for elapsed in bindings(remote, root / "bindings.bin", env, args.repeat):

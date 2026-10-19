@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from typing import Any
+from typing import Any, Self
 
 import pytest
 
@@ -23,6 +23,7 @@ from xrdclient.copy import (
     CopyTimeoutError,
     NoMoreReplicasError,
     RateThresholdError,
+    copy,
     limits,
     replicas,
 )
@@ -277,8 +278,8 @@ def test_a_dynamic_source_stops_at_the_first_short_read(tmp_path):
         def __init__(self) -> None:
             self.data = bytearray(b"x" * 2500)
 
-        def read(self, size: int) -> bytes:  # pragma: no cover - readinto is used
-            raise AssertionError
+        def read(self, size: int) -> bytes:
+            raise AssertionError("readinto is the one used")
 
         def readinto(self, buffer):
             reads.append(len(buffer))
@@ -353,9 +354,8 @@ def test_coerce_carries_into_a_resumed_upload(tmp_path):
 def test_a_forced_open_that_fails_releases_its_handle(tmp_path):
     source = tmp_path / "s"
     source.write_bytes(PAYLOAD)
-    with FakeServer(files={"/t": b"x"}) as dst:
-        with pytest.raises(FileExistsError):
-            xrdclient.copy(source, dst.url / "t", coerce=True, overwrite=False, config=CONFIG)
+    with FakeServer(files={"/t": b"x"}) as dst, pytest.raises(FileExistsError):
+        xrdclient.copy(source, dst.url / "t", coerce=True, overwrite=False, config=CONFIG)
 
 
 # ---------------------------------------------------------------------------
@@ -363,12 +363,22 @@ def test_a_forced_open_that_fails_releases_its_handle(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _locator(*answers: str) -> FakeServer:
+class _Locator(FakeServer):
+    """A :class:`FakeServer` that remembers the options of the last ``kXR_locate``."""
+
+    locate_options: int | None = None
+
+    def __enter__(self) -> Self:
+        super().__enter__()
+        return self
+
+
+def _locator(*answers: str) -> _Locator:
     """A redirector that says where the file is, and holds nothing itself."""
-    server = FakeServer(files={"/f": PAYLOAD})
+    server = _Locator(files={"/f": PAYLOAD})
 
     def answer(conn, sid, params, body):
-        conn.s.locate_options = int.from_bytes(params[0:2], "big")
+        server.locate_options = int.from_bytes(params[0:2], "big")
         yield frame(sid, c.kXR_ok, " ".join(answers).encode() + b"\x00")
 
     server.handlers[c.kXR_locate] = answer
@@ -424,15 +434,14 @@ def test_several_replicas_each_send_part_of_the_file(tmp_path):
 
 def test_a_replica_that_will_not_open_is_passed_over(tmp_path, closed_port):
     host, port = closed_port
-    with FakeServer(files={"/f": PAYLOAD}) as a:
-        with _locator(f"Sr{host}:{port}", _where(a)) as red:
-            xrdclient.copy(
-                red.url / "f",
-                tmp_path / "t",
-                sources=2,
-                chunk_size=1024,
-                config=_config(connect_timeout=2),
-            )
+    with FakeServer(files={"/f": PAYLOAD}) as a, _locator(f"Sr{host}:{port}", _where(a)) as red:
+        xrdclient.copy(
+            red.url / "f",
+            tmp_path / "t",
+            sources=2,
+            chunk_size=1024,
+            config=_config(connect_timeout=2),
+        )
     assert (tmp_path / "t").read_bytes() == PAYLOAD
 
 
@@ -465,86 +474,86 @@ def test_a_replica_shorter_than_the_file_is_given_up_on(tmp_path):
 def test_when_every_replica_fails_there_are_no_more_to_try(tmp_path):
     with FakeServer(files={"/f": PAYLOAD}) as a:
         a.handlers[c.kXR_read] = lambda conn, sid, params, body: iter([error(sid, 3007, "no")])
-        with _locator(_where(a)) as red:
-            with pytest.raises(NoMoreReplicasError, match=r"No more replicas to try: .*no"):
-                xrdclient.copy(
-                    red.url / "f", tmp_path / "t", sources=3, chunk_size=1024, config=CONFIG
-                )
+        with (
+            _locator(_where(a)) as red,
+            pytest.raises(NoMoreReplicasError, match=r"No more replicas to try: .*no"),
+        ):
+            xrdclient.copy(red.url / "f", tmp_path / "t", sources=3, chunk_size=1024, config=CONFIG)
 
 
 def test_when_no_replica_opens_there_are_none_to_try(tmp_path, closed_port):
     host, port = closed_port
-    with _locator(f"Sr{host}:{port}") as red:
-        with pytest.raises(NoMoreReplicasError):
-            xrdclient.copy(
-                red.url / "f", tmp_path / "t", sources=2, config=_config(connect_timeout=2)
-            )
+    with _locator(f"Sr{host}:{port}") as red, pytest.raises(NoMoreReplicasError):
+        xrdclient.copy(red.url / "f", tmp_path / "t", sources=2, config=_config(connect_timeout=2))
     with _locator() as red, pytest.raises(NoMoreReplicasError, match=r"try$"):
         xrdclient.copy(red.url / "f", tmp_path / "u", sources=2, config=CONFIG)
 
 
 def test_managers_are_followed_down_to_their_servers(tmp_path, closed_port):
     host, port = closed_port
-    with FakeServer(files={"/f": PAYLOAD}) as a, FakeServer(files={"/f": PAYLOAD}) as b:
-        with _locator(_where(b), _where(a)) as lower:
-            with _locator(_where(lower, "Mr"), f"Mr{host}:{port}", _where(lower, "Mr")) as top:
-                found = replicas.locate(top.url / "f", _config(connect_timeout=2))
+    with (
+        FakeServer(files={"/f": PAYLOAD}) as a,
+        FakeServer(files={"/f": PAYLOAD}) as b,
+        _locator(_where(b), _where(a)) as lower,
+        _locator(_where(lower, "Mr"), f"Mr{host}:{port}", _where(lower, "Mr")) as top,
+    ):
+        found = replicas.locate(top.url / "f", _config(connect_timeout=2))
     assert sorted(u.port for u in found) == sorted([a.address[1], b.address[1]])
     assert all(u.path == "/f" for u in found)
 
 
 def test_a_file_the_redirector_cannot_find_fails_before_the_target_is_touched(tmp_path):
-    with FakeServer() as red:
-        with pytest.raises(xrdclient.errors.NotFoundError):
-            xrdclient.copy(red.url / "f", tmp_path / "t", sources=2, config=CONFIG)
+    with FakeServer() as red, pytest.raises(xrdclient.errors.NotFoundError):
+        xrdclient.copy(red.url / "f", tmp_path / "t", sources=2, config=CONFIG)
     assert not (tmp_path / "t").exists()
 
 
 def test_a_write_failure_is_the_copys_not_the_replicas(tmp_path):
     """A reader thread that cannot write stops the others, and its error is raised."""
-    with FakeServer(files={"/f": PAYLOAD}) as a, FakeServer(files={"/f": PAYLOAD}) as b:
-        with _locator(_where(a), _where(b)) as red:
-            calls = []
+    with (
+        FakeServer(files={"/f": PAYLOAD}) as a,
+        FakeServer(files={"/f": PAYLOAD}) as b,
+        _locator(_where(a), _where(b)) as red,
+    ):
+        calls = []
 
-            def refuse(done, total):
-                calls.append(threading.current_thread() is threading.main_thread())
-                if not calls[-1]:
-                    raise OSError(28, "No space left on device")
-                time.sleep(0.05)
+        def refuse(done, total):
+            calls.append(threading.current_thread() is threading.main_thread())
+            if not calls[-1]:
+                raise OSError(28, "No space left on device")
+            time.sleep(0.05)
 
-            with pytest.raises(OSError, match="No space"):
-                xrdclient.copy(
-                    red.url / "f",
-                    tmp_path / "t",
-                    sources=2,
-                    chunk_size=1024,
-                    config=CONFIG,
-                    progress=refuse,
-                )
+        with pytest.raises(OSError, match="No space"):
+            xrdclient.copy(
+                red.url / "f",
+                tmp_path / "t",
+                sources=2,
+                chunk_size=1024,
+                config=CONFIG,
+                progress=refuse,
+            )
 
 
 def test_a_limit_ends_a_copy_from_several_sources(tmp_path):
     with FakeServer(files={"/f": PAYLOAD}) as a, FakeServer(files={"/f": PAYLOAD}) as b:
         _slow_reads(a, 0.2)
         _slow_reads(b, 0.2)
-        with _locator(_where(a), _where(b)) as red:
-            with pytest.raises(CopyTimeoutError):
-                xrdclient.copy(
-                    red.url / "f",
-                    tmp_path / "t",
-                    sources=2,
-                    chunk_size=1024,
-                    config=CONFIG,
-                    timeout=0.3,
-                )
+        with _locator(_where(a), _where(b)) as red, pytest.raises(CopyTimeoutError):
+            xrdclient.copy(
+                red.url / "f",
+                tmp_path / "t",
+                sources=2,
+                chunk_size=1024,
+                config=CONFIG,
+                timeout=0.3,
+            )
 
 
 def test_an_empty_file_from_several_sources(tmp_path):
-    with FakeServer(files={"/f": b""}) as a:
-        with _locator(_where(a)) as red:
-            result = xrdclient.copy(
-                red.url / "f", tmp_path / "t", sources=2, config=CONFIG, verify=False
-            )
+    with FakeServer(files={"/f": b""}) as a, _locator(_where(a)) as red:
+        result = xrdclient.copy(
+            red.url / "f", tmp_path / "t", sources=2, config=CONFIG, verify=False
+        )
     assert result.size == 0 and (tmp_path / "t").read_bytes() == b""
 
 
@@ -642,7 +651,7 @@ def test_third_party_init_timeout_bounds_each_step_of_the_set_up(server, end, op
     with FakeServer() as dst:
         slowed = server if end == "src" else dst
         answer = {c.kXR_open: fake._h_open, c.kXR_sync: fake._h_sync}[opcode]
-        delays = []
+        delays: list[int] = []
 
         def late(conn, sid, params, body):
             if when in body.decode(errors="replace") and not delays:
@@ -683,13 +692,13 @@ def test_the_xrdcp_flags_become_copy_keywords(monkeypatch, tmp_path):
     source = tmp_path / "s"
     source.write_bytes(PAYLOAD)
     calls: list[dict[str, Any]] = []
-    real = cp.copy
+    real = copy
 
     def spy(src, dst, **kwargs):
         calls.append(kwargs)
         return real(src, dst, **kwargs)
 
-    monkeypatch.setattr(cp, "copy", spy)
+    monkeypatch.setattr("xrdclient.cli.cp.copy", spy)
     argv = [
         str(source),
         str(tmp_path / "t"),
@@ -797,7 +806,8 @@ def test_add_job_takes_xrdcl_defaults_from_the_environment(compat_config, monkey
     process = client.CopyProcess()
     process.add_job("root://h//a", "/tmp/b")
     process.add_job("root://h//a", "/tmp/b", xrateThreshold=0, inittimeout=5, cptimeout=7)
-    first, second = process._CopyProcess__jobs
+    # Name-mangled, so reached through the instance dictionary.
+    first, second = vars(process)["_CopyProcess__jobs"]
     assert (first.inittimeout, first.cptimeout, first.xrateThreshold) == (600, 0, 1234)
     assert (second.inittimeout, second.cptimeout, second.xrateThreshold) == (5, 7, 1234)
 
@@ -904,7 +914,7 @@ def theirs():
 
 @pytest.fixture
 def real(real_server, sandbox, monkeypatch):
-    from conftest import _REAL_CONFIG
+    from tests.conftest import _REAL_CONFIG
 
     monkeypatch.setattr(env, "config", lambda: _REAL_CONFIG)
     yield real_server, sandbox
@@ -965,7 +975,7 @@ def test_threshold_and_cptimeout_end_as_with_the_bindings(theirs, real, tmp_path
     server, sandbox = real
     url, _ = _big(server, sandbox, "big", 8 << 20)
 
-    def jobs(side):
+    def jobs(side: str) -> list[tuple[str, str, dict[str, Any]]]:
         swapped = side == "theirs"
         threshold = {"retry": 1 << 40} if swapped else {"xrateThreshold": 1 << 40}
         slow = {"xrateThreshold": 1 << 20} if swapped else {"xrate": 1 << 20}
@@ -993,7 +1003,7 @@ def test_xrate_caps_both_libraries_alike(theirs, real, tmp_path):
     url, data = _big(server, sandbox, "capped", 3 << 20)
     timings = []
 
-    def jobs(side):
+    def jobs(side: str) -> list[tuple[str, str, dict[str, Any]]]:
         cap = {"xrateThreshold": 1 << 20} if side == "theirs" else {"xrate": 1 << 20}
         return [(url, str(tmp_path / side), dict(chunksize=512 << 10, **cap))]
 
@@ -1018,7 +1028,7 @@ def test_xrd_cp_xrate_keeps_pace_with_xrdcp(real, tmp_path):
     import subprocess
 
     if shutil.which("xrdcp") is None:
-        pytest.skip("no xrdcp on PATH")
+        pytest.skip("environment: no xrdcp on PATH")
     server, sandbox = real
     url, data = _big(server, sandbox, "cli", 2 << 20)
     started = time.monotonic()
@@ -1058,7 +1068,7 @@ def test_coerce_ignores_the_file_lock_as_with_the_bindings(theirs, real, tmp_pat
     base = f"{server.url.rstrip('/')}//{sandbox.lstrip('/')}"
     holders = [_held(theirs, sandbox, base, side) for side in ("theirs", "ours")]
 
-    def jobs(side):
+    def jobs(side: str) -> list[tuple[str, str, dict[str, Any]]]:
         return [
             (str(source), f"{base}/{side}-held", {"force": True}),
             (str(source), f"{base}/{side}-held", {"force": True, "coerce": True}),
@@ -1123,14 +1133,14 @@ class _Rooted:
     """A real ``xrootd`` exporting ``/`` from ``root``: the same path on every replica."""
 
     def __init__(self, root: str) -> None:
-        import _xrootd
+        from tests import _xrootd
 
         self.server = _xrootd.RealServer(root)
 
     def __enter__(self) -> Any:
         import subprocess
 
-        import _xrootd
+        from tests import _xrootd
 
         srv = self.server
         srv._config.write_text(
@@ -1156,7 +1166,7 @@ class _Rooted:
 @pytest.mark.parity
 def test_several_real_replicas_as_with_the_bindings(theirs, real_server, tmp_path, monkeypatch):
     """Two daemons with the same file behind a redirector that answers ``kXR_locate``."""
-    from conftest import _REAL_CONFIG
+    from tests.conftest import _REAL_CONFIG
 
     monkeypatch.setattr(env, "config", lambda: _REAL_CONFIG)
     data = os.urandom(6 << 20)
@@ -1183,7 +1193,8 @@ def test_several_real_replicas_as_with_the_bindings(theirs, real_server, tmp_pat
 
 def _last_update(outcome: tuple[Any, list[Any], list[Any]]) -> tuple[int, int]:
     """The first job's last ``(processed, total)``."""
-    return [e[2:] for e in outcome[2] if e[0] == "update" and e[1] == 1][-1]
+    processed, total = [e[2:] for e in outcome[2] if e[0] == "update" and e[1] == 1][-1]
+    return processed, total
 
 
 @pytest.mark.interop
@@ -1192,7 +1203,7 @@ def test_several_fake_replicas_share_the_reading_as_with_the_bindings(
     theirs, tmp_path, monkeypatch
 ):
     """Both libraries spread the reads over both replicas."""
-    from conftest import _REAL_CONFIG
+    from tests.conftest import _REAL_CONFIG
 
     monkeypatch.setattr(env, "config", lambda: _REAL_CONFIG)
     data = os.urandom(4 << 20)

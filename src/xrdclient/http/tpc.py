@@ -15,66 +15,84 @@ and both are handled here:
 * the body is a stream of performance markers that only ends when the
   transfer does, so reading it is how you wait, and the last line says
   ``success:`` or ``failure:``.
+
+Since 0.4.0 what every client of the protocol shares is
+:mod:`xrdhttp.tpc`'s: reading that stream (:func:`follow_markers`, with its
+:class:`Marker` and :class:`Outcome` - xgfalclient's HTTP plugin imports them
+by this module's name and drives the same ``COPY`` the way davix does), the
+request's headers (:func:`xrdhttp.tpc.copy_headers`), and the far side's
+token rules. What stays here is the driver in this package's terms -
+:class:`~xrdclient.XRootDURL` endpoints, a borrowed or owned
+:class:`HTTPClient`, the macaroon minted with this client's own credential,
+cleaning up a destination a failed copy left behind, and the exception an
+outcome raises.
+
+The protocol is the WLCG HTTP-TPC one (the "HttpTpcTechnical" page of the
+WLCG DOMA TPC working group, implemented by dCache, XRootD's XrdHttpTpc,
+StoRM WebDAV and EOS): a WebDAV ``COPY`` (RFC 4918 section 9.8) whose
+``Source:`` (pull) or ``Destination:`` (push) names a URL on *another*
+server, with headers prefixed ``TransferHeader`` passed on - prefix
+stripped - in the request the active side makes to the passive one. The
+header set and the token rules here follow gfal2's HTTP plug-in, so an FTS
+job and this function present the same request:
+
+* ``Overwrite: T``/``F`` - RFC 4918 section 10.6, honoured for the target;
+* ``Credential: none``/``gridsite`` - whether the active side should use a
+  delegated X.509 proxy (GridSite delegation) or only the bearer token;
+* ``RequireChecksumVerification`` and ``X-Number-Of-Streams`` - extensions
+  (dCache's and XrdHttpTpc's) that a server without them ignores; the first
+  is always sent, ``false`` unless asked for, as gfal2 sends it.
+
+The markers themselves borrow GridFTP's ``Perf Marker`` block format; see
+:func:`follow_markers`. Start reading at :func:`third_party`.
 """
 
 from __future__ import annotations
 
-import re
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from .._compat import SLOTS, TIMEOUTS
-from .._log import get_logger
+from xrdhttp import tpc as _lib
+from xrdhttp.redirects import query_token
+from xrdhttp.tpc import (
+    MAX_LINE,
+    READ_ACTIVITIES,
+    WRITE_ACTIVITIES,
+    CopyOptions,
+    Marker,
+    Outcome,
+    OutcomeKind,
+    follow_markers,
+)
+
 from ..config import Config
 from ..copy.engine import CopyResult
 from ..errors import ProtocolError, kXR_ServerError, raise_for_status
 from ..errors import TimeoutError as XRDTimeoutError
+from ..log import get_logger
 from ..url import XRootDURL, parse
 from .client import HTTPClient, absolute_url, bearer_token, status_code
 
-__all__ = ["third_party", "Marker"]
+__all__ = [
+    "MAX_LINE",
+    "READ_ACTIVITIES",
+    "WRITE_ACTIVITIES",
+    "Marker",
+    "Outcome",
+    "OutcomeKind",
+    "follow_markers",
+    "third_party",
+]
 
 _log = get_logger(__name__)
-
-#: Longest line we will believe is a performance marker. A server that sends
-#: more than this is not speaking this protocol, and reading it unbounded is
-#: how a client turns a confused endpoint into an out-of-memory kill.
-MAX_LINE = 1 << 16
-
-#: A ``failure:`` line usually quotes the status the far side got. Reusing it
-#: means a 403 from the source raises the same
-#: :class:`~xrdclient.errors.PermissionError` a direct ``GET`` would have raised,
-#: rather than a generic "the copy failed".
-_STATUS = re.compile(r"\b([45]\d\d)\b")
-
-#: The query keys that carry a token. They are moved into
-#: ``TransferHeaderAuthorization`` rather than left in the URL handed to the
-#: far side, which is where :func:`~xrdclient.http.client.request_target` puts them
-#: for a direct request too.
-_TOKEN_KEYS = ("authz", "access_token")
 
 
 class _Lines(Protocol):
     """Anything the marker reader can pull lines from - an HTTP response."""
 
-    def readline(self, limit: int = ..., /) -> bytes: ...
-
-
-@dataclass(frozen=True, **SLOTS)
-class Marker:
-    """One performance marker: how far one stripe of the transfer has got.
-
-    Servers send one block per stripe every few seconds, which is both the
-    progress report and the keepalive that stops an idle-connection reaper
-    from killing a long transfer.
-    """
-
-    index: int
-    transferred: int
-    stripes: int = 1
-    timestamp: int = 0
+    def readline(self, limit: int = ..., /) -> bytes:
+        """One line, at most ``limit`` bytes, ``b""`` at end of stream."""
 
 
 def third_party(
@@ -93,6 +111,7 @@ def third_party(
     progress: Callable[[int, int | None], None] | None = None,
     timeout: float | None = None,
     mint_token: bool = True,
+    cleanup: bool = True,
 ) -> CopyResult:
     """Ask one HTTP endpoint to transfer ``source`` to ``target`` directly.
 
@@ -103,20 +122,30 @@ def third_party(
     which fetches from the source; ``"push"`` sends it to the source instead,
     for a destination that cannot make outbound connections. The token for
     the *far* endpoint travels in ``TransferHeaderAuthorization``, and is
-    taken from that URL's ``authz`` query parameter, then ``remote_token``,
-    then the ambient token - so a pair of pre-signed URLs just works:
+    taken from that URL's ``authz`` query parameter, then ``remote_token`` -
+    so a pair of pre-signed URLs just works, each token used as given:
 
         >>> third_party(f"{src}?authz={read_token}", f"{dst}?authz={write_token}")
 
-    With none of those, and an ``https`` far end, a macaroon is minted there
-    with this client's own credential - its X.509 proxy, typically - scoped
+    With neither, and an ``https`` far end, a macaroon is minted there with
+    this client's own credential - its X.509 proxy or its ambient bearer
+    token - scoped
     to the one file and to what the transfer needs of it (``LIST,DOWNLOAD``
     to read, ``LIST,DOWNLOAD,MANAGE,UPLOAD,DELETE`` to write) for twice the
     ``timeout`` plus ten minutes. That is gfal2's ``RETRIEVE_BEARER_TOKEN``,
     and it is how a grid user with only a proxy gets EOS and dCache to copy
     between each other: neither can present the user's certificate to the
-    other. ``mint_token=False`` skips it; a far end that cannot mint (no
-    macaroon support) is logged and the copy goes ahead without.
+    other. The ambient token is minted with rather than forwarded because
+    an identity-mapped token (DiracX) that the far end accepts directly is
+    still refused on the server-to-server leg. ``mint_token=False`` skips
+    the mint; a far end that cannot mint (no macaroon support) is logged and
+    the copy goes ahead with the ambient token, if there is one.
+
+    ``verify`` sets ``RequireChecksumVerification``; left at ``None`` it is
+    sent as ``false``, as gfal2 sends it, because a source that puts no digest
+    in its ``HEAD`` would otherwise fail the copy at a destination that checks
+    in band (see :func:`xrdhttp.tpc.add_verification`). :func:`xrdclient.third_party`
+    compares the two ends' checksums itself afterwards.
 
     ``delegate=False`` sends ``Credential: none``, which is what tells a
     server not to go looking for a delegated X.509 credential it was never
@@ -128,25 +157,41 @@ def third_party(
     wait between two performance markers (by default
     :attr:`Config.request_timeout`), not a limit on the whole transfer: a
     copy that keeps reporting progress is alive however long it runs.
+
+    A failed copy that leaves an empty destination behind has it removed
+    (see :func:`_discard_if_ours`), unless ``cleanup=False`` - gfal2's
+    ``transfer_cleanup`` off - leaves it to the caller.
     """
     cfg = config or Config()
     su, du = parse(source), parse(target)
     _require_http(su, du)
-    near, far = (du, su) if mode == "pull" else (su, du)
+    # ``near`` receives the COPY and does the work; ``far`` is only ever
+    # contacted by ``near``, so it is the one the token in
+    # TransferHeaderAuthorization must be good for.
+    near, far = _lib.ends(mode, su, du)
     owned = client or HTTPClient(cfg)
+    # A delegated proxy authorises the far side by itself; minting on top
+    # would only cost a round trip.
     if remote_token is None and mint_token and not delegate:
         remote_token = _minted(far, cfg, owned, write=mode == "push", timeout=timeout)
-    headers = _copy_headers(
-        far, cfg, mode, overwrite, remote_token, delegate, verify, streams, transfer_headers
+    options = CopyOptions(
+        mode,
+        overwrite,
+        _remote_token(far, remote_token, cfg),
+        delegate,
+        verify,
+        streams,
+        transfer_headers,
     )
+    # The near side's own Authorization is added by HTTPClient like any
+    # request's; every header built here is about the far side.
+    headers = _lib.copy_headers(_remote_url(far), options)
     started = time.monotonic()
     _log.debug("COPY %s %s -> %s", mode, su, du)
     try:
         size = _run_copy(owned, near, headers, progress, timeout)
-    except OSError:
-        from ..copy.tpc import discard_if_empty
-
-        discard_if_empty(du, cfg)
+    except OSError as exc:
+        _discard_if_ours(du, cfg, exc, overwrite=overwrite, cleanup=cleanup)
         raise
     finally:
         if client is None:
@@ -154,86 +199,81 @@ def third_party(
     return CopyResult(source=str(su), target=str(du), size=size, seconds=time.monotonic() - started)
 
 
-#: What the far end is asked to allow, as gfal2 asks: reading needs a listing
-#: and a download; writing also needs the name made, filled and - for a
-#: failed copy's cleanup - removed.
-READ_ACTIVITIES = ("LIST", "DOWNLOAD")
-WRITE_ACTIVITIES = ("LIST", "DOWNLOAD", "MANAGE", "UPLOAD", "DELETE")
+def _discard_if_ours(
+    target: XRootDURL, config: Config, exc: OSError, *, overwrite: bool, cleanup: bool
+) -> None:
+    """After a failed ``COPY``: remove an empty destination this copy left behind.
+
+    A target that names the file before refusing the copy (EOS does, even
+    when the refusal is the ``COPY``'s own 401) is left holding an empty
+    file that looks like a finished copy of an empty one, so a failure
+    normally removes an empty destination (see
+    :func:`xrdclient.copy.tpc.discard_if_empty`). The exception is the
+    refusal of a destination that was already there: with ``overwrite``
+    off, ``Overwrite: F`` meeting an existing file answers 412
+    (:class:`FileExistsError`), and that file - empty or not - was never
+    this copy's to remove. ``config`` is the one the ``COPY`` itself went
+    out with, which in pull mode is the destination's. ``cleanup=False``
+    (gfal2's ``transfer_cleanup`` off) removes nothing at all.
+    """
+    if not cleanup or (not overwrite and isinstance(exc, FileExistsError)):
+        return
+    from ..copy.tpc import discard_if_empty
+
+    discard_if_empty(target, config)
 
 
 def _minted(
     far: XRootDURL, config: Config, client: HTTPClient, *, write: bool, timeout: float | None
 ) -> str | None:
-    """A macaroon for ``far``, when nothing else will authorise it; else ``None``."""
-    if not far.use_tls or _remote_token(far, None, config):
+    """A macaroon for ``far``, when nothing else will authorise it; else ``None``.
+
+    A far-end token written at the call site - its URL's ``authz``, or an
+    explicit ``remote_token`` the caller passed (which, when given, means this
+    is never reached) - is the far end's to accept, so it is used as given and
+    no macaroon is minted. But the *ambient* token, the user's own, is not: it
+    authorises the control request to the near side, while the far leg is a
+    server-to-server transfer the active SE makes with whatever
+    ``TransferHeaderAuthorization`` carries, and an identity-mapped token
+    (a DiracX token, say - accepted for a direct read or write, and to mint a
+    macaroon, but not for the delegated leg) is refused there. So a macaroon
+    scoped to this one file is minted with it, exactly as the proxy path does;
+    if the far end cannot mint one, the ambient token is forwarded after all
+    (:func:`_remote_token` falls back to it).
+    """
+    if not far.use_tls or query_token(far.query):
         return None
     from .dav import macaroon
 
-    minutes = 2 * int(timeout or config.request_timeout or 0) // 60 + 10
-    activities = WRITE_ACTIVITIES if write else READ_ACTIVITIES
+    # gfal2's lifetime and scope (xrdhttp.tpc.token_minutes and
+    # macaroon_caveats): long enough to outlast a slow transfer, short enough
+    # that a leaked token is not a standing credential, and only the
+    # activities the transfer needs of the one file.
+    minutes = _lib.token_minutes(timeout or config.request_timeout)
     try:
         return macaroon(
             far,
-            caveats=[f"activity:{','.join(activities)}"],
+            caveats=_lib.macaroon_caveats(write),
             validity=f"PT{minutes}M",
             config=config,
             client=client,
         )
     except (OSError, ProtocolError) as exc:
+        # Not fatal: an endpoint without macaroon support may still accept
+        # the copy on delegation or on a token it trusts by other means.
         _log.debug("no macaroon from %s, copying without one: %s", far.host, exc)
         return None
 
 
 def _require_http(source: XRootDURL, target: XRootDURL) -> None:
+    """Refuse a non-HTTP endpoint before any request is made.
+
+    A mixed ``root://``-to-``https://`` copy is :mod:`xrdclient.copy`'s
+    business; there is no ``COPY`` a ``root://`` server would understand.
+    """
     for url in (source, target):
         if not url.is_http:
             raise ValueError(f"HTTP third-party copy needs two http(s) endpoints, not {url.scheme}")
-
-
-def _copy_headers(
-    far: XRootDURL,
-    config: Config,
-    mode: Literal["pull", "push"],
-    overwrite: bool,
-    explicit_token: str | None,
-    delegate: bool,
-    verify: bool | None,
-    streams: int | None,
-    transfer_headers: Mapping[str, str] | None,
-) -> dict[str, str]:
-    headers = {
-        "Source" if mode == "pull" else "Destination": _remote_url(far),
-        "Overwrite": "T" if overwrite else "F",
-        # Without this a server that supports delegation waits for one.
-        "Credential": "gridsite" if delegate else "none",
-    }
-    _add_token(headers, _remote_token(far, explicit_token, config))
-    _add_verification(headers, verify)
-    _add_streams(headers, streams)
-    _add_transfer_headers(headers, transfer_headers)
-    return headers
-
-
-def _add_token(headers: dict[str, str], token: str | None) -> None:
-    if token:
-        headers["TransferHeaderAuthorization"] = f"Bearer {token}"
-
-
-def _add_verification(headers: dict[str, str], verify: bool | None) -> None:
-    if verify is not None:
-        headers["RequireChecksumVerification"] = "true" if verify else "false"
-
-
-def _add_streams(headers: dict[str, str], streams: int | None) -> None:
-    if streams is not None:
-        headers["X-Number-Of-Streams"] = str(streams)
-
-
-def _add_transfer_headers(
-    headers: dict[str, str], transfer_headers: Mapping[str, str] | None
-) -> None:
-    for name, value in (transfer_headers or {}).items():
-        headers[f"TransferHeader{name}"] = value
 
 
 def _run_copy(
@@ -251,15 +291,10 @@ def _run_copy(
     alive, however long it takes.
     """
     response = client.open("COPY", near, headers=headers, expect=(200, 201, 202), timeout=timeout)
-    try:
+    # Closing reads out a short rest of the markers, and drops the connection
+    # rather than leave a longer one on the socket for the next request.
+    with response:
         return _follow(response, near, progress)
-    except BaseException:
-        # A copy given up mid-body leaves the rest of its markers on the
-        # socket, where the next request on the connection would read them.
-        client.abandon(response)
-        raise
-    finally:
-        response.close()
 
 
 def _remote_url(url: XRootDURL) -> str:
@@ -267,20 +302,23 @@ def _remote_url(url: XRootDURL) -> str:
 
     ``dav``/``davs`` are this package's spelling; on the wire they are
     ``http``/``https``, and a server handed ``davs://`` will not resolve it.
-    The path is percent-encoded and the rest of the query kept as written,
-    since the near side makes a request of its own with this string.
+    The path is percent-encoded and the rest of the query kept exactly as
+    written (:func:`xrdhttp.tpc.strip_tokens`), since the near side makes a
+    request of its own with this string and a signed URL covers its spelling.
     """
-    tokenless = url.evolve(query={k: v for k, v in url.query.items() if k not in _TOKEN_KEYS})
-    return absolute_url(tokenless)
+    return _lib.strip_tokens(absolute_url(url))
 
 
 def _remote_token(url: XRootDURL, explicit: str | None, config: Config) -> str | None:
-    """What authorises the far endpoint: its own URL first, then the ambient."""
-    for key in _TOKEN_KEYS:
-        from_url = url.query.get(key)
-        if from_url:
-            return from_url.removeprefix("Bearer ").strip()
-    return explicit or bearer_token(config)
+    """What authorises the far endpoint: its own URL first, then ``explicit``, then the ambient.
+
+    The URL's ``authz=``/``access_token=`` (a ``Bearer`` prefix dropped) and
+    ``explicit`` are :func:`xrdhttp.tpc.remote_token`'s rule; the ambient
+    token is this package's discovery (:func:`~xrdclient.http.bearer_token`),
+    looked up only when neither is there, so an unreadable token file does
+    not fail a copy that never needed it.
+    """
+    return _lib.remote_token(url.query, explicit) or bearer_token(config)
 
 
 def _follow(
@@ -290,100 +328,40 @@ def _follow(
 ) -> int:
     """Read markers until the outcome, and return the bytes transferred.
 
-    Each stripe reports its own running total, so the transfer's progress is
-    their sum - and a marker for a stripe that has already reported replaces
-    that stripe's contribution rather than adding to it.
-    """
-    stripes: dict[int, int] = {}
-    block: dict[str, str] = {}
-    while True:
-        text = _marker_line(stream, url)
-        finished, block = _consume_line(text, url, block, stripes, progress)
-        if finished:
-            return sum(stripes.values())
-
-
-def _marker_line(stream: _Lines, url: XRootDURL) -> str:
-    """The next line of the ``COPY`` body, stripped.
-
     Silence for longer than the read timeout is a copy that has stopped
     reporting, raised as this package's timeout like any other request's.
     """
+
+    def report(total: int, marker: Marker | None) -> None:
+        """Forward a real marker's running total; keepalive blocks are dropped.
+
+        The size is reported as ``None``: a ``COPY`` never says how big the
+        file is, only how much has moved.
+        """
+        if marker is not None and progress is not None:
+            progress(total, None)
+
     try:
-        line = stream.readline(MAX_LINE)
-    except TIMEOUTS as exc:
+        outcome = follow_markers(stream.readline, report)
+    except TimeoutError as exc:
         raise XRDTimeoutError(
             f"{url.host} sent nothing for longer than the timeout during a copy"
         ) from exc
-    if not line:
+    if outcome.kind == "closed":
         raise ProtocolError(
             f"{url.host} closed the connection before reporting the outcome of the copy"
         )
-    return line.decode("utf-8", "replace").strip()
-
-
-def _consume_line(
-    text: str,
-    url: XRootDURL,
-    block: dict[str, str],
-    stripes: dict[int, int],
-    progress: Callable[[int, int | None], None] | None,
-) -> tuple[bool, dict[str, str]]:
-    lowered = text.lower()
-    if lowered.startswith(("success", "failure", "failed")):
-        _outcome(text, url)
-        return True, block
-    if lowered == "perf marker":
-        return False, {}
-    if lowered == "end":
-        _record_marker(block, stripes, progress)
-    elif ":" in text:
-        name, _, value = text.partition(":")
-        block[name.strip().lower()] = value.strip()
-    return False, block
-
-
-def _record_marker(
-    block: dict[str, str],
-    stripes: dict[int, int],
-    progress: Callable[[int, int | None], None] | None,
-) -> None:
-    marker = _marker(block)
-    if marker is None:
-        return
-    stripes[marker.index] = marker.transferred
-    if progress is not None:
-        progress(sum(stripes.values()), None)
-
-
-def _marker(block: dict[str, str]) -> Marker | None:
-    """A finished ``Perf Marker`` block, or ``None`` if it said nothing useful."""
-    try:
-        transferred = int(block["stripe bytes transferred"])
-    except (KeyError, ValueError):
-        return None
-    return Marker(
-        index=_int(block.get("stripe index"), 0),
-        transferred=transferred,
-        stripes=_int(block.get("total stripe count"), 1),
-        timestamp=_int(block.get("timestamp"), 0),
-    )
-
-
-def _int(value: str | None, default: int) -> int:
-    try:
-        return int(value) if value is not None else default
-    except ValueError:
-        return default
+    _outcome(outcome.line, url)
+    return outcome.transferred
 
 
 def _outcome(text: str, url: XRootDURL) -> None:
     """Raise unless ``text`` is the success line."""
     if text.lower().startswith("success"):
         return
-    detail = text.partition(":")[2].strip() or text
-    found = _STATUS.search(detail)
+    detail, quoted = _lib.failure_detail(text)
     # The far side already classified this; raise what a direct request
-    # would have raised rather than flattening it to "server error".
-    code = status_code(int(found.group(1))) if found else kXR_ServerError
+    # would have raised - a 403 from the source is the PermissionError a
+    # direct GET would have been - rather than flattening it to "server error".
+    code = status_code(quoted) if quoted is not None else kXR_ServerError
     raise_for_status(code, f"third-party copy failed: {detail}", path=url.path)

@@ -23,7 +23,7 @@ fs = client.FileSystem(URL)
 fs.mkdir(WORK, MkDirFlags.MAKEPATH)
 
 
-def explain(label, status):
+def explain(label: str, status: client.responses.XRootDStatus) -> None:
     """Every field a script might branch on."""
     print(label)
     print(f"   ok={status.ok} error={status.error} fatal={status.fatal}")

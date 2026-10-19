@@ -10,8 +10,8 @@ from typing import Any
 import pytest
 
 import xrdclient
-from _brix import BrixProxy
-from conftest import _REAL_CONFIG
+from tests.conftest import _REAL_CONFIG
+from xrdclient.testing.brix import BrixProxy
 
 pytestmark = pytest.mark.interop
 

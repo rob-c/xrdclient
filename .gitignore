@@ -11,6 +11,7 @@ site/
 .coverage
 .coverage.*
 htmlcov/
+.hypothesis/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
@@ -20,3 +21,7 @@ venv/
 
 # Generated datasets
 /datasets/
+
+# Sibling repositories CI checks out beside this one (xrd-devtools' candidates action)
+.dependencies/
+.complexipy_cache/

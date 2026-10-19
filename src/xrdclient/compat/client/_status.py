@@ -10,6 +10,12 @@ Only failures of the *operation* become a status. A ``TypeError`` or
 ``ValueError`` is a mistake in the calling code, and the bindings raise those
 too - an I/O call on a closed file is ``ValueError`` in both - so they are
 left to propagate rather than being dressed up as a server's answer.
+
+The integer names below are module constants (not imported from
+:class:`~.responses.XRootDStatus`) so that the hot path - every failed call
+- compares plain ints, and so this module lists exactly the codes a native
+failure can produce; :class:`~.responses.XRootDStatus` carries the full set
+for callers.
 """
 
 from __future__ import annotations
@@ -23,12 +29,15 @@ from .responses import XRootDStatus
 
 __all__ = ["OK", "UnsupportedURLError", "failure", "from_exception", "guard", "status"]
 
-# XrdCl::XRootDStatus::status
+# XrdCl::XRootDStatus::status. 2 is unused upstream; ``stFatal`` marks the
+# failures XrdCl treats as fatal (a broken connection, a refused login).
 stOK = 0
 stError = 1
 stFatal = 3
 
-# XrdCl::XRootDStatus::code - the ones a native failure can map to.
+# XrdCl::XRootDStatus::code - the ones a native failure can map to. The
+# ``su*`` success codes reuse the small numbers (``suContinue`` is 1, as is
+# ``errRetry``): a code means nothing without the ``status`` level beside it.
 errNone = 0
 suContinue = 1
 suPartial = 3
@@ -55,7 +64,9 @@ errErrorResponse = 400
 errRedirect = 401
 errLocalError = 402
 
-#: XrdCl's words for each code, which lead every status message.
+#: XrdCl's words for each code, which lead every status message. Copied
+#: verbatim - capitalisation (``CheckSum``) included - because scripts match
+#: on these strings.
 _DESCRIPTIONS = {
     errNone: "",
     errUnknown: "Unknown error",
@@ -88,6 +99,8 @@ class UnsupportedURLError(Exception):
 
 
 #: Most specific first: ``isinstance`` picks the first class that matches.
+#: Each row is (native exception, XrdCl ``code``, ``status`` level); the level
+#: is what makes ``status.fatal`` true for the kinds XrdCl gives up on.
 _CLASS_CODES: tuple[tuple[type[BaseException], int, int], ...] = (
     (e.ChecksumMismatchError, errCheckSumError, stError),
     (e.PageIntegrityError, errDataError, stError),
@@ -108,6 +121,8 @@ def status(
     """A status with XrdCl's fields, message and shell code filled in."""
     if level is None:
         level = stOK if code == errNone else stError
+    # ``shellcode`` is XrdCl's ``GetShellCode``: 50 plus the code's hundreds,
+    # the exit status ``xrdcp`` and friends use (54 for a server error).
     return XRootDStatus(
         {
             "status": level,
@@ -124,6 +139,7 @@ def status(
 
 def _message(level: int, code: int, errno: int, detail: str) -> str:
     """XrdCl's rendering: ``[ERROR] <what>: [<errno>] <detail>``."""
+    # The trailing space on a plain success is XrdCl's, and code compares it.
     if level == stOK:
         return "[SUCCESS] Continue" if code == suContinue else "[SUCCESS] "
     prefix = "[FATAL] " if level == stFatal else "[ERROR] "
@@ -157,6 +173,8 @@ def from_exception(exc: BaseException) -> XRootDStatus:
     for cls, code, level in _CLASS_CODES:
         if isinstance(exc, cls):
             return status(code, message=str(exc), level=level)
+    # After the class table: several native errors are ``OSError`` subclasses
+    # (``ConnectionError``, ``TimeoutError``) and must keep their own codes.
     if isinstance(exc, OSError):
         # A local file - the ``file://`` end of a copy - failing the way the
         # operating system says it did.
@@ -166,6 +184,11 @@ def from_exception(exc: BaseException) -> XRootDStatus:
 
 
 def guard(exc: BaseException) -> None:
-    """Re-raise what the bindings would also raise; return for the rest."""
+    """Re-raise what the bindings would also raise; return for the rest.
+
+    ``OSError`` is excluded explicitly: some exceptions are both it and a
+    ``ValueError`` (``io.UnsupportedOperation``), and an ``OSError`` is a
+    failure of the operation, which the bindings report as a status.
+    """
     if isinstance(exc, (TypeError, ValueError)) and not isinstance(exc, OSError):
         raise exc

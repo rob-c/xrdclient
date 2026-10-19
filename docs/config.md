@@ -20,16 +20,17 @@ production. `evolve` returns a new one.
 
 | Field | Default | Environment | Meaning |
 | --- | --- | --- | --- |
-| `connect_timeout` | `30.0` | `XRD_CONNECTIONWINDOW` | TCP connect and login |
+| `connect_timeout` | `30.0` | `XRD_CONNECTIONWINDOW` | name lookup plus TCP connect, all addresses together |
 | `request_timeout` | `300.0` | `XRD_REQUESTTIMEOUT` | one request/response |
-| `stream_timeout` | `60.0` | `XRD_STREAMTIMEOUT` | idle socket before a keepalive |
 | `connect_retries` | `3` | `XRD_CONNECTIONRETRY` | reconnection attempts |
-| `retry_backoff` | `0.5` | `XRD_RETRYBACKOFF` | first backoff, then doubling |
+| `retry_backoff` | `0.5` | `XRD_RETRYBACKOFF` | first backoff ceiling, then doubling; jittered |
 | `redirect_limit` | `16` | `XRD_REDIRECTLIMIT` | redirects before giving up |
 | `wait_cap` | `600.0` | | ceiling on a server-requested wait |
 | `stall_deadline` | `1800.0` | `XRD_STALLDEADLINE` | one whole operation, first byte to last |
 | `wait_budget` | `1800.0` | `XRD_WAITBUDGET` | total parking one operation may be asked for |
-| `keepalive_interval` | `60.0` | | seconds between `kXR_ping`s |
+| `tpc_timeout` | `1800.0` | `XRD_CPTPCTIMEOUT` | a `root://` third-party copy's pull, start to finish (XrdCl's `CPTPCTimeout`); `0` leaves it to the limits above |
+| `keepalive_interval` | `60.0` | `XRD_TCPKEEPALIVETIME` | idle seconds before TCP keepalive probes start; `0` turns them off |
+| `network_stack` | `"IPAuto"` | `XRD_NETWORKSTACK` | address families: `IPAuto`, `IPv4`, `IPv6`, `IPv4Mapped6` |
 
 `request_timeout` bounds a single read from the socket and `stall_deadline`
 bounds the operation those reads add up to: a server that dribbles a byte at a
@@ -38,6 +39,53 @@ exactly what the second is for. A `kXR_wait` restarts the deadline — a delay
 the server declared is not a stall — but the delays are added up against
 `wait_budget`, so a redirector cannot park a caller indefinitely one polite
 minute at a time. Both take `0` to wait forever.
+
+A third-party copy's pull is the exception to all three: the destination
+answers its `kXR_sync` only when the whole file has arrived, and is silent
+until then. `third_party` gives that one connection `tpc_timeout` for each of
+`request_timeout`, `stall_deadline` and `wait_budget` (when it is longer), and
+expires the pull itself once `tpc_timeout` has passed - XrdCl's `CPTPCTimeout`.
+The copy's own `timeout=` argument, when given, takes its place.
+
+Every retry loop in the package - reconnecting, re-opening, resuming a copy,
+a bulk worker getting its span back, an HTTP read - waits the same way:
+exponential with **full jitter**. The *n*-th wait is drawn uniformly between
+zero and `min(wait_cap, retry_backoff * 2**(n-1))` (a bulk worker caps it at
+5 s), and never runs past a [`deadline`](errors.md). The jitter is what stops
+a farm of jobs that lost the same data server from coming back to it in
+lockstep, retry after retry.
+
+**Connecting.** `connect_timeout` is one budget for the whole connect: the
+name lookup (which runs on a helper thread so a stuck resolver cannot exceed
+it) and every address the name has. Those addresses are raced as RFC 8305
+("Happy Eyeballs") describes - families interleaved, a new attempt every
+250 ms or as soon as the previous one is refused, the first to connect wins -
+so a host with a black-holed IPv6 address costs a quarter of a second, not the
+whole window. `network_stack` restricts the families, with XrdCl's names:
+`IPv4` or `IPv6` only, or `IPv4Mapped6` for IPv6 sockets throughout (IPv4
+addresses reached as `::ffff:a.b.c.d`). When nothing connects, the error lists
+every address and what happened to it.
+
+**Keepalive.** Control and data connections have TCP keepalive on: after
+`keepalive_interval` idle seconds the kernel starts probing, a third of that
+apart, and three unanswered probes drop the connection - so a peer that
+vanished without closing (a rebooted node, a NAT that dropped the flow) is
+noticed in about twice the interval instead of at the next request's
+`request_timeout`. The per-socket timings are set where the platform has them
+(`TCP_KEEPIDLE` on Linux, `TCP_KEEPALIVE` on macOS, `TCP_KEEPINTVL`,
+`TCP_KEEPCNT`).
+
+**There is no `stream_timeout`.** XrdCl's `StreamTimeout` is how long a
+connection with requests outstanding may stay silent; here that has always
+been `request_timeout`, which bounds every socket read, and an idle *pooled*
+connection is retired by `pool_idle_ttl`. The field never had an effect and
+was removed in 0.4.0, with `$XRD_STREAMTIMEOUT`. (The pyxrootd layer's
+`StreamTimeout` maps to `request_timeout`.)
+
+**A malformed variable is reported.** `XRD_REQUESTTIMEOUT=5m` is not a
+number; the default is used, as before, but a warning on the
+`xrdclient.config` logger now names the variable, the value and the default
+- once per variable per process.
 
 `XRD_RETRYBACKOFF` is this package's own name. The official client's
 `XRD_STREAMERRORWINDOW` looks similar but is not a backoff: it is how long a
@@ -149,14 +197,20 @@ believes in. `pool_size = 0` turns pooling off entirely.
 | `token_file` | `None` | `BEARER_TOKEN_FILE` |
 | `keytab` | `None` | `XrdSecSSSKT`, `XrdSecsssKT` |
 | `proxy` | `None` | `X509_USER_PROXY` |
+| `usercert` | `None` | `X509_USER_CERT` |
+| `userkey` | `None` | `X509_USER_KEY` |
+| `key_password` | `None` (ask through `prompter`, if anyone can be asked) | |
 | `ca_path` | `None` | `X509_CERT_DIR` |
 | `ca_file` | `None` | `SSL_CERT_FILE` |
+| `tls_system_ca` | `None` (by scheme) | `XRD_TLSSYSTEMCA` |
+| `check_crl` | `""` (off) | `XRD_CHECKCRL` |
 | `auth_order` | `("gsi", "ztn", "krb5", "sss", "unix", "host")` | |
 | `verify_tls` | `True` | |
 | `require_tls` | `False` | |
 | `trusted_redirect_domains` | `()` (credentials stay with their origin) | `XRD_TRUSTEDREDIRECTDOMAINS` |
 | `ztn_cleartext` | `False` | `XRD_ZTNCLEARTEXT` |
 | `gsi_delegate` | `False` | `XrdSecGSIDELEGPROXY` (a positive number turns it on) |
+| `gsi_verify_server` | `True` | `XRD_GSI_VERIFY_SERVER` (`0` turns it off) |
 | `prompt` | `None` (ask only at a terminal) | `XRD_PROMPT` |
 | `prompter` | `None` (ask on the terminal) | |
 
@@ -166,10 +220,42 @@ See [Authentication](auth.md) for what each mechanism looks for.
 is not TLS, which the client otherwise refuses to do - a token sent in the
 clear is a token anyone on the path can replay. Prefer `roots://`.
 
+`usercert` and `userkey` are a user certificate and its private key kept in
+two files (`usercert.pem`, `userkey.pem`) rather than combined as a proxy is.
+They are used when both are set and no `proxy` is - gfal2's order: a named
+proxy, then this pair, then the default proxy location. HTTPS and `roots://`
+present them as the TLS client certificate; GSI logs in with a 12-hour proxy
+it makes from them in memory, as `XrdSecgsi`'s `createpxy` does. Nothing is
+written to disk either way: the key is read once, refused unless it is a
+regular file of yours that group and others cannot read (`chmod 600`), and
+handed to OpenSSL through a pipe. An encrypted key is unlocked with
+`key_password` - a callable returning the pass phrase, asked only when the key
+needs one - or, without it, by asking through `prompter` when `prompt` allows;
+otherwise it is refused with `CredentialError`.
+
+Two TLS settings say which CAs and revocation lists are consulted (see
+[Security](security.md#which-cas-are-trusted)); both default from the
+environment variables they always read:
+
+| Field (variable) | Default | Effect |
+| --- | --- | --- |
+| `tls_system_ca` (`XRD_TLSSYSTEMCA`) | `None`: by scheme | `True` (`1`) adds the system CA store to `ca_path`/`ca_file` for every scheme; `False` (`0`) never does. `None`: `https://` and `s3://` add it and `davs://`/`roots://` do not. Without a grid CA directory the system store is used regardless. |
+| `check_crl` (`XRD_CHECKCRL`) | `""`: off | `"leaf"` (`1`) checks the server certificate against the CRLs (`<hash>.r0`) in `ca_path`; `"chain"` checks every certificate of its chain. Needs `ca_path`; ignored with `verify_tls=False`. |
+
 `gsi_delegate` delegates the X.509 proxy to a GSI server that asks for one -
 what a third-party copy needs from its destination. The server's certificate
 is checked against `ca_path` and the host name first; see
 [Delegation](auth.md#delegation).
+
+`gsi_verify_server` makes every GSI login check the server's certificate -
+CA chain and host name, widened by `$XrdSecGSISRVNAMES` patterns - before
+the proxy chain is sent, as `XrdSecgsi` clients do. Turn it off only for a
+test setup that cannot pass; see [The server proves who it is](auth.md#the-server-proves-who-it-is).
+
+`token_file` set to anything other than `$BEARER_TOKEN_FILE` (its default) is
+read *before* `$BEARER_TOKEN`; left at the default it is read after it, as the
+WLCG discovery order says. Token files, proxies and keytabs must be mode
+`0600` and yours - see [Credential files](auth.md#credential-files-must-be-yours-alone).
 
 ## Behaviour
 
@@ -183,9 +269,35 @@ is checked against `ca_path` and the host name first; see
 | `max_metalink_wait` | `60.0` | `kXR_wait` budget for a replica while another remains |
 | `zip_metalink_checksum` | `False` | with a selected ZIP member, use the Metalink checksum |
 | `s3_folder_markers` | `False` | make `mkdir` on S3 write a zero-length `dir/` marker object |
+| `local_redirect` | `"local"` | follow a `file://` redirect: `never`, `local` (only from a server on this host), `always`; `$XRD_LOCALREDIRECT` |
+| `aio_workers` | `32` | threads `xrdclient.aio` runs calls on; `$XRD_AIOWORKERS` |
+
 `recover_handles=False` turns a lost data server into a `TransientError` at the
 call that hit it, which is what you want when your job would rather fail than
 re-read.
+
+**Going back to the manager.** When a data server a manager sent a request to
+fails it - the connection drops, or it answers `kXR_IOError`, `kXR_FSError`,
+`kXR_ServerError`, `kXR_NotFound`, `kXR_Overloaded` or `kXR_NoMemory` - the
+request goes back to the manager with `tried=<host>` (every server that has
+failed it so far, comma-joined) and `triedrc=<reason>` (`enoent`, `ioerr`,
+`fserr`, `srverr`) in its CGI, as XrdCl does, so the manager routes around it;
+a missing file also sets `kXR_refresh` on the open. A re-opened file
+(`recover_handles`) does the same. Only requests that are safe to repeat are
+sent back - a write is not - and each trip back counts against
+`redirect_limit`, so a file that is nowhere still ends with the server's own
+error.
+
+**Local redirects.** XCache and disk-local sites can answer an open with a
+redirect to `file://localhost/path`: the file is on a disk this machine can
+read. As XrdCl's `LocalFileHandler` does, the file is then read through the
+operating system, with the same `File` API - open, read, vector read, stat,
+close; a write, or a server-side operation such as a checksum, is refused with
+`UnsupportedError`. `local_redirect` decides whether to follow one: by default
+only when the server that sent it is on this host (a loopback address, or the
+host's own), since a remote server that could point a client at any local file
+could have a copy job upload it anywhere; `always` follows them from anywhere,
+as XrdCl does, and `never` refuses them.
 
 ## Username
 
@@ -250,8 +362,8 @@ No file at all means the defaults, which is what an absent dotfile should
 mean. An `--alias` that the file does not define is an error naming the
 aliases it does, because a typo there would quietly connect as somebody else.
 
-Two settings are refused in a file: `prompter`, which is a callable and cannot
-be spelled in INI, and `token`, because a literal bearer token in a dotfile is
+Three settings are refused in a file: `prompter` and `key_password`, which
+are callables and cannot be spelled in INI, and `token`, because a literal bearer token in a dotfile is
 a secret in every backup of that dotfile - say `token_file` instead.
 
 ## Environment only

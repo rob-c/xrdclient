@@ -6,8 +6,9 @@ For code that cannot be edited (a vendored library, someone else's tool),
 compat layer. It must run before anything imports the real bindings, and it
 refuses if they are already imported rather than mixing the two.
 
-The two lines marked ``compat only`` are the whole change; without them this
-is an ordinary PyXRootD script.
+The line marked ``compat only`` is the whole change: it imports
+``_compat_hook``, which calls ``xrdclient.compat.install()``, before the
+PyXRootD imports run. Without it this is an ordinary PyXRootD script.
 
 Usage: python install_hook.py [root://host:port] [/working/dir]
 """
@@ -16,13 +17,12 @@ from __future__ import annotations
 
 import sys
 
-import xrdclient.compat  # compat only
-
-xrdclient.compat.install()  # compat only
+# Imported for its effect; the alias says the unused name is wanted.
+import _compat_hook as _compat_hook  # compat only
+from XRootD import client
+from XRootD.client.flags import MkDirFlags, OpenFlags
 
 # From here on, the file is exactly what a PyXRootD user wrote.
-from XRootD import client  # noqa: E402
-from XRootD.client.flags import MkDirFlags, OpenFlags  # noqa: E402
 
 URL = sys.argv[1] if len(sys.argv) > 1 else "root://localhost:1094"
 WORK = sys.argv[2] if len(sys.argv) > 2 else "/tmp/pyxrootd-examples"

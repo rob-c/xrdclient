@@ -30,9 +30,10 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import TypedDict
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import xrdclient
 from xrdclient.client.file import File
@@ -43,7 +44,7 @@ CONFIG = Config(auth_order=("unix", "host"))
 
 try:
     from XRootD import client as bindings
-except ImportError:  # pragma: no cover - optional
+except ImportError:  # the official bindings are optional
     bindings = None
 
 
@@ -51,12 +52,24 @@ def _mib(count: int) -> str:
     return f"{count / (1 << 20):.1f} MiB"
 
 
+class Row(TypedDict):
+    """One timed case for one client, as printed and as written to ``--json``."""
+
+    case: str
+    client: str
+    seconds: float
+    median: float
+    bytes: int
+    rate_mib_s: float | None
+    ops_s: float | None
+
+
 class Timer:
     """Best-of-N timing, reported as both seconds and throughput."""
 
     def __init__(self, repeat: int) -> None:
         self.repeat = repeat
-        self.rows: list[dict[str, object]] = []
+        self.rows: list[Row] = []
 
     def run(self, case: str, who: str, fn: Callable[[], int]) -> None:
         times: list[float] = []
@@ -66,7 +79,7 @@ class Timer:
             moved = fn()
             times.append(time.perf_counter() - start)
         best = min(times)
-        row = {
+        row: Row = {
             "case": case,
             "client": who,
             # Six places, not the two the printout shows: a metadata call on
@@ -85,15 +98,12 @@ class Timer:
     def report(self) -> None:
         """Print each case's contenders relative to the fastest of them."""
         print("\nrelative to the best in each case (1.00 is fastest):")
-        cases: dict[str, list[dict[str, object]]] = {}
+        cases: dict[str, list[Row]] = {}
         for row in self.rows:
-            cases.setdefault(str(row["case"]), []).append(row)
+            cases.setdefault(row["case"], []).append(row)
         for case, rows in cases.items():
-            best = min(float(r["seconds"]) for r in rows) or 1e-9  # type: ignore[arg-type]
-            parts = " ".join(
-                f"{r['client']}={float(r['seconds']) / best:.2f}x"
-                for r in rows  # type: ignore[arg-type]
-            )
+            best = min(r["seconds"] for r in rows) or 1e-9
+            parts = " ".join(f"{r['client']}={r['seconds'] / best:.2f}x" for r in rows)
             print(f"  {case:<24} {parts}")
 
 
@@ -107,7 +117,7 @@ def endpoint(url: str | None) -> Iterator[tuple[str, str]]:
             fs.mkdir(parsed.path, parents=True, exist_ok=True)
         yield base, parsed.path
         return
-    import _xrootd
+    from tests import _xrootd
 
     if not _xrootd.available():
         sys.exit("no xrootd binary on PATH and no --url given")

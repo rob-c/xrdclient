@@ -38,6 +38,7 @@ def test_oserror_attributes_are_populated():
     with pytest.raises(e.NotFoundError) as info:
         e.raise_for_status(e.kXR_NotFound, "no such file", path="/a/b")
     exc = info.value
+    assert isinstance(exc, FileNotFoundError)
     assert exc.errno == errno.ENOENT
     assert exc.filename == "/a/b"
     assert "no such file" in str(exc)
@@ -56,7 +57,7 @@ def test_unknown_codes_still_raise_a_server_error():
 
 
 def test_ok_does_not_raise():
-    assert e.raise_for_status(0, "") is None
+    e.raise_for_status(0, "")  # returns rather than raising
 
 
 def test_everything_descends_from_xrootderror():
@@ -115,7 +116,7 @@ def test_errors_survive_pickling(exc):
 
 def test_pickled_server_error_keeps_code_and_path():
     back = pickle.loads(pickle.dumps(e.NotFoundError(e.kXR_NotFound, "gone", path="/p")))
-    assert isinstance(back, FileNotFoundError)
+    assert isinstance(back, e.ServerError) and isinstance(back, FileNotFoundError)
     assert (back.code, back.path, back.errno) == (e.kXR_NotFound, "/p", errno.ENOENT)
 
 
@@ -131,7 +132,7 @@ def test_a_server_timeout_is_caught_by_the_same_except_as_a_client_one():
     # falling back to OSError's "[Errno 110] took too long".
     assert str(info.value).startswith("The server request timed out.")
     assert "XRootD error 3034" in str(info.value)
-    assert info.value.message == "took too long"
+    assert isinstance(info.value, e.ServerError) and info.value.message == "took too long"
 
 
 def test_tls_required_names_the_fix():
@@ -149,7 +150,7 @@ def test_tls_required_names_the_fix():
 
 def test_tls_required_survives_pickling():
     back = pickle.loads(pickle.dumps(e.TLSRequiredError(e.kXR_TLSRequired, "TLS", path="/p")))
-    assert isinstance(back, PermissionError)
+    assert isinstance(back, e.TLSRequiredError)
     assert (back.code, back.path, back.errno) == (e.kXR_TLSRequired, "/p", errno.EACCES)
     assert str(back).startswith("The server requires an encrypted connection.")
 
@@ -159,3 +160,69 @@ def test_every_error_code_the_protocol_defines_has_a_name():
     before XProtocol.hh's kXR_ERRFENCE - a gap here prints as a number."""
     for code in range(3000, 3036):
         assert not e._CODE_NAMES[code].startswith("kXR_unknown")
+
+
+# ---------------------------------------------------------------------------
+# The join with xrdcore.errors (docs/errors.md)
+# ---------------------------------------------------------------------------
+
+#: xrdclient's name -> the xrdcore class it *is*.
+SHARED = {
+    "XRootDError": "XrdError",
+    "ProtocolError": "ProtocolError",
+    "MetalinkError": "MetalinkError",
+    "ConnectionError": "ConnectionError",
+    "TransientError": "TransientError",
+    "TimeoutError": "TimeoutError",
+    "AuthenticationError": "AuthenticationError",
+    "CredentialError": "CredentialError",
+    "TokenExpiredError": "TokenExpiredError",
+    "InsecureCredentialError": "InsecureCredentialError",
+}
+
+
+@pytest.mark.parametrize(("ours", "theirs"), sorted(SHARED.items()))
+def test_the_shared_vocabulary_is_xrdcores_own_classes(ours, theirs):
+    from xrdcore import errors as core
+
+    assert getattr(e, ours) is getattr(core, theirs)
+
+
+@pytest.mark.parametrize("name", sorted(set(SHARED) - {"XRootDError"}))
+def test_what_a_library_raises_is_caught_by_the_client_name(name):
+    """``except xrdclient.errors.X`` catches the X xrdcore, xrdsec or xrdhttp raise."""
+    from xrdcore import errors as core
+
+    library_error = getattr(core, SHARED[name])
+    raised = (
+        library_error("proxy is world-readable", "/tmp/x509up_u1")
+        if name == "InsecureCredentialError"
+        else library_error("from a library")
+    )
+    with pytest.raises(getattr(e, name)):
+        raise raised
+    with pytest.raises(e.XRootDError):
+        raise raised
+
+
+def test_the_client_only_errors_join_the_shared_base():
+    """XRootD's own errors are what ``except xrdcore.errors.XrdError`` catches too."""
+    from xrdcore import errors as core
+
+    for cls in (e.ServerError, e.NotFoundError, e.AbortedError, e.NoMechanismError):
+        assert issubclass(cls, core.XrdError)
+    assert issubclass(e.ServerTimeoutError, core.TimeoutError)
+    assert issubclass(e.WaitLimitError, core.TransientError)
+    assert issubclass(e.ServerTimeoutError, TimeoutError)  # still the builtin as well
+    with pytest.raises(core.TimeoutError):
+        e.raise_for_status(e.kXR_ReqTimedOut, "slow", path="/a")
+
+
+def test_a_shared_error_pickles_with_its_state():
+    """``InsecureCredentialError.path`` survives a process boundary (it did not before 0.4.0)."""
+    error = e.InsecureCredentialError("too open", "/tmp/x509up_u1")
+    back = pickle.loads(pickle.dumps(error))
+    assert type(back) is e.InsecureCredentialError
+    assert (str(back), back.path) == ("too open", "/tmp/x509up_u1")
+    transient = pickle.loads(pickle.dumps(e.TimeoutError("late", attempts=3, committed=9)))
+    assert (transient.attempts, transient.committed) == (3, 9)

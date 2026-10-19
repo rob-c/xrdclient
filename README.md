@@ -45,23 +45,36 @@ bindings.
 $ pip install xrdclient                 # includes the generic runtime dependencies
 ```
 
-Requires Python 3.9.2+. Runtime dependencies are `botocore`, `PyJWT[crypto]`,
-`urllib3`, `asn1crypto` and `cryptography`.
-The [0.3.0 release notes](CHANGELOG.md) describe the current unreleased
-candidate. Python 3.9 clean installation is currently blocked by the
-botocore/urllib3 dependency conflict; see [platform status](docs/platforms.md).
-XML parsing uses a local declaration-rejecting wrapper around Python's built-in
+Requires Python 3.11+. Runtime dependencies are
+`cryptography`, [xrdcore](https://github.com/rob-c/xrdcore),
+the dependency-free core this client shares with xgfalclient and xrdarc
+(safe XML, checksums, log redaction, cancellation, the copy pump, backoff,
+the `--json`/`--xml` report and the error vocabulary), and
+[xrdhttp](https://github.com/rob-c/xrdhttp), the HTTP protocol pieces it
+shares with xgfalclient (request engine, connections, WebDAV, byte ranges,
+Tape REST, HTTP third-party copy, Metalink, S3 SigV4 - which brings
+`botocore`, imported only when an `s3://` URL is used), and
+[xrdsec](https://github.com/rob-c/xrdsec), the grid security all three
+clients share (X.509 and proxies, VOMS, tokens, credential discovery, TLS
+contexts; it brings `asn1crypto`).
+The [0.4.0 release notes](CHANGELOG.md) describe the current unreleased
+candidate; see [platform status](docs/platforms.md) for the tested platforms.
+XML parsing uses xrdcore's declaration-rejecting wrapper around Python's built-in
 parsers; no libxml2, lxml or XML build tools are required. Binary protocol
 records use local, bounds-checked readers and standard-library `struct`.
 Cryptography supplies native wheels for supported mainstream platforms.
 
-Native Kerberos is optional: `pip install 'xrdclient[krb5]'` adds python-gssapi
-and pykrb5 (distribution name `krb5`). Both have macOS wheels; Linux source
-installs need a C compiler and Kerberos development headers. The default
-install keeps the portable Kerberos paths without requesting either binding.
-Set `XRD_KRB5_BACKEND=native` to use pykrb5 for credential-cache reads.
+Native Kerberos is optional: `pip install 'xrdclient[krb5]'` adds python-gssapi,
+which has macOS wheels; Linux source installs need a C compiler and Kerberos
+development headers. The default install keeps the portable Kerberos paths
+without requesting the binding.
 
-CI checks wheel-only dependency resolution for Python 3.9 and 3.14 on
+Paged reads/writes and `crc32c` checksums want `pip install 'xrdclient[fast]'`
+(which installs `xrdcore[fast]`, i.e. google-crc32c, wheels for CPython 3.11-3.14 on Linux x86_64/aarch64 and
+macOS); without it a pure-Python CRC-32C runs at a few MB/s. `xrd-fs doctor`
+says which is in use.
+
+CI checks wheel-only dependency resolution for Python 3.11 and 3.14 on
 macOS Intel/Apple Silicon, glibc Linux (2.28+) and musl Linux (1.2+), on x86-64
 and ARM64. Clean installs are exercised on Linux and macOS. These gates check
 current releases; they cannot guarantee future upstream wheel availability.
@@ -70,15 +83,16 @@ Python's built-in XML parser must be kept up to date through Python or
 operating-system updates. Parser regression tests cover declaration rejection,
 encoded input, malformed records and existing protocol error codes.
 
-The maintained libraries own AWS signing, JWT claim decoding, DER primitives,
+The maintained libraries own AWS signing, DER primitives,
 cipher/curve operations and connection setup/TLS. Protocol-specific GSI,
 RFC 3820/VOMS policy, redirects and upload handshakes remain client adapters.
 Legacy raw-RSA GSI operations, 512-bit compatibility key generation and
 XRootD ticket forwarding still retain local implementations.
 
-xrdclient also owns the small security/parsing core shared with xgfalclient:
-VOMS policy and diagnostics, DER and RSA helpers, AES/signature adapters,
-X.509 names and declaration-rejecting XML loading. It remains independently
+xrdclient also owns the small security core shared with xgfalclient:
+VOMS policy and diagnostics, DER and RSA helpers, AES/signature adapters and
+X.509 names; the declaration-rejecting XML loading, checksums and report
+format it shares are xrdcore's. It remains independently
 installable and does not import or depend on xgfalclient.
 
 ## What it does
@@ -340,9 +354,9 @@ and no `openssl`. The remainder are the interoperability suite, which runs again
 real `xrootd` daemon and reads back what `xrdcp` and `xrdfs` write, and the
 parity suite, which runs every operation through this client and the official
 XRootD bindings and compares the answers field by field. Coverage is 100% of
-statements *and* branches across the package, and the wire protocol, the
-cryptography and the client surface are gated there; `ruff` and
-`mypy --strict` pass clean and are hard gates too. An absolute
+statements *and* branches across the whole package, and gated there; `ruff`,
+`mypy --strict` (over the tests, tools and examples too) and complexipy pass
+clean and are hard gates, with no suppression comments to get there. An absolute
 [maintainability gate](docs/maintainability.md) reports CCN, Cognitive
 Complexity, NPath, Halstead Volume and maximum nesting per function and file;
 the same limits apply to all existing and new code, without baseline allowances. The
@@ -376,6 +390,13 @@ can delegate the X.509 proxy - `Config(gsi_delegate=True)` or
 `XrdSecGSIDELEGPROXY=1`, off by default as in the stock client - signing the
 server's proxy request only once its certificate checks out against the CA
 directory and the host name. See [Authentication](docs/auth.md).
+
+**Proxies and VOMS.** `xrd-proxy init -voms atlas` makes a VOMS proxy the way
+`voms-proxy-init` does - the AC fetched over VOMS' REST interface, the proxy
+made in memory and written `0600` - and `xrd-proxy info`/`destroy` stand in
+for `voms-proxy-info`/`voms-proxy-destroy`. From Python, one issuer
+(`xrdclient.crypto.proxies`) makes RFC 3820, ARC, XRootD and legacy Globus
+proxies. See [Proxies and VOMS](docs/proxy.md).
 
 Not yet: HTTP/2.
 

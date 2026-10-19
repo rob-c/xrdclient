@@ -16,7 +16,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from _xrootd import XROOTD, RealServer
+from tests._xrootd import XROOTD, RealServer
 
 OPENSSL = shutil.which("openssl")
 
@@ -82,11 +82,12 @@ class PKI:
         for who in ("ca", "host", "user", "proxy"):
             _openssl("genrsa", "-out", str(root / f"{who}.key"), "2048")
         _openssl(
-            "req", "-new", "-x509", "-key", str(root / "ca.key"), "-out", str(root / "ca.pem"),
-            "-days", "2", "-subj", "/O=example/CN=Demo CA",
-            "-addext", "basicConstraints=critical,CA:TRUE",
-            "-addext", "keyUsage=critical,keyCertSign,cRLSign",
-        )  # fmt: skip
+            *("req", "-new", "-x509", "-days", "2"),
+            *("-key", str(root / "ca.key"), "-out", str(root / "ca.pem")),
+            *("-subj", "/O=example/CN=Demo CA"),
+            *("-addext", "basicConstraints=critical,CA:TRUE"),
+            *("-addext", "keyUsage=critical,keyCertSign,cRLSign"),
+        )
         self._issue("host", "/O=example/CN=localhost", "ca", "02", "host.ext")
         self._issue("user", USER_DN, "ca", "03", "user.ext")
         self._issue("proxy", PROXY_DN, "user", "04", "proxy.ext", extensions="proxy")
@@ -115,15 +116,15 @@ class PKI:
     ) -> None:
         root = self.root
         _openssl(
-            "req", "-new", "-key", str(root / f"{who}.key"), "-out", str(root / f"{who}.csr"),
-            "-subj", subject,
-        )  # fmt: skip
+            *("req", "-new", "-subj", subject),
+            *("-key", str(root / f"{who}.key"), "-out", str(root / f"{who}.csr")),
+        )
         argv = [
-            "x509", "-req", "-in", str(root / f"{who}.csr"),
-            "-CA", str(root / f"{issuer}.pem"), "-CAkey", str(root / f"{issuer}.key"),
-            "-set_serial", serial, "-days", "1", "-out", str(root / f"{who}.pem"),
-            "-extfile", str(root / ext),
-        ]  # fmt: skip
+            *("x509", "-req", "-in", str(root / f"{who}.csr")),
+            *("-CA", str(root / f"{issuer}.pem"), "-CAkey", str(root / f"{issuer}.key")),
+            *("-set_serial", serial, "-days", "1", "-out", str(root / f"{who}.pem")),
+            *("-extfile", str(root / ext)),
+        ]
         if extensions:
             argv += ["-extensions", extensions]
         _openssl(*argv)
@@ -132,15 +133,15 @@ class PKI:
         """``openssl verify`` of one delegated proxy, through Jane's proxy, to the CA."""
         return subprocess.run(
             [
-                str(OPENSSL), "verify", "-allow_proxy_certs",
-                "-CAfile", str(self.root / "ca.pem"),
-                "-untrusted", str(self.untrusted),
+                *(str(OPENSSL), "verify", "-allow_proxy_certs"),
+                *("-CAfile", str(self.root / "ca.pem")),
+                *("-untrusted", str(self.untrusted)),
                 str(leaf_pem),
             ],
             capture_output=True,
             text=True,
             check=False,
-        )  # fmt: skip
+        )
 
 
 class GSIXrootd(RealServer):

@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+from typing import Any
 
 from xrdclient.compat import client  # was: from XRootD import client
 from xrdclient.compat.client.flags import MkDirFlags
@@ -27,18 +28,18 @@ class Progress(client.utils.CopyProgressHandler):
     def __init__(self) -> None:
         self.updates: dict[int, tuple[int, int]] = {}
 
-    def begin(self, jobId, total, source, target):
+    def begin(self, jobId: int, total: int, source: client.URL, target: client.URL) -> None:
         print(f"job {jobId} of {total}: {source.protocol} -> {target.protocol}")
 
-    def update(self, jobId, processed, total):
+    def update(self, jobId: int, processed: int, total: int) -> None:
         # How many updates arrive depends on the chunking; the last one does not.
         self.updates[jobId] = (processed, total)
 
-    def end(self, jobId, results):
+    def end(self, jobId: int, results: dict[str, Any]) -> None:
         processed, total = self.updates.get(jobId, (0, 0))
         print(f"job {jobId} done: {results['status']} last update {processed}/{total}")
 
-    def should_cancel(self, jobId):
+    def should_cancel(self, jobId: int) -> bool:
         return False
 
 

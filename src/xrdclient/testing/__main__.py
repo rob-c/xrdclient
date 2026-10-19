@@ -7,7 +7,7 @@ module its own package has already imported.
 
 from __future__ import annotations
 
-from .server import main
+from .server import main as main
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     raise SystemExit(main())

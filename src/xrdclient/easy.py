@@ -33,36 +33,36 @@ import os
 import shutil
 import stat as _stat
 from collections.abc import Sequence
-from typing import Union
+
+from xrdcore.checksum import new as new_checksum
 
 from .config import Config
-from .crypto import new as new_checksum
 from .flags import StatInfoFlags, permissions
 from .path import XRootDPath
 from .types import ChecksumInfo, StatInfo
 from .url import XRootDURL, parse
 
 __all__ = [
-    "ls",
-    "glob",
-    "stat",
-    "exists",
-    "size",
     "checksum",
+    "exists",
+    "glob",
+    "is_online",
+    "ls",
+    "mkdir",
+    "move",
     "read_bytes",
     "read_text",
+    "remove",
+    "size",
+    "stage",
+    "stat",
     "write_bytes",
     "write_text",
-    "mkdir",
-    "remove",
-    "move",
-    "stage",
-    "is_online",
 ]
 
 #: What every verb here will take for a place: the URL as text, as a parsed
 #: URL, or as a path object somebody already has.
-Location = Union[str, XRootDURL, XRootDPath]
+Location = str | XRootDURL | XRootDPath
 
 
 def _url(location: Location) -> XRootDURL:
@@ -146,12 +146,28 @@ def glob(pattern: Location, *, config: Config | None = None) -> list[XRootDPath]
 
         xrdclient.glob("root://eos.example.org//store/run7/**/*.root")
 
+    ``?`` matches one character, even though it is also a URL's query
+    delimiter: the pattern is read back from the parsed URL with
+    :meth:`~xrdclient.url.XRootDURL.glob_pattern`, so ``.../f??.dat`` is not
+    cut short at its first ``?``. The listings themselves go through the URL
+    with no query at all, since that "query" is part of the pattern and a
+    strict server (dCache) rejects it as stray opaque data.
+
     A local pattern is :meth:`pathlib.Path.glob`'s job.
     """
     _refuse_local(pattern, "glob", "use pathlib.Path.glob")
-    with XRootDPath(pattern, config) as here:
-        found = list(here.fs.glob(here.url.path))
-    return [XRootDPath(here.url.with_path(path), config) for path in found]
+    from .client import FileSystem
+
+    url = _url(pattern)
+    target = url.glob_pattern()
+    # A pattern ending in '?' parses to an empty query, so glob_pattern cannot
+    # tell it from a path with no '?' at all; restore that one '?'.
+    if isinstance(pattern, str) and pattern.endswith("?") and not target.endswith("?"):
+        target += "?"
+    base = url.without_query()
+    with FileSystem(base, config) as fs:
+        found = list(fs.glob(target))
+    return [XRootDPath(base.with_path(path), config) for path in found]
 
 
 def stat(url: Location, *, config: Config | None = None) -> StatInfo:

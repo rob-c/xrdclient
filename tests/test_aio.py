@@ -5,19 +5,24 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from collections.abc import Coroutine
+from typing import Any, TypeVar
 
 import pytest
+from xrdcore.fanout import Pool
 
 import xrdclient
 from xrdclient.aio import AsyncFile, AsyncFileSystem
 from xrdclient.errors import UnsupportedError
 from xrdclient.flags import DirListFlags, QueryCode
 from xrdclient.testing import FakeDAVServer, FakeServer
+from xrdclient.types import StatInfo
 
 BODY = b"hello world"
+T = TypeVar("T")
 
 
-def run(coroutine):
+def run(coroutine: Coroutine[Any, Any, T]) -> T:
     """Drive one coroutine to completion on a fresh event loop."""
     return asyncio.run(coroutine)
 
@@ -64,7 +69,7 @@ def test_the_facade_is_reachable_both_ways():
 
 
 def test_a_file_reads_the_way_it_does_synchronously(server):
-    async def main():
+    async def main() -> None:
         async with xrdclient.aio.open(server.url / "data/a.root") as handle:
             assert handle.readable() and not handle.writable()
             assert handle.seekable() and not handle.closed
@@ -78,7 +83,7 @@ def test_a_file_reads_the_way_it_does_synchronously(server):
 
 
 def test_await_open_gives_a_file_you_close_yourself(server):
-    async def main():
+    async def main() -> None:
         handle = await xrdclient.aio.open(server.url / "data/a.root")
         try:
             assert await handle.read() == BODY
@@ -91,7 +96,7 @@ def test_await_open_gives_a_file_you_close_yourself(server):
 
 
 def test_text_mode_survives_the_crossing(server):
-    async def main():
+    async def main() -> None:
         async with xrdclient.aio.open(server.url / "data/a.root", "r") as handle:
             assert await handle.read() == "hello world"
 
@@ -101,7 +106,7 @@ def test_text_mode_survives_the_crossing(server):
 def test_a_file_iterates_line_by_line(server):
     server.add_file("/data/lines.txt", b"one\ntwo\nthree\n")
 
-    async def main():
+    async def main() -> list[bytes]:
         async with xrdclient.aio.open(server.url / "data/lines.txt") as handle:
             return [line async for line in handle]
 
@@ -109,7 +114,7 @@ def test_a_file_iterates_line_by_line(server):
 
 
 def test_writing_and_flushing(server):
-    async def main():
+    async def main() -> None:
         async with xrdclient.aio.open(server.url / "data/out.bin", "wb") as handle:
             assert await handle.write(b"written") == 7
             await handle.flush()
@@ -123,7 +128,7 @@ def test_writing_and_flushing(server):
 
 
 def test_readinto_fills_the_buffer_given(server):
-    async def main():
+    async def main() -> bytes:
         buffer = bytearray(5)
         async with xrdclient.aio.open(server.url / "data/a.root", buffering=0) as handle:
             assert await handle.readinto(buffer) == 5
@@ -133,7 +138,7 @@ def test_readinto_fills_the_buffer_given(server):
 
 
 def test_the_protocol_level_operations_are_there(server):
-    async def main():
+    async def main() -> None:
         async with xrdclient.aio.open(server.url / "data/a.root") as handle:
             assert handle.file is not None
             assert await handle.readv([(0, 5), (6, 5)]) == [b"hello", b"world"]
@@ -147,7 +152,7 @@ def test_the_protocol_level_operations_are_there(server):
 
 
 def test_the_scattered_write_operations_are_there(server):
-    async def main():
+    async def main() -> None:
         async with xrdclient.aio.open(server.url / "data/v.bin", "wb") as handle:
             assert await handle.writev([(0, b"aaaa"), (4, b"bbbb")]) == 8
             assert await handle.pgwrite(b"cc", 8) == 2
@@ -160,11 +165,12 @@ def test_the_scattered_write_operations_are_there(server):
 
 
 def test_a_clone_copies_ranges_server_side(server):
-    async def main():
+    async def main() -> None:
         async with xrdclient.aio.open(server.url / "data/c.bin", "wb") as handle:
             await handle.write(b"0123456789")
             await handle.flush()  # the server can only clone what it has
             assert await handle.clone(handle, [(0, 4, 10)]) == 4  # the async wrapper
+            assert handle.file is not None
             assert await handle.clone(handle.file, [(0, 4, 14)]) == 4  # the file underneath
 
     run(main())
@@ -174,7 +180,7 @@ def test_a_clone_copies_ranges_server_side(server):
 def test_cloning_from_something_that_is_not_a_root_file_is_refused(server):
     import io as _io
 
-    async def main():
+    async def main() -> None:
         async with xrdclient.aio.open(server.url / "data/c.bin", "wb") as handle:
             with pytest.raises(UnsupportedError, match="clone needs a root://"):
                 await handle.clone(AsyncFile(_io.BytesIO(b"local")))
@@ -183,7 +189,7 @@ def test_cloning_from_something_that_is_not_a_root_file_is_refused(server):
 
 
 def test_lines_are_read_and_written_in_bulk(server):
-    async def main():
+    async def main() -> None:
         async with xrdclient.aio.open(server.url / "data/l.txt", "w") as handle:
             await handle.writelines(["one\n", "two\n"])
         async with xrdclient.aio.open(server.url / "data/l.txt", "r") as handle:
@@ -195,7 +201,7 @@ def test_lines_are_read_and_written_in_bulk(server):
 
 
 def test_what_http_cannot_do_says_so_rather_than_failing_obscurely(dav):
-    async def main():
+    async def main() -> None:
         async with xrdclient.aio.open(dav.url / "d/a.root") as handle:
             assert await handle.read() == BODY
             assert handle.file is None
@@ -206,7 +212,7 @@ def test_what_http_cannot_do_says_so_rather_than_failing_obscurely(dav):
 
 
 def test_the_raw_object_is_reachable_for_anything_not_mirrored(server):
-    async def main():
+    async def main() -> None:
         async with xrdclient.aio.open(server.url / "data/a.root") as handle:
             assert handle.mode == "rb"
             assert handle.name.endswith("/data/a.root")
@@ -230,7 +236,7 @@ def test_constructing_a_filesystem_touches_no_network():
 
 
 def test_the_namespace_surface(server):
-    async def main():
+    async def main() -> None:
         async with AsyncFileSystem(server.url) as fs:
             await _assert_namespace_metadata(fs)
             await _assert_namespace_operations(fs)
@@ -238,7 +244,7 @@ def test_the_namespace_surface(server):
     run(main())
 
 
-async def _assert_namespace_metadata(fs):
+async def _assert_namespace_metadata(fs) -> None:
     await fs.ping()
     assert (await fs.protocol()).version
     assert (await fs.stat("/data/a.root")).st_size == len(BODY)
@@ -249,7 +255,7 @@ async def _assert_namespace_metadata(fs):
     assert await fs.getsize("/data/a.root") == len(BODY)
 
 
-async def _assert_namespace_operations(fs):
+async def _assert_namespace_operations(fs) -> None:
     assert await fs.listdir("/data") == ["a.root", "empty"]
     assert [e.name for e in await fs.scandir("/data")] == ["a.root", "empty"]
     assert (await fs.checksum("/data/a.root")).value == "1a0b045d"
@@ -263,7 +269,7 @@ async def _assert_namespace_operations(fs):
 def test_the_friendly_keywords_reach_the_synchronous_call(server):
     """The facade is a thread away from the sync one; the words have to survive."""
 
-    async def main():
+    async def main() -> None:
         async with AsyncFileSystem(server.url) as fs:
             listed = await fs.scandir("/data", stat=False, online=True)
             assert [e.name for e in listed] == ["a.root", "empty"]
@@ -280,11 +286,12 @@ def test_the_friendly_keywords_reach_the_synchronous_call(server):
 def test_a_listing_can_digest_every_entry(server):
     """The digest keyword survives the trip through the executor."""
 
-    async def main():
+    async def main() -> None:
         async with AsyncFileSystem(server.url) as fs:
             listed = {e.name: e.checksum for e in await fs.scandir("/data", algorithm="adler32")}
-            assert listed["a.root"].algorithm == "adler32"
-            assert listed["a.root"].value == "1a0b045d"
+            digest = listed["a.root"]
+            assert digest is not None
+            assert (digest.algorithm, digest.value) == ("adler32", "1a0b045d")
             assert listed["empty"] is None  # a directory has nothing to digest
 
     run(main())
@@ -294,7 +301,7 @@ def test_the_server_side_bookkeeping_is_mirrored(server):
     """The calls that ask a server to stop doing something, or to label who is
     asking, are as much part of the surface as the ones that move bytes."""
 
-    async def main():
+    async def main() -> None:
         async with AsyncFileSystem(server.url) as fs:
             handle = await fs.prepare(["/data/a.root"])
             assert (await fs.query_prepare(handle, ["/data/a.root"]))[0].online
@@ -315,7 +322,7 @@ def test_the_server_side_bookkeeping_is_mirrored(server):
 def test_listing_is_lazy_and_asynchronous(server):
     server.add_file("/data/sub/deep.bin", b"x")
 
-    async def main():
+    async def main() -> tuple[list[str], list[str], list[str]]:
         async with AsyncFileSystem(server.url) as fs:
             names = [entry.name async for entry in fs.iterdir("/data")]
             roots = [root async for root, _dirs, _files in fs.walk("/data")]
@@ -333,16 +340,17 @@ def test_an_iteration_stopped_early_stops_the_walk_too(server):
     for index in range(4):
         server.add_file(f"/data/tree/{index}/f.bin", b"x")
 
-    async def main():
+    async def main() -> str | None:
         async with AsyncFileSystem(server.url) as fs:
             async for root, _dirs, _files in fs.walk("/data/tree"):
                 return root
+        return None
 
     assert run(main()) == "/data/tree"
 
 
 def test_the_mutation_surface(server):
-    async def main():
+    async def main() -> None:
         async with AsyncFileSystem(server.url) as fs:
             await fs.mkdir("/data/new")
             await fs.makedirs("/data/new/deep/deeper", exist_ok=True)
@@ -365,7 +373,7 @@ def test_the_mutation_surface(server):
 def test_the_optional_arguments_are_passed_through_not_swallowed(server):
     server.add_file("/data/tree/deep/f.bin", b"x")
 
-    async def main():
+    async def main() -> None:
         async with AsyncFileSystem(server.url) as fs:
             assert await fs.query(QueryCode.CONFIG, "version")  # raw, undecoded
             listed = await fs.scandir("/data", flags=DirListFlags.NONE)
@@ -385,7 +393,7 @@ def test_the_optional_arguments_are_passed_through_not_swallowed(server):
 
 
 def test_extended_attributes(server):
-    async def main():
+    async def main() -> None:
         async with AsyncFileSystem(server.url) as fs:
             await fs.setxattr("/data/a.root", "run", b"42")
             assert await fs.getxattr("/data/a.root", "run") == b"42"
@@ -400,7 +408,7 @@ def test_extended_attributes(server):
 
 
 def test_a_filesystem_opens_files_both_ways(server):
-    async def main():
+    async def main() -> None:
         async with AsyncFileSystem(server.url) as fs:
             async with fs.open("/data/a.root") as handle:
                 assert await handle.read() == BODY
@@ -423,7 +431,7 @@ def test_a_mirror_can_share_an_existing_connection(server):
 
 
 def test_errors_arrive_as_the_same_exceptions(server):
-    async def main():
+    async def main() -> None:
         async with AsyncFileSystem(server.url) as fs:
             with pytest.raises(FileNotFoundError):
                 await fs.stat("/data/nope")
@@ -432,7 +440,7 @@ def test_errors_arrive_as_the_same_exceptions(server):
 
 
 def test_webdav_endpoints_work_through_the_same_facade(dav):
-    async def main():
+    async def main() -> None:
         async with AsyncFileSystem(dav.url) as fs:
             assert await fs.listdir("/d") == ["a.root"]
             assert await fs.read_bytes("/d/a.root") == BODY
@@ -452,11 +460,13 @@ def test_webdav_endpoints_work_through_the_same_facade(dav):
 def test_two_endpoints_are_read_at_the_same_time(server):
     """The loop is never blocked, so separate connections overlap."""
 
-    async def main():
+    async def main() -> list[bytes]:
         with FakeServer(files={"/data/b.root": b"second"}) as other:
             async with AsyncFileSystem(server.url) as first, AsyncFileSystem(other.url) as second:
-                return await asyncio.gather(
-                    first.read_bytes("/data/a.root"), second.read_bytes("/data/b.root")
+                return list(
+                    await asyncio.gather(
+                        first.read_bytes("/data/a.root"), second.read_bytes("/data/b.root")
+                    )
                 )
 
     assert run(main()) == [BODY, b"second"]
@@ -467,7 +477,7 @@ def test_one_endpoint_serialises_rather_than_corrupting(server):
     for index in range(6):
         server.add_file(f"/data/n{index}.bin", str(index).encode() * 4)
 
-    async def main():
+    async def main() -> list[bytes]:
         async with AsyncFileSystem(server.url) as fs:
             return await asyncio.gather(*(fs.read_bytes(f"/data/n{i}.bin") for i in range(6)))
 
@@ -475,7 +485,7 @@ def test_one_endpoint_serialises_rather_than_corrupting(server):
 
 
 def test_copying_is_awaitable(server, tmp_path):
-    async def main():
+    async def main() -> None:
         result = await xrdclient.aio.copy(server.url / "data/a.root", tmp_path / "out.root")
         assert result.size == len(BODY)
         results = await xrdclient.aio.copy_tree(server.url / "data", tmp_path / "tree")
@@ -494,7 +504,7 @@ def test_copying_is_awaitable(server, tmp_path):
 def test_an_async_file_is_its_own_context_manager(server):
     """``await open(...)`` then ``async with`` on the result: still closed once."""
 
-    async def main():
+    async def main() -> AsyncFile[Any]:
         handle = await xrdclient.aio.open(server.url / "data/a.root")
         async with handle as inner:
             assert inner is handle
@@ -508,7 +518,7 @@ def test_an_async_file_is_its_own_context_manager(server):
 def test_leaving_an_unentered_open_alone_closes_nothing(server):
     """``__aexit__`` with nothing opened is the path a failed ``__aenter__`` takes."""
 
-    async def main():
+    async def main() -> None:
         opening = xrdclient.aio.open(server.url / "data/a.root")
         await opening.__aexit__(None, None, None)
 
@@ -521,7 +531,7 @@ def test_leaving_an_unentered_open_alone_closes_nothing(server):
 
 
 def test_the_link_family_is_mirrored(server):
-    async def main():
+    async def main() -> None:
         async with AsyncFileSystem(server.url) as fs:
             await fs.symlink("/data/a.root", "/data/soft")
             assert await fs.readlink("/data/soft") == "/data/a.root"
@@ -534,7 +544,7 @@ def test_the_link_family_is_mirrored(server):
 
 
 def test_the_times_and_the_owner_are_set_from_a_coroutine(server):
-    async def main():
+    async def main() -> None:
         async with AsyncFileSystem(server.url) as fs:
             await fs.utime(
                 "/data/a.root", ns=(1_000_000_000_000_000_001, 2_000_000_000_000_000_002)
@@ -547,7 +557,7 @@ def test_the_times_and_the_owner_are_set_from_a_coroutine(server):
 
 
 def test_lstat_describes_the_link_and_stat_what_it_points_at(server):
-    async def main():
+    async def main() -> tuple[StatInfo, StatInfo]:
         async with AsyncFileSystem(server.url) as fs:
             await fs.symlink("/data/a.root", "/data/soft")
             assert await fs.is_symlink("/data/soft")
@@ -563,14 +573,16 @@ def test_lstat_describes_the_link_and_stat_what_it_points_at(server):
 def test_a_checkpoint_commits_what_the_block_wrote(server):
     from xrdclient.proto import constants as c
 
-    async def main():
-        async with xrdclient.aio.open(server.url / "data/a.root", "r+b") as handle:
-            async with handle.checkpoint() as checkpoint:
-                await handle.write(b"HELLO")
-                await handle.flush()
-                info = await checkpoint.query()
-                assert info.used == 5
-                assert repr(checkpoint).startswith("AsyncCheckpoint(")
+    async def main() -> None:
+        async with (
+            xrdclient.aio.open(server.url / "data/a.root", "r+b") as handle,
+            handle.checkpoint() as checkpoint,
+        ):
+            await handle.write(b"HELLO")
+            await handle.flush()
+            info = await checkpoint.query()
+            assert info.used == 5
+            assert repr(checkpoint).startswith("AsyncCheckpoint(")
 
     run(main())
     assert server.contents("/data/a.root") == b"HELLO world"
@@ -578,7 +590,7 @@ def test_a_checkpoint_commits_what_the_block_wrote(server):
 
 
 def test_a_checkpoint_rolls_back_what_raised(server):
-    async def main():
+    async def main() -> None:
         async with xrdclient.aio.open(server.url / "data/a.root", "r+b") as handle:
             with pytest.raises(ZeroDivisionError):
                 async with handle.checkpoint():
@@ -591,7 +603,7 @@ def test_a_checkpoint_rolls_back_what_raised(server):
 
 
 def test_a_checkpoint_needs_a_root_endpoint(dav):
-    async def main():
+    async def main() -> None:
         async with xrdclient.aio.open(str(dav.url) + "d/a.root") as handle:
             with pytest.raises(UnsupportedError, match="checkpoint"):
                 async with handle.checkpoint():
@@ -606,7 +618,7 @@ def test_a_checkpoint_needs_a_root_endpoint(dav):
 
 
 def test_positional_reads_and_writes_leave_the_cursor_alone(server):
-    async def main():
+    async def main() -> None:
         async with xrdclient.aio.open(server.url / "data/p.bin", "w+b") as handle:
             await handle.write(b"0123456789")  # still in the buffer: pwrite must not overtake it
             assert await handle.pwrite(b"AB", 2) == 2
@@ -619,7 +631,7 @@ def test_positional_reads_and_writes_leave_the_cursor_alone(server):
 
 
 def test_extended_attributes_on_an_open_handle(server):
-    async def main():
+    async def main() -> None:
         async with xrdclient.aio.open(server.url / "data/a.root", "r+b") as handle:
             await handle.setxattr("run", b"7")
             assert await handle.getxattr("run") == b"7"
@@ -631,12 +643,13 @@ def test_extended_attributes_on_an_open_handle(server):
 
 
 def test_the_handle_bookkeeping_is_mirrored(server):
-    async def main():
+    async def main() -> None:
         async with xrdclient.aio.open(server.url / "data/a.root") as handle:
             assert handle.is_open
             assert await handle.size() == len(BODY)
             assert handle.compression == (0, "")
             assert handle.recoverable
+            assert handle.file is not None
             assert handle.endpoint == handle.file.endpoint
             assert isinstance(await handle.visa(), bytes)
             await handle.verify("1a0b045d")
@@ -648,7 +661,7 @@ def test_the_handle_bookkeeping_is_mirrored(server):
 
 
 def test_the_positional_and_attribute_calls_need_a_root_endpoint(dav):
-    async def main():
+    async def main() -> None:
         async with xrdclient.aio.open(dav.url / "d/a.root") as handle:
             with pytest.raises(UnsupportedError, match="pread needs a root://"):
                 await handle.pread(5, 0)
@@ -666,7 +679,7 @@ def test_the_positional_and_attribute_calls_need_a_root_endpoint(dav):
 def test_move_and_unlink_are_the_os_spellings(server):
     server.add_file("/data/m.bin", b"m")
 
-    async def main():
+    async def main() -> None:
         async with AsyncFileSystem(server.url) as fs:
             await fs.move("/data/m.bin", "/data/n.bin")
             assert await fs.exists("/data/n.bin")
@@ -678,9 +691,9 @@ def test_move_and_unlink_are_the_os_spellings(server):
 
 def test_walk_takes_the_os_walk_arguments(server):
     server.add_file("/data/tree/x/f.bin", b"x")
-    seen = []
+    seen: list[OSError] = []
 
-    async def main():
+    async def main() -> list[str]:
         async with AsyncFileSystem(server.url) as fs:
             return [
                 root
@@ -699,7 +712,7 @@ def test_walk_takes_the_os_walk_arguments(server):
 
 
 def test_the_easy_listing_verbs_are_awaitable(server, config):
-    async def main():
+    async def main() -> tuple[list[str], list[str]]:
         listed = await xrdclient.aio.ls(server.url.with_path("/data"), config=config)
         matched = await xrdclient.aio.glob(server.url.with_path("/data/*.root"), config=config)
         return [p.name for p in listed], [p.name for p in matched]
@@ -711,7 +724,7 @@ def test_the_easy_reading_verbs_are_awaitable(server, config):
     aio = xrdclient.aio
     url = server.url.with_path("/data/a.root")
 
-    async def main():
+    async def main() -> None:
         assert (await aio.stat(url, config=config)).st_size == len(BODY)
         assert await aio.exists(url, config=config)
         assert await aio.size(url, config=config) == len(BODY)
@@ -727,7 +740,7 @@ def test_the_easy_reading_verbs_are_awaitable(server, config):
 def test_the_easy_mutating_verbs_are_awaitable(server, config):
     aio = xrdclient.aio
 
-    async def main():
+    async def main() -> None:
         made = server.url.with_path("/data/new/deeper")
         await aio.mkdir(made, 0o700, parents=True, exist_ok=False, config=config)
         target = server.url.with_path("/data/new/deeper/t.txt")
@@ -753,11 +766,108 @@ def test_fcntl_and_archive_listings_are_mirrored(server):
     server.add_file("/data/a.zip", buffer.getvalue())
     server.fctl = lambda path, data: data[::-1]
 
-    async def main():
+    async def main() -> None:
         async with xrdclient.aio.open(server.url / "data/a.root") as handle:
             assert await handle.fcntl(b"abc") == b"cba"
         async with AsyncFileSystem(server.url) as fs:
             entries = await fs.list_archive("/data/a.zip")
-        assert [(e.name, e.stat.st_size) for e in entries] == [("member", 1)]
+        assert [(e.name, e.stat and e.stat.st_size) for e in entries] == [("member", 1)]
 
     run(main())
+
+
+# ---------------------------------------------------------------------------
+# Its own pool, shared handles, cancelled opens
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fresh_pool(monkeypatch):
+    import xrdclient.aio as aio
+
+    monkeypatch.setattr(aio, "_pool", Pool("xrd-aio", aio._workers))
+    yield aio
+    aio._pool.shutdown()
+
+
+def test_calls_run_on_the_facades_own_pool_sized_by_the_config(fresh_pool):
+    import threading
+
+    aio = fresh_pool
+    with xrdclient.config.override(aio_workers=3):
+        name = run(aio._run(lambda: threading.current_thread().name))
+    assert name.startswith("xrd-aio")
+    assert aio._pool.executor()._max_workers == 3
+
+
+def test_the_callers_context_reaches_the_worker(fresh_pool):
+    async def main() -> float:
+        with xrdclient.config.override(request_timeout=12.5):
+            timeout: float = await fresh_pool._run(lambda: xrdclient.Config().request_timeout)
+            return timeout
+
+    assert run(main()) == 12.5
+
+
+def test_concurrent_preads_on_one_file_are_safe(fresh_pool):
+    data = bytes(range(256)) * 4096
+    with FakeServer(files={"/f": data}) as srv:
+
+        async def main() -> bytes:
+            async with fresh_pool.open(srv.url.with_path("/f"), "rb", buffering=0) as fh:
+                offsets = list(range(0, len(data), 16384))
+                got = await asyncio.gather(*(fh.pread(16384, at) for at in offsets))
+                return b"".join(got)
+
+        assert run(main()) == data
+
+
+def test_a_cancelled_open_closes_the_handle_it_produced(fresh_pool, monkeypatch):
+    import threading
+
+    aio = fresh_pool
+    started, finish, closed = threading.Event(), threading.Event(), threading.Event()
+
+    class Handle:
+        def close(self) -> None:
+            closed.set()
+
+    def slow_open(*args: object, **kwargs: object) -> Handle:
+        started.set()
+        finish.wait(5)
+        return Handle()
+
+    monkeypatch.setattr(aio, "_open_url", slow_open)
+
+    async def main() -> None:
+        task = asyncio.ensure_future(aio.open("root://h//f").__aenter__())
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        finish.set()
+
+    run(main())
+    assert closed.wait(5)
+
+
+def test_a_cancelled_open_that_never_started_leaves_nothing_behind(fresh_pool):
+    import concurrent.futures
+
+    aio = fresh_pool
+    future: concurrent.futures.Future[object] = concurrent.futures.Future()
+    future.cancel()
+    aio._release_late(future, lambda value: pytest.fail("released"))
+    failed: concurrent.futures.Future[object] = concurrent.futures.Future()
+    failed.set_exception(OSError("no such file"))
+    aio._release_late(failed, lambda value: pytest.fail("released"))
+
+
+def test_a_late_close_that_fails_is_only_logged(fresh_pool, caplog):
+    def broken(value) -> None:
+        raise OSError("already gone")
+
+    with caplog.at_level("DEBUG", logger="xrdclient.aio"):
+        fresh_pool._quietly(broken, "handle")
+    assert "after its caller gave up on it failed" in caplog.text

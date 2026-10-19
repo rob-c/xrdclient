@@ -18,6 +18,18 @@ xrdclient.copy("root://a.example.org//store/f.root", "davs://b.example.org/store
 Schemes: `http`, `https`, `dav`, `davs`, `webdav`. Nothing here needs a wheel
 - `http.client` and `xml.etree` do the work.
 
+Since 0.4.0 the protocol pieces - the redirect loop and stale-connection
+retry, the connections, `Expect: 100-continue`, multi-range reads,
+`PROPFIND` parsing, the WLCG Tape REST and HTTP-TPC vocabulary, Metalink,
+and which credentials may follow a redirect - are
+[xrdhttp](https://github.com/rob-c/xrdhttp)'s, shared with xgfalclient's
+gfal2 HTTP plug-in. Behaviour described on this page is this package's
+facade on them: its URL type, configuration, credentials, TLS contexts and
+errors. A relative `Location` now keeps the scheme it was reached by (a hop
+from `davs://` stays `davs://`, and keeps the grid's CA set), and a
+network-path one (`//other.host/x`) no longer carries the user name to the
+other host.
+
 ## What the WebDAV filesystem supports
 
 | Operation | Method |
@@ -27,8 +39,9 @@ Schemes: `http`, `https`, `dav`, `davs`, `webdav`. Nothing here needs a wheel
 | `mkdir`, `makedirs` | `MKCOL` |
 | `remove`, `rmdir`, `rmtree` | `DELETE` |
 | `rename` | `MOVE` |
-| `checksum` | RFC 3230 `Want-Digest` / `Digest` |
+| `checksum` | RFC 9530 `Want-Repr-Digest` / `Repr-Digest`, and RFC 3230 `Want-Digest` / `Digest` |
 | `read_bytes`, `open` | `GET`, with `Range` for seeks |
+| `readv` on an open file, fsspec `cat_ranges` | one multi-range `GET`, `multipart/byteranges` back |
 | `write_bytes`, `open("wb")` | `PUT` |
 | `third_party` | `COPY` with `Source:`/`Destination:` |
 | `prepare`, `query_prepare`, `cancel_prepare` | the WLCG tape API, `/api/v1/stage` |
@@ -82,6 +95,38 @@ which arrives as a `NotFoundError` naming the API path.
 are detected (a `200` where a `206` was asked for) and reported rather than
 silently returning the whole file.
 
+### Vector reads
+
+`HTTPRawIO.readv(ranges)` - what `open(..., buffering=0)` returns over
+`http(s)://`/`dav(s)://`, and what fsspec's `cat_ranges` uses - asks for every
+range in one request (`Range: bytes=0-99,4096-4195`, up to 64 per request)
+and reads the `multipart/byteranges` answer. Overlapping and touching ranges
+are merged before they are asked for; the answer is one `bytes` per range, in
+the order asked, and the file position does not move.
+
+What comes back is checked rather than trusted: every part must lie inside a
+range that was asked for, the parts together may not carry more than those
+ranges hold (with some slack for a server that coalesces small gaps, which
+RFC 9110 allows), and boundary lines and part headers are read within fixed
+limits. Memory is the bytes asked for plus a 1 MiB read buffer. A server that
+serves only one range, or ignores `Range` and starts sending the whole file,
+is not read to the end: the remaining ranges are fetched one request each,
+and that file stops asking for several at once. S3 never serves several
+ranges, so `s3://` files use single-range requests from the start. The total
+asked for is bounded by `Config.max_read_size`, as a whole-file read is.
+
+## Checksums
+
+`checksum()` sends both negotiations in one `HEAD`: RFC 9530's
+`Want-Repr-Digest: sha-256=10` and RFC 3230's `Want-Digest: sha-256`. A
+`Repr-Digest` answer (a structured-field dictionary of base64 byte
+sequences, `sha-256=:...:`, with parameters ignored and repeated header lines
+joined) is preferred when the server sends both; otherwise `Digest` is read
+as before, then `Content-MD5` for MD5. RFC 9530's registry names are mapped
+to this library's: `sha-256`/`sha-512`, `sha` (SHA-1), `adler` (`adler32`),
+`crc32c`, `md5`; our own names are accepted too, and a hex token where a
+byte sequence belongs is read rather than discarded.
+
 ## Authentication
 
 ```python
@@ -92,6 +137,20 @@ Config(proxy="/tmp/x509up_u1000")     # mutual TLS with the X.509 proxy
 A bearer token goes in the `Authorization` header; an X.509 proxy is
 presented as the client certificate for `davs://` and `https://` alike. The
 same `Config` drives both protocols.
+
+### TLS
+
+Connections are the standard library's own `http.client.HTTPSConnection`:
+SNI names the host, the certificate must name it too, and the handshake is
+bounded by `connect_timeout`. The TLS context is built once per distinct
+setup - trust store, verification, proxy - and shared by every connection,
+including `roots://` ones; it is rebuilt when the proxy file, the CA file or
+the CA directory changes on disk, so a renewed proxy is picked up on the next
+connection. Which CAs are trusted depends on the scheme: `davs://` uses the
+grid CA directory alone, while `https://` - and every S3 endpoint - adds the
+system store. See [Security](security.md#which-cas-are-trusted) and
+[Configuration](config.md#security) for `XRD_TLSSYSTEMCA` and
+`XRD_CHECKCRL`.
 
 ### Credentials and redirects
 
@@ -110,6 +169,15 @@ the rule that browsers, `curl` and `requests` use:
 - A token that the redirect itself carries (`Location: ...?authz=...`) is
   still presented, because the redirecting server chose to hand it over.
   That is how dCache and EOS doors usually hand off.
+- A `COPY`'s `TransferHeader*` headers - the far side's credential, not
+  yours - also follow a redirect within the origin's parent domain
+  (`eoslhcb.cern.ch` to `st-096-*.cern.ch`), even onto `http`, because EOS
+  hands every copy to a disk server that way. Not when that parent is a
+  public suffix: `se.ac.uk`'s parent is `ac.uk`, every university in the
+  country, so its headers stay with `se.ac.uk` itself. A curated list of
+  research-network registries (`ac.uk`, `ac.jp`, `edu.au`, `ernet.in`...) and
+  any `ac`/`co`/`com`/`edu`/`gov`/`net`/`org`/`gob`/`or`/`ne`/`go` directly
+  under a country code count as public suffixes.
 - An S3 signature is still computed for each hop. It is bound to the host it
   was computed for, so no other host can use it.
 

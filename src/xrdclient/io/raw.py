@@ -21,27 +21,76 @@ if TYPE_CHECKING:
 #: ``parse_mode`` and ``flags_for_mode`` live in :mod:`xrdclient.flags`, which has
 #: no imports of its own; they are re-exported here because this is where
 #: mode strings are turned into open requests.
-__all__ = ["XRootDRawIO", "flags_for_mode", "parse_mode", "OpenBinaryMode", "OpenTextMode"]
+__all__ = ["OpenBinaryMode", "OpenTextMode", "XRootDRawIO", "flags_for_mode", "parse_mode"]
 
 #: The mode strings that mean bytes, spelled the ways people actually spell
 #: them. :func:`parse_mode` accepts any permutation at runtime; these exist so
 #: that a literal mode gives the caller a precisely typed file object back.
 OpenBinaryMode = Literal[
-    "rb", "br", "wb", "bw", "xb", "bx", "ab", "ba",
-    "rb+", "r+b", "br+", "wb+", "w+b", "bw+",
-    "xb+", "x+b", "bx+", "ab+", "a+b", "ba+",
-]  # fmt: skip
+    "rb",
+    "br",
+    "wb",
+    "bw",
+    "xb",
+    "bx",
+    "ab",
+    "ba",
+    "rb+",
+    "r+b",
+    "br+",
+    "wb+",
+    "w+b",
+    "bw+",
+    "xb+",
+    "x+b",
+    "bx+",
+    "ab+",
+    "a+b",
+    "ba+",
+]
 
 #: The mode strings that mean text - the default, exactly as for the builtin.
 OpenTextMode = Literal[
-    "r", "w", "x", "a", "rt", "tr", "wt", "tw", "xt", "tx", "at", "ta",
-    "r+", "rt+", "r+t", "w+", "wt+", "w+t",
-    "x+", "xt+", "x+t", "a+", "at+", "a+t",
-]  # fmt: skip
+    "r",
+    "w",
+    "x",
+    "a",
+    "rt",
+    "tr",
+    "wt",
+    "tw",
+    "xt",
+    "tx",
+    "at",
+    "ta",
+    "r+",
+    "rt+",
+    "r+t",
+    "w+",
+    "wt+",
+    "w+t",
+    "x+",
+    "xt+",
+    "x+t",
+    "a+",
+    "at+",
+    "a+t",
+]
 
 
 class XRootDRawIO(io.RawIOBase):
-    """Unbuffered binary I/O on a remote file."""
+    """Unbuffered binary I/O on a remote file.
+
+    Every :meth:`readinto` and :meth:`write` is a positioned request on the
+    underlying :class:`~xrdclient.client.file.File` (``kXR_read`` /
+    ``kXR_write`` at an explicit offset): the position lives here, not on the
+    server, which is what makes :meth:`seek` free. The object owns the handle
+    and closes it with itself; :attr:`file` lends it out for vector and paged
+    reads, which have no :mod:`io` equivalent.
+
+    Normally reached through :func:`~xrdclient.io.open_url` with
+    ``buffering=0``, or underneath its buffered layers.
+    """
 
     def __init__(
         self,
@@ -51,6 +100,15 @@ class XRootDRawIO(io.RawIOBase):
         posc: bool = False,
         opened: bool = False,
     ) -> None:
+        """Wrap ``file``, opening it for ``mode`` unless ``opened`` says it already is.
+
+        ``mode`` is a builtin :func:`open` mode string, mapped to XRootD open
+        flags by :func:`~xrdclient.flags.flags_for_mode`. ``posc`` adds
+        persist-on-successful-close (``kXR_posc``): the server deletes the
+        file if the handle is lost before :meth:`close`. ``opened`` is for a
+        caller that opened the handle itself with flags of its choosing. In
+        ``"a"`` mode the position starts at the end, as for a local file.
+        """
         super().__init__()
         base, _, updating = parse_mode(mode)
         self._file = file
@@ -86,23 +144,29 @@ class XRootDRawIO(io.RawIOBase):
     # -- capabilities ---------------------------------------------------
 
     def readable(self) -> bool:
+        """Whether the mode allows reading (``r`` or any ``+``)."""
         return self._readable
 
     def writable(self) -> bool:
+        """Whether the mode allows writing (``w``, ``x``, ``a`` or any ``+``)."""
         return self._writable
 
     def seekable(self) -> bool:
+        """Always true: every request carries its own offset."""
         return True
 
     def isatty(self) -> bool:
+        """Always false; asked by :class:`io.TextIOWrapper` to pick line buffering."""
         return False
 
     @property
     def mode(self) -> str:
+        """The mode string as given to the constructor."""
         return self._mode
 
     @property
     def name(self) -> str:
+        """The file's URL, as the handle reports it."""
         return str(self._file.url)
 
     @property
@@ -113,9 +177,17 @@ class XRootDRawIO(io.RawIOBase):
     # -- position -------------------------------------------------------
 
     def tell(self) -> int:
+        """The client-side position; no request is made."""
         return self._pos
 
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        """Move the position, as :meth:`io.IOBase.seek` does, without a round trip.
+
+        ``SEEK_END`` uses the size the handle last saw (from the open, or a
+        later stat), so it can be stale if another client is writing.
+        Seeking past the end is allowed - a write there leaves a hole, as on
+        a local file - and a negative result is ``EINVAL``.
+        """
         if whence == io.SEEK_SET:
             target = offset
         elif whence == io.SEEK_CUR:
@@ -132,6 +204,7 @@ class XRootDRawIO(io.RawIOBase):
     # -- data -----------------------------------------------------------
 
     def readinto(self, buffer: WriteableBuffer) -> int:
+        """Read up to ``len(buffer)`` bytes at the position; 0 means end of file."""
         self._check_readable()
         view = memoryview(buffer).cast("B")
         if not view:
@@ -158,6 +231,11 @@ class XRootDRawIO(io.RawIOBase):
         return data
 
     def write(self, data: ReadableBuffer) -> int:
+        """Write ``data`` at the position (the current end in ``"a"`` mode).
+
+        Returns the count the server accepted, which a buffered writer above
+        uses to know what is left to send; a refused write raises instead.
+        """
         self._check_writable()
         payload = _flat(data)
         if not payload:
@@ -173,16 +251,23 @@ class XRootDRawIO(io.RawIOBase):
         return written
 
     def truncate(self, size: int | None = None) -> int:
+        """``kXR_truncate`` to ``size`` (default: the position); the position stays."""
         self._check_writable()
         target = self._pos if size is None else size
         self._file.truncate(target)
         return target
 
     def flush(self) -> None:
+        """``kXR_sync`` a writable, open handle: data the server holds reaches storage.
+
+        A no-op otherwise, because :class:`io.IOBase` calls ``flush`` from
+        ``close`` and from finalisers, where a closed handle must not raise.
+        """
         if self._writable and not self.closed and self._file.is_open:
             self._file.sync()
 
     def close(self) -> None:
+        """Flush, then close the remote handle; a second call does nothing."""
         if self.closed:
             return
         try:
@@ -194,18 +279,21 @@ class XRootDRawIO(io.RawIOBase):
     # -- checks ---------------------------------------------------------
 
     def _check_readable(self) -> None:
+        """The errors the builtin raises for a closed or write-only file."""
         if self.closed:
             raise ValueError("I/O operation on closed file")
         if not self._readable:
             raise io.UnsupportedOperation(f"{self.name} is not open for reading")
 
     def _check_writable(self) -> None:
+        """The errors the builtin raises for a closed or read-only file."""
         if self.closed:
             raise ValueError("I/O operation on closed file")
         if not self._writable:
             raise io.UnsupportedOperation(f"{self.name} is not open for writing")
 
     def __repr__(self) -> str:
+        """URL, mode and position, for debugging."""
         return f"XRootDRawIO({self.name!r}, mode={self._mode!r}, pos={self._pos})"
 
 

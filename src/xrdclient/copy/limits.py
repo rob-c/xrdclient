@@ -16,10 +16,9 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from .._compat import SLOTS
 from ..errors import TimeoutError, TransientError
 
-__all__ = ["CopyTimeoutError", "RateThresholdError", "Pace", "Limits"]
+__all__ = ["CopyTimeoutError", "Limits", "Pace", "RateThresholdError"]
 
 #: Called with ``(bytes_done, total_or_None)`` after every chunk.
 Progress = Callable[[int, "int | None"], None]
@@ -45,11 +44,12 @@ class _Stop(Exception):
     """
 
     def __init__(self, error: Exception) -> None:
+        """Carry ``error`` for the engine to unwrap and raise as itself."""
         super().__init__(str(error))
         self.error = error
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class Limits:
     """What a caller asked of the copy's pace; every field off by default."""
 
@@ -64,6 +64,7 @@ class Limits:
 
     @property
     def active(self) -> bool:
+        """Whether any limit is set; if not, the engine skips :class:`Pace` entirely."""
         return bool(self.max_rate or self.min_rate or self.timeout)
 
 
@@ -77,6 +78,7 @@ class Pace:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
+        """Start the copy's clock now; ``clock`` and ``sleep`` are seams for tests."""
         self._limits = limits
         self._clock = clock
         self._sleep = sleep
@@ -101,7 +103,12 @@ class Pace:
         self._flowing = self._clock()
 
     def chunk(self, length: int) -> None:
-        """One more chunk of ``length`` bytes has arrived."""
+        """One more chunk of ``length`` bytes has arrived.
+
+        Several bulk workers report into one :class:`Pace`; the lock is held
+        through the throttle's sleep on purpose, so that ``max_rate`` caps the
+        copy as a whole rather than each worker separately.
+        """
         with self._lock:
             self.check()
             self._throttle(length)
@@ -137,6 +144,7 @@ class Pace:
         seen = start
 
         def report(done: int, total: int | None) -> None:
+            """Measure the chunk since the last report, then pass the report on."""
             nonlocal seen
             try:
                 self.chunk(done - seen)

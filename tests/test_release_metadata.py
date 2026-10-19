@@ -1,21 +1,20 @@
-"""Release metadata stays connected to the public runtime version."""
+"""xrdclient's release metadata: xrd-devtools' release gate, run on this checkout.
 
-from pathlib import Path
+One version source (``src/xrdclient/_version.py``), a CHANGELOG led by exactly
+that version's section, project metadata and README that name this
+repository, and a release workflow that builds through the shared publish
+action: the checks every repository of the chain shares
+(``xrddevtools.release``). The gate is found in an xrd-devtools checkout (a
+sibling ``../xrd-devtools``, CI's ``.dependencies/xrd-devtools``, or one
+installed or on ``PYTHONPATH``); where there is none, it skips with that
+environmental reason.
+"""
 
-import xrdclient
+import pytest
 
-ROOT = Path(__file__).parents[1]
+plugin = pytest.importorskip(
+    "xrddevtools.pytest_plugin",
+    reason="environmental: no xrd-devtools checkout (../xrd-devtools, .dependencies/xrd-devtools)",
+)
 
-
-def test_version_has_one_build_source_and_release_notes() -> None:
-    project = (ROOT / "pyproject.toml").read_text()
-    changelog = (ROOT / "CHANGELOG.md").read_text()
-
-    assert 'dynamic = ["version"]' in project
-    assert 'path = "src/xrdclient/_version.py"' in project
-    headings = [line for line in changelog.splitlines() if line.startswith("## [")]
-    assert headings[0].startswith(f"## [{xrdclient.__version__}] - ")
-    assert sum(line.startswith(f"## [{xrdclient.__version__}]") for line in headings) == 1
-    assert f"[{xrdclient.__version__}]: https://github.com/rob-c/xrdclient/compare/" in changelog
-    assert "## [0.2.0] - 2026-10-01" in headings
-    assert xrdclient.__version__.count(".") == 2
+test_xrdclient_release_metadata_is_consistent = plugin.release_gate(__file__)

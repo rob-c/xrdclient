@@ -16,13 +16,13 @@ from __future__ import annotations
 import time
 
 import pytest
+from xrdsec.krb5 import client as krb5_client
+from xrdsec.krb5.ccache import read_ccache
 
-import _krb5kdc
-import _xrootd
 import xrdclient
+from tests import _krb5kdc, _xrootd
 from xrdclient.auth import krb5
 from xrdclient.auth.base import Offer
-from xrdclient.auth.kerberos.ccache import read_ccache
 from xrdclient.config import Config
 from xrdclient.errors import AuthenticationError
 
@@ -43,9 +43,9 @@ SHA384 = "aes256-cts-hmac-sha384-192"
 @pytest.fixture(autouse=True)
 def _fresh_memory():
     """Service tickets fetched by one test must not serve another's realm."""
-    krb5._FETCHED.clear()
+    krb5_client.clear_cache()
     yield
-    krb5._FETCHED.clear()
+    krb5_client.clear_cache()
 
 
 def _realm(tmp_path, monkeypatch, *enctypes: str) -> _krb5kdc.MitRealm:
@@ -79,7 +79,8 @@ def _servers_tickets(realm: _krb5kdc.MitRealm) -> list[str]:
 def test_a_tgt_alone_logs_in_via_a_pure_python_tgs_exchange(tmp_path, realm):
     realm.kinit()
     assert _servers_tickets(realm) == [f"krbtgt/{realm.realm}@{realm.realm}"]
-    with _krb5kdc.KerberizedXrootd(tmp_path / "export", realm) as server:
+    server = _krb5kdc.KerberizedXrootd(tmp_path / "export", realm)
+    with server:
         assert _round_trip(server) == b"written by jane as k.txt"
         assert server.logins() == ["jane"]
     # The KDC saw our TGS-REQ and issued the ticket...
@@ -108,7 +109,8 @@ def test_a_cached_service_ticket_is_used_without_the_kdc(tmp_path, realm, monkey
     dead = tmp_path / "dead-krb5.conf"
     dead.write_text(realm.krb5_conf.read_text().replace(f":{realm.port}", ":9"))
     monkeypatch.setenv("KRB5_CONFIG", str(dead))
-    with _krb5kdc.KerberizedXrootd(tmp_path / "export", realm) as server:
+    server = _krb5kdc.KerberizedXrootd(tmp_path / "export", realm)
+    with server:
         assert _round_trip(server) == b"written by jane as k.txt"
         assert server.logins() == ["jane"]
 
@@ -126,9 +128,11 @@ def test_each_aes_family_logs_in(tmp_path, monkeypatch, enctype, number):
             offer, CONFIG, username="jane", host="localhost"
         )
         assert credential is not None
+        assert credential._ticket is not None
         assert credential._ticket.enctype == number  # the session key the KDC chose
         assert f"etypes {{rep={number}" in realm.kdc_log() or str(number) in realm.kdc_log()
-        with _krb5kdc.KerberizedXrootd(tmp_path / "export", realm) as server:
+        server = _krb5kdc.KerberizedXrootd(tmp_path / "export", realm)
+        with server:
             assert _round_trip(server) == b"written by jane as k.txt"
             assert server.logins() == ["jane"]
     finally:
@@ -141,7 +145,8 @@ def test_the_kdc_can_be_reached_over_tcp_only(tmp_path, realm, monkeypatch):
     tcp = tmp_path / "tcp-krb5.conf"
     tcp.write_text(realm.krb5_conf.read_text().replace("kdc = 127", "kdc = tcp/127"))
     monkeypatch.setenv("KRB5_CONFIG", str(tcp))
-    with _krb5kdc.KerberizedXrootd(tmp_path / "export", realm) as server:
+    server = _krb5kdc.KerberizedXrootd(tmp_path / "export", realm)
+    with server:
         assert _round_trip(server) == b"written by jane as k.txt"
 
 
@@ -151,7 +156,8 @@ def test_the_kdc_can_be_reached_over_tcp_only(tmp_path, realm, monkeypatch):
 def test_an_expired_ticket_says_so_and_says_kinit(tmp_path, realm):
     realm.kinit("-l", "2s")
     time.sleep(3)
-    with _krb5kdc.KerberizedXrootd(tmp_path / "export", realm) as server:
+    server = _krb5kdc.KerberizedXrootd(tmp_path / "export", realm)
+    with server:
         with pytest.raises(AuthenticationError) as info:
             _round_trip(server)
         assert server.logins() == []
@@ -162,9 +168,9 @@ def test_an_expired_ticket_says_so_and_says_kinit(tmp_path, realm):
 def test_a_service_principal_the_kdc_does_not_know_is_named(tmp_path, realm):
     realm.kinit()
     wrong = f"xrootd/nosuch@{realm.realm}"
-    with _krb5kdc.KerberizedXrootd(tmp_path / "export", realm, principal=wrong) as server:
-        with pytest.raises(AuthenticationError) as info:
-            _round_trip(server)
+    server = _krb5kdc.KerberizedXrootd(tmp_path / "export", realm, principal=wrong)
+    with server, pytest.raises(AuthenticationError) as info:
+        _round_trip(server)
     assert f"the KDC has no principal {wrong}" in str(info.value)
     assert "KDC error 7" in str(info.value)
 
@@ -175,9 +181,8 @@ def test_a_service_principal_the_kdc_does_not_know_is_named(tmp_path, realm):
 def test_a_forwarded_tgt_reaches_an_exptkn_server_and_is_written_where_it_says(tmp_path, realm):
     realm.kinit("-f")
     exported = tmp_path / "fwd_<user>"
-    with _krb5kdc.KerberizedXrootd(
-        tmp_path / "export", realm, export_tickets=str(exported)
-    ) as server:
+    server = _krb5kdc.KerberizedXrootd(tmp_path / "export", realm, export_tickets=str(exported))
+    with server:
         assert _round_trip(server) == b"written by jane as k.txt"
         assert server.logins() == ["jane"]
     written = tmp_path / "fwd_jane"
@@ -194,8 +199,23 @@ def test_a_forwarded_tgt_reaches_an_exptkn_server_and_is_written_where_it_says(t
 def test_an_exptkn_server_and_a_tgt_that_is_not_forwardable_is_explained(tmp_path, realm):
     realm.kinit("-F")  # explicitly not forwardable
     exported = tmp_path / "fwd_<user>"
-    with _krb5kdc.KerberizedXrootd(
-        tmp_path / "export", realm, export_tickets=str(exported)
-    ) as server:
-        with pytest.raises(AuthenticationError, match="not forwardable; run kinit -f"):
-            _round_trip(server)
+    server = _krb5kdc.KerberizedXrootd(tmp_path / "export", realm, export_tickets=str(exported))
+    with server, pytest.raises(AuthenticationError, match="not forwardable; run kinit -f"):
+        _round_trip(server)
+
+
+# -- (e) the system library, through python-gssapi -----------------------------
+
+
+@pytest.mark.parametrize("cached", [False, True], ids=["tgt-only", "service-ticket-cached"])
+def test_the_system_library_logs_in_with_the_raw_ap_req(tmp_path, realm, monkeypatch, cached):
+    """``auto``'s first choice: GSS-API's token, unwrapped, is what ``krb5_rd_req`` takes."""
+    pytest.importorskip("gssapi", reason="python-gssapi (the krb5 extra) is not installed")
+    monkeypatch.setenv("XRD_KRB5_BACKEND", "gssapi")
+    realm.kinit()
+    if cached:
+        realm.kvno(realm.service)
+    server = _krb5kdc.KerberizedXrootd(tmp_path / "export", realm)
+    with server:
+        assert _round_trip(server) == b"written by jane as k.txt"
+        assert server.logins() == ["jane"]

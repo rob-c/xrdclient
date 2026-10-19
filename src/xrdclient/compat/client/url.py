@@ -23,10 +23,17 @@ class URL:
     """A URL as XrdCl parses it: ``hostid``, ``path``, ``path_with_params``."""
 
     def __init__(self, url: str) -> None:
+        """Parse ``url``; one XrdCl cannot parse leaves every field empty, not an error."""
         self.__url = str(url)
         self.__parse(self.__url)
 
     def __parse(self, text: str) -> None:
+        """Split ``text`` into fields the way ``XrdCl::URL::FromString`` does.
+
+        A string without ``://`` is a local path when it starts with ``/``
+        and a bare ``host[:port]/path`` otherwise, as XrdCl guesses. Any part
+        that fails resets everything, so a half-parsed URL never escapes.
+        """
         self.__clear_parsed()
         if "://" not in text:
             text = f"file://localhost{text}" if text.startswith("/") else f"root://{text}"
@@ -48,6 +55,7 @@ class URL:
         self.__params = params
 
     def __clear_parsed(self) -> None:
+        """Every field back to the empty, invalid URL (port keeps XrdCl's default)."""
         self.protocol = self.username = self.password = self.hostname = ""
         self.port = _DEFAULT_PORT
         self.path = self.__params = ""
@@ -78,6 +86,7 @@ class URL:
         self.__clear_parsed()
 
     def __str__(self) -> str:
+        """XrdCl's ``GetURL``: normalised, port always shown, ``""`` when invalid."""
         if not self.is_valid():
             return ""
         if self.protocol == "file":
@@ -85,17 +94,21 @@ class URL:
         return f"{self.protocol}://{self.hostid}/{self.path_with_params}"
 
     def __repr__(self) -> str:
+        """The normalised URL, tagged with the class the bindings name."""
         return f"<XRootD.client.URL {str(self)!r}>"
 
     def __eq__(self, other: object) -> bool:
+        """Equal when they normalise alike: ``root://h`` equals ``root://h:1094/``."""
         return isinstance(other, URL) and str(self) == str(other)
 
     def __hash__(self) -> int:
+        """Hash of the normalised form, consistent with :meth:`__eq__`."""
         return hash(str(self))
 
 
 def _authority(url: URL, authority: str) -> bool:
     """Fill ``url``'s credentials, host and port from ``user:pw@host:port``."""
+    # ``rpartition``: a password may itself contain ``@``; the host cannot.
     credentials, at, hostport = authority.rpartition("@")
     if at:
         url.username, _, url.password = credentials.partition(":")

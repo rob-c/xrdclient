@@ -39,9 +39,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from xrdcore import safexml
+
+#: This checkout; its ``src`` goes first on the runs' ``PYTHONPATH`` so the
+#: compat copy tests this tree, not an installed xrdclient.
 REPO = Path(__file__).resolve().parent.parent
 
 #: An import statement that names the official package: ``from XRootD ...``,
@@ -64,12 +67,19 @@ def rewrite_line(line: str) -> str:
 
 
 def rewrite_tree(root: Path) -> list[tuple[str, int, str, str]]:
-    """Rewrite every ``.py`` file under ``root``; return what changed."""
+    """Rewrite every ``.py`` file under ``root``; return what changed.
+
+    Each change is ``(relative path, line number, old, new)``, printed by
+    :func:`run_both` so a reviewer can confirm that only imports moved -
+    the whole value of the run rests on the tests themselves being upstream's.
+    Files are only rewritten when something changed, and line endings are
+    kept (``keepends``) so nothing else in a file differs.
+    """
     changes = []
     for path in sorted(root.rglob("*.py")):
         lines = path.read_text().splitlines(keepends=True)
         new = [rewrite_line(line) for line in lines]
-        for number, (old, line) in enumerate(zip(lines, new), 1):
+        for number, (old, line) in enumerate(zip(lines, new, strict=False), 1):
             if old != line:
                 changes.append((str(path.relative_to(root)), number, old.rstrip(), line.rstrip()))
         if new != lines:
@@ -78,7 +88,16 @@ def rewrite_tree(root: Path) -> list[tuple[str, int, str, str]]:
 
 
 def run_pytest(python: str, tests: Path, junit: Path, extra: list[str], timeout: float) -> str:
-    """Run the suite in ``tests``; return pytest's last summary line."""
+    """Run the suite in ``tests``; return pytest's last summary line.
+
+    ``-o addopts=`` drops any options the upstream suite or this repo's
+    configuration would add (coverage, xdist), so both runs are identical
+    except for the code under test. ``--continue-on-collection-errors``
+    matters: a test module importing API the installed bindings lack must
+    not stop the rest of the official run. A non-zero pytest exit is
+    expected (failing tests) and is read from the JUnit report, not raised;
+    only ``timeout`` aborts, via :class:`subprocess.TimeoutExpired`.
+    """
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(REPO / "src"), env.get("PYTHONPATH")]))
     command = [
@@ -103,11 +122,17 @@ def run_pytest(python: str, tests: Path, junit: Path, extra: list[str], timeout:
 
 
 def outcomes(junit: Path) -> dict[str, str]:
-    """``{test id: passed|failed|error|skipped}`` from a JUnit XML report."""
+    """``{test id: passed|failed|error|skipped}`` from a JUnit XML report.
+
+    The id is ``classname::name``, which is identical across the two copies
+    because they share a directory layout. A missing report (pytest crashed
+    before writing it) yields no outcomes, which :func:`main` treats as a
+    failed comparison rather than a clean pass.
+    """
     result: dict[str, str] = {}
     if not junit.exists():
         return result
-    for case in ET.parse(junit).getroot().iter("testcase"):
+    for case in safexml.fromstring(junit.read_bytes()).iter("testcase"):
         name = f"{case.get('classname', '')}::{case.get('name', '')}".strip(":")
         state = "passed"
         for child in case:
@@ -132,6 +157,8 @@ def uncollected(theirs: dict[str, str], ours: dict[str, str]) -> list[str]:
     return sorted(m for m in modules if any(n.startswith(f"{m}::") for n in ours))
 
 
+# Both copies live under one scratch directory with the same relative layout
+# (``*/tests``), so pytest computes the same test ids for each run.
 def run_both(
     upstream: Path, python: str, extra: list[str], timeout: float
 ) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
@@ -200,6 +227,13 @@ def print_classified(theirs: dict[str, str], ours: dict[str, str]) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run both suites and compare; 0 only if nothing regressed and tests ran.
+
+    Exit 2 means the source checkout has no ``python/tests``; exit 1 means at
+    least one test passing on the official bindings did not pass on compat,
+    or that the official run produced no outcomes at all (so there was
+    nothing to compare against).
+    """
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
         "source",
@@ -224,6 +258,8 @@ def main(argv: list[str] | None = None) -> int:
     print_differences(theirs, ours)
     better = print_classified(theirs, ours)
 
+    # A regression is judged against the official run only: compat-only
+    # failures of tests that also fail upstream are reported, not counted.
     regressions = [
         n for n, state in theirs.items() if state == "passed" and ours.get(n) != "passed"
     ]

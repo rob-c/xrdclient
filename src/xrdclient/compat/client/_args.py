@@ -18,6 +18,11 @@ __all__ = ["chunks", "u16", "u32", "u64"]
 
 
 def _unsigned(value: Any, bits: int, name: str) -> int:
+    """``value`` if it is an ``int`` that fits ``bits`` unsigned bits; else raise.
+
+    The slow, general check behind :func:`u64`/:func:`u32`/:func:`u16`; it
+    also produces the error messages, so it runs for every rejected value.
+    """
     # ``bool`` is an ``int`` to Python and not to the C parser; neither is a
     # float, however whole.
     if not isinstance(value, int) or isinstance(value, bool):
@@ -52,6 +57,8 @@ def u16(value: Any, name: str = "timeout") -> int:
     return _unsigned(value, 16, name)
 
 
+#: The exclusive upper bounds the fast paths compare with; module globals so
+#: the hot check is two comparisons, not a shift per call.
 _U64, _U32, _U16 = 1 << 64, 1 << 32, 1 << 16
 
 

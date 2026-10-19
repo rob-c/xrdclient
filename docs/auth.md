@@ -11,6 +11,38 @@ If everything is refused you get one `NoMechanismError` that names each
 mechanism and why it did not apply - "no proxy at $X509_USER_PROXY", "token
 expired at ...", "server did not offer sss" - rather than a bare failure.
 
+To *make* a proxy (with VOMS attributes) rather than use one, see
+[Proxies and VOMS](proxy.md) and the `xrd-proxy` command.
+
+## Credential files must be yours alone
+
+A proxy, a user key (`userkey.pem`), a bearer-token file and an SSS keytab
+are each read only when the
+file is a regular file, owned by the effective uid, and neither readable nor
+writable by group or others - mode `0600` (or `0400`), what
+`voms-proxy-init`, `htgettoken` and `xrdsssadmin` write and what `XrdSecgsi`
+and `XrdSecsss` expect. Anything else raises `InsecureCredentialError` (a
+`CredentialError` and a `PermissionError`) naming the file and the fix:
+
+```text
+the X.509 proxy /tmp/x509up_u1000 is readable by group or others (mode 0644); run: chmod 600 /tmp/x509up_u1000
+```
+
+The checks are made on the open file descriptor, so the file checked is the
+file read. At the predictable locations - `/tmp/x509up_u<uid>`,
+`$XDG_RUNTIME_DIR/bt_u<uid>` and `/tmp/bt_u<uid>` - a symbolic link is
+refused rather than followed, since anyone can create one in `/tmp`; a path
+you named (`$X509_USER_PROXY`, `$BEARER_TOKEN_FILE`, `Config(proxy=...)`,
+`--token-file`) may be a link, and the file it reaches is checked. Ownership
+is strict for root too: a process running as root reads only root's own
+credential files, never one another user left behind - copy a file that
+has to be shared rather than opening it in place.
+
+A refused proxy or keytab is skipped with a warning (the ladder moves on,
+and `NoMechanismError` repeats the reason); a refused token file stops token
+discovery, because falling through to the next location would log in as
+whoever left a token there.
+
 ## `gsi` - X.509 proxies
 
 Reads `$X509_USER_PROXY`, or `/tmp/x509up_u$UID`. RFC 3820 and legacy Globus
@@ -30,8 +62,35 @@ proxy = load_proxy("/tmp/x509up_u1000")
 print(proxy.identity, proxy.remaining() / 3600, "hours left")
 ```
 
-DER primitives and signature/cipher operations use asn1crypto and cryptography.
-Proxy and VOMS policy remain in the client.
+Reading proxies, issuing them, VOMS and trust checks are
+[xrdsec](https://github.com/rob-c/xrdsec)'s since 0.4.0 - the grid security
+library xgfalclient and xrdarc use too, built on `cryptography` and
+`asn1crypto` - and `xrdclient.crypto.x509`, `.proxies`, `.voms` and the rest
+are its modules under xrdclient's names (`xrdclient.crypto.voms is
+xrdsec.voms`). What stays in xrdclient is XRootD's own protocol: the GSI,
+`sss`, Kerberos and `ztn` handshakes, and the `kXR_sigver` signer.
+
+### A certificate and key without a proxy
+
+A robot account, a CI job or a host certificate often has no proxy - just
+`usercert.pem` and `userkey.pem`. Name them (or set `$X509_USER_CERT` and
+`$X509_USER_KEY`, as for `XrdSecgsi` and gfal2) and leave `proxy` unset:
+
+```python
+Config(
+    proxy=None,
+    usercert="~/.globus/usercert.pem",
+    userkey="~/.globus/userkey.pem",
+    key_password=lambda: keyring.get_password("grid", "userkey"),  # only if encrypted
+)
+```
+
+GSI then makes a 12-hour RFC 3820 proxy from them **in memory** - a fresh
+2048-bit key, signed by yours, as `XrdSecgsi`'s `createpxy` does - and logs in
+with that; HTTPS presents the certificate itself. Nothing is written to disk:
+there is no need to splice the key into a temporary proxy file (which a crash
+leaves behind). The key must pass the checks above. The order is gfal2's: a
+proxy you named wins, then this pair, then `/tmp/x509up_u$UID`.
 
 ### VOMS attributes
 
@@ -98,6 +157,35 @@ the *signed* exchange - each side signs its DH value with its private key, the
 server's is checked against the key in its certificate, and every encrypted
 buffer carries a fresh IV. Older servers get the original unsigned exchange.
 
+Either way the server's group and public value are checked first, as
+OpenSSL's `DH_check_pub_key` checks them: a prime under 512 bits is
+refused, one under 2048 bits is used with a warning (current `xrootd` sends
+3072 bits; older servers may send less), and a public value that is not
+strictly between 1 and p-1 - which would pin the shared secret to a value
+anyone can compute - is refused. The arithmetic stays on Python integers:
+`cryptography` 50 deprecated finite-field DH, and GSI cannot move off it.
+
+### The server proves who it is
+
+On every login - not only before delegating - the server's certificate must
+chain to a CA in `ca_path` (`$X509_CERT_DIR`, else the grid-security
+directory) and name the host that was dialled, by `CN`, `<service>/<host>`
+or `subjectAltName`, before the proxy chain is sent to it. That is what
+`XrdSecgsi` clients do. A server whose certificate carries another name -
+an alias, a load-balanced head node - can be allowed by pattern with the
+stock variable:
+
+```console
+$ export XrdSecGSISRVNAMES='*.example.org,door-*.site.net'
+```
+
+The patterns (`*` and `?` wildcards, comma-separated) are matched against
+the host name in the certificate's `CN`; the chain and dates are still
+checked in full. For a test setup that cannot pass at all,
+`Config(gsi_verify_server=False)` or `XRD_GSI_VERIFY_SERVER=0` turns the
+login check off; a proxy is still never *delegated* to a server that fails
+it.
+
 ### Delegation
 
 A server that is to act for you - a third-party copy pulling from another
@@ -118,8 +206,9 @@ variable turns it on. When it is on:
 - it signs nothing until the server's certificate chains to a CA in
   `ca_path` (`$X509_CERT_DIR`, else the Linux/Homebrew grid-security path) and
   names the host dialled - by `CN`, `<service>/<host>` or `subjectAltName`.
-  A server that fails either is still logged into, and told "Not allowed to
-  sign proxy requests", exactly the stock client's answer;
+  With the login check on (the default) such a server is not logged into at
+  all; with it off, it is logged into and told "Not allowed to sign proxy
+  requests", exactly the stock client's answer;
 - delegation needs the signed exchange; a server older than GSI 10400 is
   logged into without one, with a warning.
 
@@ -143,13 +232,24 @@ value has no effect on it. The Python bindings and this client both honour it.
 ## `ztn` - bearer tokens (WLCG, SciTokens, macaroons)
 
 Discovery follows the WLCG Bearer Token Discovery specification, the same
-order the C client uses:
+order the C client uses - and since 0.4.0 the same order for `root://`,
+`davs://` and HTTP third-party copy, which share one implementation:
 
-1. `Config(token=...)`
-2. `$BEARER_TOKEN`
-3. `$BEARER_TOKEN_FILE` (or `Config(token_file=...)`)
-4. `$XDG_RUNTIME_DIR/bt_u$UID`
-5. `/tmp/bt_u$UID`
+1. a token in the URL (`?authz=` or `?access_token=`; HTTP only)
+2. `Config(token=...)`
+3. `Config(token_file=...)`, when set to something other than
+   `$BEARER_TOKEN_FILE` (its default) - in code, a settings file or
+   `--token-file`
+4. `$BEARER_TOKEN`
+5. `$BEARER_TOKEN_FILE`
+6. `$XDG_RUNTIME_DIR/bt_u$UID`
+7. `/tmp/bt_u$UID`
+
+`$UID` is the effective uid (`id -u`). An unset variable, a missing file or
+a blank one passes to the next step; a token file that is not private to you
+stops discovery with `InsecureCredentialError` (see above). Write one with
+`(umask 077; oidc-token <issuer> > /tmp/bt_u$(id -u))`, so it is `0600` from
+the moment it exists.
 
 ```python
 Config(token=os.environ["MY_TOKEN"])
@@ -167,8 +267,12 @@ scheme; `Config(require_tls=True)` refuses a server that will not upgrade.
 
 ## `krb5` - Kerberos
 
-Pure Python, like everything else: `kinit` as usual, and the client does the
-rest.
+`kinit` as usual, and the client does the rest - through the system's own
+Kerberos library when python-gssapi is installed (`xrdclient[krb5]`), and in
+pure Python otherwise. Both are xrdsec's (`xrdsec.krb5`: the pure-Python
+client in `xrdsec.krb5.client`, the GSS-API layer in `xrdsec.krb5.gss`),
+shared with xgfalclient since 0.4.0; what xrdclient adds is XRootD's
+`krb5` framing and the choice between the two.
 
 ```console
 $ kinit jane@EXAMPLE.ORG
@@ -197,8 +301,8 @@ followed wherever they start a line of `krb5.conf`, as MIT follows them.
 | `DIR:dir`, `DIR::dir/tktX` | the collection's `primary` cache, or the one named | kept in memory |
 | `KCM:`, `KCM:name` (RHEL 9's default, `sssd-kcm`; Heimdal's `kcm`) | the KCM protocol over the daemon's Unix socket | kept in memory **and** stored in the cache (`STORE`), as MIT's library does |
 | `KEYRING:persistent:uid`, `KEYRING:session:name`, `KEYRING:user:name`, `KEYRING:process:name`, `KEYRING:thread:name`, `KEYRING:name` | the Linux `keyctl` system call, through `ctypes` | kept in memory; the keyring is never written |
-| `API:` (macOS) | refused - held by Heimdal's credential service over XPC | - |
-| `MEMORY:`, `MSLSA:` | refused - they live in another process, or Windows | - |
+| `API:` (macOS) | through python-gssapi only - held by Heimdal's credential service over XPC | the library's business |
+| `MEMORY:`, `MSLSA:` | `MEMORY:` through python-gssapi; `MSLSA:` refused - Windows | - |
 
 **KCM.** The socket is `kcm_socket` in `[libdefaults]`, else
 `/var/run/.heim_org.h5l.kcm-socket`. `KCM:` asks the daemon for its default
@@ -226,31 +330,53 @@ client does not create keyrings, so a missing one is no cache; nor does it
 add keys, so a fetched ticket stays in memory, as for a file. Off Linux,
 `KEYRING:` is a `CredentialError` that says so and names the fix.
 
-### Optional native cache handling
+### Which implementation: `XRD_KRB5_BACKEND`
 
-Install `xrdclient[krb5]` and set `XRD_KRB5_BACKEND=native` to delegate cache
-selection and reading to pykrb5 (distribution `krb5`). It uses the installed
-MIT/Heimdal library's FILE, DIR, KCM, KEYRING and macOS API support, copies
-credential data into the existing model, preserves flags and clock offsets,
-and never rewrites the cache. Unset that variable to keep the portable reader.
-The XRootD AP-REQ/TGS and forwarding adapters remain; pykrb5 does not expose
-all the APIs needed to replace them. Native binding errors retain their
-numeric code and explain how to check the cache or run kinit.
+| Value | What logs in |
+| --- | --- |
+| unset, `auto` | the system library through python-gssapi when it is installed and the server does not ask for a forwarded TGT; the portable reader otherwise, or when the library finds no credential |
+| `gssapi` | the system library alone; its errors are reported as they are |
+| `portable` | the pure-Python reader, TGS exchange and AP-REQ builder described above |
 
-macOS wheels install without a compiler. Linux installs of this optional
-extra need a C compiler and Kerberos development headers when no compatible
-wheel is available. Normal installs do not request native bindings.
+Why the system library first: it reads every cache type the platform has
+(macOS `API:` and `MEMORY:` included), discovers KDCs through DNS, follows
+cross-realm referrals and supports whatever enctypes the site allows - all
+of which the portable reader refuses. Its GSS-API token is unwrapped to the
+raw AP-REQ XRootD's `krb5` plugin requires, and that is checked against a
+real MIT KDC and `xrootd`, both with only a TGT in the cache and with the
+service ticket already there (`tests/test_krb5_interop.py`). Like every
+other Kerberos program it may store the service ticket it fetched in your
+cache. A service principal the server names without a realm gets one from
+`[domain_realm]` first, as on the portable path.
+
+Why the portable reader stays: it needs nothing installed, and it is the
+only way to forward a TGT to an `-exptkn` server - python-gssapi cannot hand
+over the raw KRB-CRED XRootD reads. A forwarding login always uses it.
+
+Why there is no `native` any more: it read the cache through pykrb5, but
+python-gssapi reaches the same caches through the same library and also does
+the TGS exchange, so pykrb5 added a second binding and a second set of error
+paths for nothing. It was removed in 0.4.0; `XRD_KRB5_BACKEND=native` is now
+a `CredentialError` that says to leave the variable unset (or set `gssapi`).
+The portable reader stays: its parity with MIT is what the tests below
+establish, and removing it would lose forwarding and the no-dependency
+install.
+
+macOS wheels of python-gssapi install without a compiler. Linux installs of
+the optional extra need a C compiler and Kerberos development headers when
+no compatible wheel is available; distributions package it as
+`python3-gssapi`. Normal installs do not request native bindings.
 
 ### Portable implementation interoperability evidence
 
 | Claim | Tested against |
 | --- | --- |
-| KCM wire format: framing, opcodes, status codes, marshalling | MIT krb5 1.22 (Homebrew, macOS) and 1.21 (AlmaLinux 9) `kinit`, `klist` and `kvno` running against the in-process fake daemon (`tests/_kcmd.py`) - with and without MIT's extensions |
-| KCM reading returns exactly what the FILE reader returns | caches MIT wrote (`tests/_krb5_mit.py`), served by the fake daemon |
+| KCM wire format: framing, opcodes, status codes, marshalling | MIT krb5 1.22 (Homebrew, macOS) and 1.21 (AlmaLinux 9) `kinit`, `klist` and `kvno` running against the in-process fake daemon (`xrdsec.testing.krb5.FakeKcm`) - with and without MIT's extensions |
+| KCM reading returns exactly what the FILE reader returns | caches MIT wrote (xrdsec's `tests/_krb5_mit.py`), served by the fake daemon |
 | a TGT from KCM logs in to `xrootd`; the stored ticket is one MIT uses | the fake daemon + a real MIT KDC + a real `xrootd`; MIT's `klist` lists the stored ticket and MIT's `kvno` uses it with the KDC stopped |
 | the same, against a **real** `sssd-kcm` | sssd 2.9.8 on AlmaLinux 9 (in a container), with MIT 1.21 and `xrootd` 5.9.7: `tests/test_krb5_kcm.py::test_a_real_kcm_daemon_...`, which runs only with `XRDCLIENT_TEST_SYSTEM_KCM=1` because it uses the machine's daemon |
 | Heimdal's own `kcm` | only as the fake daemon's `heimdal=True` mode (no MIT extensions); not against Heimdal itself |
-| KEYRING layout and resolution, every anchor, the error paths | a fake `keyctl` (`FakeKernel` in `tests/test_krb5_keyring.py`) that is called exactly as the syscall is, ctypes buffers included - runs everywhere |
+| KEYRING layout and resolution, every anchor, the error paths | a fake `keyctl` (`FakeKernel` in xrdsec's `tests/test_krb5_keyring.py`) that is called exactly as the syscall is, ctypes buffers included - runs everywhere |
 | the real `keyctl` syscall; MIT's real keyring layout | Linux only, skipped elsewhere: the syscall reading the session keyring; a cache laid out with `keyutils`' `keyctl`; MIT `kinit` into `KEYRING:session:` and `KEYRING:persistent:` then a login to a real `xrootd` - all run on AlmaLinux 9 (kernel keyrings through Docker with `seccomp=unconfined`) |
 | macOS `API:` | refused; nothing to test beyond the message |
 
@@ -274,8 +400,8 @@ Supported: the AES enctypes - `aes256-cts-hmac-sha1-96`,
 | a macOS `API:` cache, or `MEMORY:` | uses python-gssapi for a non-forwarded AP-REQ; requires native-library support. For forwarding, use `KRB5CCNAME=FILE:/tmp/krb5cc_$(id -u) kinit -f` |
 | a `KEYRING:` cache anywhere but Linux | the same |
 | tickets that have expired | `kinit` - the error says how long ago |
-| a realm with no `kdc =` line (DNS SRV lookup is not done) | add `[realms] REALM = { kdc = host }` |
-| a service in another realm than your TGT (cross-realm) | not supported |
+| a realm with no `kdc =` line (DNS SRV lookup is not done) | add `[realms] REALM = { kdc = host }`, or install python-gssapi |
+| a service in another realm than your TGT (cross-realm) | install python-gssapi; not supported by the portable reader |
 | DES, triple-DES or RC4 keys | ask for AES keys - RC4 needs MD4, which `hashlib` often lacks |
 
 Host names are not canonicalised through DNS (as with
@@ -295,6 +421,14 @@ $ chmod 600 ~/.xrd/sss.keytab
 A keytab that group or others can read is **refused**, exactly as the C
 implementation refuses it, with a warning in the log. The file holds shared
 secrets in the clear.
+
+SSS encrypts its credential with Blowfish, which OpenSSL 3 only provides
+through its *legacy* provider. On a host in FIPS mode, or one whose OpenSSL
+runs without that provider, SSS is unavailable: the mechanism says so - and
+what to do about it - and the ladder moves on to the next one. If site
+policy allows, point `OPENSSL_CONF` at an `openssl.cnf` that activates both
+the `default` and `legacy` providers; otherwise ask the server's
+administrators for `ztn`, `gsi` or `krb5`.
 
 ## `unix` and `host`
 
@@ -329,10 +463,23 @@ Config(
 )
 ```
 
-The same X.509 proxy is presented as the client certificate, so mutual TLS
-costs no extra argument. `verify_tls=False` exists for self-signed test
+The same X.509 proxy is presented as the client certificate - or, with no
+proxy named, `usercert` and `userkey` - so mutual TLS costs no extra argument.
+`tls_system_ca` and `check_crl` (`$XRD_TLSSYSTEMCA`, `$XRD_CHECKCRL`) choose
+the extra trust store and revocation checking; see
+[Configuration](config.md#security). `verify_tls=False` exists for self-signed test
 endpoints and is spelled `--no-verify-tls` on the command line so that it
 shows up in shell history and in review.
+
+A tool that makes its own HTTPS connections can have the same context:
+`xrdclient.tls.client_context(cert=..., ca_path=..., check_crl=...)` -
+which is `xrdsec.tls.client_context`, the builder `tls_context()` calls - built
+by the same code and sharing its cache - with one difference, that it
+presents no certificate unless given one (`present_default=True` restores
+the default-proxy behaviour). The searches behind the defaults above
+(`find_proxy`, `find_user_credential`, `find_bearer_token`, `grid_ca_path`)
+are public in `xrdclient.credentials` (`xrdsec.credentials`); see
+[Building a tool on xrdclient](building-tools.md).
 
 ## Being asked for what is missing
 

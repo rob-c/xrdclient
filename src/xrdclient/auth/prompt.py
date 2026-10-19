@@ -27,8 +27,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import IO, TYPE_CHECKING
 
-from .._compat import SLOTS
-from .._log import get_logger
+from ..log import get_logger
 
 if TYPE_CHECKING:
     from ..config import Config
@@ -47,7 +46,7 @@ __all__ = [
 _log = get_logger(__name__)
 
 
-@dataclass(frozen=True, **SLOTS)
+@dataclass(frozen=True, slots=True)
 class Ask:
     """One request for credential material a person could supply.
 

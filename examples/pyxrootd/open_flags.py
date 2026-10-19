@@ -18,7 +18,7 @@ fs = client.FileSystem(URL)
 path = f"{URL}/{WORK}/deep/er/flags.txt"
 
 
-def attempt(label, flags, mode=0, data=None):
+def attempt(label: str, flags: int, mode: int = 0, data: bytes | None = None) -> None:
     """Open with ``flags``, optionally write, and say what happened."""
     with client.File() as f:
         status, _ = f.open(path, flags, mode)

@@ -17,6 +17,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -24,7 +25,7 @@ HERE = Path(__file__).resolve().parent
 EXAMPLES = HERE.parent / "examples" / "pyxrootd"
 
 
-def _load_runner():
+def _load_runner() -> ModuleType:
     spec = importlib.util.spec_from_file_location("pyxrootd_run_all", EXAMPLES / "run_all.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -38,7 +39,9 @@ run_all = _load_runner()
 
 PORTED = "from xrdclient.compat import client  # was: from XRootD import client"
 SUBMODULE = re.compile(r"^from xrdclient\.compat\.client\.(flags|utils|responses) import \w+")
-SCRIPTS = [p for p in run_all.examples() if p.name != "install_hook.py"]
+SCRIPTS = [
+    p for p in run_all.examples() if p.name != "install_hook.py" and not p.name.startswith("_")
+]
 
 
 def test_there_is_an_example_for_each_topic():
@@ -70,8 +73,12 @@ def test_reverting_the_import_leaves_a_pyxrootd_script(script):
 
 def test_the_install_hook_example_imports_xrootd_unmodified():
     source = (EXAMPLES / "install_hook.py").read_text()
-    assert "xrdclient.compat.install()  # compat only" in source
-    assert "\nfrom XRootD import client  # noqa: E402\n" in source
+    # The hook is a module of its own, imported first, so the PyXRootD imports
+    # after it are ordinary top-of-file imports.
+    assert "xrdclient.compat.install()" in (EXAMPLES / "_compat_hook.py").read_text()
+    assert "\nimport _compat_hook as _compat_hook  # compat only\n" in source
+    assert "\nfrom XRootD import client\n" in source
+    assert source.index("\nimport _compat_hook") < source.index("\nfrom XRootD import client\n")
     original = run_all.to_official(source)
     # The docstring still talks about xrdclient; the code no longer uses it.
     code = [line.strip() for line in original.splitlines()]
@@ -91,10 +98,10 @@ def test_normalising_masks_only_what_varies_between_runs():
 
 
 def _run_all(*args: str) -> subprocess.CompletedProcess[str]:
-    import _xrootd
+    from tests import _xrootd
 
     if not _xrootd.available():
-        pytest.skip("no xrootd binary on PATH")
+        pytest.skip("environmental: no xrootd binary on PATH")
     return subprocess.run(
         [sys.executable, str(EXAMPLES / "run_all.py"), *args],
         capture_output=True,
@@ -118,7 +125,7 @@ def test_every_example_prints_what_it_prints_on_the_official_bindings():
     # Probed in a child: importing the bindings here would shadow the
     # compat layer's install() for the rest of the session.
     if not run_all.have_official(sys.executable):
-        pytest.skip("the official bindings are not installed")
+        pytest.skip("environmental: the official XRootD bindings are not installed")
     proc = _run_all()
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "passed (official and compat)" in proc.stdout

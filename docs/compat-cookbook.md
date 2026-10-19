@@ -723,8 +723,9 @@ fsspec-xrootd.
 
 The `ztn` mechanism finds a token where the C++ client does:
 `$BEARER_TOKEN`, then the file named by `$BEARER_TOKEN_FILE`, then
-`$XDG_RUNTIME_DIR/bt_u$UID`, then `/tmp/bt_u$UID`. Set one of them before the
-objects are created:
+`$XDG_RUNTIME_DIR/bt_u$UID`, then `/tmp/bt_u$UID` - and `davs://` looks in
+the same places in the same order. A token file must be mode `0600`. Set one
+of them before the objects are created:
 
 ```console
 $ export BEARER_TOKEN_FILE=$HOME/.tokens/eos.jwt

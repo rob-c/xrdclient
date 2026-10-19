@@ -14,14 +14,15 @@ Skipped cleanly where ``xrootd``, its GSI plugin or ``openssl`` is missing.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-import _gsi
 import xrdclient
+from tests import _gsi
 from xrdclient.crypto.delegation import proxy_path_length
 from xrdclient.crypto.rsa import load_private_key
 from xrdclient.crypto.x509 import (
@@ -74,11 +75,11 @@ def config(pki, **changes) -> xrdclient.Config:
     return base.evolve(**changes)
 
 
-def login(server, cfg) -> None:
+def login(server: _gsi.GSIXrootd, cfg: xrdclient.Config) -> None:
     assert xrdclient.stat(server.url + server.path("hello.txt"), config=cfg).size == 3
 
 
-def only_delegated(server) -> Path:
+def only_delegated(server: _gsi.GSIXrootd) -> Path:
     (path,) = server.delegated()
     return path
 
@@ -128,8 +129,18 @@ def test_the_stock_environment_variable_turns_it_on(fresh, pki, monkeypatch):
     assert len(fresh.delegated()) == 1
 
 
-def test_a_server_that_cannot_be_verified_is_logged_into_but_not_given_a_proxy(fresh, pki, caplog):
-    login(fresh, config(pki, gsi_delegate=True, ca_path=str(pki.empty_ca_dir)))
+def test_a_server_that_cannot_be_verified_is_not_logged_into(fresh, pki):
+    """Since 0.4.0 the server proves who it is on every login, as XrdSecgsi's client asks."""
+    with pytest.raises(xrdclient.errors.AuthenticationError, match="did not prove its identity"):
+        login(fresh, config(pki, ca_path=str(pki.empty_ca_dir)))
+    assert fresh.delegated() == []
+
+
+def test_with_the_login_check_off_it_is_logged_into_but_not_given_a_proxy(fresh, pki, caplog):
+    unchecked = config(
+        pki, gsi_delegate=True, gsi_verify_server=False, ca_path=str(pki.empty_ca_dir)
+    )
+    login(fresh, unchecked)
     assert fresh.delegated() == []
     assert "not delegating the X.509 proxy" in caplog.text
     assert "Not allowed to sign proxy requests" in fresh.log()
@@ -210,6 +221,7 @@ def test_the_proxies_both_clients_sign_have_the_same_shape(fresh, pki, tmp_path)
     assert ours.issuer == theirs.issuer
     assert len(ours.subject.rdns) == len(theirs.subject.rdns)
     assert ours.not_after == theirs.not_after
+    assert ours.public_key is not None and theirs.public_key is not None
     assert ours.public_key.e == theirs.public_key.e
     assert ours.public_key.n.bit_length() == theirs.public_key.n.bit_length()
 
@@ -217,7 +229,7 @@ def test_the_proxies_both_clients_sign_have_the_same_shape(fresh, pki, tmp_path)
     assert path_length(ours) == path_length(theirs) is None
 
 
-@pytest.mark.skipif(_gsi.shutil.which("xrdcp") is None, reason="no xrdcp on PATH")
+@pytest.mark.skipif(shutil.which("xrdcp") is None, reason="environmental: no xrdcp on PATH")
 def test_xrdcp_delegates_only_for_a_delegated_tpc_whatever_the_environment(fresh, pki, tmp_path):
     """``xrdcp`` sets ``XrdSecGSIDELEGPROXY`` itself: on for ``--tpc delegate``, else off."""
     env = {

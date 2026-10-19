@@ -8,28 +8,30 @@ across two sockets, so the tests here are mostly about who sends what where.
 from __future__ import annotations
 
 import asyncio
+import io
 import struct
 
 import pytest
 
 import xrdclient
-from conftest import error, handshake_reply, login_body, ok, protocol_body
+from tests.conftest import error, handshake_reply, login_body, ok, protocol_body
 from xrdclient.config import Config
 from xrdclient.errors import ConnectionError as XrdConnectionError
 from xrdclient.errors import ProtocolError, ServerError
 from xrdclient.flags import OpenFlags
+from xrdclient.io import XRootDRawIO
 from xrdclient.proto import constants as c
 from xrdclient.proto import machine as m
 from xrdclient.proto import requests as r
 from xrdclient.proto import responses as rp
-from xrdclient.proto.frames import encode
+from xrdclient.proto.frames import Request, encode
 from xrdclient.session import Session
 from xrdclient.testing import FakeServer
 
 _HDR = struct.Struct(">HH16sI")
 
 
-def parts(request, streamid: int = 4):
+def parts(request: Request, streamid: int = 4) -> tuple[bytes, int, bytes]:
     """``(params, dlen, body)`` of an encoded request."""
     frame = encode(request, streamid)
     _, _, params, dlen = _HDR.unpack(frame[:24])
@@ -117,9 +119,15 @@ def machine(**kwargs) -> m.SessionMachine:
     )
 
 
+def bound(sessid: bytes) -> m.SessionMachine:
+    """A fresh machine for a data connection joining session ``sessid``."""
+    primary = machine()
+    return m.SessionMachine.data_path(primary, sessid, config=primary.config, want_tls=False)
+
+
 def bind_up(sessid: bytes = b"\x11" * 16) -> m.SessionMachine:
     """A machine brought all the way up as a data connection."""
-    machine_ = machine(bind_to=sessid)
+    machine_ = bound(sessid)
     machine_.start()
     machine_.data_to_send()
     machine_.receive_data(handshake_reply())
@@ -128,7 +136,7 @@ def bind_up(sessid: bytes = b"\x11" * 16) -> m.SessionMachine:
 
 
 def test_a_data_connection_binds_instead_of_logging_in():
-    machine_ = machine(bind_to=b"\x11" * 16)
+    machine_ = bound(b"\x11" * 16)
     machine_.start()
     machine_.data_to_send()
     machine_.receive_data(handshake_reply())
@@ -244,7 +252,7 @@ def test_a_path_that_dies_with_nothing_on_it_is_only_reported():
 # --------------------------------------------------------------------------
 
 
-def _open(session, path: str, options: int = c.kXR_open_read) -> bytes:
+def _open(session: Session, path: str, options: int = c.kXR_open_read) -> bytes:
     return rp.parse_open(session.execute(r.Open(path, options)).data)[0]
 
 
@@ -404,6 +412,7 @@ def test_a_re_opened_file_does_not_believe_in_its_old_path(server, config):
 
 def test_an_opened_file_reaches_the_path_through_the_facade(server, config):
     with xrdclient.open(f"{server.url}//data/a.root", "rb", config=config) as fh:
+        assert isinstance(fh, io.BufferedReader) and isinstance(fh.raw, XRootDRawIO)
         assert fh.raw.file.bind_data_path() == 1
         assert fh.read() == b"hello world"
 
@@ -411,7 +420,7 @@ def test_an_opened_file_reaches_the_path_through_the_facade(server, config):
 def test_the_async_facade_binds_a_path_too(server, config):
     import xrdclient.aio
 
-    async def go():
+    async def go() -> None:
         async with xrdclient.aio.open(f"{server.url}//data/a.root", "rb", config=config) as fh:
             assert fh.data_path == 0
             assert await fh.bind_data_path() == 1
@@ -425,7 +434,7 @@ def test_an_http_file_has_no_data_path():
     import xrdclient.aio
     from xrdclient.testing import FakeDAVServer
 
-    async def go(url):
+    async def go(url: str) -> None:
         async with xrdclient.aio.open(url, "rb") as fh:
             assert fh.data_path == 0
             with pytest.raises(xrdclient.errors.UnsupportedError, match="bind_data_path"):
@@ -436,10 +445,12 @@ def test_an_http_file_has_no_data_path():
 
 
 def test_a_second_file_on_the_same_server_gets_its_own_path(server, config):
-    with FakeServer(files={"/d/a": b"a" * 16}) as other:
-        with xrdclient.File(f"{other.url}//d/a", config) as first:
-            with xrdclient.File(f"{other.url}//d/a", config) as second:
-                assert first.bind_data_path() == 1
-                assert second.bind_data_path() == 1  # its own session, its own numbering
-                assert first.read(4, 0) == b"aaaa"
-                assert second.read(4, 4) == b"aaaa"
+    with (
+        FakeServer(files={"/d/a": b"a" * 16}) as other,
+        xrdclient.File(f"{other.url}//d/a", config) as first,
+        xrdclient.File(f"{other.url}//d/a", config) as second,
+    ):
+        assert first.bind_data_path() == 1
+        assert second.bind_data_path() == 1  # its own session, its own numbering
+        assert first.read(4, 0) == b"aaaa"
+        assert second.read(4, 4) == b"aaaa"

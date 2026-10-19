@@ -8,6 +8,7 @@ the *client* does, which is the only part of this that ships.
 
 from __future__ import annotations
 
+import contextlib
 import socket
 import threading
 import time
@@ -21,6 +22,7 @@ from xrdclient.errors import ConnectionError as XrdConnectionError
 from xrdclient.errors import ProtocolError, TransientError
 from xrdclient.errors import TimeoutError as XrdTimeoutError
 from xrdclient.flags import OpenFlags
+from xrdclient.io import XRootDRawIO
 from xrdclient.testing import FakeServer, FaultProxy
 from xrdclient.testing.faults import _address, _pieces
 from xrdclient.url import parse
@@ -150,9 +152,8 @@ def test_an_idempotent_request_survives_a_dropped_connection(broken, patient):
 
 def test_a_connection_that_keeps_dropping_gives_up_and_says_so(broken, patient):
     broken.drop_after(0)
-    with FileSystem(broken.url, patient) as fs:
-        with pytest.raises(TransientError) as caught:
-            fs.stat("/data/a.root")
+    with FileSystem(broken.url, patient) as fs, pytest.raises(TransientError) as caught:
+        fs.stat("/data/a.root")
     assert caught.value.attempts == patient.connect_retries + 1
     assert broken.connections > patient.connect_retries
 
@@ -161,9 +162,8 @@ def test_a_stalled_server_times_out_rather_than_hanging(broken, patient):
     """No answer and no error is the failure that costs a whole grid job."""
     broken.stall_after(0)
     started = time.monotonic()
-    with FileSystem(broken.url, patient) as fs:
-        with pytest.raises(XrdTimeoutError) as caught:
-            fs.stat("/data/a.root")
+    with FileSystem(broken.url, patient) as fs, pytest.raises(XrdTimeoutError) as caught:
+        fs.stat("/data/a.root")
     assert time.monotonic() - started < 30
     # It is still transient - retrying is reasonable - but it says *why*.
     assert isinstance(caught.value, TransientError)
@@ -307,24 +307,22 @@ def test_the_high_level_file_object_recovers_too(broken, patient):
 def test_a_flipped_bit_in_a_page_is_caught_by_its_checksum(patient):
     """``kXR_pgread`` exists for exactly this; the proxy is the bad memory."""
     page = bytes(range(256)) * 16  # 4 KiB
-    with FakeServer(files={"/p.root": page + page}) as origin:
-        with FaultProxy(origin) as proxy:
-            proxy.rewrite(lambda data: data.replace(b"\x00\x01\x02\x03", b"\x00\x01\x02\xff"))
-            handle = File(proxy.url.with_path("/p.root"), patient)
-            with handle:
-                result = handle.pgread(8192, 0)
+    with FakeServer(files={"/p.root": page + page}) as origin, FaultProxy(origin) as proxy:
+        proxy.rewrite(lambda data: data.replace(b"\x00\x01\x02\x03", b"\x00\x01\x02\xff"))
+        handle = File(proxy.url.with_path("/p.root"), patient)
+        with handle:
+            result = handle.pgread(8192, 0)
     assert result.corrupt_pages
     assert result.data != page + page
 
 
 def test_an_unverified_paged_read_hands_back_what_arrived(patient):
     page = bytes(range(256)) * 16
-    with FakeServer(files={"/p.root": page}) as origin:
-        with FaultProxy(origin) as proxy:
-            proxy.rewrite(lambda data: data.replace(b"\x00\x01\x02\x03", b"\x00\x01\x02\xff"))
-            handle = File(proxy.url.with_path("/p.root"), patient)
-            with handle:
-                result = handle.pgread(4096, 0, verify=False)
+    with FakeServer(files={"/p.root": page}) as origin, FaultProxy(origin) as proxy:
+        proxy.rewrite(lambda data: data.replace(b"\x00\x01\x02\x03", b"\x00\x01\x02\xff"))
+        handle = File(proxy.url.with_path("/p.root"), patient)
+        with handle:
+            result = handle.pgread(4096, 0, verify=False)
     assert result.corrupt_pages == ()
     assert result.data != page
 
@@ -336,18 +334,24 @@ def test_a_flipped_byte_at_a_chosen_offset_reaches_the_caller(patient):
     this proxy carries: a data sub-stream would carry the read's bytes on a
     connection of its own and the count would land somewhere else.
     """
-    with FakeServer(files={"/f.root": b"A" * 64}) as origin, FaultProxy(origin) as proxy:
-        with File(proxy.url.with_path("/f.root"), patient.evolve(data_streams=0)) as handle:
-            proxy.corrupt(proxy.bytes_from_server + 8, 0x20)  # the first byte of the data
-            data = handle.read(64, 0)
+    with (
+        FakeServer(files={"/f.root": b"A" * 64}) as origin,
+        FaultProxy(origin) as proxy,
+        File(proxy.url.with_path("/f.root"), patient.evolve(data_streams=0)) as handle,
+    ):
+        proxy.corrupt(proxy.bytes_from_server + 8, 0x20)  # the first byte of the data
+        data = handle.read(64, 0)
     assert data == b"a" + b"A" * 63
 
 
 def test_a_proxy_in_front_of_nothing_is_a_connection_error(patient, closed_port):
     """The upstream is gone: the proxy accepts, finds nobody, and hangs up."""
-    with FaultProxy(closed_port) as proxy:
-        with FileSystem(proxy.url, patient) as fs, pytest.raises(XrdConnectionError):
-            fs.stat("/f.root")
+    with (
+        FaultProxy(closed_port) as proxy,
+        FileSystem(proxy.url, patient) as fs,
+        pytest.raises(XrdConnectionError),
+    ):
+        fs.stat("/f.root")
     assert proxy.connections >= 1
 
 
@@ -358,6 +362,7 @@ def test_a_borrowed_connection_is_not_closed_by_the_handle_that_lost_it(broken, 
             assert fh.read(32) == PAYLOAD[:32]
             broken.cut()
             assert fh.read(32) == PAYLOAD[32:64]
+            assert isinstance(fh, XRootDRawIO)  # buffering=0
             assert fh.file.recoveries == 1
         assert fs.stat("/data/big.root").st_size == len(PAYLOAD)
 
@@ -421,11 +426,9 @@ def test_a_peer_that_stops_reading_is_dropped_instead_of_jamming_the_proxy():
 
 
 def _send_blast(peer: socket.socket, blast: bytes) -> None:
-    with peer:
-        try:
-            peer.sendall(blast)
-        except OSError:
-            pass  # the proxy hung up on us, which is the point
+    # The proxy hanging up on us is the point.
+    with peer, contextlib.suppress(OSError):
+        peer.sendall(blast)
 
 
 def _flood(listener: socket.socket, blast: bytes) -> None:

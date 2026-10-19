@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import builtins
+import pathlib
 import runpy
-import sys
+import tomllib
 import warnings
-from importlib.metadata import requires
-from types import SimpleNamespace
 
 import pytest
 from packaging.requirements import Requirement
+from xrdsec.krb5 import gss
 
 from xrdclient.auth import krb5
 from xrdclient.auth.base import Offer
@@ -20,41 +20,23 @@ from xrdclient.crypto import blowfish, der, ed25519, p256
 from xrdclient.errors import CredentialError
 
 
-def _token(
-    wrapper=0x60, mechanism="1.2.840.113554.1.2.2", prefix=b"\x01\x00", request=b"\x6e\x02\x30\x00"
-):
-    return der.encode(wrapper, der.encode_oid(mechanism) + prefix + request)
-
-
 @pytest.mark.parametrize("cache", ["API:user", "MEMORY:user"])
-def test_native_cache_retains_xrootd_ap_req(monkeypatch, cache):
-    calls = {}
+def test_a_platform_only_cache_gets_its_ap_req_from_xrdsecs_gss_layer(monkeypatch, cache):
+    """``API:``/``MEMORY:`` go to the system library; the raw AP-REQ is framed as ``krb5``."""
+    asked: list[str] = []
 
-    def credentials(**kwargs):
-        calls["credentials"] = kwargs
-        return object()
+    def initiator_ap_req(principal: str, *, backend: str | None = None) -> bytes:
+        asked.append(principal)
+        return b"\x6e\x02\x30\x00"
 
-    def context(**kwargs):
-        calls["context"] = kwargs
-        return SimpleNamespace(step=lambda: _token())
-
-    module = SimpleNamespace(
-        Credentials=credentials,
-        SecurityContext=context,
-        Name=lambda principal, **kwargs: principal,
-        NameType=SimpleNamespace(kerberos_principal="principal"),
-        MechType=SimpleNamespace(kerberos="kerberos"),
-        exceptions=SimpleNamespace(GSSError=RuntimeError),
-    )
-    monkeypatch.setitem(sys.modules, "gssapi", module)
+    monkeypatch.setattr(gss, "load_backend", lambda name=None, **_: None)
+    monkeypatch.setattr(gss, "initiator_ap_req", initiator_ap_req)
     monkeypatch.setenv("KRB5CCNAME", cache)
     offer = Offer("krb5", "xrootd/server@EXAMPLE")
     credential = krb5.KerberosCredential.available(offer, Config(), username="", host="server")
     assert credential is not None
     assert credential.initial() == b"krb5\0\x6e\x02\x30\x00"
-    assert calls["credentials"] == {"usage": "initiate", "mechs": ["kerberos"]}
-    assert calls["context"]["flags"] == 0  # no unsolicited delegation
-    assert calls["context"]["name"] == "xrootd/server@EXAMPLE"
+    assert asked == ["xrootd/server@EXAMPLE"]
 
 
 def test_native_cache_forwarding_is_explicitly_unsupported(monkeypatch):
@@ -63,53 +45,6 @@ def test_native_cache_forwarding_is_explicitly_unsupported(monkeypatch):
         krb5.KerberosCredential.available(
             Offer("krb5", "xrootd/server@EXAMPLE,fwd"), Config(), username="", host="server"
         )
-
-
-@pytest.mark.parametrize(
-    "token",
-    [
-        b"",
-        b"bad",
-        _token(wrapper=0x30),
-        _token(mechanism="1.2.3"),
-        _token(prefix=b"\0\0"),
-        _token(request=b"\x30\0"),
-        _token(request=b"\x6e\0x"),
-        _token() + b"x",
-    ],
-)
-def test_native_gss_headers_are_checked(token):
-    with pytest.raises(CredentialError, match="malformed AP-REQ"):
-        krb5._unwrap_ap_req(token)
-
-
-@pytest.mark.parametrize("error", [RuntimeError("no ticket"), NotImplementedError("no store")])
-def test_native_cache_errors_are_actionable(monkeypatch, error):
-    def credentials(**kwargs):
-        raise error
-
-    module = SimpleNamespace(
-        Credentials=credentials,
-        MechType=SimpleNamespace(kerberos="kerberos"),
-        exceptions=SimpleNamespace(GSSError=RuntimeError),
-    )
-    monkeypatch.setitem(sys.modules, "gssapi", module)
-    with pytest.raises(CredentialError, match=r"API:user.*Run kinit"):
-        krb5._native_ap_req("xrootd/server", "API:user")
-
-
-def test_native_empty_token_is_not_accepted(monkeypatch):
-    module = SimpleNamespace(
-        Credentials=lambda **kwargs: None,
-        SecurityContext=lambda **kwargs: SimpleNamespace(step=lambda: None),
-        Name=lambda *args, **kwargs: None,
-        NameType=SimpleNamespace(kerberos_principal="principal"),
-        MechType=SimpleNamespace(kerberos="kerberos"),
-        exceptions=SimpleNamespace(GSSError=RuntimeError),
-    )
-    monkeypatch.setitem(sys.modules, "gssapi", module)
-    with pytest.raises(CredentialError, match="malformed"):
-        krb5._native_ap_req("xrootd/server", "API:user")
 
 
 def test_cryptography_45_blowfish_import_compatibility(monkeypatch):
@@ -124,9 +59,8 @@ def test_cryptography_45_blowfish_import_compatibility(monkeypatch):
         warnings.simplefilter("ignore")
         patcher.setattr(builtins, "__import__", older_import)
         loaded = runpy.run_path(blowfish.__file__)
-    assert loaded["Blowfish"](b"k").decrypt_ecb(
-        loaded["Blowfish"](b"k").encrypt_ecb(bytes(8))
-    ) == bytes(8)
+    cipher = loaded["Blowfish"](b"k")
+    assert cipher.decrypt_cfb64(bytes(8), cipher.encrypt_cfb64(bytes(8), b"data")) == b"data"
 
 
 def test_dependency_rejection_boundaries():
@@ -141,29 +75,31 @@ def test_dependency_rejection_boundaries():
     assert token_claims("opaque") == {}
 
 
+#: The project file wheels are built from. Read rather than the installed
+#: metadata, which belongs to whichever checkout was last ``pip install``-ed
+#: and so can describe a different tree from the one under test.
+PROJECT = tomllib.loads((pathlib.Path(__file__).parents[1] / "pyproject.toml").read_text())
+
+
+def _names(requirements: list[str]) -> set[str]:
+    return {Requirement(value).name.lower() for value in requirements}
+
+
 def test_required_dependencies_are_portable():
-    runtime = {
-        Requirement(value).name.lower()
-        for value in requires("xrdclient") or []
-        if Requirement(value).marker is None or Requirement(value).marker.evaluate({"extra": ""})
-    }
-    assert runtime == {
-        "asn1crypto",
-        "botocore",
+    assert _names(PROJECT["project"]["dependencies"]) == {
         "cryptography",
-        "pyjwt",
-        "urllib3",
+        "xrdcore",
+        # botocore comes with xrdhttp, the only package that imports it.
+        "xrdhttp",
+        # asn1crypto comes with xrdsec, which alone imports it now.
+        "xrdsec",
     }
 
 
 def test_native_kerberos_bindings_are_in_the_optional_extra():
-    optional = {
-        Requirement(value).name.lower()
-        for value in requires("xrdclient") or []
-        if Requirement(value).marker is not None
-        and Requirement(value).marker.evaluate({"extra": "krb5"})
-    }
-    assert optional == {"gssapi", "krb5"}
+    """python-gssapi comes with xrdsec's ``krb5`` extra, where the GSS layer is."""
+    (requirement,) = map(Requirement, PROJECT["project"]["optional-dependencies"]["krb5"])
+    assert (requirement.name, requirement.extras) == ("xrdsec", {"krb5"})
 
 
 def test_blowfish_decryption_checks_iv_size():

@@ -25,6 +25,14 @@ from . import client
 __all__ = ["client", "install"]
 
 
+class _Package(types.ModuleType):
+    """The ``XRootD`` package :func:`install` puts in :data:`sys.modules`."""
+
+    #: Marks the package as this layer, so a second :func:`install` is allowed.
+    __xrdclient_compat__: bool
+    client: types.ModuleType
+
+
 def install() -> None:
     """Make ``import XRootD`` and ``from XRootD import client`` load this package.
 
@@ -36,10 +44,10 @@ def install() -> None:
     existing = sys.modules.get("XRootD")
     if existing is not None and getattr(existing, "__xrdclient_compat__", False) is False:
         raise RuntimeError("the official XRootD bindings are already imported")
-    package = types.ModuleType("XRootD")
+    package = _Package("XRootD")
     package.__path__ = []
-    package.__xrdclient_compat__ = True  # type: ignore[attr-defined]
-    package.client = client  # type: ignore[attr-defined]
+    package.__xrdclient_compat__ = True
+    package.client = client
     sys.modules["XRootD"] = package
     sys.modules["XRootD.client"] = client
     for name in (

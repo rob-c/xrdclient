@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import socket
 import threading
+from collections.abc import Iterator
 
 import pytest
 
@@ -26,6 +27,7 @@ from xrdclient.session.pool import SESSIONS
 from xrdclient.session.router import Router, _path_fields, _redirect_path, _repath, _retarget
 from xrdclient.session.sync import RedirectRequired, Session
 from xrdclient.testing import FakeServer
+from xrdclient.testing.server import _Connection
 
 
 def _logins(server: FakeServer) -> int:
@@ -157,7 +159,7 @@ def test_a_redirect_in_one_thread_does_not_close_anothers_session():
                 i += 1
                 try:
                     fs.mkdir(f"/d{i}")
-                except Exception as exc:  # pragma: no cover - the failure being tested
+                except Exception as exc:  # the failure being tested
                     errors.append(repr(exc))
 
         worker = threading.Thread(target=busy)
@@ -167,7 +169,7 @@ def test_a_redirect_in_one_thread_does_not_close_anothers_session():
                 manager.redirects[c.kXR_stat] = (*ds.address, "")
                 try:
                     fs.stat("/a")
-                except Exception as exc:  # pragma: no cover - the failure being tested
+                except Exception as exc:  # the failure being tested
                     errors.append("stat: " + repr(exc))
         finally:
             stop.set()
@@ -199,7 +201,7 @@ def test_a_borrowed_session_is_let_go_of_not_closed(server, config):
 def test_a_dropped_hop_goes_back_to_the_manager(config):
     """A data server that vanishes mid-request sends the retry home."""
     with FakeServer() as manager, FakeServer(files={"/a": b"A"}) as ds:
-        fs = xrdclient.FileSystem(manager.url, Config(**{**_plain(config), "retry_backoff": 0}))
+        fs = xrdclient.FileSystem(manager.url, _plain(config).evolve(retry_backoff=0))
         manager.redirects[c.kXR_stat] = (*ds.address, "")
         ds.handlers[c.kXR_stat] = _hang_up
         with pytest.raises(FileNotFoundError):
@@ -219,19 +221,21 @@ def test_a_non_idempotent_request_is_not_retried_after_a_hop_fails(config):
         fs.close()
 
 
-def _plain(config: Config) -> dict[str, object]:
-    return {
-        "username": config.username,
-        "auth_order": config.auth_order,
-        "require_tls": False,
-        "data_streams": 0,
-    }
+def _plain(config: Config) -> Config:
+    return Config(
+        username=config.username,
+        auth_order=config.auth_order,
+        require_tls=False,
+        data_streams=0,
+    )
 
 
-def _hang_up(conn, sid, params, body):  # type: ignore[no-untyped-def]
+def _hang_up(conn: _Connection, sid: int, params: bytes, body: bytes) -> Iterator[bytes]:
     """Cut the connection the way a crashed data server does."""
-    conn.sock.shutdown(socket.SHUT_RDWR)
-    conn.sock.close()
+    sock = conn.sock
+    assert isinstance(sock, socket.socket)
+    sock.shutdown(socket.SHUT_RDWR)
+    sock.close()
     return iter(())
 
 
@@ -407,7 +411,7 @@ def test_only_a_url_naming_a_path_moves_the_request(host, port, path):
 
 
 def test_a_redirect_path_leaves_requests_without_one_alone():
-    by_handle = {"path": ""}
+    by_handle: dict[str, str | list[str]] = {"path": ""}
     _repath(by_handle, "/g")
     assert by_handle == {"path": ""}
     many: dict[str, str | list[str]] = {"paths": ["/a", "/b"]}
@@ -436,12 +440,15 @@ def test_a_hop_connection_that_cannot_be_pooled_is_closed(config, monkeypatch):
         real(self)
 
     monkeypatch.setattr(Session, "close", spy)
-    no_pool = Config(**{**_plain(config), "pool_size": 0})
-    with FakeServer() as manager, FakeServer(files={"/a": b"A"}) as ds:
-        with xrdclient.FileSystem(manager.url, no_pool) as fs:
-            manager.redirects[c.kXR_stat] = (*ds.address, "")
-            fs.stat("/a")
-            assert [s.endpoint for s in closed] == [f"{ds.address[0]}:{ds.address[1]}"]
+    no_pool = _plain(config).evolve(pool_size=0)
+    with (
+        FakeServer() as manager,
+        FakeServer(files={"/a": b"A"}) as ds,
+        xrdclient.FileSystem(manager.url, no_pool) as fs,
+    ):
+        manager.redirects[c.kXR_stat] = (*ds.address, "")
+        fs.stat("/a")
+        assert [s.endpoint for s in closed] == [f"{ds.address[0]}:{ds.address[1]}"]
     assert len(SESSIONS) == 0
 
 

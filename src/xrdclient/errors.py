@@ -1,89 +1,105 @@
-"""Exception hierarchy.
+"""Exception hierarchy, joined to :mod:`xrdcore.errors`.
 
 Every failure raises. Server-reported errors map onto the ``OSError`` subclass
 a local filesystem would have raised, so ``except FileNotFoundError`` works
 identically against ``/tmp/x`` and ``root://host//store/x``.
+
+Where to start: :func:`raise_for_status` is the single place a ``kXR_error``
+response becomes an exception; ``_CODE_CLASSES`` picks the class and
+:data:`KXR_ERRNO` mirrors ``XProtocol::toErrno`` so ``errno`` values match
+what XrdCl's callers see. ``ConnectionError`` and ``TimeoutError`` shadow the
+builtins on purpose - each *subclasses* its builtin, so either spelling of
+``except`` catches them.
+
+How this joins the libraries (docs/errors.md has the whole picture): since
+0.4.0 the vocabulary every library on the stack raises - xrdcore, xrdsec,
+xrdhttp - is :mod:`xrdcore.errors`, and the names here that mean the same
+thing *are* those classes, not copies or subclasses of them::
+
+    XRootDError is xrdcore.errors.XrdError
+    ProtocolError, MetalinkError, ConnectionError, TransientError,
+    TimeoutError, AuthenticationError, CredentialError, TokenExpiredError,
+    InsecureCredentialError                 is the xrdcore class of that name
+
+So ``except xrdclient.errors.CredentialError`` catches the
+:class:`~xrdcore.errors.CredentialError` xrdsec raises, ``except
+xrdclient.XRootDError`` catches everything any library raises, and nothing
+is translated or re-raised on the way. A subclass the other way round
+(``class CredentialError(XRootDError, xrdcore.errors.CredentialError)``)
+would not do that: an ``except`` only catches its own class and those below
+it. The errors only XRootD has - :class:`ServerError` and its ``OSError``
+family, :class:`NoMechanismError`, :class:`PageIntegrityError`,
+:class:`AbortedError`, ... - are defined here and join the hierarchy by
+inheritance, by multiple inheritance where they are also a builtin.
+
+What must not break: every exception here pickles with all its attributes
+(``__reduce__`` + :func:`rebuild`, which is xrdcore's; ``tests/test_errors.py``
+pins it), because errors cross process boundaries under fsspec/dask and
+``concurrent.futures``. A new exception with keyword-only or extra state
+needs its own ``__reduce__``.
 """
 
 from __future__ import annotations
 
 import builtins
 import errno as _errno
+from collections.abc import Callable
+
+from xrdcore.errors import (
+    AuthenticationError,
+    ConnectionError,
+    CredentialError,
+    InsecureCredentialError,
+    MetalinkError,
+    ProtocolError,
+    TimeoutError,
+    TokenExpiredError,
+    TransientError,
+    rebuild,
+)
+from xrdcore.errors import XrdError as XRootDError
+
+#: What ``__reduce__`` returns here, the same shape as xrdcore's own errors:
+#: :func:`rebuild` and the arguments it is called with.
+_Reduced = tuple[Callable[..., BaseException], tuple[object, ...]]
 
 __all__ = [
-    "XRootDError",
-    "ProtocolError",
-    "ConnectionError",
-    "TimeoutError",
-    "TransientError",
+    "KXR_ERRNO",
+    "AbortedError",
     "AuthenticationError",
-    "NoMechanismError",
+    "ChecksumMismatchError",
+    "ConnectionError",
     "CredentialError",
-    "TokenExpiredError",
+    "InsecureCredentialError",
+    "MetalinkError",
+    "NoMechanismError",
+    "PageIntegrityError",
+    "ProtocolError",
+    "RedirectLimitError",
     "ServerError",
     "TLSRequiredError",
-    "RedirectLimitError",
-    "WaitLimitError",
-    "ChecksumMismatchError",
-    "MetalinkError",
-    "PageIntegrityError",
+    "TimeoutError",
+    "TokenExpiredError",
     "TooLargeError",
+    "TransientError",
+    "WaitLimitError",
+    "XRootDError",
+    "errno_for",
+    "kxr_for",
     "raise_for_status",
 ]
-
-
-class XRootDError(Exception):
-    """Base of every error this package raises."""
-
-
-def _rebuild(cls: type, args: tuple, kwargs: dict) -> BaseException:  # type: ignore[type-arg]
-    """Unpickle helper: these exceptions carry more than ``args``."""
-    return cls(*args, **kwargs)  # type: ignore[no-any-return]
-
-
-class ProtocolError(XRootDError):
-    """A malformed frame, an unexpected opcode, or a version mismatch."""
-
-
-class MetalinkError(ProtocolError, ValueError):
-    """A Metalink descriptor is unsafe, malformed, or unusable."""
-
-
-class ConnectionError(XRootDError, builtins.ConnectionError):
-    """The transport failed."""
-
-
-class TransientError(ConnectionError):
-    """A retryable failure. Records progress so a caller can resume."""
-
-    def __init__(self, message: str, *, attempts: int = 0, committed: int = 0) -> None:
-        super().__init__(message)
-        self.attempts = attempts
-        self.committed = committed
-
-    def __reduce__(self) -> tuple:  # type: ignore[type-arg]
-        state = {"attempts": self.attempts, "committed": self.committed}
-        return _rebuild, (type(self), (self.args[0],), state)
-
-
-class TimeoutError(TransientError, builtins.TimeoutError):
-    """An operation exceeded its deadline.
-
-    A timeout is a :class:`TransientError` because that is what it is - the
-    request may well succeed on the next attempt - so code that retries on
-    ``TransientError`` catches it, and code that cares specifically about
-    slowness can still catch the builtin :class:`TimeoutError`.
-    """
-
-
-class AuthenticationError(XRootDError):
-    """Authentication could not be completed."""
 
 
 class NoMechanismError(AuthenticationError):
     """The server offered no mechanism this client can satisfy."""
 
     def __init__(self, offered: list[str], tried: dict[str, str] | None = None) -> None:
+        """``offered`` is the server's ``kXR_login`` security list in its order.
+
+        ``tried`` maps each mechanism this client attempted to why it failed;
+        both go into the message because "login failed" alone gives a user
+        nothing to act on.
+        """
         self.offered = offered
         self.tried = tried or {}
         detail = "; ".join(f"{k}: {v}" for k, v in self.tried.items())
@@ -93,16 +109,9 @@ class NoMechanismError(AuthenticationError):
         )
         super().__init__(f"{msg} [{detail}]" if detail else msg)
 
-    def __reduce__(self) -> tuple:  # type: ignore[type-arg]
-        return _rebuild, (type(self), (self.offered, self.tried), {})
-
-
-class CredentialError(AuthenticationError):
-    """A credential was missing, unreadable, or malformed."""
-
-
-class TokenExpiredError(CredentialError):
-    """A bearer token is expired; the server would have rejected it."""
+    def __reduce__(self) -> _Reduced:
+        """Pickle by the offered/tried lists; the message is rebuilt from them."""
+        return rebuild, (type(self), (self.offered, self.tried), {})
 
 
 class RedirectLimitError(XRootDError):
@@ -122,6 +131,12 @@ class ChecksumMismatchError(XRootDError):
     """A computed checksum did not match the expected one."""
 
     def __init__(self, algorithm: str, expected: str, actual: str) -> None:
+        """Hold both digests and the algorithm, for code that wants to compare them.
+
+        The message tells the user to check the *source*: a mismatch after a
+        copy almost always means the source changed or was corrupt, not that
+        retrying the transfer will help.
+        """
         super().__init__(
             f"The {algorithm} checksum does not match: expected {expected}, got {actual}. "
             "Check the source file before copying it again."
@@ -130,8 +145,9 @@ class ChecksumMismatchError(XRootDError):
         self.expected = expected
         self.actual = actual
 
-    def __reduce__(self) -> tuple:  # type: ignore[type-arg]
-        return _rebuild, (type(self), (self.algorithm, self.expected, self.actual), {})
+    def __reduce__(self) -> _Reduced:
+        """Pickle by the three digest fields; the message is rebuilt from them."""
+        return rebuild, (type(self), (self.algorithm, self.expected, self.actual), {})
 
 
 class PageIntegrityError(XRootDError):
@@ -144,6 +160,7 @@ class PageIntegrityError(XRootDError):
     """
 
     def __init__(self, offset: int, retries: int, *, path: str | None = None) -> None:
+        """``offset`` is the first byte of the bad page; ``retries`` the retransmissions spent."""
         self.offset = offset
         self.retries = retries
         self.path = path
@@ -153,8 +170,9 @@ class PageIntegrityError(XRootDError):
             f"{retries} retransmissions"
         )
 
-    def __reduce__(self) -> tuple:  # type: ignore[type-arg]
-        return _rebuild, (type(self), (self.offset, self.retries), {"path": self.path})
+    def __reduce__(self) -> _Reduced:
+        """Pickle with ``path`` intact (it is keyword-only, so ``args`` cannot carry it)."""
+        return rebuild, (type(self), (self.offset, self.retries), {"path": self.path})
 
 
 class TooLargeError(XRootDError):
@@ -168,6 +186,7 @@ class TooLargeError(XRootDError):
     """
 
     def __init__(self, size: int, limit: int, *, path: str | None = None) -> None:
+        """``size`` is the file's length, ``limit`` the ceiling it would have broken."""
         self.size = size
         self.limit = limit
         self.path = path
@@ -178,8 +197,42 @@ class TooLargeError(XRootDError):
             f"with xrdclient.copy(), or raise config.max_read_size"
         )
 
-    def __reduce__(self) -> tuple:  # type: ignore[type-arg]
-        return _rebuild, (type(self), (self.size, self.limit), {"path": self.path})
+    def __reduce__(self) -> _Reduced:
+        """Pickle with ``path`` intact (it is keyword-only, so ``args`` cannot carry it)."""
+        return rebuild, (type(self), (self.size, self.limit), {"path": self.path})
+
+
+class AbortedError(XRootDError, builtins.OSError):
+    """The operation was called off by :meth:`~xrdclient.File.abort` (or a cancel hook).
+
+    Raised by the call that was blocked when the abort came - it is woken,
+    rather than left to its timeout - and by every call made on the aborted
+    object afterwards. ``errno`` is ``ECANCELED``, the number XrdCl's
+    callers see for a cancelled job (``kXR_Cancelled`` maps to it), so
+    ``except OSError`` code that switches on ``errno`` reads it correctly.
+
+    Deliberately *not* a :class:`TransientError`: code that retries on a
+    transient failure must not retry what someone asked to stop.
+    """
+
+    errno = _errno.ECANCELED
+
+    def __init__(self, message: str = "the operation was aborted") -> None:
+        """Set ``errno``/``strerror`` exactly as ``OSError(ECANCELED, message)`` would.
+
+        ``args`` is pinned to the same pair so ``repr`` and pickling agree with
+        what a local cancelled system call would have produced.
+        """
+        builtins.OSError.__init__(self, _errno.ECANCELED, message)
+        self.args = (_errno.ECANCELED, message)
+
+    def __str__(self) -> str:
+        """Just the message, without the ``[Errno 125]`` prefix ``OSError`` would add."""
+        return str(self.strerror)
+
+    def __reduce__(self) -> _Reduced:
+        """Pickle from the message alone; ``errno`` is fixed for this class."""
+        return rebuild, (type(self), (self.strerror,), {})
 
 
 class ServerError(XRootDError):
@@ -195,6 +248,11 @@ class ServerError(XRootDError):
     hint: str = ""
 
     def __init__(self, code: int, message: str, *, path: str | None = None) -> None:
+        """``code`` is the ``kXR_*`` error number, ``message`` the server's own text.
+
+        ``path`` is what the request named, added by the caller because the
+        server's message often omits it.
+        """
         self.code = code
         self.message = message
         self.path = path
@@ -207,47 +265,138 @@ class ServerError(XRootDError):
             self.args = (self._describe(),)
 
     def _describe(self) -> str:
+        """The user-facing sentence: summary, path, server text, code, then hint.
+
+        The plain-language summary leads because that is what a user acts on;
+        the raw server text and the numeric code follow for the bug report.
+        """
         summary = _USER_ERRORS.get(self.code, "The server could not complete the request.")
         where = f" [{self.path}]" if self.path else ""
         note = f" ({self.hint})" if self.hint else ""
         detail = f" Server: {self.message}" if self.message else ""
         return f"{summary}{where}{detail} (XRootD error {self.code}){note}"
 
-    def __reduce__(self) -> tuple:  # type: ignore[type-arg]
-        # ``OSError.__reduce__`` would round-trip through ``(errno, strerror)``
-        # and lose both the kXR code and the path.
-        return _rebuild, (type(self), (self.code, self.message), {"path": self.path})
+    def __reduce__(self) -> _Reduced:
+        """Pickle by ``(code, message)`` plus ``path``, for every subclass alike.
+
+        ``OSError.__reduce__`` would round-trip through ``(errno, strerror)``
+        and lose both the kXR code and the path; the generated ``OSError``
+        subclasses inherit this method, so they pickle the same way.
+        """
+        return rebuild, (type(self), (self.code, self.message), {"path": self.path})
 
 
-def _oserror(name: str, base: type[OSError], eno: int) -> type[ServerError]:
-    """Build a ServerError subclass that is also the natural OSError."""
+class _ServerOSError(ServerError, OSError):
+    """A :class:`ServerError` that is also the natural ``OSError``.
 
-    def __init__(self: ServerError, code: int, message: str, *, path: str | None = None) -> None:
+    Each subclass names its builtin base and sets ``errno``, so ``except
+    FileNotFoundError`` code sees what it would locally.
+    """
+
+    errno: int
+
+    def __init__(self, code: int, message: str, *, path: str | None = None) -> None:
+        """Fill both halves: the ``kXR`` fields and the ``OSError`` triple.
+
+        ``OSError.__init__`` gets ``(errno, message, path)`` so ``.filename`` is
+        set; ``args`` is then cut back to ``(errno, message)`` so the path is not
+        printed twice.
+        """
         self.code = code
         self.message = message
         self.path = path
-        base.__init__(self, eno, message, path)
-        self.args = (eno, message)
+        OSError.__init__(self, self.errno, message, path)
+        self.args = (self.errno, message)
 
-    def __str__(self: ServerError) -> str:
+    def __str__(self) -> str:
+        """The plain-language summary, not ``OSError``'s ``[Errno 2] ...: 'path'`` form."""
         return self._describe()
 
-    return type(name, (ServerError, base), {"__init__": __init__, "__str__": __str__, "errno": eno})
+
+class NotFoundError(_ServerOSError, FileNotFoundError):
+    """The path does not exist (``kXR_NotFound``); also a :class:`FileNotFoundError`."""
+
+    errno = _errno.ENOENT
 
 
-NotFoundError = _oserror("NotFoundError", FileNotFoundError, _errno.ENOENT)
-ExistsError = _oserror("ExistsError", FileExistsError, _errno.EEXIST)
-PermissionError_ = _oserror("PermissionError", builtins.PermissionError, _errno.EACCES)
-IsADirectoryError_ = _oserror("IsADirectoryError", IsADirectoryError, _errno.EISDIR)
-NotADirectoryError_ = _oserror("NotADirectoryError", NotADirectoryError, _errno.ENOTDIR)
-NoSpaceError = _oserror("NoSpaceError", OSError, _errno.ENOSPC)
-IOError_ = _oserror("IOError", OSError, _errno.EIO)
-UnsupportedError = _oserror("UnsupportedError", OSError, _errno.ENOSYS)
-ReadOnlyError = _oserror("ReadOnlyError", OSError, _errno.EROFS)
-QuotaError = _oserror("QuotaError", OSError, _errno.EDQUOT)
-AttrNotFoundError = _oserror("AttrNotFoundError", OSError, _errno.ENODATA)
-BusyError = _oserror("BusyError", OSError, _errno.EBUSY)
-InvalidArgumentError = _oserror("InvalidArgumentError", OSError, _errno.EINVAL)
+class ExistsError(_ServerOSError, FileExistsError):
+    """The path already exists; also a :class:`FileExistsError`."""
+
+    errno = _errno.EEXIST
+
+
+class PermissionError_(_ServerOSError, builtins.PermissionError):
+    """Not authorised; also the builtin :class:`PermissionError`."""
+
+    errno = _errno.EACCES
+
+
+class IsADirectoryError_(_ServerOSError, IsADirectoryError):
+    """A directory where a file was needed; also an :class:`IsADirectoryError`."""
+
+    errno = _errno.EISDIR
+
+
+class NotADirectoryError_(_ServerOSError, NotADirectoryError):
+    """A file where a directory was needed; also a :class:`NotADirectoryError`."""
+
+    errno = _errno.ENOTDIR
+
+
+class NoSpaceError(_ServerOSError, OSError):
+    """The server is out of space (``ENOSPC``)."""
+
+    errno = _errno.ENOSPC
+
+
+class IOError_(_ServerOSError, OSError):
+    """A server-side I/O failure (``EIO``)."""
+
+    errno = _errno.EIO
+
+
+class UnsupportedError(_ServerOSError, OSError):
+    """The server does not support the request (``ENOSYS``)."""
+
+    errno = _errno.ENOSYS
+
+
+class ReadOnlyError(_ServerOSError, OSError):
+    """The target is read-only (``EROFS``)."""
+
+    errno = _errno.EROFS
+
+
+class QuotaError(_ServerOSError, OSError):
+    """A quota would be exceeded (``EDQUOT``)."""
+
+    errno = _errno.EDQUOT
+
+
+class AttrNotFoundError(_ServerOSError, OSError):
+    """No such extended attribute (``ENODATA``)."""
+
+    errno = _errno.ENODATA
+
+
+class BusyError(_ServerOSError, OSError):
+    """The target is busy (``EBUSY``)."""
+
+    errno = _errno.EBUSY
+
+
+class InvalidArgumentError(_ServerOSError, OSError):
+    """The server rejected an argument (``EINVAL``)."""
+
+    errno = _errno.EINVAL
+
+
+# Named as the builtins they stand for, as they were when generated; the
+# trailing underscore only keeps the builtins usable in this module.
+PermissionError_.__name__ = "PermissionError"
+IsADirectoryError_.__name__ = "IsADirectoryError"
+NotADirectoryError_.__name__ = "NotADirectoryError"
+IOError_.__name__ = "IOError"
 
 
 class ServerTimeoutError(ServerError, TimeoutError):
@@ -262,6 +411,11 @@ class ServerTimeoutError(ServerError, TimeoutError):
     errno = _errno.ETIMEDOUT
 
     def __init__(self, code: int, message: str, *, path: str | None = None) -> None:
+        """Initialise as a :class:`TransientError` and an ``OSError`` with ``ETIMEDOUT``.
+
+        ``TransientError.__init__`` is called explicitly (not via ``super``) so
+        ``attempts``/``committed`` exist and retry code that reads them works.
+        """
         self.code = code
         self.message = message
         self.path = path
@@ -270,6 +424,7 @@ class ServerTimeoutError(ServerError, TimeoutError):
         self.args = (_errno.ETIMEDOUT, message)
 
     def __str__(self) -> str:
+        """The plain-language summary rather than ``OSError``'s errno-prefixed form."""
         return self._describe()
 
 
@@ -284,6 +439,7 @@ class TLSRequiredError(ServerError, builtins.PermissionError):
     errno = _errno.EACCES
 
     def __init__(self, code: int, message: str, *, path: str | None = None) -> None:
+        """Initialise as a ``PermissionError`` with ``EACCES`` and the path as ``filename``."""
         self.code = code
         self.message = message
         self.path = path
@@ -291,12 +447,14 @@ class TLSRequiredError(ServerError, builtins.PermissionError):
         self.args = (_errno.EACCES, message)
 
     def _describe(self) -> str:
+        """The base description plus the one thing that fixes it: use TLS."""
         return (
             ServerError._describe(self)
             + " - the server wants TLS for this operation; connect with roots:// (or davs://)"
         )
 
     def __str__(self) -> str:
+        """The summary plus the ``roots://`` hint from :meth:`_describe`."""
         return self._describe()
 
 
@@ -425,11 +583,117 @@ _CODE_CLASSES: dict[int, type[ServerError]] = {
 }
 
 
+def _platform_errno(name: str, fallback: int) -> int:
+    """An ``errno`` constant this platform may lack, falling back as XProtocol.hh does."""
+    return int(getattr(_errno, name, fallback))
+
+
+_EAUTH = _platform_errno("EAUTH", _platform_errno("EBADE", _errno.EACCES))
+_EBADRQC = _platform_errno("EBADRQC", _platform_errno("EBADRPC", _errno.EINVAL))
+_ENOATTR = _platform_errno("ENOATTR", _errno.ENODATA)
+_ETIME = _platform_errno("ETIME", _errno.ETIMEDOUT)
+
+#: ``XProtocol::toErrno`` (XRootD 5.9): each ``kXR_*`` error code as the
+#: ``errno`` XrdCl reports for it. :func:`errno_for` reads it; a code that is
+#: not listed is ``ENOMSG``, as there. Platform-specific numbers (``EAUTH``,
+#: ``EBADRQC``, ``ENOATTR``, ``ETIME``) fall back as XProtocol.hh's do on a
+#: platform without them.
+KXR_ERRNO: dict[int, int] = {
+    kXR_ArgInvalid: _errno.EINVAL,
+    kXR_ArgMissing: _errno.EINVAL,
+    kXR_ArgTooLong: _errno.ENAMETOOLONG,
+    kXR_FileLocked: _errno.EDEADLK,
+    kXR_FileNotOpen: _errno.EBADF,
+    kXR_FSError: _errno.ENODEV,
+    kXR_InvalidRequest: _EBADRQC,
+    kXR_IOError: _errno.EIO,
+    kXR_NoMemory: _errno.ENOMEM,
+    kXR_NoSpace: _errno.ENOSPC,
+    kXR_NotAuthorized: _errno.EACCES,
+    kXR_NotFound: _errno.ENOENT,
+    kXR_ServerError: _errno.EFAULT,
+    kXR_Unsupported: _errno.ENOTSUP,
+    kXR_noserver: _errno.EHOSTUNREACH,
+    kXR_NotFile: _errno.ENOTBLK,
+    kXR_isDirectory: _errno.EISDIR,
+    kXR_Cancelled: _errno.ECANCELED,
+    kXR_ItExists: _errno.EEXIST,
+    kXR_ChkSumErr: _errno.EDOM,
+    kXR_inProgress: _errno.EINPROGRESS,
+    kXR_overQuota: _errno.EDQUOT,
+    kXR_SigVerErr: _errno.EILSEQ,
+    kXR_DecryptErr: _errno.ERANGE,
+    kXR_Overloaded: _errno.EUSERS,
+    kXR_fsReadOnly: _errno.EROFS,
+    kXR_BadPayload: _errno.EINVAL,
+    kXR_AttrNotFound: _ENOATTR,
+    kXR_TLSRequired: _errno.EPROTOTYPE,
+    kXR_noReplicas: _errno.EADDRNOTAVAIL,
+    kXR_AuthFailed: _EAUTH,
+    kXR_Impossible: _errno.EIDRM,
+    kXR_Conflict: _errno.ENOTTY,
+    kXR_TooManyErrs: _errno.ETOOMANYREFS,
+    kXR_ReqTimedOut: _errno.ETIMEDOUT,
+    kXR_TimerExpired: _ETIME,
+}
+
+
+def _inverse() -> dict[int, int]:
+    """``errno`` to ``kXR_*``: the first code :data:`KXR_ERRNO` gives each number.
+
+    The table is many-to-one in three places (``EINVAL`` is three codes), and
+    the first - lowest - code is the one ``XProtocol::mapError`` answers with.
+    ``mapError`` also knows a few numbers no code maps *to*: ``EPERM`` is
+    "not authorised" like ``EACCES``, ``ENOBUFS`` is "no memory", and
+    ``ENOTEMPTY`` is "it exists", as a directory that will not go away is.
+    """
+    table: dict[int, int] = {}
+    for code, number in KXR_ERRNO.items():
+        table.setdefault(number, code)
+    table.update(
+        {
+            _errno.EPERM: kXR_NotAuthorized,
+            _errno.ENOBUFS: kXR_NoMemory,
+            _errno.ENOTEMPTY: kXR_ItExists,
+        }
+    )
+    return table
+
+
+_ERRNO_KXR = _inverse()
+
+
+def errno_for(code: int) -> int:
+    """The ``errno`` for a ``kXR_*`` error code, as XrdCl reports it (``XProtocol::toErrno``).
+
+        >>> errno_for(kXR_NotFound) == errno.ENOENT
+        True
+
+    ``ENOMSG`` for a code the protocol does not define, which is what XrdCl
+    says when it cannot say anything better.
+    """
+    return KXR_ERRNO.get(int(code), _errno.ENOMSG)
+
+
+def kxr_for(number: int, default: int = kXR_FSError) -> int:
+    """The ``kXR_*`` code for an ``errno`` (``XProtocol::mapError``), :func:`errno_for` reversed.
+
+    A negative number is read as its magnitude, as ``mapError`` reads a
+    POSIX ``-errno`` return. One with no code of its own is ``default`` -
+    ``kXR_FSError``, as in XRootD, unless the caller has a better answer.
+    """
+    return _ERRNO_KXR.get(abs(int(number)), default)
+
+
 def raise_for_status(code: int, message: str, *, path: str | None = None) -> None:
     """Raise the exception that best represents a ``kXR_error`` response."""
-    if code == 0:
-        return
+    if code != 0:
+        raise _error_for_status(code, message, path=path)
+
+
+def _error_for_status(code: int, message: str, *, path: str | None = None) -> XRootDError:
+    """The exception :func:`raise_for_status` raises for a non-zero ``code``."""
     if code == kXR_ChkSumErr:
-        raise ChecksumMismatchError("crc32c", "<server>", message or "<client>")
+        return ChecksumMismatchError("crc32c", "<server>", message or "<client>")
     cls = _CODE_CLASSES.get(code, ServerError)
-    raise cls(code, message, path=path)
+    return cls(code, message, path=path)

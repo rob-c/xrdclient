@@ -8,9 +8,12 @@ two.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import sys
+import threading
+from typing import cast
 
 import pytest
 
@@ -21,10 +24,12 @@ from xrdclient.proto import constants as c
 from xrdclient.session import SESSIONS, Session, SessionPool
 from xrdclient.session import pool as pool_module
 from xrdclient.session.pool import _identity, _key
+from xrdclient.testing import FakeServer
+from xrdclient.transport.sync import SocketTransport
 from xrdclient.url import parse
 
 
-def logins(server) -> int:
+def logins(server: FakeServer) -> int:
     return server.seen.count(c.kXR_login)
 
 
@@ -47,7 +52,7 @@ class FakeSession:
 
 def pooled(*sessions: FakeSession) -> Session:
     """One of the stubs above, seen as the Session the pool thinks it holds."""
-    return sessions[0]  # type: ignore[return-value]
+    return cast("Session", sessions[0])
 
 
 # ----------------------------------------------------------------------
@@ -145,10 +150,8 @@ def test_a_shared_connection_one_holder_discarded_is_closed_not_pooled(server, c
 
 
 def test_an_open_that_fails_still_returns_its_connection(server, config):
-    try:
+    with contextlib.suppress(FileNotFoundError):
         xrdclient.File(f"{server.url}/data/missing.root", config).open()
-    except FileNotFoundError:
-        pass
     assert len(SESSIONS) == 1
 
 
@@ -471,7 +474,7 @@ def test_the_files_each_mechanism_reads_are_the_ones_watched(tmp_path, monkeypat
 
 def test_a_session_goes_back_under_the_identity_it_logged_in_with(monkeypatch):
     pool, url, config = SessionPool(), parse("root://example.org/"), Config(auth_order=("ztn",))
-    stub = FakeSession()
+    stub = pooled(FakeSession())
     monkeypatch.setattr(Session, "connect", staticmethod(lambda *a, **k: stub))
     monkeypatch.setenv("BEARER_TOKEN", "alice")
     session = pool.connect(url, config)
@@ -484,7 +487,7 @@ def test_a_session_goes_back_under_the_identity_it_logged_in_with(monkeypatch):
 
 def test_a_session_dialled_with_pooling_off_is_not_remembered(monkeypatch):
     pool, url = SessionPool(), parse("root://example.org/")
-    stub = FakeSession()
+    stub = pooled(FakeSession())
     monkeypatch.setattr(Session, "connect", staticmethod(lambda *a, **k: stub))
     assert pool.connect(url, Config(pool_size=0)) is stub
     assert len(pool._born) == 0
@@ -531,7 +534,9 @@ def test_a_session_whose_socket_was_finalized_is_never_handed_out(server, config
     """
     session = Session.connect(server.url, config=config)
     assert SESSIONS.release(session, server.url, config)
-    session._t._sock.close()  # what the collector's finalizer does to it
+    transport = session._t
+    assert isinstance(transport, SocketTransport)
+    transport._sock.close()  # what the collector's finalizer does to it
     assert session.closed
     assert SESSIONS.acquire(server.url, config) is None
 
@@ -541,7 +546,9 @@ def test_a_write_after_a_socket_died_in_the_pool_goes_on_a_fresh_one(server, con
     be sent on a pooled connection whose socket is already closed."""
     with xrdclient.FileSystem(server.url, config) as fs:
         fs.stat("/")
-        sock = fs._router._session._t._sock
+        session = fs._router._session
+        assert session is not None and isinstance(session._t, SocketTransport)
+        sock = session._t._sock
     sock.close()  # pooled by the close above, then finalized under the pool
     with xrdclient.FileSystem(server.url, config) as fs:
         fs.mkdir("/made-after-ebadf")  # not idempotent: a dead socket would fail it
@@ -554,3 +561,140 @@ def test_a_delegating_login_is_never_pooled_for_one_that_did_not_ask(config):
 
     url = parse("root://h//")
     assert _key(url, replace(config, gsi_delegate=True)) != _key(url, config)
+
+
+# ----------------------------------------------------------------------
+# Routers the garbage collector frees
+
+
+def test_a_router_freed_in_a_cycle_while_the_pool_is_locked_does_not_deadlock(server, config):
+    """The collector may run on a thread already inside the pool.
+
+    ``Router.__del__`` used to close from the collector: take the router's
+    lock, then the pool's non-reentrant one, and maybe flush a
+    ``kXR_endsess``. With another thread holding the pool's lock that call
+    never returned. Now the finalizer only queues the connection.
+    """
+    import gc
+
+    from xrdclient.session.router import Router
+
+    router = Router(server.url, config)
+    assert router.session is not None  # connect
+    # Reachable only through a reference cycle, so only the collector frees it.
+    cycle: list[object] = [router]
+    cycle.append(cycle)
+    del cycle
+    before = len(SESSIONS)
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_the_lock():
+        with SESSIONS._lock:
+            held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold_the_lock)
+    holder.start()
+    held.wait(5)
+    collected = threading.Event()
+
+    def collect():
+        gc.collect()
+        collected.set()
+
+    try:
+        del router
+        collector = threading.Thread(target=collect, daemon=True)
+        collector.start()
+        assert collected.wait(5), "the collector deadlocked on the pool's lock"
+    finally:
+        release.set()
+        holder.join(5)
+    assert len(SESSIONS) == before + 1  # the abandoned connection went back to the pool
+
+
+def test_an_abandoned_connection_is_released_by_the_next_pool_operation(server, config):
+    import gc
+
+    with xrdclient.FileSystem(server.url, config) as fs:
+        fs.stat("/data/a.root")
+    fs = xrdclient.FileSystem(server.url, config)
+    fs.stat("/data/a.root")
+    # Reachable only through a reference cycle, so only the collector frees it.
+    cycle: list[object] = [fs]
+    cycle.append(cycle)
+    del cycle, fs
+    gc.collect()
+    assert SESSIONS.acquire(server.url, config) is not None  # reaped, pooled, reused
+
+
+def test_an_abandoned_shared_connection_leaves_its_loan():
+    pool = SessionPool()
+    left = []
+
+    class Holder:
+        def leave(self, *, spoiled=False):
+            left.append(spoiled)
+
+    pool.adopt(pooled(FakeSession()), Holder(), parse("root://h//"), Config())
+    assert pool.reap() == 1 and left == [False]
+
+
+def test_an_abandoned_connection_the_pool_refuses_is_closed():
+    pool = SessionPool()
+    session = FakeSession()
+    pool.adopt(pooled(session), None, parse("root://h//"), Config(pool_size=0))
+    pool.clear()
+    assert session.closes == 1
+
+
+def test_one_bad_abandoned_connection_does_not_strand_the_rest(caplog):
+    pool = SessionPool()
+
+    class Broken:
+        def leave(self, *, spoiled=False):
+            raise RuntimeError("boom")
+
+    good = FakeSession()
+    url = parse("root://h//")
+    pool.adopt(pooled(FakeSession()), Broken(), url, Config())
+    pool.adopt(pooled(good), None, url, Config(pool_size=0))
+    with caplog.at_level("DEBUG", logger="xrdclient.session.pool"):
+        assert pool.reap() == 2
+    assert good.closes == 1 and "releasing an abandoned connection failed" in caplog.text
+
+
+def test_the_reaper_runs_once_per_process_and_ends_with_its_pool(monkeypatch):
+    import gc
+    import time
+    import weakref
+
+    monkeypatch.setattr(pool_module, "REAP_INTERVAL", 0.01)
+    pool = SessionPool()
+    pool._ensure_reaper()
+    first = pool._reaper
+    pool._ensure_reaper()
+    assert pool._reaper is first
+    session = FakeSession()
+    pool.adopt(pooled(session), None, parse("root://h//"), Config(pool_size=0))
+    deadline = time.monotonic() + 5
+    while not session.closes and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert session.closes == 1  # the reaper got to it with nobody calling the pool
+    assert first is not None
+    thread = first[1]
+    ref = weakref.ref(pool)
+    del pool, first
+    gc.collect()
+    assert ref() is None
+    thread.join(5)
+    assert not thread.is_alive()
+
+
+def test_a_forked_child_forgets_the_parents_orphans():
+    pool = SessionPool()
+    pool.adopt(pooled(FakeSession()), None, parse("root://h//"), Config())
+    pool._reaper = (os.getpid(), threading.Thread(target=print))  # never started
+    pool.forget()
+    assert pool.reap() == 0 and pool._reaper is None

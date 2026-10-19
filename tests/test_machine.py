@@ -7,10 +7,11 @@ sight - which is the whole point of the sans-io split.
 from __future__ import annotations
 
 import struct
+from typing import TypeVar
 
 import pytest
 
-from conftest import error, frame, handshake_reply, login_body, ok, protocol_body
+from tests.conftest import error, frame, handshake_reply, login_body, ok, protocol_body
 from xrdclient.auth.base import Credential
 from xrdclient.auth.simple import HostCredential
 from xrdclient.config import Config
@@ -22,6 +23,8 @@ from xrdclient.proto import requests as r
 
 SID = 4  # the first streamid the machine hands out
 
+_E = TypeVar("_E", bound=m.Event)
+
 
 def drain(machine: m.SessionMachine) -> list[m.Event]:
     return list(machine.events())
@@ -31,19 +34,37 @@ def kinds(events: list[m.Event]) -> list[str]:
     return [type(e).__name__ for e in events]
 
 
-def only(machine: m.SessionMachine, kind: type) -> m.Event:
+def only(machine: m.SessionMachine, kind: type[_E]) -> _E:
     events = drain(machine)
     matching = [e for e in events if isinstance(e, kind)]
     assert matching, f"no {kind.__name__} in {kinds(events)}"
     return matching[0]
 
 
-def new(config: Config | None = None, **kwargs) -> m.SessionMachine:
-    return m.SessionMachine(
+def new(config: Config | None = None, credentials=None, **kwargs) -> m.SessionMachine:
+    machine = m.SessionMachine(
         host="srv.example.org",
         config=config or Config(username="tester", auth_order=("host",)),
         **kwargs,
     )
+    if credentials is not None:
+        # The authentication ladder, given by hand rather than chosen by
+        # ``auth.select`` from what the server offers.
+        machine._credentials = credentials
+    return machine
+
+
+def replies(machine: m.SessionMachine) -> list[m.Completed]:
+    """Every event, each of which the test expects to be a completed reply."""
+    events = drain(machine)
+    done = [e for e in events if isinstance(e, m.Completed)]
+    assert done == events, kinds(events)
+    return done
+
+
+def state(machine: m.SessionMachine) -> m.State:
+    """The machine's state now (a fresh read, after the calls that moved it)."""
+    return machine.state
 
 
 def bring_up(machine: m.SessionMachine, *, sec: str = "", flags: int = 0) -> None:
@@ -157,20 +178,20 @@ def test_a_security_trailer_starts_the_auth_exchange():
 
     machine.receive_data(ok(3))
     assert only(machine, m.Ready).mechanism == "host"
-    assert machine.state is m.State.READY
+    assert state(machine) is m.State.READY
 
 
 def test_a_multi_round_mechanism_answers_every_challenge():
     class TwoStep(Credential):
         name = "two"
 
-        def __init__(self):
-            self.seen = []
+        def __init__(self) -> None:
+            self.seen: list[bytes] = []
 
-        def initial(self):
+        def initial(self) -> bytes:
             return b"first"
 
-        def step(self, challenge):
+        def step(self, challenge: bytes) -> bytes | None:
             self.seen.append(challenge)
             return b"second" if len(self.seen) == 1 else None
 
@@ -326,7 +347,7 @@ def test_a_server_that_demands_tls_stops_for_the_upgrade():
     assert machine.data_to_send() == b""  # login is withheld until the socket is up
 
     machine.tls_established()
-    assert machine.tls_active and machine.state is m.State.LOGIN
+    assert machine.tls_active and state(machine) is m.State.LOGIN
     assert struct.unpack(">H", machine.data_to_send()[2:4])[0] == c.kXR_login
 
 
@@ -428,9 +449,10 @@ def test_oksofar_chunks_accumulate_into_the_final_body():
     machine.receive_data(frame(sid, c.kXR_oksofar, b"def"))
     machine.receive_data(ok(sid, b"ghi"))
     events = drain(machine)
-    assert kinds(events) == ["Chunk", "Chunk", "Completed"]
-    assert [e.data for e in events[:2]] == [b"abc", b"def"]
-    assert events[2].data == b"abcdefghi"
+    first, second, done = events
+    assert isinstance(first, m.Chunk) and isinstance(second, m.Chunk)
+    assert isinstance(done, m.Completed)
+    assert (first.data, second.data, done.data) == (b"abc", b"def", b"abcdefghi")
 
 
 def test_a_request_error_names_the_path_it_was_about():
@@ -683,14 +705,14 @@ def test_two_responses_in_one_read_are_both_dispatched():
     machine = ready()
     first, second = machine.submit(r.Ping()), machine.submit(r.Ping())
     machine.receive_data(ok(first) + ok(second))
-    assert [e.streamid for e in drain(machine)] == [first, second]
+    assert [e.streamid for e in replies(machine)] == [first, second]
 
 
 def test_responses_may_arrive_out_of_order():
     machine = ready()
     first, second = machine.submit(r.Ping()), machine.submit(r.Ping())
     machine.receive_data(ok(second) + ok(first))
-    assert [e.streamid for e in drain(machine)] == [second, first]
+    assert [e.streamid for e in replies(machine)] == [second, first]
 
 
 # --------------------------------------------------------------------------
@@ -704,8 +726,9 @@ def test_eof_fails_every_stream_in_flight():
     machine.receive_data(b"")
     events = drain(machine)
     assert kinds(events) == ["Failed", "Disconnected"]
-    assert events[0].streamid == sid
-    assert isinstance(events[0].error, XrdConnectionError)
+    failed = events[0]
+    assert isinstance(failed, m.Failed) and failed.streamid == sid
+    assert isinstance(failed.error, XrdConnectionError)
     assert machine.state is m.State.CLOSED
     assert machine.in_flight == 0
 
@@ -822,7 +845,7 @@ def test_an_error_body_that_is_not_an_error_still_becomes_one():
     """``raise_for_status`` says nothing about code 0; the caller still needs an exception."""
     from xrdclient.proto import responses as rp
 
-    exc = m._server_error(rp.ErrorInfo(0, "nothing went wrong"), "/d/f.root")
+    exc = m.server_error(rp.ErrorInfo(0, "nothing went wrong"), "/d/f.root")
     assert isinstance(exc, ServerError)
     assert "nothing went wrong" in str(exc)
 
@@ -903,7 +926,7 @@ class _Refusable(Credential):
         return cls()
 
 
-def _refused_at_login(*credentials, sec="&P=gsi&P=host"):
+def _refused_at_login(*credentials: Credential, sec: str = "&P=gsi&P=host") -> m.SessionMachine:
     machine = new(credentials=iter(credentials))
     machine.start()
     machine.data_to_send()
@@ -941,6 +964,66 @@ def test_the_last_refusal_is_the_one_reported():
     machine.data_to_send()
     machine.receive_data(error(3, 3010, "unix is not allowed here"))
     event = only(machine, m.Failed)
-    assert event.error.code == 3010
+    assert isinstance(event.error, ServerError) and event.error.code == 3010
     assert "unix is not allowed here" in str(event.error)
     assert "gsi: refused by the server: [3030]" in str(event.error)
+
+
+# --------------------------------------------------------------------------
+# The outbox as buffers
+# --------------------------------------------------------------------------
+
+
+def test_the_outbox_hands_a_write_payload_over_uncopied():
+    machine = ready()
+    data = bytearray(b"z" * 8192)
+    sid = machine.submit(r.Write(b"\0\0\0\1", 0, data))
+    head, body = machine.buffers_to_send()
+    assert isinstance(body, memoryview) and body.obj is data
+    assert int.from_bytes(head[:2], "big") == sid
+    assert machine.buffers_to_send() == []  # drained
+
+
+def test_a_kxr_wait_resends_the_same_buffers():
+    machine = ready()
+    data = b"p" * 5000
+    sid = machine.submit(r.Write(b"\0\0\0\1", 0, data))
+    first = machine.data_to_send()
+    machine.resume(sid)
+    assert machine.data_to_send() == first
+
+
+def test_a_path_write_queues_its_payload_for_the_path_as_a_buffer():
+    machine = ready()
+    data = bytearray(b"q" * 6000)
+    sid = machine.submit(r.Write(b"\0\0\0\1", 0, data, 2))
+    (payload,) = machine.path_buffers_to_send(2)
+    assert isinstance(payload, memoryview) and payload.obj is data
+    assert machine.path_buffers_to_send(2) == []
+    assert machine.path_data_to_send(2) == b""
+    assert machine.streams_on(2) == [sid]
+    assert machine.streams_on(0) == []
+    machine.resume(sid)
+    assert machine.path_data_to_send(2) == bytes(data)
+
+
+def test_an_arrival_write_queues_its_whole_frame_on_the_path():
+    machine = ready()
+    data = b"a" * 6000
+    machine.submit(r.Write(b"\0\0\0\1", 0, data, 2), arrive_on_path=True)
+    assert machine.data_to_send() == b""
+    sent = machine.path_data_to_send(2)
+    assert sent.endswith(data) and len(sent) == 24 + len(data)
+
+
+def test_frame_parts_for_a_bulk_write_keep_the_payload_and_a_signature_joins_it():
+    from xrdclient.crypto.sigver import Signer
+
+    machine = ready()
+    (sid,) = machine.lease_sids(1)
+    piece = memoryview(b"w" * 5000)
+    _, body = machine.frame_parts_for(r.Write(b"\0\0\0\1", 0, piece), sid)
+    assert isinstance(body, memoryview) and body.obj is piece.obj
+    machine.signer = Signer(b"k" * 32, c.kXR_secPedantic)
+    parts = machine.frame_parts_for(r.Write(b"\0\0\0\1", 0, piece), sid)
+    assert len(parts) == 1 and bytes(parts[0]).endswith(bytes(piece))

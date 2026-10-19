@@ -5,6 +5,12 @@ because that is what the bindings hand back, and code written against them
 reaches for ``info.size`` and ``vars(info)`` and ``repr(info)`` alike. The
 attribute names, their types and the ``repr`` are the bindings' own, checked
 against them on a live server; see ``tests/test_pyxrootd_compat.py``.
+
+The class-level annotations on each :class:`Struct` subclass document the
+fields for readers and type checkers only - nothing enforces them at run
+time, exactly as with the bindings, whose objects are built from whatever
+dict the C++ side produced. :mod:`._convert` is where native results become
+these objects; keep the two in step when a field is added.
 """
 
 from __future__ import annotations
@@ -48,6 +54,7 @@ class XRootDError(RuntimeError):
     """What an unsuccessful :class:`XRootDStatus` raises; ``.status`` is that status."""
 
     def __init__(self, status: XRootDStatus) -> None:
+        """Carry ``status``; the message is the status's own, as in the bindings."""
         self.status = status
         RuntimeError.__init__(self, str(status))
 
@@ -76,18 +83,22 @@ class Struct:
     """A ``dict`` turned into attributes, printed the way the bindings print it."""
 
     def __init__(self, entries: dict[str, Any]) -> None:
+        """Take ``entries`` as attributes, in their order; no field is required."""
         self.__dict__.update(entries)
 
     def __repr__(self) -> str:
+        """``<name: value, ...>`` - the bindings' format, which doctests and logs match."""
         fields = ", ".join(f"{key}: {value!r}" for key, value in self.__dict__.items())
         return f"<{fields}>"
 
     def __eq__(self, other: object) -> bool:
+        """Equal when the same kind with the same fields; a ``StatInfo`` never equals a dict."""
         if type(other) is not type(self):
             return NotImplemented
         return self.__dict__ == other.__dict__
 
-    __hash__ = None  # type: ignore[assignment]  # mutable, like the bindings'
+    # Defining ``__eq__`` leaves ``__hash__`` as None: unhashable, being
+    # mutable, like the bindings' own objects.
 
 
 class XRootDStatus(Struct):
@@ -111,7 +122,10 @@ class XRootDStatus(Struct):
     ok: bool
 
     # XrdCl::XRootDStatus's ``code`` values, by the bindings' names. Class
-    # attributes, so ``vars(status)`` and the ``repr`` stay the six fields.
+    # attributes, so ``vars(status)`` and the ``repr`` stay the eight fields.
+    # The hundreds group them as ``XrdClStatus.hh`` does: 0-99 generic,
+    # 100s socket, 200s protocol, 300s the client's own checks, 400s what a
+    # server answered, 500s a negative response from a handler.
     suDone = 0
     suContinue = 1
     suRetry = 2
@@ -177,18 +191,22 @@ class XRootDStatus(Struct):
     _ERROR_NAMES: ClassVar[dict[int, str]] = {}
 
     def __str__(self) -> str:
+        """The message alone (``[ERROR] Server responded with an error: ...``)."""
         return self.message
 
     def __getitem__(self, key: str) -> Any:
+        """``status["ok"]``: dict-style access, for code written against dict statuses."""
         return self.__dict__[key]
 
     def __contains__(self, key: object) -> bool:
+        """``"errno" in status``, the other half of the dict-like reading."""
         return key in self.__dict__
 
     @property
     def error_name(self) -> str | None:
         """The symbolic name of ``code`` (``"errNotFound"``), or ``None`` for one XrdCl lacks."""
-        return self._ERROR_NAMES.get(getattr(self, "code", None))  # type: ignore[arg-type]
+        # -1 is no XrdCl code, so a status without one has no name either.
+        return self._ERROR_NAMES.get(getattr(self, "code", -1))
 
     def exception(self) -> XRootDError | None:
         """The exception this status stands for, or ``None`` if it is OK.
@@ -209,7 +227,10 @@ class XRootDStatus(Struct):
 
 
 class ProtocolInfo(Struct):
-    """``version`` and ``hostinfo``, both as the server sent them."""
+    """``version`` and ``hostinfo``, both as the server sent them.
+
+    Byte-swapped, as the bindings report them; see :func:`._convert.protocol_info`.
+    """
 
     version: int
     hostinfo: int
@@ -242,7 +263,11 @@ class StatInfo(Struct):
 
 
 class StatInfoVFS(Struct):
-    """``kXR_stat`` with ``kXR_vfs``: space across the servers behind a path."""
+    """``kXR_stat`` with ``kXR_vfs``: space across the servers behind a path.
+
+    ``free_*`` are in megabytes and ``utilization_*`` percentages, as the
+    server reports them; ``*_staging`` describe the staging (tape-backed) pool.
+    """
 
     nodes_rw: int
     free_rw: int
@@ -268,11 +293,17 @@ class DirectoryList(Struct):
     dirlist: list[ListEntry]
 
     def __iter__(self) -> Iterator[ListEntry]:
+        """The entries in the order the server listed them."""
         return iter(self.dirlist)
 
 
 class Location(Struct):
-    """One server that has a file: ``address``, ``type``, ``accesstype``."""
+    """One server that has a file: ``address``, ``type``, ``accesstype``.
+
+    ``type`` is a :class:`~.flags.LocationType` and ``accesstype`` an
+    :class:`~.flags.AccessType`, as integers; ``is_manager``/``is_server``
+    are the same fact as booleans, which the bindings also provide.
+    """
 
     address: str
     type: int
@@ -287,6 +318,7 @@ class LocationInfo(Struct):
     locations: list[Location]
 
     def __iter__(self) -> Iterator[Location]:
+        """The locations, in the order the redirector gave them."""
         return iter(self.locations)
 
 
@@ -305,11 +337,17 @@ class VectorReadInfo(Struct):
     chunks: list[ChunkInfo]
 
     def __iter__(self) -> Iterator[ChunkInfo]:
+        """The chunks in request order, whatever order the server sent them."""
         return iter(self.chunks)
 
 
 class HostInfo(Struct):
-    """One server a request passed through on its way to an answer."""
+    """One server a request passed through on its way to an answer.
+
+    ``protocol`` and ``flags`` are 0 for a server that redirected before it
+    could say (or was never reached); ``load_balancer`` marks the manager
+    that redirected the request.
+    """
 
     url: URL
     protocol: int
@@ -323,9 +361,13 @@ class HostList(Struct):
     hosts: list[HostInfo]
 
     def __iter__(self) -> Iterator[HostInfo]:
+        """The hosts from the first contacted to the one that answered."""
         return iter(self.hosts)
 
 
+# Built after the class body because a comprehension inside it cannot see the
+# class namespace. ``errPipelineError`` and ``errPipelineFailed`` share 17;
+# the later name in the class body wins, which is the one XrdCl now uses.
 XRootDStatus._ERROR_NAMES = {
     value: name
     for name, value in vars(XRootDStatus).items()
@@ -358,6 +400,13 @@ _EXCEPTIONS: tuple[tuple[type[XRootDError], tuple[int, ...], tuple[int, ...]], .
 
 
 def _exception_type(code: object, errno: object) -> type[XRootDError]:
+    """The :class:`XRootDError` subclass for a failed status's ``code`` and ``errno``.
+
+    The server's ``errno`` only counts when ``code`` says the server answered
+    (``errErrorResponse``): a client-side failure's ``errno`` is an OS number
+    and could collide with nothing meaningful here. Anything unmatched is a
+    plain :class:`XRootDOperationError`.
+    """
     server = code == XRootDStatus.errErrorResponse
     for kind, codes, errnos in _EXCEPTIONS:
         if code in codes or (server and errno in errnos):
@@ -395,6 +444,11 @@ class TapeArchiveInfo(Struct):
     error: str | None
 
     def __init__(self, info: dict[str, Any]) -> None:
+        """Take one archive-info entry; ``locality`` and ``error`` default to ``None``.
+
+        The Tape REST API omits whichever of the two does not apply, and the
+        bindings' object has both attributes regardless.
+        """
         payload: dict[str, Any] = {"locality": None, "error": None}
         payload.update(info)
         super().__init__(payload)
@@ -431,12 +485,19 @@ class TapeStageStatus(Struct):
     files: list[TapeStageFileStatus]
 
     def __init__(self, status: Mapping[str, Any]) -> None:
+        """Take the stage-status JSON, turning each ``files`` entry into an object."""
         entries = dict(status)
         entries["files"] = [TapeStageFileStatus(f) for f in entries.get("files", [])]
         super().__init__(entries)
 
     @staticmethod
     def _normalize_path(path: str) -> str:
+        """The path a site reports, for a path or a full ``https://`` URL.
+
+        Sites echo the bare path back in ``files``; a caller often holds the
+        URL. A doubled leading slash (``root://h//p``'s spelling) is folded
+        to one so either form finds the entry.
+        """
         parsed = urlparse(path)
         if parsed.scheme and parsed.netloc:
             path = parsed.path or "/"

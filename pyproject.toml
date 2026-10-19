@@ -9,7 +9,7 @@ name = "xrdclient"
 dynamic = ["version"]
 description = "A Python 3, Pythonic client for XRootD (root://, roots://) and HEP WebDAV"
 readme = "README.md"
-requires-python = ">=3.9.2"
+requires-python = ">=3.11"
 license = { text = "LGPL-3.0-or-later" }
 authors = [{ name = "Robert Currie", email = "robert.andrew.currie@gmail.com" }]
 keywords = ["xrootd", "hep", "webdav", "storage", "root"]
@@ -17,8 +17,6 @@ classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Science/Research",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.9",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
@@ -26,12 +24,21 @@ classifiers = [
   "Topic :: System :: Filesystems",
 ]
 # Maintained libraries provide reusable parsing, transport and security primitives.
+# xrdcore is the dependency-free shared core (safe XML, checksums, log
+# redaction, cancellation, the copy pump, backoff, the CLI report, the error
+# vocabulary); xrdhttp is the HTTP protocol pieces (request engine,
+# connections, WebDAV, ranges, Tape REST, HTTP-TPC, Metalink, S3 SigV4 and
+# codec); xrdsec is the grid security shared with xgfalclient and xrdarc
+# (X.509, proxies, VOMS, tokens, credential discovery, TLS contexts). All
+# three move in lockstep with this package within a minor series. botocore
+# arrives through xrdhttp's ``s3`` extra (xrdhttp alone imports it, only for S3);
+# asn1crypto through xrdsec. cryptography stays a direct dependency: SSS's
+# Blowfish and the Kerberos enctypes are XRootD's own and use it here.
 dependencies = [
-  "asn1crypto>=1.5.1",
-  "botocore>=1.35",
   "cryptography>=45",
-  "PyJWT[crypto]>=2.10",
-  "urllib3>=2.2",
+  "xrdcore>=0.4.0,<0.5",
+  "xrdhttp[s3]>=0.4.0,<0.5",
+  "xrdsec>=0.4.0,<0.5",
 ]
 
 [project.urls]
@@ -42,13 +49,22 @@ Issues = "https://github.com/rob-c/xrdclient/issues"
 Changelog = "https://github.com/rob-c/xrdclient/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-# Native Kerberos bindings need system headers when no wheel is available.
-krb5 = ["gssapi>=1.12,<2", "krb5>=0.10,<0.11"]
+# Hardware-assisted CRC-32C for paged reads/writes and crc32c checksums; the
+# pure-Python fallback is a few MB/s. Wheels for CPython 3.11-3.14 on Linux
+# x86_64/aarch64 (manylinux2014) and macOS x86_64/arm64. The CRC lives in
+# xrdcore since 0.4.0, so this is xrdcore's extra (google-crc32c>=1.5).
+fast = ["xrdcore[fast]>=0.4.0,<0.5"]
+# The system Kerberos library through python-gssapi, for xrdsec.krb5.gss
+# (API:/MEMORY: caches, cross-realm, DNS KDC discovery); the GSS layer is
+# xrdsec's since 0.4.0, so this is xrdsec's extra. Native bindings need
+# Kerberos development headers when no wheel is available.
+krb5 = ["xrdsec[krb5]>=0.4.0,<0.5"]
 dev = [
   "build>=1,<2",
   "complexipy>=6,<7",
   "fsspec>=2024.2.0",
-  "mypy>=1.10",
+  "hypothesis>=6.100,<7",
+  "mypy>=2.3,<2.5",
   "pytest>=8",
   "pytest-cov",
   "pytest-timeout",
@@ -66,6 +82,7 @@ docs = [
 [project.scripts]
 xrd-cp = "xrdclient.cli.cp:main"
 xrd-fs = "xrdclient.cli.fs:main"
+xrd-proxy = "xrdclient.cli.proxy:main"
 
 [project.entry-points."fsspec.specs"]
 root = "xrdclient.fsspec_impl:XRootDFileSystem"
@@ -84,83 +101,152 @@ path = "src/xrdclient/_version.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# ``tests/test_maintainability.py`` imports ``tools.maintainability``, and a
-# bare ``pytest`` - which is what CI runs - does not put the working directory
-# on the path the way ``python -m pytest`` does.
-pythonpath = ["."]
+# Test modules import their helpers as ``tests.<module>``, and a bare
+# ``pytest`` does not put the working directory on the path the way
+# ``python -m pytest`` does.
+# The take-over and maintainability gates (tests/test_scorecard.py,
+# tests/test_maintainability.py) are xrd-devtools' pytest plugin, found in a
+# sibling checkout or CI's .dependencies/ checkout (it cannot be a dependency:
+# PyPI refuses direct-URL requirements); without one they skip.
+pythonpath = [".", "../xrd-devtools/src", ".dependencies/xrd-devtools/src"]
 timeout = 120
-filterwarnings = ["error::ResourceWarning"]
+# >>> xrddevtools sync: pytest-warnings (generated from xrd-devtools/src/xrddevtools/standard) >>>
+# Every warning fails the run, ours and third parties' alike; a test that
+# expects one says so with ``pytest.warns``.
+filterwarnings = ["error"]
+# <<< xrddevtools sync: pytest-warnings <<<
 markers = [
     "interop: needs a real xrootd daemon on PATH (the Kerberos ones, MIT krb5 as well)",
     "parity: needs the official XRootD python bindings as well",
+    "property: the heavier hypothesis property tests (XRD_PROPERTY_EXAMPLES scales them)",
 ]
 
+# >>> xrddevtools sync: coverage (generated from xrd-devtools/src/xrddevtools/standard) >>>
 [tool.coverage.run]
 branch = true
 source = ["xrdclient"]
 parallel = true
 
 [tool.coverage.report]
+# Every line and branch, reached by a test that makes the case happen.
+fail_under = 100
 exclude_also = [
   "if TYPE_CHECKING:",
+  "@overload",
   "raise NotImplementedError",
   "\\.\\.\\.$",
   "if __name__ == .__main__.:",
 ]
-# The wire protocol, the cryptography and the client surface are where a gap
-# in coverage means an untested code path against a real server, so they are
-# gated at the full line-and-branch mark; the optional adapters (fsspec,
-# asyncio, CLI) are not, because their coverage depends on which extras are
-# installed - the suite covers those too, but only when they are there.
-include = [
-  "*/xrdclient/proto/*", "*/xrdclient/crypto/*", "*/xrdclient/client/*", "*/xrdclient/s3/*",
-  "*/xrdclient/http/_engine.py", "*/xrdclient/http/_connection.py",
-  "*/xrdclient/http/expect.py", "*/xrdclient/copy/_pipeline.py",
-  "*/xrdclient/session/bulk.py",
-  "*/xrdclient/cli/_output.py",
-]
-fail_under = 100
 show_missing = true
 skip_covered = true
+# <<< xrddevtools sync: coverage <<<
 
+# >>> xrddevtools sync: ruff (generated from xrd-devtools/src/xrddevtools/standard) >>>
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py311"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = [
-  "E", "F", "W", "I", "UP", "B", "C4", "RUF",
-  # High-confidence security checks. Broader Bandit-compatible rules are
-  # deliberately reviewed rather than enabled wholesale: this client contains
-  # protocol-mandated hashes, parsers and subprocesses which those rules cannot
-  # distinguish from unsafe application code.
+  "E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF",
+  # High-confidence security checks. The wider S family cannot tell the
+  # protocol-mandated hashes, parsers and subprocesses of a storage client
+  # from unsafe application code, so it is reviewed rather than enabled.
   "S102", "S307", "S506", "S602", "S608", "S609", "S701",
+  # Banned APIs: the banned-api table.
+  "TID251",
 ]
-# RUF022/RUF023: ``__all__`` and ``__slots__`` are grouped by meaning here -
-# urls, values, flags, errors - with a comment on each group. Alphabetising
-# them would trade a reader's map of the package for a sort order nobody reads.
-ignore = ["E741", "RUF022", "RUF023"]
+# No rule is ignored and there are no per-file ignores: old code passes the
+# same checks as new code.
+ignore = []
+# <<< xrddevtools sync: ruff <<<
 
+# >>> xrddevtools sync: banned-api (generated from xrd-devtools/src/xrddevtools/standard) >>>
+# What another part of the chain owns, this repository does not do itself:
+# each message names the replacement. No entry is scoped by file and nothing
+# is ignored; CONTRIBUTING.md's "Banned APIs" explains each one.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"http.client".msg = "HTTP is xrdhttp's: requests through xrdhttp.session.Session; connections, and the http.client types a client names (IncompleteRead, HTTPMessage, ...), through xrdhttp.connection"
+"urllib3".msg = "the chain has no third-party HTTP stack: use xrdhttp.session.Session (pooling, redirects, retries; TLS from xrdsec.tls)"
+"requests".msg = "the chain has no third-party HTTP stack: use xrdhttp.session.Session (pooling, redirects, retries; TLS from xrdsec.tls)"
+"httpx".msg = "the chain has no third-party HTTP stack: use xrdhttp.session.Session (pooling, redirects, retries; TLS from xrdsec.tls)"
+"urllib.request".msg = "use xrdhttp.session.Session: urllib's opener has none of the chain's TLS, redirect or retry rules"
+"gssapi".msg = "Kerberos GSS-API is xrdsec.krb5.gss (the xrdsec[krb5] extra), one wrapper for every client"
+"krb5".msg = "pykrb5 is not a dependency: credential caches are xrdsec.krb5.caches / xrdsec.krb5.ccache, GSS-API is xrdsec.krb5.gss"
+"ssl.PROTOCOL_TLS".msg = "TLS contexts are built by xrdsec.tls.client_context (grid CAs, CRLs, proxies, caching); GSI data channels by xrdsec.gsi.gss.data_contexts; tests by xrdsec.testing.pki.PKI.client_context / server_context"
+"ssl.PROTOCOL_TLS_CLIENT".msg = "TLS contexts are built by xrdsec.tls.client_context (grid CAs, CRLs, proxies, caching); GSI data channels by xrdsec.gsi.gss.data_contexts; tests by xrdsec.testing.pki.PKI.client_context / server_context"
+"ssl.PROTOCOL_TLS_SERVER".msg = "TLS contexts are built by xrdsec.tls.client_context (grid CAs, CRLs, proxies, caching); GSI data channels by xrdsec.gsi.gss.data_contexts; tests by xrdsec.testing.pki.PKI.client_context / server_context"
+"ssl._create_unverified_context".msg = "TLS contexts are built by xrdsec.tls.client_context (grid CAs, CRLs, proxies, caching); GSI data channels by xrdsec.gsi.gss.data_contexts; tests by xrdsec.testing.pki.PKI.client_context / server_context"
+"ssl.create_default_context".msg = "TLS contexts are built by xrdsec.tls.client_context (grid CAs, CRLs, proxies, caching); GSI data channels by xrdsec.gsi.gss.data_contexts; tests by xrdsec.testing.pki.PKI.client_context / server_context"
+"concurrent.futures.ThreadPoolExecutor".msg = "a fan-out is xrdcore.fanout.run_all (first failure raised, the rest stopped); a long-lived pool is xrdcore.fanout.Pool"
+"xml.etree.ElementTree.XML".msg = "parse XML with xrdcore.safexml.fromstring, which refuses DOCTYPEs and entities"
+"xml.etree.ElementTree.XMLParser".msg = "parse XML with xrdcore.safexml.fromstring, which refuses DOCTYPEs and entities"
+"xml.etree.ElementTree.XMLPullParser".msg = "parse XML with xrdcore.safexml.fromstring, which refuses DOCTYPEs and entities"
+"xml.etree.ElementTree.fromstring".msg = "parse XML with xrdcore.safexml.fromstring, which refuses DOCTYPEs and entities"
+"xml.etree.ElementTree.fromstringlist".msg = "parse XML with xrdcore.safexml.fromstring, which refuses DOCTYPEs and entities"
+"xml.etree.ElementTree.iterparse".msg = "parse XML with xrdcore.safexml.fromstring, which refuses DOCTYPEs and entities"
+"xml.etree.ElementTree.parse".msg = "parse XML with xrdcore.safexml.fromstring, which refuses DOCTYPEs and entities"
+"xml.dom.minidom".msg = "parse XML with xrdcore.safexml.fromstring, which refuses DOCTYPEs and entities"
+"xml.dom.pulldom".msg = "parse XML with xrdcore.safexml.fromstring, which refuses DOCTYPEs and entities"
+"xml.parsers.expat".msg = "parse XML with xrdcore.safexml.fromstring, which refuses DOCTYPEs and entities"
+"xml.sax.make_parser".msg = "parse XML with xrdcore.safexml.fromstring, which refuses DOCTYPEs and entities"
+"xml.sax.parse".msg = "parse XML with xrdcore.safexml.fromstring, which refuses DOCTYPEs and entities"
+"xml.sax.parseString".msg = "parse XML with xrdcore.safexml.fromstring, which refuses DOCTYPEs and entities"
+"botocore".msg = "S3 signing and the S3 codec are xrdhttp.s3 (the xrdhttp[s3] extra); only xrdhttp.s3 imports botocore"
+"boto3".msg = "S3 signing and the S3 codec are xrdhttp.s3 (the xrdhttp[s3] extra); only xrdhttp.s3 imports botocore"
+"xgfalclient".msg = "xrdclient sits below xgfalclient in the chain and never imports it (dependency direction)"
+"xrdarc".msg = "xrdclient does not depend on xrdarc: the clients share code through the libraries, not each other"
+"xrdwms".msg = "xrdclient sits below xrdwms in the chain and never imports it (dependency direction)"
+# <<< xrddevtools sync: banned-api <<<
+
+# Cognitive complexity per function, over everything handwritten; no snapshot,
+# no ignore markers. CI runs ``complexipy``; xrd-devtools' maintainability
+# check (and so tests/test_maintainability.py) holds every function to the
+# same limit.
+# >>> xrddevtools sync: complexipy (generated from xrd-devtools/src/xrddevtools/standard) >>>
+[tool.complexipy]
+# Every function of every Python file, with no snapshot of old offenders.
+paths = ["src", "tests", "tools", "benchmarks", "examples"]
+max-complexity-allowed = 15
+failed = true
+# <<< xrddevtools sync: complexipy <<<
+
+# The floor is 3.11: AlmaLinux 8 and 9 offer python3.11 and python3.12 from
+# AppStream and 10 ships 3.12, so 3.11 is the oldest interpreter any supported
+# platform hands a user. mypy checks against it, and tests/test_compat.py
+# parses every shipped module with the 3.11 grammar and imports the whole
+# package under a real 3.11 when one is on PATH.
+# >>> xrddevtools sync: mypy (generated from xrd-devtools/src/xrddevtools/standard) >>>
 [tool.mypy]
-# The floor is 3.9 - what RHEL 9 and AlmaLinux 9 ship - but mypy itself refuses
-# to be pointed below 3.10, so the floor is held by the interpreter instead:
-# tests/test_compat.py parses every shipped module as 3.9 and imports the whole
-# package under a real 3.9 if one is installed, and CI runs the suite on it.
-python_version = "3.10"
+# 3.11 is the oldest interpreter any supported platform hands a user.
+python_version = "3.11"
 strict = true
-packages = ["xrdclient"]
-mypy_path = "src"
+# <<< xrddevtools sync: mypy <<<
+# Everything handwritten is checked, not only the package: the suite, the
+# maintenance tools, the benchmarks and the examples are code a reader
+# trusts too, and every ``type: ignore`` left in them is verified by
+# ``warn_unused_ignores`` (which ``strict`` turns on).
+files = ["src", "tests", "tools", "benchmarks", "examples"]
+# ``.`` names tests.*, tools.* and benchmarks.*; examples/pyxrootd is a base
+# of its own because its scripts import their sibling ``_compat_hook``.
+mypy_path = "src:.:typings:examples/pyxrootd"
+explicit_package_bases = true
 
-# The optional accelerators and adapters ship no stubs. They are reached
-# through narrow, guarded imports, so untyped is the honest description of
-# them rather than a hole in our own checking.
+# >>> xrddevtools sync: mypy-overrides (generated from xrd-devtools/src/xrddevtools/standard) >>>
+# Tests may leave a fixture-taking test function unannotated, but its body is
+# still checked, so a type error (or an unused ignore) in a test fails too.
 [[tool.mypy.overrides]]
-module = ["google_crc32c.*", "fsspec.*"]
+module = ["tests.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
+
+# XRootD, the official pyxrootd bindings the parity tests, benchmarks and
+# examples compare against, ships neither inline types nor stubs. (fsspec
+# ships none either, but the adapter subclasses it, so typings/fsspec holds
+# stubs for exactly the part of it this project uses.)
+[[tool.mypy.overrides]]
+module = ["XRootD.*"]
 ignore_missing_imports = true
-
-# ``AbstractFileSystem`` is therefore ``Any``, and subclassing it is the whole
-# point of the adapter.
-[[tool.mypy.overrides]]
-module = "xrdclient.fsspec_impl"
-disallow_subclassing_any = false
+# <<< xrddevtools sync: mypy-overrides <<<

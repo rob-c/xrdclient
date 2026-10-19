@@ -53,16 +53,23 @@ def test_an_open_carries_the_template_after_the_options():
 
 
 def test_fcntl_is_an_opaque_query_the_stock_server_refuses(server, config):
-    with File(f"{server.url}/data/a.root", config) as fh:
-        with pytest.raises(UnsupportedError) as caught:
-            fh.fcntl(b"anything")
+    with (
+        File(f"{server.url}/data/a.root", config) as fh,
+        pytest.raises(UnsupportedError) as caught,
+    ):
+        fh.fcntl(b"anything")
     assert caught.value.code == kXR_Unsupported
     assert "fctl operation not supported" in str(caught.value)
 
 
 def test_fcntl_hands_the_plugin_the_bytes_and_returns_its_answer(server, config):
-    asked = []
-    server.fctl = lambda path, data: (asked.append((path, data)), b"re:" + data)[1]
+    asked: list[tuple[str, bytes]] = []
+
+    def plugin(path: str, data: bytes) -> bytes:
+        asked.append((path, data))
+        return b"re:" + data
+
+    server.fctl = plugin
     with File(f"{server.url}/data/a.root", config) as fh:
         assert fh.fcntl(b"\x00binary\xff") == b"re:\x00binary\xff"
         assert fh.fcntl() == b"re:"
@@ -201,7 +208,8 @@ class _Reads:
     """A reader over ``data`` that remembers what it was asked for."""
 
     def __init__(self, data: bytes) -> None:
-        self.data, self.asked = data, []
+        self.data = data
+        self.asked: list[tuple[int, int]] = []
 
     def __call__(self, offset: int, length: int) -> bytes:
         self.asked.append((offset, length))
@@ -333,7 +341,7 @@ def test_a_directory_shorter_than_its_count_stops_where_it_ends():
 
 
 def _zip64_field(*values: int, wide: tuple[int, ...] = (8, 8, 8, 4)) -> bytes:
-    body = b"".join(v.to_bytes(w, "little") for v, w in zip(values, wide))
+    body = b"".join(v.to_bytes(w, "little") for v, w in zip(values, wide, strict=False))
     return struct.pack("<HH", 1, len(body)) + body
 
 
@@ -430,9 +438,11 @@ ARCHIVE = _archive({"hello.txt": b"hello world", "dir/": b"", "dir/inner": b"x" 
 
 @pytest.fixture
 def zipped(config):
-    with FakeServer(files={"/z/a.zip": ARCHIVE, "/z/not.zip": b"abc", "/z/e.zip": b""}) as srv:
-        with FileSystem(srv.url, config) as fs:
-            yield srv, fs
+    with (
+        FakeServer(files={"/z/a.zip": ARCHIVE, "/z/not.zip": b"abc", "/z/e.zip": b""}) as srv,
+        FileSystem(srv.url, config) as fs,
+    ):
+        yield srv, fs
 
 
 def test_list_archive_gives_each_member_the_archives_stat(zipped):

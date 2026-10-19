@@ -67,8 +67,8 @@ def test_append_matches_the_builtin(srv, tmp_path):
     """The same sequence of calls, remote and local, ends in the same bytes."""
     local = tmp_path / "log"
     local.write_bytes(b"HELLO")
-    for stream in (open(local, "a+b"), open_url(f"{srv.url}/log", "a+b")):
-        with stream:
+    with open(local, "a+b") as builtin, open_url(f"{srv.url}/log", "a+b") as remote:
+        for stream in (builtin, remote):
             stream.write(b"1")
             stream.seek(0, io.SEEK_SET)
             stream.write(b"2")
@@ -82,7 +82,7 @@ def test_append_matches_the_builtin(srv, tmp_path):
 def test_append_on_a_real_server_ignores_the_position(real_server, sandbox):
     """Against the genuine daemon, which opens the file ``kXR_open_apnd``."""
     import xrdclient
-    from conftest import _REAL_CONFIG
+    from tests.conftest import _REAL_CONFIG
 
     path = f"{sandbox}/log"
     with xrdclient.FileSystem(real_server.url, _REAL_CONFIG) as fs:

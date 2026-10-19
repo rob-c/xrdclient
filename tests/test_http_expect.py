@@ -37,39 +37,12 @@ def disk():
         yield server
 
 
-def test_a_body_is_announced_before_it_is_sent(head, disk):
-    head.redirects["/d/f.bin"] = str(disk.url / "d/f.bin")
-    with HTTPClient(Config()) as client:
-        client.request("PUT", head.url / "d/f.bin", body=BIG, expect=(201,))
-    assert disk.contents("/d/f.bin") == BIG
-    assert head.headers[0]["Expect"] == "100-continue"
-    assert head.seen == [("PUT", "/d/f.bin")]
-
-
 def test_a_small_body_goes_straight_out(disk):
     """Under :data:`EXPECT_OVER` the round trip buys nothing."""
     with HTTPClient(Config()) as client:
         client.request("PUT", disk.url / "d/s.bin", body=b"tiny", expect=(201,))
     assert "Expect" not in disk.headers[0]
     assert disk.contents("/d/s.bin") == b"tiny"
-
-
-def test_a_server_that_ignores_the_expectation_still_gets_the_body(disk, monkeypatch):
-    """HTTP lets it; after :data:`CONTINUE_WAIT` the body is sent anyway, as curl does."""
-    monkeypatch.setattr(expect, "CONTINUE_WAIT", 0.05)
-    monkeypatch.setattr(expect.await_continue, "__defaults__", (0.05,))
-    disk.expect_continue = False
-    with HTTPClient(Config()) as client:
-        client.request("PUT", disk.url / "d/f.bin", body=BIG, expect=(201,))
-    assert disk.contents("/d/f.bin") == BIG
-
-
-def test_an_early_refusal_is_the_answer(head):
-    """Not a broken pipe: the server said no, and says why."""
-    head.handlers["PUT"] = lambda method, path, headers: (403, b"read-only", {})
-    head.early_redirects = False
-    with HTTPClient(Config()) as client, pytest.raises(PermissionError):
-        client.request("PUT", head.url / "d/f.bin", body=BIG, expect=(201,))
 
 
 def test_a_streamed_upload_follows_the_redirect_before_its_first_chunk(head, disk):

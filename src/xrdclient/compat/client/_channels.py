@@ -22,7 +22,11 @@ from ...url import parse
 
 __all__ = ["close_all", "router_for"]
 
+#: Guards :data:`_channels`; opens on many threads (callbacks) race to make one.
 _lock = threading.Lock()
+#: One native filesystem per (scheme, host:port, settings). ``Config`` is in the
+#: key because a put setting (``env.EnvPutInt``) must not reuse a connection
+#: built under the old ones; it is frozen, so it hashes by value.
 _channels: dict[tuple[str, str, Config], FileSystem] = {}
 
 
@@ -40,6 +44,8 @@ def router_for(url: str, config: Config) -> Router | None:
         channel = _channels.get(key)
         if channel is None:
             channel = _channels[key] = FileSystem(parsed.with_path("/"), config)
+    # A lent router starts on the shared connection and, if the open is
+    # redirected, moves to the data server alone - the channel stays put.
     return channel._router.lend()
 
 

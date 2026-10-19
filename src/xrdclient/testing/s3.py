@@ -10,35 +10,100 @@ cases a real bucket will not produce on demand.
     ...     xrdclient.s3.S3FileSystem(srv.url, endpoint=srv.endpoint).listdir("/d")
     ['a.root']
 
-Signatures are checked here rather than trusted: the verification is written
-out again from the specification, against the request as it arrived on the
-wire, so a client that signs the wrong string is caught rather than agreed
-with.
+Since 0.4.0 the server is xrdhttp's shared fake storage element,
+:class:`xrdhttp.testing.StorageServer`, with its S3 dialect on (the one
+xgfalclient's suite runs against too). Signatures are checked there rather
+than trusted, written out again from the specification against the request
+as it arrived on the wire, so a client that signs the wrong string is
+caught rather than agreed with. :class:`FakeS3Server` is the thin preset
+that keeps this package's names: one bucket, its objects as a plain dict
+(:attr:`~FakeS3Server.objects`), the request log as
+:attr:`~FakeS3Server.seen`, and the dialect's knobs (``forbidden``,
+``complete_fails``, ``failing_parts``, ...) as attributes of the server.
+
+The server is path-style only (``http://host:port/bucket/key``): the client
+chooses path style whenever it is given an explicit endpoint, which is how
+every test reaches this server. Every object claims the same modification
+time, so listings and stats are reproducible.
 """
 
 from __future__ import annotations
 
-import hashlib
-import hmac
-import threading
-import urllib.parse
-import xml.etree.ElementTree as ET
-from email.utils import formatdate
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Generic, Self, TypeVar, overload
+
+from xrdhttp.testing import S3, MemoryStore, StorageServer
 
 from ..url import XRootDURL, parse
-from .http import _endpoint
 
 __all__ = ["FakeS3Server"]
 
-#: The stamp every object claims to have been written at, in the two spellings
-#: S3 uses for it: ISO 8601 in a listing, RFC 5322 in a header.
-_MODIFIED = "2024-01-02T03:04:05.000Z"
+#: The stamp every object claims to have been written at (2024-01-02T03:04:05Z).
 _MODIFIED_EPOCH = 1704164645
 
+_T = TypeVar("_T")
 
-class FakeS3Server:
-    """An S3 endpoint on loopback, holding one bucket, populated from a dict."""
+
+class _Knob(Generic[_T]):
+    """One field of the server's :class:`~xrdhttp.testing.S3` state under its flat name.
+
+    The dialect's state lives on :attr:`FakeS3Server.s3`, shared with every
+    other client's preset; this keeps ``server.forbidden = True`` meaning
+    what it always has.
+    """
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        """Remember which field this is: the attribute's own name."""
+        self.name = name
+
+    @overload
+    def __get__(self, server: None, owner: type) -> Self: ...
+
+    @overload
+    def __get__(self, server: FakeS3Server, owner: type) -> _T: ...
+
+    def __get__(self, server: FakeS3Server | None, owner: type) -> Self | _T:
+        """The field's value (the descriptor itself, read from the class)."""
+        if server is None:
+            return self
+        value: _T = getattr(server.dialect, self.name)
+        return value
+
+    def __set__(self, server: FakeS3Server, value: _T) -> None:
+        """Set the field."""
+        setattr(server.dialect, self.name, value)
+
+
+class FakeS3Server(StorageServer):
+    """An S3 endpoint on loopback, holding one bucket, populated from a dict.
+
+    State lives in plain public attributes - :attr:`objects`, :attr:`seen`,
+    :attr:`uploads` - so a test arranges a scenario by assigning to them and
+    checks the outcome by reading them back; the fault knobs (``forbidden``,
+    ``complete_fails``, ``failing_parts`` ...) are attributes for the same
+    reason, and may be flipped while the server runs. The port is bound
+    lazily and released by :meth:`stop`; the serving threads are daemons, so
+    a test that forgets to stop the server cannot hang the interpreter on exit.
+    """
+
+    #: What a signature must be made with; ``access_key = ""`` accepts anything.
+    access_key: _Knob[str] = _Knob()
+    secret_key: _Knob[str] = _Knob()
+    #: Keys per listing page, which is how a test reaches the second one.
+    page_size: _Knob[int] = _Knob()
+    #: Multipart uploads in flight: id to ``{part number: bytes}``.
+    uploads: _Knob[dict[str, dict[int, bytes]]] = _Knob()
+    #: Uploads that were abandoned, so a test can see that they were.
+    aborted: _Knob[list[str]] = _Knob()
+    #: Begin a multipart upload without naming it, as nothing sane does.
+    nameless_uploads: _Knob[bool] = _Knob()
+    #: Report a failure in the body of an otherwise successful completion.
+    complete_fails: _Knob[bool] = _Knob()
+    #: Part numbers to refuse with a 500, once each.
+    failing_parts: _Knob[set[int]] = _Knob()
+    #: Report a failure in the body of an otherwise successful copy.
+    copy_fails: _Knob[bool] = _Knob()
+    #: Refuse every request, whatever it is signed with.
+    forbidden: _Knob[bool] = _Knob()
 
     def __init__(
         self,
@@ -50,473 +115,62 @@ class FakeS3Server:
         host: str = "127.0.0.1",
         port: int = 0,
     ) -> None:
+        """Hold ``objects`` in ``bucket``; nothing is bound until first use.
+
+        The default keys are the documentation example pair AWS publishes,
+        so a signature computed here can be compared against the worked
+        examples in the SigV4 specification. ``access_key=""`` turns the
+        signature check off for tests that are not about authentication.
+        Any region a signature's scope names is accepted.
+        """
+        self._memory = MemoryStore(buckets={bucket: dict(objects or {})}, mtime=_MODIFIED_EPOCH)
+        super().__init__(self._memory, host=host, port=port, name="xrdclient-fake-s3")
         #: The one bucket this endpoint serves.
         self.bucket = bucket
-        #: Key to contents. Mutated by the client, readable by the test.
-        self.objects: dict[str, bytes] = dict(objects or {})
-        #: What a signature must be made with; ``""`` accepts anything.
-        self.access_key = access_key
-        self.secret_key = secret_key
-        #: ``(method, path, query)`` for every request served, in order.
-        self.seen: list[tuple[str, str, str]] = []
-        #: Keys per listing page, which is how a test reaches the second one.
-        self.page_size = 1000
-        #: Key to ``ETag`` for the objects whose tag is not a plain MD5 - the
-        #: ones that arrived as a multipart upload, whose tag is a digest of
-        #: digests with the part count on the end.
-        self.etags: dict[str, str] = {}
-        #: Multipart uploads in flight: id to ``{part number: bytes}``.
-        self.uploads: dict[str, dict[int, bytes]] = {}
-        #: Uploads that were abandoned, so a test can see that they were.
-        self.aborted: list[str] = []
-        #: Begin a multipart upload without naming it, as nothing sane does.
-        self.nameless_uploads = False
-        #: Report a failure in the body of an otherwise successful completion,
-        #: which is exactly how S3 reports one.
-        self.complete_fails = False
-        #: Part numbers to refuse with a 500, once each: a part lost on the
-        #: way in, which the rest of the upload must not paper over.
-        self.failing_parts: set[int] = set()
-        #: Report a failure in the body of an otherwise successful copy,
-        #: which S3 does for ``CopyObject`` exactly as it does for completion.
-        self.copy_fails = False
-        #: Refuse every request, whatever it is signed with.
-        self.forbidden = False
-
-        self._wanted = (host, port)
-        self._last: tuple[str, int] | None = None
-        self._bound: ThreadingHTTPServer | None = None
-        self._thread: threading.Thread | None = None
-
-    # -- contents ------------------------------------------------------
-
-    def contents(self, key: str) -> bytes:
-        return self.objects[key.lstrip("/")]
-
-    # -- lifecycle -----------------------------------------------------
+        self.s3 = S3(access_key=access_key, secret_key=secret_key, region=None)
 
     @property
-    def _server(self) -> ThreadingHTTPServer:
-        if self._bound is None:
-            self._bound = _Server(self._wanted, _Handler)
-            self._bound.fake = self
-        return self._bound
+    def dialect(self) -> S3:
+        """The S3 state the knobs are fields of."""
+        assert self.s3 is not None  # set in __init__; the preset is always S3
+        return self.s3
 
     @property
-    def address(self) -> tuple[str, int]:
-        if self._bound is None and self._last is not None:
-            return self._last
-        return _endpoint(self._server)
+    def objects(self) -> dict[str, bytes]:
+        """Key to contents. Mutated by the client, readable (and writable) by the test."""
+        return self._memory.buckets[self.bucket]
+
+    @property
+    def etags(self) -> dict[str, str]:
+        """Key to ``ETag`` for the objects that arrived as a multipart upload."""
+        prefix = f"{self.bucket}/"
+        tags = self.dialect.etags
+        return {name[len(prefix) :]: tag for name, tag in tags.items() if name.startswith(prefix)}
+
+    @property
+    def seen(self) -> list[tuple[str, str, str]]:
+        """``(method, path, query)`` for every request served, in order, as sent."""
+        seen = []
+        for request in list(self.requests):
+            path, _, query = request.target.partition("?")
+            seen.append((request.method, path, query))
+        return seen
+
+    def contents(self, path: str) -> bytes:
+        """The object stored at key ``path``; a leading ``/`` is forgiven, as paths carry one."""
+        return self.objects[path.lstrip("/")]
 
     @property
     def endpoint(self) -> str:
         """``http://host:port`` - what :class:`~xrdclient.s3.S3FileSystem` talks to."""
-        host, port = self.address
-        return f"http://{host}:{port}"
+        return self.base
 
     @property
     def url(self) -> XRootDURL:
         """``s3://bucket/`` - what the bucket is called."""
         return parse(f"s3://{self.bucket}/")
 
-    def start(self) -> FakeS3Server:
-        """Serve in a background thread. Idempotent."""
-        if self._thread is None:
-            self._thread = threading.Thread(
-                target=self._server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
-            )
-            self._thread.start()
-        return self
-
-    def stop(self) -> None:
-        """Stop serving and release the port. Idempotent."""
-        if self._bound is None:
-            return
-        self._last = _endpoint(self._bound)
-        if self._thread is not None:
-            self._bound.shutdown()
-            self._thread = None
-        self._bound.server_close()
-        self._bound = None
-
-    def __enter__(self) -> FakeS3Server:
-        return self.start()
-
-    def __exit__(self, *exc: object) -> None:
-        self.stop()
-
     def __repr__(self) -> str:
-        bound = _endpoint(self._bound) if self._bound else self._last
-        where = f"{bound[0]}:{bound[1]}" if bound else "unbound"
+        """Where it listens and how much it holds, without binding a port to say so."""
+        where = self._where()
         return f"FakeS3Server({where}, bucket={self.bucket!r}, objects={len(self.objects)})"
-
-
-class _Server(ThreadingHTTPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-    fake: FakeS3Server
-
-    def handle_error(self, request: object, address: object) -> None:
-        """A client that hangs up mid-request is normal here, not a failure."""
-
-
-class _Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-    server: _Server
-
-    def log_message(self, fmt: str, *args: object) -> None:
-        """Quiet: a test's output is the test's own."""
-
-    @property
-    def fake(self) -> FakeS3Server:
-        return self.server.fake
-
-    # -- plumbing ------------------------------------------------------
-
-    def _parts(self) -> tuple[str, str, dict[str, str]]:
-        """``(bucket, key, query)`` of this request."""
-        path, _, query = self.path.partition("?")
-        plain = urllib.parse.unquote(path).lstrip("/")
-        bucket, _, key = plain.partition("/")
-        return bucket, key, dict(urllib.parse.parse_qsl(query, keep_blank_values=True))
-
-    def _body(self) -> bytes:
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        return self.rfile.read(length)
-
-    def _send(self, status: int, body: bytes = b"", **headers: str) -> None:
-        self.send_response(status)
-        for name, value in headers.items():
-            self.send_header(name.replace("_", "-"), value)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        if body and self.command != "HEAD":
-            self.wfile.write(body)
-
-    def _error(self, status: int, code: str) -> None:
-        body = f"<Error><Code>{code}</Code></Error>".encode()
-        self._send(status, body, Content_Type="application/xml")
-
-    def _gate(self, body: bytes) -> bool:
-        """Record the request, and check what authorises it."""
-        path, _, query = self.path.partition("?")
-        self.fake.seen.append((self.command, path, query))
-        if self.fake.forbidden:
-            self._error(403, "AccessDenied")
-            return False
-        bucket = self._parts()[0]
-        if bucket != self.fake.bucket:
-            self._error(404, "NoSuchBucket")
-            return False
-        if self.fake.access_key and not self._signed(body):
-            self._error(403, "SignatureDoesNotMatch")
-            return False
-        return True
-
-    def _signed(self, body: bytes) -> bool:
-        """Recompute the signature from the request, and see if it agrees.
-
-        Written out from the specification rather than borrowed from
-        :mod:`xrdclient.s3.sigv4`: a check that calls the code under test would
-        agree with it however wrong it was.
-        """
-        fields = self._authorization()
-        if fields is None:
-            return False
-        scope = fields["Credential"].partition("/")[2]
-        names = fields["SignedHeaders"].split(";")
-        hashed = self.headers.get("x-amz-content-sha256", "")
-        if hashed != "UNSIGNED-PAYLOAD" and hashed != hashlib.sha256(body).hexdigest():
-            return False
-        path, _, query = self.path.partition("?")
-        canonical = "\n".join(
-            [
-                self.command,
-                urllib.parse.quote(urllib.parse.unquote(path), safe="/"),
-                _sorted_query(query),
-                "".join(f"{name}:{self._header(name)}\n" for name in names),
-                ";".join(names),
-                hashed,
-            ]
-        )
-        to_sign = "\n".join(
-            [
-                "AWS4-HMAC-SHA256",
-                self.headers.get("x-amz-date", ""),
-                scope,
-                hashlib.sha256(canonical.encode()).hexdigest(),
-            ]
-        )
-        derived = f"AWS4{self.fake.secret_key}".encode()
-        for step in scope.split("/"):
-            derived = hmac.new(derived, step.encode(), hashlib.sha256).digest()
-        expected = hmac.new(derived, to_sign.encode(), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected, fields["Signature"])
-
-    def _authorization(self) -> dict[str, str] | None:
-        """The fields of the ``Authorization`` header, or ``None`` if it is not ours.
-
-        "Ours" means SigV4, carrying every field a check needs, for our access
-        key, with a credential scope that matches the request's date.
-        """
-        header = self.headers.get("Authorization", "")
-        algorithm, _, rest = header.partition(" ")
-        fields = dict(item.strip().split("=", 1) for item in rest.split(",") if "=" in item)
-        if algorithm != "AWS4-HMAC-SHA256" or not fields.keys() >= {
-            "Credential",
-            "SignedHeaders",
-            "Signature",
-        }:
-            return None
-        key, _, scope = fields["Credential"].partition("/")
-        stamp = self.headers.get("x-amz-date", "")
-        if key != self.fake.access_key or scope.split("/")[::3] != [stamp[:8], "aws4_request"]:
-            return None
-        return fields
-
-    def _header(self, name: str) -> str:
-        """One signed header's value, whitespace-folded as the rules say."""
-        if name == "host":
-            return self.headers.get("Host", "")
-        return " ".join(self.headers.get(name, "").split())
-
-    # -- verbs ---------------------------------------------------------
-
-    def do_HEAD(self) -> None:
-        self.do_GET()
-
-    def do_GET(self) -> None:
-        if not self._gate(b""):
-            return
-        _bucket, key, query = self._parts()
-        if not key:
-            self._list(query)
-            return
-        data = self.fake.objects.get(key)
-        if data is None:
-            self._error(404, "NoSuchKey")
-            return
-        extra = {
-            "ETag": f'"{self.fake.etags.get(key) or _md5(data)}"',
-            "Last-Modified": formatdate(_MODIFIED_EPOCH, usegmt=True),
-            "Accept-Ranges": "bytes",
-        }
-        span = self.headers.get("Range")
-        if span:
-            start = int(span.split("=", 1)[1].partition("-")[0] or 0)
-            piece = data[start:]
-            extra["Content-Range"] = f"bytes {start}-{len(data) - 1}/{len(data)}"
-            self._send(206, piece, **extra)
-            return
-        self._send(200, data, **extra)
-
-    def _list(self, query: dict[str, str]) -> None:
-        """``ListObjectsV2``: one page of keys and common prefixes."""
-        if query.get("list-type") != "2":
-            self._send(200, b"", Content_Type="text/plain")  # a bare HEAD on the bucket
-            return
-        prefix = query.get("prefix", "")
-        delimiter = query.get("delimiter", "")
-        limit = min(int(query.get("max-keys", self.fake.page_size)), self.fake.page_size)
-        start = query.get("continuation-token", "")
-
-        keys = sorted(k for k in self.fake.objects if k.startswith(prefix) and k > start)
-        contents, prefixes, last = _listing_page(keys, prefix, delimiter, limit)
-        truncated = bool(last) and last != keys[-1]
-        self._send(
-            200,
-            _listing(
-                self.fake.bucket,
-                prefix,
-                contents,
-                prefixes,
-                self.fake.objects,
-                self.fake.etags,
-                last if truncated else "",
-            ),
-            Content_Type="application/xml",
-        )
-
-    def do_PUT(self) -> None:
-        body = self._body()
-        if not self._gate(body):
-            return
-        _bucket, key, query = self._parts()
-        upload = query.get("uploadId")
-        if upload is not None:
-            self._part(upload, int(query.get("partNumber", 0)), body)
-            return
-        source = self.headers.get("x-amz-copy-source")
-        if source:
-            self._copy(key, source)
-            return
-        self.fake.objects[key] = body
-        self.fake.etags.pop(key, None)
-        self._send(200, b"", ETag=f'"{_md5(body)}"')
-
-    def _copy(self, key: str, source: str) -> None:
-        """Server-side copy, which is what makes ``rename`` possible."""
-        _bucket, _, name = urllib.parse.unquote(source).lstrip("/").partition("/")
-        data = self.fake.objects.get(name)
-        if data is None:
-            self._error(404, "NoSuchKey")
-            return
-        if self.fake.copy_fails:
-            self._send(200, b"<Error><Code>InternalError</Code></Error>")
-            return
-        self.fake.objects[key] = data
-        self._send(
-            200,
-            f"<CopyObjectResult><ETag>&quot;{_md5(data)}&quot;</ETag></CopyObjectResult>".encode(),
-            Content_Type="application/xml",
-        )
-
-    def _part(self, upload: str, number: int, body: bytes) -> None:
-        parts = self.fake.uploads.get(upload)
-        if parts is None or not number:
-            self._error(404, "NoSuchUpload")
-            return
-        if number in self.fake.failing_parts:
-            self.fake.failing_parts.discard(number)
-            self._error(500, "InternalError")
-            return
-        parts[number] = body
-        self._send(200, b"", ETag=f'"{_md5(body)}"')
-
-    def do_POST(self) -> None:
-        body = self._body()
-        if not self._gate(body):
-            return
-        _bucket, key, query = self._parts()
-        if "uploads" in query:
-            self._begin(key)
-        elif "uploadId" in query:
-            self._complete(key, query["uploadId"], body)
-        else:
-            self._error(400, "MalformedPOSTRequest")
-
-    def _begin(self, key: str) -> None:
-        handle = f"upload-{len(self.fake.uploads) + 1:04d}"
-        self.fake.uploads[handle] = {}
-        named = "" if self.fake.nameless_uploads else f"<UploadId>{handle}</UploadId>"
-        self._send(
-            200,
-            f"<InitiateMultipartUploadResult><Key>{key}</Key>{named}"
-            "</InitiateMultipartUploadResult>".encode(),
-            Content_Type="application/xml",
-        )
-
-    def _complete(self, key: str, upload: str, body: bytes) -> None:
-        parts = self.fake.uploads.pop(upload, None)
-        if parts is None:
-            self._error(404, "NoSuchUpload")
-            return
-        if self.fake.complete_fails:
-            # 200 with a failure inside it: S3 answers before it knows, so
-            # that it can hold the connection open while it assembles.
-            self._send(200, b"<Error><Code>InternalError</Code></Error>")
-            return
-        wanted = [int(n.text or 0) for n in _find(body, "PartNumber")]
-        self.fake.objects[key] = b"".join(parts[n] for n in wanted)
-        digests = b"".join(hashlib.md5(parts[n]).digest() for n in wanted)
-        tag = f"{hashlib.md5(digests).hexdigest()}-{len(wanted)}"
-        self.fake.etags[key] = tag
-        self._send(
-            200,
-            f"<CompleteMultipartUploadResult><Key>{key}</Key>"
-            f"<ETag>&quot;{tag}&quot;</ETag></CompleteMultipartUploadResult>".encode(),
-            Content_Type="application/xml",
-        )
-
-    def do_DELETE(self) -> None:
-        if not self._gate(b""):
-            return
-        _bucket, key, query = self._parts()
-        upload = query.get("uploadId")
-        if upload is not None:
-            self.fake.uploads.pop(upload, None)
-            self.fake.aborted.append(upload)
-            self._send(204)
-            return
-        # Deleting a key that is not there is a success, as it is in S3.
-        self.fake.objects.pop(key, None)
-        self._send(204)
-
-
-def _listing_page(
-    keys: list[str], prefix: str, delimiter: str, limit: int
-) -> tuple[list[str], list[str], str]:
-    """Select one S3 page, coalescing keys beneath a common prefix."""
-    contents: list[str] = []
-    prefixes: list[str] = []
-    taken = 0
-    last = ""
-    for key in keys:
-        if key <= last:
-            continue  # inside a group already rolled past, below
-        tail = key[len(prefix) :]
-        if delimiter and delimiter in tail:
-            group = prefix + tail.split(delimiter, 1)[0] + delimiter
-            prefixes.append(group)
-            # Past the whole group, so the next page cannot name it again:
-            # a common prefix appears in exactly one page of a listing.
-            last = max(k for k in keys if k.startswith(group))
-        else:
-            contents.append(key)
-            last = key
-        taken += 1
-        if taken >= limit:
-            break
-    return contents, prefixes, last
-
-
-def _sorted_query(query: str) -> str:
-    pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
-    return "&".join(
-        f"{urllib.parse.quote(name, safe='')}={urllib.parse.quote(value, safe='')}"
-        for name, value in sorted(pairs)
-    )
-
-
-def _md5(data: bytes) -> str:
-    return hashlib.md5(data).hexdigest()
-
-
-def _find(body: bytes, name: str) -> list[ET.Element]:
-    try:
-        root = ET.fromstring(body)
-    except ET.ParseError:
-        return []
-    return [node for node in root.iter() if node.tag.rpartition("}")[2] == name]
-
-
-def _listing(
-    bucket: str,
-    prefix: str,
-    contents: list[str],
-    prefixes: list[str],
-    objects: dict[str, bytes],
-    etags: dict[str, str],
-    token: str,
-) -> bytes:
-    """A ``ListObjectsV2`` result, namespaced the way a real one is."""
-    parts = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">',
-        f"<Name>{bucket}</Name><Prefix>{prefix}</Prefix>",
-        f"<IsTruncated>{'true' if token else 'false'}</IsTruncated>",
-    ]
-    if token:
-        parts.append(f"<NextContinuationToken>{token}</NextContinuationToken>")
-    for key in contents:
-        data = objects[key]
-        parts.append(
-            f"<Contents><Key>{key}</Key><Size>{len(data)}</Size>"
-            f"<LastModified>{_MODIFIED}</LastModified>"
-            f"<ETag>&quot;{etags.get(key) or _md5(data)}&quot;</ETag>"
-            f"<StorageClass>STANDARD</StorageClass></Contents>"
-        )
-    for group in prefixes:
-        parts.append(f"<CommonPrefixes><Prefix>{group}</Prefix></CommonPrefixes>")
-    parts.append("</ListBucketResult>")
-    return "".join(parts).encode()

@@ -12,11 +12,12 @@ import struct
 import time
 import traceback
 import zlib
+from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
 from xrdclient import auth
-from xrdclient._log import redact
 from xrdclient.auth.base import Offer, parse_security_trailer
 from xrdclient.auth.simple import HostCredential, UnixCredential
 from xrdclient.auth.sss import (
@@ -31,6 +32,7 @@ from xrdclient.auth.ztn import TokenCredential, discover_token, token_claims, to
 from xrdclient.config import Config
 from xrdclient.crypto.blowfish import Blowfish
 from xrdclient.errors import CredentialError, NoMechanismError, TokenExpiredError
+from xrdclient.log import redact
 
 # --------------------------------------------------------------------------
 # The security trailer
@@ -72,6 +74,7 @@ def test_unix_credential_is_the_tag_then_the_username():
 
 def test_unix_falls_back_to_the_configured_username():
     cred = UnixCredential.available(Offer("unix"), Config(username="cfg"), username="", host="h")
+    assert cred is not None
     assert cred.initial() == b"unix\x00cfg"
 
 
@@ -79,6 +82,7 @@ def test_an_explicit_username_beats_the_config():
     cred = UnixCredential.available(
         Offer("unix"), Config(username="cfg"), username="explicit", host="h"
     )
+    assert cred is not None
     assert cred.username == "explicit"
 
 
@@ -110,6 +114,69 @@ def test_token_claims_decode_without_verifying():
 def test_token_claims_of_something_that_is_not_a_jwt():
     assert token_claims("opaque-token") == {}
     assert token_claims("a.b") == {}
+
+
+def _segment(value: object) -> str:
+    """``value`` as JSON (or raw bytes as given), base64url, padding off."""
+    import base64
+    import json
+
+    raw = value if isinstance(value, bytes) else json.dumps(value).encode()
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def test_token_claims_ignore_the_signature_segment():
+    """Not decoded at all: expiry inspection must not depend on it."""
+    assert token_claims(f"{JWT_HEADER}.{_segment({'exp': 1})}.!!not base64!!") == {"exp": 1}
+
+
+def test_token_claims_accept_whole_quantum_padding():
+    """Some issuers keep the ``=``; where it makes a whole quantum it is fine."""
+    one, two = _segment({"exp": 12}), _segment({"exp": 1})
+    assert (len(one) % 4, len(two) % 4) == (3, 2)
+    assert token_claims(f"{JWT_HEADER}.{one}=.sig") == {"exp": 12}
+    assert token_claims(f"{JWT_HEADER}.{two}==.sig") == {"exp": 1}
+    assert token_claims(f"{JWT_HEADER}=.{two}.sig") == {"exp": 1}  # the header too
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _segment({"exp": 1}) + "===",  # more padding than base64 ever needs
+        _segment({"exp": 123}) + "=",  # padding where none was needed
+        _segment({"exp": 12}) + "==",  # more padding than this one needed
+        "+" + _segment({"exp": 1})[1:],  # the other base64 alphabet
+        _segment({"exp": 1})[:4] + "=" + _segment({"exp": 1})[4:],  # padding inside
+        _segment({"exp": 1}) + "!",  # not base64 of any kind
+        "A" * 5,  # a length no base64 encoding has
+        _segment({"a": 1})[:-1] + "1",  # spare bits set: non-canonical
+        _segment(b"\x80not text"),  # not UTF-8
+        _segment(b"{not json"),
+        _segment(b"[" * 100_000),  # nesting json gives up on
+        _segment([1, 2]),  # JSON, but not an object
+        "",  # nothing at all
+    ],
+)
+def test_token_claims_refuse_a_malformed_payload(payload):
+    """Strict: two different strings never decode to the same claims."""
+    assert token_claims(f"{JWT_HEADER}.{payload}.sig") == {}
+
+
+@pytest.mark.parametrize("header", [_segment([]), _segment(b"nope"), "!", ""])
+def test_token_claims_refuse_a_malformed_header(header):
+    assert token_claims(f"{header}.{_segment({'exp': 1})}.sig") == {}
+
+
+def test_token_claims_of_a_detached_payload_are_empty():
+    """RFC 7797 ``"b64": false``: the claims are not in the token."""
+    header = _segment({"alg": "none", "b64": False})
+    assert token_claims(f"{header}.{_segment({'exp': 1})}.sig") == {}
+
+
+def test_token_claims_want_exactly_three_segments():
+    payload = _segment({"exp": 1})
+    assert token_claims(f"{JWT_HEADER}.{payload}.sig.extra") == {}
+    assert token_claims(f"{JWT_HEADER}.{payload}") == {}
 
 
 def test_token_expiry_reads_the_exp_claim():
@@ -161,29 +228,34 @@ def test_discover_token_prefers_the_config(monkeypatch):
 
 def test_discover_token_falls_back_to_the_environment(monkeypatch):
     monkeypatch.setenv("BEARER_TOKEN", "from-env\n")
-    monkeypatch.setattr("os.getuid", lambda: 999999)
+    monkeypatch.setattr("os.geteuid", lambda: 999999)
     assert discover_token(Config()) == "from-env"
 
 
+def _token_file(path: Path, text: str) -> Path:
+    path.write_text(text)
+    path.chmod(0o600)
+    return path
+
+
 def test_discover_token_reads_the_token_file(monkeypatch, tmp_path):
-    path = tmp_path / "bt"
-    path.write_text("from-file\n")
+    path = _token_file(tmp_path / "bt", "from-file\n")
     monkeypatch.delenv("BEARER_TOKEN", raising=False)
     assert discover_token(Config(token_file=str(path))) == "from-file"
 
 
 def test_discover_token_skips_an_empty_file(monkeypatch, tmp_path):
-    (tmp_path / "bt").write_text("   \n")
+    _token_file(tmp_path / "bt", "   \n")
     monkeypatch.delenv("BEARER_TOKEN", raising=False)
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
-    monkeypatch.setattr("os.getuid", lambda: 999999)
+    monkeypatch.setattr("xrdclient._tokens.TMP_DIR", str(tmp_path / "empty"))
     assert discover_token(Config(token_file=str(tmp_path / "bt"))) is None
 
 
 def test_ztn_is_unavailable_without_a_token(monkeypatch, tmp_path):
     monkeypatch.delenv("BEARER_TOKEN", raising=False)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    monkeypatch.setattr("os.getuid", lambda: 999999)
+    monkeypatch.setattr("os.geteuid", lambda: 999999)
     assert TokenCredential.available(Offer("ztn"), Config(), username="", host="h") is None
 
 
@@ -333,7 +405,7 @@ KEYTAB = """\
 """.format("aa" * 32, "bb" * 32)
 
 
-def write_keytab(tmp_path, text=KEYTAB):
+def write_keytab(tmp_path: Path, text: str = KEYTAB) -> str:
     path = tmp_path / "sss.keytab"
     path.write_text(text)
     path.chmod(0o600)
@@ -375,9 +447,48 @@ def test_a_keytab_others_can_read_is_refused(tmp_path, mode):
     assert read_keytab(path, require_private=False)[0].id == 1
 
 
-def test_an_exposed_keytab_is_skipped_with_a_warning(tmp_path, caplog):
+def _no_blowfish(monkeypatch: pytest.MonkeyPatch) -> None:
+    """What ``cryptography`` raises on a FIPS host or without OpenSSL's legacy provider."""
+    from cryptography.exceptions import UnsupportedAlgorithm
+
+    from xrdclient.auth import sss
+
+    class Refused:
+        def __init__(self, key: bytes) -> None:
+            raise UnsupportedAlgorithm("Blowfish is not supported by this backend")
+
+    monkeypatch.setattr(sss, "Blowfish", Refused)
+
+
+def test_sss_without_blowfish_is_explained_while_the_ladder_can_move_on(tmp_path, monkeypatch):
+    _no_blowfish(monkeypatch)
     config = Config(keytab=write_keytab(tmp_path))
-    os.chmod(config.keytab, 0o644)
+    with pytest.raises(CredentialError, match=r"FIPS mode.*'legacy' provider"):
+        SSSCredential.available(Offer("sss"), config, username="", host="h")
+    rejected: dict[str, str] = {}
+    names = [c.name for c in auth.select("&P=sss&P=host", config, rejected=rejected)]
+    assert names == ["host"]
+    assert "ztn (a bearer token), gsi or krb5" in rejected["sss"]
+
+
+def test_sss_without_blowfish_never_leaks_unsupported_algorithm(monkeypatch):
+    _no_blowfish(monkeypatch)
+    with pytest.raises(CredentialError, match="Blowfish") as refused:
+        build_credential(KEY, "u")
+    assert type(refused.value) is CredentialError
+
+
+def test_a_keytab_that_is_not_a_file_is_skipped_with_a_warning(tmp_path, caplog):
+    config = Config(keytab=str(tmp_path))
+    with caplog.at_level(logging.WARNING, logger="xrdclient.auth.sss"):
+        assert SSSCredential.available(Offer("sss"), config, username="", host="h") is None
+    assert "not a regular file" in caplog.text
+
+
+def test_an_exposed_keytab_is_skipped_with_a_warning(tmp_path, caplog):
+    keytab = write_keytab(tmp_path)
+    config = Config(keytab=keytab)
+    os.chmod(keytab, 0o644)
     with caplog.at_level(logging.WARNING, logger="xrdclient.xrdclient.auth.sss"):
         assert SSSCredential.available(Offer("sss"), config, username="", host="h") is None
     assert "readable by group or others" in caplog.text
@@ -415,13 +526,13 @@ def test_default_keytab_path_falls_back_to_the_home_directory(monkeypatch):
 def test_sss_selects_the_named_key_the_server_asked_for(tmp_path):
     config = Config(keytab=write_keytab(tmp_path))
     cred = SSSCredential.available(Offer("sss", "n:other"), config, username="bob", host="h")
-    assert cred.key.id == 2
+    assert cred is not None and cred.key.id == 2
 
 
 def test_sss_takes_the_first_key_when_no_name_is_offered(tmp_path):
     config = Config(keytab=write_keytab(tmp_path))
     cred = SSSCredential.available(Offer("sss"), config, username="bob", host="h")
-    assert cred.key.id == 1
+    assert cred is not None and cred.key.id == 1
 
 
 def test_sss_is_unavailable_when_the_named_key_is_missing(tmp_path):
@@ -481,7 +592,7 @@ def test_registry_holds_the_default_install_mechanisms():
 
 
 def test_registry_returns_a_copy():
-    auth.registry()["bogus"] = object
+    auth.registry()["bogus"] = HostCredential
     assert "bogus" not in auth.registry()
 
 
@@ -512,11 +623,11 @@ def test_select_records_why_a_mechanism_had_no_material(tmp_path, monkeypatch):
     it looked, and the command that would have put something there."""
     monkeypatch.delenv("BEARER_TOKEN", raising=False)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-    monkeypatch.setattr("os.getuid", lambda: 999999)
+    monkeypatch.setattr("os.geteuid", lambda: 999999)
     rejected: dict[str, str] = {}
     list(auth.select("&P=ztn&P=host", Config(), username="b", rejected=rejected))
     assert rejected["ztn"].startswith("nothing in $BEARER_TOKEN, ")
-    assert "/tmp/bt_u999999; try: oidc-token" in rejected["ztn"]
+    assert "/tmp/bt_u999999; try: (umask 077; oidc-token" in rejected["ztn"]
 
 
 def test_a_mechanism_that_raises_does_not_mask_the_rest(monkeypatch):
@@ -625,6 +736,74 @@ def test_redact_removes_credential_material(text, leak):
     assert "<redacted>" in cleaned
 
 
+MACAROON = "MDAxY2xvY2F0aW9uIE9wdGlvbmFsLmVtcHR5CjAwMThpZGVudGlmaWVyIGFiYwo"
+
+
+@pytest.mark.parametrize(
+    "text, leak",
+    [
+        # S3 pre-signed URLs, SigV4 and V2
+        ("GET /b/k?X-Amz-Algorithm=AWS4&X-Amz-Signature=deadbeef01&x=1", "deadbeef01"),
+        (
+            "GET /b/k?X-Amz-Credential=AKIDEXAMPLE%2F20240101%2Fus-east-1&X-Amz-Date=1",
+            "AKIDEXAMPLE",
+        ),
+        ("GET /b/k?X-Amz-Security-Token=FwoGZXIvYXdz&X-Amz-Date=1", "FwoGZXIvYXdz"),
+        ("GET /b/k?AWSAccessKeyId=AKIAIOSFODNN7&Expires=1&Signature=vjbyPxyb%2B", "AKIAIOSFODNN7"),
+        ("GET /b/k?AWSAccessKeyId=AKIAIOSFODNN7&Expires=1&Signature=vjbyPxyb%2B", "vjbyPxyb"),
+        # Azure / Google shared-access signatures
+        ("https://acct.blob.core.windows.net/c/b?sv=2020&sig=Zm9vYmFy%3D", "Zm9vYmFy"),
+        # EOS capabilities
+        ("root://eos//f?cap.sym=QmFzZTY0U3lt&cap.msg=QmFzZTY0TXNn", "QmFzZTY0U3lt"),
+        ("root://eos//f?cap.sym=QmFzZTY0U3lt&cap.msg=QmFzZTY0TXNn", "QmFzZTY0TXNn"),
+        # OAuth
+        ("https://h/f?access_token=opaque-xyz", "opaque-xyz"),
+        # macaroons, wherever they turn up
+        (f"https://h/f?authz={MACAROON}", MACAROON[4:]),
+        (f"macaroon issued: {MACAROON}", MACAROON[4:]),
+        # whole Authorization headers, raw and as a dict
+        (
+            "Authorization: AWS4-HMAC-SHA256 Credential=AKID/20240101/us-east-1/s3/aws4_request, "
+            "SignedHeaders=host;x-amz-date, Signature=fe5f80f77d5fa3beca038a248ff027",
+            "fe5f80f77d5fa3beca038a248ff027",
+        ),
+        (
+            "Authorization: AWS4-HMAC-SHA256 Credential=AKID/20240101/us-east-1/s3/aws4_request, "
+            "SignedHeaders=host, Signature=fe5f80",
+            "AKID/",
+        ),
+        ("{'Authorization': 'AWS AKIAIOSFODNN7:frJIUN8DYpKDtOLCwo', 'Host': 'h'}", "frJIUN8D"),
+        ("TransferHeaderAuthorization: opaque-without-a-scheme", "opaque-without"),
+    ],
+)
+def test_redact_removes_signatures_capabilities_and_macaroons(text, leak):
+    cleaned = redact(text)
+    assert leak not in cleaned, cleaned
+    assert "<redacted>" in cleaned
+
+
+def test_redact_keeps_what_is_needed_to_read_the_line():
+    assert redact("GET /b/k?X-Amz-Date=20240101&X-Amz-Signature=abc") == (
+        "GET /b/k?X-Amz-Date=20240101&X-Amz-Signature=<redacted>"
+    )
+    assert redact("Authorization: Bearer abc.def") == "Authorization: Bearer <redacted>"
+    assert redact(f"{MACAROON} done") == "MDAx<redacted> done"
+    # ``sig`` only as a whole parameter name: ``xsig=`` and ``.sig=`` are someone else's.
+    assert redact("?xsig=keep&file.sig=keep2") == "?xsig=keep&file.sig=keep2"
+    assert redact("{'Host': 'h', 'Authorization': 'Bearer t0k'}") == (
+        "{'Host': 'h', 'Authorization': 'Bearer <redacted>'}"
+    )
+
+
+def test_a_url_repr_hides_more_than_authz():
+    from xrdclient.url import parse
+
+    url = parse("https://h/b/k?n=1&X-Amz-Signature=deadbeef&access_token=xyz&authz=t")
+    text = repr(url)
+    assert "deadbeef" not in text and "xyz" not in text and "authz=t" not in text
+    assert "n=1" in text
+
+
 def test_redact_leaves_ordinary_text_alone():
     assert redact("opened root://host:1094//store/data.root") == (
         "opened root://host:1094//store/data.root"
@@ -644,7 +823,7 @@ def test_no_credential_reaches_a_traceback():
     """A stack trace is the one thing everybody pastes into a bug report."""
     secret = "s3cr3t-material"
     token = jwt(int(time.time()) - 10).replace("sig", secret)
-    cases = [
+    cases: list[Callable[[], bytes]] = [
         lambda: TokenCredential(token).initial(),
         lambda: SSSCredential(SSSKey(id=1, secret=secret.encode(), expires=1), "bob").initial(),
     ]
@@ -652,8 +831,7 @@ def test_no_credential_reaches_a_traceback():
         try:
             call()
         except Exception as exc:
-            # the three-argument form: 3.10 added the shorter one
-            text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            text = "".join(traceback.format_exception(exc))
             assert secret not in text, text
         else:
             raise AssertionError("expected the credential to be refused")
@@ -677,7 +855,7 @@ def test_redaction_does_not_eat_a_placeholder(caplog):
 
 def test_a_broken_format_string_is_still_passed_along():
     """Redaction cannot read the message, and a logging bug is not ours to eat."""
-    from xrdclient._log import _filter
+    from xrdclient.log import _filter
 
     record = logging.LogRecord(
         "xrdclient.auth", logging.DEBUG, __file__, 1, "counted %d", ("x",), None
@@ -699,7 +877,7 @@ def test_a_credential_with_nothing_to_show_prints_its_mechanism():
 
 def test_a_clean_message_with_no_arguments_is_left_exactly_as_it_was():
     """The filter only rewrites a record it had a reason to touch."""
-    from xrdclient._log import _filter
+    from xrdclient.log import _filter
 
     record = logging.LogRecord(
         "xrdclient.auth", logging.DEBUG, __file__, 1, "connected", None, None

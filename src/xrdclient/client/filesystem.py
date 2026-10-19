@@ -1,6 +1,9 @@
 """Namespace operations against one storage endpoint.
 
-:class:`FileSystem` is the explicit, per-operation layer. It reads like
+:class:`FileSystem` is the explicit, per-operation layer, and the ``root://``
+implementation of :class:`~xrdclient.client.BaseFileSystem`; constructed with
+an ``http(s)``/``dav(s)`` or ``s3`` URL it hands back the WebDAV or S3
+sibling instead (see :meth:`FileSystem.__new__`). It reads like
 ``os`` and ``shutil`` because those are the names Python programmers already
 know: :meth:`stat`, :meth:`listdir`, :meth:`makedirs`, :meth:`remove`,
 :meth:`rename`, :meth:`walk`.
@@ -13,23 +16,13 @@ know: :meth:`stat`, :meth:`listdir`, :meth:`makedirs`, :meth:`remove`,
 
 from __future__ import annotations
 
-import dataclasses
-import errno
 import posixpath
-import re
 import urllib.parse
-from collections.abc import Callable, Iterator, Sequence
-from typing import IO, Any
+from collections.abc import Callable, Sequence
+from typing import IO, TYPE_CHECKING, Any, Unpack, cast
 
-from .._compat import zip_strict
-from .._log import get_logger
 from ..config import Config
-from ..errors import (
-    ExistsError,
-    InvalidArgumentError,
-    NotFoundError,
-    ProtocolError,
-)
+from ..errors import ExistsError, ProtocolError
 from ..flags import (
     Access,
     DirListFlags,
@@ -43,6 +36,7 @@ from ..flags import (
     permissions,
     prepare_flags,
 )
+from ..log import get_logger, redact
 from ..proto import constants as c
 from ..proto import requests as r
 from ..proto import responses as rp
@@ -58,68 +52,20 @@ from ..types import (
     VFSInfo,
 )
 from ..url import XRootDURL, parse
-from . import _fattr, _zip
+from . import _fattr
+from ._fsbase import BaseFileSystem
 
-__all__ = ["FileSystem"]
+# Re-exported: defined here before the shared helpers moved to the base
+# class, and still imported from this module.
+from ._fsbase import _glob_regex as _glob_regex
+
+if TYPE_CHECKING:
+    from ..s3.fs import S3Options
+from ._fsbase import _split_cgi as _split_cgi
+
+__all__ = ["BaseFileSystem", "FileSystem"]
 
 _log = get_logger(__name__)
-
-_MAGIC = "*?["
-
-
-def _glob_regex(pattern: str) -> re.Pattern[str]:
-    """Compile a glob pattern, slash-aware.
-
-    :func:`fnmatch.fnmatch` is no use here because its ``*`` swallows path
-    separators, which makes ``/store/*/file`` match three levels down and
-    ``**`` mean nothing in particular. This is the pathlib reading: ``**/``
-    is zero or more directories, everything else stays in its component.
-    """
-    out: list[str] = []
-    i = 0
-    while i < len(pattern):
-        if pattern.startswith("**/", i):
-            out.append("(?:[^/]+/)*")
-            i += 3
-        elif pattern.startswith("**", i):
-            out.append(".*")
-            i += 2
-        elif pattern[i] == "*":
-            out.append("[^/]*")
-            i += 1
-        elif pattern[i] == "?":
-            out.append("[^/]")
-            i += 1
-        elif pattern[i] == "[":
-            end = pattern.find("]", i + 1)
-            if end < 0:  # an unclosed bracket is a literal one, as in fnmatch
-                out.append(re.escape("["))
-                i += 1
-                continue
-            body = pattern[i + 1 : end].replace("\\", "\\\\")
-            out.append("[" + ("^" + body[1:] if body.startswith("!") else body) + "]")
-            i = end + 1
-        else:
-            out.append(re.escape(pattern[i]))
-            i += 1
-    return re.compile("".join(out))
-
-
-def _literal_prefix(pattern: str) -> str:
-    """The deepest directory of ``pattern`` that contains no wildcard."""
-    parts = pattern.split("/")[:-1]
-    keep: list[str] = []
-    for part in parts:
-        if any(ch in part for ch in _MAGIC):
-            break
-        keep.append(part)
-    return "/".join(keep) or "/"
-
-
-def _split_cgi(path: str) -> tuple[str, str]:
-    """A resolved path split into the path itself and its opaque suffix."""
-    base, sep, cgi = path.partition("?")
-    return base, (sep + cgi if sep else "")
 
 
 def _cgi(explicit: str, inherited: XRootDURL) -> str:
@@ -136,68 +82,6 @@ def _cgi(explicit: str, inherited: XRootDURL) -> str:
     return f"?{explicit}&{extra}" if explicit else f"?{extra}"
 
 
-def _not_empty(exc: OSError) -> bool:
-    """Whether a refused ``rmdir`` said "that directory has something in it".
-
-    Stock xrootd reports ``ENOTEMPTY`` as ``kXR_ItExists``, which arrives as
-    an ``EEXIST``; the POSIX spelling is accepted as well.
-    """
-    return exc.errno in (errno.EEXIST, errno.ENOTEMPTY)
-
-
-class _Links:
-    """Whether a path is a symbolic link, from the one source that can say.
-
-    :meth:`FileSystem.is_symlink` is a ``kXR_readlink``, a vendor opcode, and a
-    stock server answers it with an error that reads as "not a link" - for a
-    link too. So it is believed only from a server whose :meth:`extensions`
-    list it, or from a subclass that answers it without asking (WebDAV and S3
-    have no links at all). Anywhere else the answer is ``None``: unknown. The
-    decision costs one ``kXR_query``, made the first time it is needed.
-    """
-
-    def __init__(self, fs: FileSystem) -> None:
-        self._fs = fs
-        self._trusted: bool | None = None
-
-    def __call__(self, path: str) -> bool | None:
-        if self._trusted is None:
-            self._trusted = self._decide()
-        return self._fs.is_symlink(path) if self._trusted else None
-
-    def _decide(self) -> bool:
-        if type(self._fs).is_symlink is not FileSystem.is_symlink:
-            return True
-        try:
-            return "readlink" in self._fs.extensions()
-        except OSError:
-            return False
-
-
-class _Descent:
-    """Which directories one :meth:`FileSystem.walk` goes into.
-
-    ``os.walk`` does not enter a link to a directory unless told to, and a
-    walk that does - by request, or because the server cannot say which
-    entries are links - still enters each directory once: the stat id is the
-    server's device and inode, so a link cycle is seen coming round again.
-    """
-
-    def __init__(self, links: _Links, followlinks: bool) -> None:
-        self._links = links
-        self._follow = followlinks
-        self._seen: set[str] = set()
-
-    def enters(self, path: str, ident: str) -> bool:
-        if not self._follow and self._links(path):
-            return False
-        if ident in self._seen:
-            return False
-        if ident:  # an entry with no id (an S3 prefix) is never a repeat
-            self._seen.add(ident)
-        return True
-
-
 class _Batches:
     """Each part of a listing, parsed and handed on as the server sends it.
 
@@ -209,12 +93,19 @@ class _Batches:
     def __init__(
         self, target: str, with_stat: bool, deliver: Callable[[list[DirEntry]], None]
     ) -> None:
+        """``deliver`` receives each part's entries; ``with_stat`` is what was asked for."""
         self._target = target
         self._with_stat = with_stat
         self._deliver = deliver
         self._started = False
 
     def __call__(self, piece: bytes) -> None:
+        """Parse one ``kXR_oksofar``/final part of a ``kXR_dirlist`` reply and deliver it.
+
+        Whether the listing really carries stat lines is decided by the first
+        part alone (a server that ignores ``kXR_dstat`` sends names only), and
+        that decision then governs every later part.
+        """
         if not self._started:
             self._started = True
             self._with_stat = self._with_stat and piece.startswith(b".\n")
@@ -225,86 +116,30 @@ class _Batches:
         self._deliver(rp.parse_dirlist(piece, self._target, with_stat=self._with_stat))
 
 
-class _TreeRemoval:
-    """One :meth:`FileSystem.rmtree`: what to remove, and what to do on failure.
+def _refuse_s3_options(options: S3Options, url: XRootDURL) -> None:
+    """Refuse S3's own keywords for a URL that is not ``s3://``, as a constructor would."""
+    if options:
+        names = ", ".join(sorted(options))
+        raise TypeError(f"{names}: only an s3:// filesystem takes these, not {url.scheme}://")
 
-    A link is removed with ``kXR_rm``, as ``unlink(2)`` removes a link, and
-    never descended into: a listing describes what a link points at, so a
-    link to a directory is indistinguishable from one, and following it would
-    delete whatever it named, inside the tree or not. Where :class:`_Links`
-    cannot tell, the directory is first sent a ``kXR_rmdir``, which never
-    follows a link: an empty directory goes, a full one answers "not empty"
-    and is cleared, and any other answer means it is not a directory we may
-    enter, so it is unlinked instead.
+
+class FileSystem(BaseFileSystem):
+    """Namespace and administrative operations on one endpoint.
+
+    The ``root://`` implementation, and the name to construct and to check
+    against for every scheme: ``FileSystem("davs://...")`` is an
+    :class:`~xrdclient.http.HTTPFileSystem` and ``FileSystem("s3://...")`` an
+    :class:`~xrdclient.s3.S3FileSystem`, both registered as virtual
+    subclasses, so ``isinstance(fs, FileSystem)`` is true of all three.
     """
 
-    def __init__(self, fs: FileSystem, cgi: str, ignore_errors: bool) -> None:
-        self._fs = fs
-        self._cgi = cgi
-        self._ignore = ignore_errors
-        self._links = _Links(fs)
-
-    def run(self, target: str) -> None:
-        link = self._links(target)
-        if link:
-            # ``shutil.rmtree`` refuses a link as its root rather than choose
-            # between deleting the link and deleting through it.
-            self._fail(NotADirectoryError(errno.ENOTDIR, "rmtree on a symbolic link", target))
-        elif link is False or self._full(target, self._fail):
-            self._clear(target)
-
-    def _entry(self, path: str, entry: DirEntry) -> None:
-        info = entry.stat if entry.stat is not None else self._fs._stat_or_none(path)
-        link = self._links(path) if info is not None and info.is_dir() else True
-        if link:
-            self._attempt(self._fs.remove, path)
-        elif link is False or self._full(path, lambda _: self._attempt(self._fs.remove, path)):
-            self._clear(path)
-
-    def _full(self, path: str, refused: Callable[[OSError], None]) -> bool:
-        """``kXR_rmdir`` as a question: is this a directory with things in it?"""
-        try:
-            self._fs.rmdir(path)
-        except OSError as exc:
-            if _not_empty(exc):
-                return True
-            refused(exc)
-        return False
-
-    def _clear(self, path: str) -> None:
-        """Remove what is in the directory ``path``, then the directory."""
-        try:
-            entries = self._fs.scandir(path)
-        except OSError as exc:
-            self._fail(exc)
-            return
-        base, _ = _split_cgi(path)
-        for entry in entries:
-            self._entry(posixpath.join(base, entry.name) + self._cgi, entry)
-        self._attempt(self._fs.rmdir, path)
-
-    def _attempt(self, operation: Callable[[str], None], path: str) -> None:
-        try:
-            operation(path)
-        except OSError as exc:
-            self._fail(exc)
-
-    def _fail(self, exc: OSError) -> None:
-        if not self._ignore:
-            raise exc
-
-
-class FileSystem:
-    """Namespace and administrative operations on one endpoint."""
-
     def __new__(
-        cls, url: str | XRootDURL, config: Config | None = None, **_extra: object
+        cls, url: str | XRootDURL, config: Config | None = None, **s3: Unpack[S3Options]
     ) -> FileSystem:
         """Pick the implementation the scheme calls for.
 
-        ``_extra`` is whatever a subclass's own constructor takes - S3's
-        credentials, say - which ``__new__`` has no use for but must accept,
-        because Python hands it the same arguments ``__init__`` gets.
+        ``s3`` is what :class:`~xrdclient.s3.S3FileSystem` alone takes
+        (credentials, region, endpoint); any other scheme refuses it.
 
         ``root://`` is this class; ``https://`` and the WebDAV spellings are
         :class:`~xrdclient.http.HTTPFileSystem`, and ``s3://`` is
@@ -312,25 +147,41 @@ class FileSystem:
         dispatch lives in ``__new__`` for the same reason
         :class:`pathlib.Path`'s does: callers should name what they want, not
         which implementation provides it.
+
+        The other two are siblings of this class under
+        :class:`~xrdclient.client.BaseFileSystem`, not subclasses of it, so
+        none of the ``root://`` wire code is inherited where it cannot work.
+        Their instance is therefore built here, whole: Python runs
+        ``__init__`` after ``__new__`` only for an instance of a real
+        subclass, and these are virtual ones (``FileSystem.register``).
         """
         if cls is FileSystem:
             target = parse(url)
             if target.is_http:
                 from ..http.dav import HTTPFileSystem
 
-                return object.__new__(HTTPFileSystem)
+                _refuse_s3_options(s3, target)
+                return cast("FileSystem", HTTPFileSystem(url, config))
             if target.is_s3:
                 from ..s3.fs import S3FileSystem
 
-                return object.__new__(S3FileSystem)
-        return object.__new__(cls)
+                return cast("FileSystem", S3FileSystem(url, config, **s3))
+        return super().__new__(cls)
 
-    def __init__(self, url: str | XRootDURL, config: Config | None = None) -> None:
+    def __init__(
+        self, url: str | XRootDURL, config: Config | None = None, **s3: Unpack[S3Options]
+    ) -> None:
+        """Bind to ``url``; no connection is made until the first request.
+
+        ``s3`` is refused here: only an ``s3://`` URL takes it (see :meth:`__new__`).
+
+        The router is not sticky: every request starts at this URL - the
+        manager, in a federation - and a redirect sends that one request on,
+        not the filesystem. The next path may well live on another data server.
+        """
         self.url = parse(url) if isinstance(url, str) else url
+        _refuse_s3_options(s3, self.url)
         self.config = config or Config()
-        # Not sticky: every request starts at this URL - the manager, in a
-        # federation - and a redirect sends that one request on, not the
-        # filesystem. The next path may well live on another data server.
         self._router = Router(self.url, self.config, sticky=False)
 
     # ------------------------------------------------------------------
@@ -360,22 +211,48 @@ class FileSystem:
 
     @property
     def endpoint(self) -> str:
+        """``host:port`` of the URL this filesystem starts every request from."""
         return self._router.endpoint
 
     def close(self) -> None:
+        """Give the connection back: pooled if nobody else is using it. Idempotent.
+
+        Files opened from this filesystem that share its connection keep it
+        alive until they close too; see :meth:`Router.close`.
+        """
         self._router.close()
 
-    def __enter__(self) -> FileSystem:
-        return self
+    def abort(self) -> None:
+        """Stop every request on this filesystem now, and refuse every one after.
 
-    def __exit__(self, *exc: object) -> None:
-        self.close()
+        Thread-safe and idempotent; never blocks on the network. The
+        connections this filesystem's requests are out on - its own, and the
+        pooled ones a redirected request borrowed - are shut down, which wakes
+        a thread blocked on one at once, and its request raises
+        :class:`~xrdclient.errors.AbortedError` (``errno`` ``ECANCELED``), as
+        does every call made afterwards. Nothing is retried or reconnected,
+        and the connection is never pooled again.
+
+        For a caller that must give up on a silent server from another thread
+        - a cancelled job, a watchdog - where a timeout would come too late::
+
+            threading.Timer(30, fs.abort).start()
+            fs.stat(path)          # AbortedError after 30 s, if still waiting
+
+        The connection is what an abort reaches: a file opened from this
+        filesystem that shares its connection finds it dropped, and fails as
+        it would if the server had gone away. Abort the
+        :class:`~xrdclient.File` itself to stop only that one.
+        """
+        self._router.abort()
 
     def __repr__(self) -> str:
-        return f"FileSystem({str(self.url)!r})"
+        """``FileSystem('<url>')``, with credentials in the URL's CGI redacted.
 
-    def __fspath__(self) -> str:
-        return str(self.url)
+        See :meth:`File.__repr__`: a ``repr`` is routinely logged, so tokens
+        never appear in it.
+        """
+        return f"FileSystem({redact(str(self.url))!r})"
 
     # ------------------------------------------------------------------
     # Interrogation
@@ -404,23 +281,6 @@ class FileSystem:
         res = self._router.execute(r.Stat(target, options), path=target)
         return rp.parse_stat(res.data, target)
 
-    def lstat(self, path: str) -> StatInfo:
-        """``os.lstat``: stat a symbolic link rather than what it points at."""
-        return self.stat(path, follow_symlinks=False)
-
-    def is_symlink(self, path: str) -> bool:
-        """Whether ``path`` is a symbolic link.
-
-        Asked as a :meth:`readlink`, because that is the question the server
-        can answer without ambiguity: a stat that followed the link looks
-        exactly like a stat of a file that never was one.
-        """
-        try:
-            self.readlink(path)
-        except (NotFoundError, InvalidArgumentError):
-            return False
-        return True
-
     def statvfs(self, path: str = "/") -> VFSInfo:
         """Space and staging utilisation, in ``os.statvfs`` spirit."""
         target = self._abs(path)
@@ -434,30 +294,7 @@ class FileSystem:
         flags = rp.parse_statx(res.data)
         if len(flags) != len(targets):
             raise ProtocolError(f"statx returned {len(flags)} flags for {len(targets)} paths")
-        return [StatInfo(flags=f, path=p) for f, p in zip_strict(flags, targets)]
-
-    def exists(self, path: str) -> bool:
-        """``True`` if ``path`` resolves. Never raises for a missing file."""
-        try:
-            self.stat(path)
-        except NotFoundError:
-            return False
-        return True
-
-    def isdir(self, path: str) -> bool:
-        try:
-            return self.stat(path).is_dir()
-        except NotFoundError:
-            return False
-
-    def isfile(self, path: str) -> bool:
-        try:
-            return self.stat(path).is_file()
-        except NotFoundError:
-            return False
-
-    def getsize(self, path: str) -> int:
-        return self.stat(path).st_size
+        return [StatInfo(flags=f, path=p) for f, p in zip(flags, targets, strict=True)]
 
     # ------------------------------------------------------------------
     # Listing
@@ -495,9 +332,8 @@ class FileSystem:
         To list inside a ZIP archive, as XrdCl's ``DirListFlags::Zip`` does,
         see :meth:`list_archive`.
         """
-        return self._scandir_parts(
-            path, None, stat=stat, online=online, algorithm=algorithm, flags=flags
-        )
+        chosen = dirlist_flags(stat=stat, online=online, algorithm=algorithm, flags=flags)
+        return self._scandir_parts(path, None, algorithm=algorithm, flags=chosen)
 
     def _scandir_parts(
         self,
@@ -505,7 +341,6 @@ class FileSystem:
         on_batch: Callable[[list[DirEntry]], None] | None,
         *,
         stat: bool = True,
-        online: bool = False,
         algorithm: str = "",
         flags: DirListFlags | int | str | None = None,
     ) -> list[DirEntry]:
@@ -515,9 +350,15 @@ class FileSystem:
         instalments; each is parsed and handed to ``on_batch`` as it comes
         in - what XrdCl's ``DirListFlags::Chunked`` delivers - and the whole
         listing is still returned at the end.
+
+        ``flags``, when given, is the listing's options already resolved
+        (:meth:`scandir` folds ``online`` into it); without it ``stat`` and
+        ``algorithm`` choose them, which is how the pyxrootd compat layer
+        asks. ``algorithm`` is still needed beside resolved flags: it names
+        the digest in the ``cks.type`` CGI, which no flag bit carries.
         """
         target = self._abs(path or "/")
-        options = dirlist_flags(stat=stat, online=online, algorithm=algorithm, flags=flags)
+        options = dirlist_flags(stat=stat, algorithm=algorithm, flags=flags)
         if algorithm:
             target += ("&" if "?" in target else "?") + f"cks.type={algorithm}"
         with_stat = bool(options & DirListFlags.STAT)
@@ -529,171 +370,34 @@ class FileSystem:
             res = self._router.execute(request, path=target, on_chunk=batches)
         return rp.parse_dirlist(res.data, target, with_stat=with_stat)
 
-    def list_archive(self, path: str) -> list[DirEntry]:
-        """The members of the ZIP archive at ``path``, read from its central directory.
-
-            for entry in fs.list_archive("/store/run7/logs.zip"):
-                print(entry.name, entry.stat.st_size)
-
-        This is XrdCl's ``DirListFlags::Zip`` listing. Only the end of the
-        archive is read - the directory records, found through the
-        end-of-central-directory record in two or three ranged reads - so a
-        large archive costs what a small one does. Names are as stored,
-        directories included (``"sub/"``), in the archive's own order.
-
-        Each entry's stat is the one XrdCl gives it: the archive's own, never
-        writable, with the member's uncompressed size in place of the
-        archive's. A file that is not an archive, or is a damaged one, raises
-        :class:`~xrdclient.client._zip.ZipArchiveError` in XrdCl's words for
-        what is wrong with it; an empty file is an empty archive.
-        """
-        return self._archive(path, self.stat(path))
-
-    def _archive(self, path: str, archive: StatInfo) -> list[DirEntry]:
-        """:meth:`list_archive`, for an archive already stat-ed as ``archive``."""
-        with self.open(path, "rb") as fh:
-
-            def read(at: int, length: int) -> bytes:
-                fh.seek(at)
-                data: bytes = fh.read(length)
-                return data
-
-            found = _zip.members(read, archive.st_size)
-        parent = self._abs(path).partition("?")[0]
-        flags = archive.flags & ~StatInfoFlags.IS_WRITABLE
-        return [
-            DirEntry(
-                name=member.name,
-                parent=parent,
-                stat=dataclasses.replace(
-                    archive,
-                    st_size=member.size,
-                    flags=flags,
-                    path=f"{parent.rstrip('/')}/{member.name}",
-                ),
-            )
-            for member in found
-        ]
-
-    def listdir(self, path: str = "") -> list[str]:
-        """Entry names only, like :func:`os.listdir`."""
-        return [e.name for e in self.scandir(path, stat=False)]
-
-    def iterdir(self, path: str = "") -> Iterator[DirEntry]:
-        """Iterate entries. The protocol has no cursor, so this reads it all."""
-        yield from self.scandir(path)
-
-    def walk(
+    def dirlist(
         self,
-        top: str = "",
+        path: str = "",
         *,
-        topdown: bool = True,
-        onerror: object = None,
-        followlinks: bool = False,
-    ) -> Iterator[tuple[str, list[str], list[str]]]:
-        """``os.walk`` over the remote namespace.
+        stat: bool = True,
+        online: bool = False,
+        flags: DirListFlags | int | str | None = None,
+    ) -> bytes:
+        """The ``kXR_dirlist`` answer as the server sent it, every part joined.
 
-        As in ``os.walk``, a link to a directory is listed among the
-        directories but not entered unless ``followlinks`` says so. A stock
-        server cannot say which entries are links (``kXR_readlink`` is a
-        vendor extension), and there the walk follows them - reading, not
-        deleting - but enters each directory once, so a link cycle ends.
+        :meth:`scandir` is this, parsed - and parsing is most of what a long
+        listing costs, because every entry becomes a
+        :class:`~xrdclient.types.StatInfo`. A caller that wants three fields
+        of each, or the names only, parses the bytes itself and pays for
+        what it reads. The request goes out exactly as :meth:`scandir`'s
+        does: redirects followed, the filesystem's CGI on the path.
+
+        The format is the protocol's: one name per line; with ``stat``
+        (``kXR_dstat``) a server that honours it starts with a ``.`` line and
+        its stat line, then sends name and stat line in turn
+        (``"<id> <size> <flags> <mtime> ..."``). A server that ignores the
+        flag sends names alone, so the leading ``.`` - not the flag that was
+        sent - says which form arrived. The body may end in a NUL.
         """
-        root = self._abs(top or "/")
-        yield from self._walk(root, topdown, onerror, _Descent(_Links(self), followlinks))
-
-    def _walk(
-        self, root: str, topdown: bool, onerror: object, descent: _Descent
-    ) -> Iterator[tuple[str, list[str], list[str]]]:
-        entries = self._walk_entries(root, onerror)
-        if entries is None:
-            return
-        # Opaque data belongs on the request, not in the name of a directory:
-        # what is yielded is a path, and what descends carries the token.
-        base, cgi = _split_cgi(root)
-        dirs, files, ids = self._partition(base, cgi, entries)
-        if topdown:
-            yield base, dirs, files
-        for name in list(dirs):
-            child = posixpath.join(base, name) + cgi
-            if descent.enters(child, ids.get(name, "")):
-                yield from self._walk(child, topdown, onerror, descent)
-        if not topdown:
-            yield base, dirs, files
-
-    def _walk_entries(self, root: str, onerror: object) -> list[DirEntry] | None:
-        try:
-            return self.scandir(root)
-        except OSError as exc:
-            if callable(onerror):
-                onerror(exc)
-            return None
-
-    def _partition(
-        self, base: str, cgi: str, entries: Sequence[DirEntry]
-    ) -> tuple[list[str], list[str], dict[str, str]]:
-        """Directories, everything else, and each directory's stat id.
-
-        A server that ignores ``kXR_dstat`` lists names alone, and an entry
-        without a stat is not known to be a file: it is asked about, as
-        ``os.walk`` falls back to a ``stat`` when ``d_type`` says nothing.
-        """
-        dirs: list[str] = []
-        files: list[str] = []
-        ids: dict[str, str] = {}
-        for entry in entries:
-            info = entry.stat
-            if info is None:
-                info = self._stat_or_none(posixpath.join(base, entry.name) + cgi)
-            if info is not None and info.is_dir():
-                dirs.append(entry.name)
-                ids[entry.name] = info.id
-            else:
-                files.append(entry.name)
-        return dirs, files, ids
-
-    def _stat_or_none(self, path: str) -> StatInfo | None:
-        """A stat, or ``None`` for an entry that is gone or a dangling link."""
-        try:
-            return self.stat(path)
-        except NotFoundError:
-            return None
-
-    def glob(self, pattern: str, *, root: str = "") -> Iterator[str]:
-        """Match ``pattern`` against the namespace, absolute paths out.
-
-        The semantics are :meth:`pathlib.Path.glob`'s, because that is what a
-        caller writing ``**/*.root`` means: ``*`` and ``?`` stay inside one
-        path component, ``**`` crosses them, and directories match as well as
-        files. A relative pattern is taken from ``root``, an absolute one as
-        it stands.
-
-        Only the directories a pattern can actually reach are listed: the
-        literal prefix is walked, not the whole namespace, so
-        ``glob("/store/mc/**/*.root")`` never asks about ``/store/data``.
-        """
-        base, cgi = _split_cgi(self._abs(root or "/"))
-        target = pattern if pattern.startswith("/") else posixpath.join(base, pattern)
-        match = _glob_regex(target).fullmatch
-        start = _literal_prefix(target)
-        deep = "**" in posixpath.basename(target)  # ``/d/**.root`` still descends
-        if not deep and start == posixpath.dirname(target):  # magic in the last component only
-            yield from self._flat_glob(start, cgi, match)
-            return
-        yield from self._deep_glob(start, cgi, match)
-
-    def _flat_glob(self, start: str, cgi: str, match: Any) -> Iterator[str]:
-        for entry in self.scandir(start + cgi, stat=False):
-            full = posixpath.join(start, entry.name)
-            if match(full):
-                yield full
-
-    def _deep_glob(self, start: str, cgi: str, match: Any) -> Iterator[str]:
-        for dirpath, dirs, files in self.walk(start + cgi):
-            for name in sorted(dirs + files):
-                full = posixpath.join(dirpath, name)
-                if match(full):
-                    yield full
+        target = self._abs(path or "/")
+        options = dirlist_flags(stat=stat, online=online, flags=flags)
+        request = r.Dirlist(target, int(options) & ~int(DirListFlags.RECURSIVE))
+        return bytes(self._router.execute(request, path=target).data)
 
     # ------------------------------------------------------------------
     # Mutation
@@ -717,10 +421,6 @@ class FileSystem:
             if not exist_ok or not self.isdir(path):
                 raise
 
-    def makedirs(self, path: str, mode: int | str = 0o755, exist_ok: bool = False) -> None:
-        """:func:`os.makedirs`."""
-        self.mkdir(path, mode, parents=True, exist_ok=exist_ok)
-
     def rmdir(self, path: str) -> None:
         """Remove an empty directory."""
         target = self._abs(path)
@@ -733,19 +433,6 @@ class FileSystem:
 
     #: :func:`os.unlink` is the same call.
     unlink = remove
-
-    def rmtree(self, path: str, *, ignore_errors: bool = False) -> None:
-        """``shutil.rmtree``. There is no server-side primitive.
-
-        Symbolic links are removed, never followed: nothing outside the tree
-        is touched, and a link as ``path`` itself is refused. Stock xrootd
-        will not unlink a link, so a tree holding one fails to go rather
-        than be emptied through it; see :class:`_TreeRemoval` for how a link
-        is told from a directory on a server that cannot say.
-        """
-        target = self._abs(path)
-        _, cgi = _split_cgi(target)
-        _TreeRemoval(self, cgi, ignore_errors).run(target)
 
     def rename(self, src: str, dst: str) -> None:
         """Rename within the same storage element."""
@@ -781,6 +468,7 @@ class FileSystem:
         return rp.parse_readlink(result.data)
 
     def chmod(self, path: str, mode: int | str) -> None:
+        """``kXR_chmod``: set the nine permission bits (``0o755``, ``"755"``, ``"rwxr-xr-x"``)."""
         target = self._abs(path)
         self._router.execute(r.Chmod(target, permissions(mode)), path=target)
 
@@ -825,7 +513,7 @@ class FileSystem:
         symbolic links: it changes the link, not what the link points at.
         """
         target = self._abs(path)
-        request = r.Setattr(target, c.kXR_sa_owner, uid=int(uid), gid=int(gid))
+        request = r.Setattr(target, c.kXR_sa_owner, owner=(int(uid), int(gid)))
         self._router.execute(request, path=target)
 
     def truncate(self, path: str, size: int) -> None:
@@ -893,7 +581,7 @@ class FileSystem:
         res = self._router.execute(r.Query(c.kXR_Qconfig, "\n".join(wanted)))
         body = res.data.split(b"\x00", 1)[0].decode("utf-8", "replace")
         values = body.split("\n")
-        return {name: value for name, value in zip(wanted, values) if value}
+        return {name: value for name, value in zip(wanted, values, strict=False) if value}
 
     def extensions(self) -> frozenset[str]:
         """Which vendor opcodes the server admits to implementing.
@@ -958,15 +646,6 @@ class FileSystem:
         it; this is here for a server that understands more.
         """
         self._router.execute(r.Set(directive))
-
-    def appid(self, name: str) -> None:
-        """Label this connection in the server's monitoring stream.
-
-        An operator looking at the server sees which application the traffic
-        belongs to instead of another anonymous connection. The name is
-        advisory and a server that does not monitor ignores it.
-        """
-        self.set_property(f"appid {name}")
 
     def locate(
         self,
@@ -1048,6 +727,8 @@ class FileSystem:
         fresh: bool = False,
         priority: int = 0,
         flags: PrepareFlags | int | str | None = None,
+        cancel: bool = False,
+        reqid: str | None = None,
     ) -> str:
         """Ask the site to bring files onto disk. Returns the request handle.
 
@@ -1062,7 +743,18 @@ class FileSystem:
         to be told when it is done, and ``fresh=True`` re-stages a file the
         site thinks it already has. The remaining ``kXR_prepare`` options are
         reachable as words: ``flags="stage colocate"``.
+
+        ``cancel=True`` withdraws the request ``reqid`` - the handle an
+        earlier stage returned - for ``paths``, or for all of it when
+        ``paths`` is empty: ``kXR_cancel``, with the request id leading the
+        path list, as XrdCl sends it. The staging words do not apply to a
+        cancel and are ignored; ``flags`` is added to it, for a server that
+        reads more. A request id is only ever the name of a request to
+        cancel, so one without ``cancel=True`` - or a cancel without one -
+        is refused with :class:`ValueError` before anything is sent.
         """
+        if cancel or reqid is not None:
+            return self._cancel(paths, reqid, priority, flags, cancel=cancel)
         targets = [self._abs(p) for p in paths]
         options = prepare_flags(stage=stage, evict=evict, notify=notify, fresh=fresh, flags=flags)
         # The options byte, then the extended half-word above it: see
@@ -1070,10 +762,6 @@ class FileSystem:
         request = r.Prepare(targets, int(options) & 0xFF, priority, extended=int(options) >> 8)
         res = self._router.execute(request)
         return res.data.split(b"\x00", 1)[0].decode("utf-8", "replace").strip()
-
-    def evict(self, paths: Sequence[str]) -> str:
-        """Ask the server to drop its cached copies."""
-        return self.prepare(paths, evict=True)
 
     def archive_info(self, paths: Sequence[str]) -> list[PrepareStatus]:
         """Where each of these files lives, without asking for any of it to move.
@@ -1119,15 +807,39 @@ class FileSystem:
         res = self._router.execute(r.Query(c.kXR_QPrep, args), path=targets[0] if targets else "")
         return rp.parse_prepare_status(res.data)
 
-    def cancel_prepare(self, handle: str) -> None:
-        """Withdraw a staging request :meth:`prepare` made.
+    def _cancel(
+        self,
+        paths: Sequence[str],
+        reqid: str | None,
+        priority: int,
+        flags: PrepareFlags | int | str | None,
+        *,
+        cancel: bool,
+    ) -> str:
+        """``prepare(cancel=True, reqid=...)``: see :meth:`prepare`."""
+        if not cancel:
+            raise ValueError("reqid names a request to cancel; pass cancel=True with it")
+        if not reqid:
+            raise ValueError("prepare(cancel=True) needs the reqid of the request to cancel")
+        options = PrepareFlags.CANCEL | (PrepareFlags(flags) if flags is not None else 0)
+        # The id goes on the wire as it is, never resolved as a path: it
+        # names a request, and the server reads the first entry as one.
+        entries = [reqid, *(self._abs(p) for p in paths)]
+        request = r.Prepare(entries, int(options) & 0xFF, priority, extended=int(options) >> 8)
+        res = self._router.execute(request)
+        return res.data.split(b"\x00", 1)[0].decode("utf-8", "replace").strip()
 
-        The handle takes the place of the path list, which is what makes this
-        a separate method rather than a flag on :meth:`prepare`: cancelling
-        names the request, not the files, and passing paths here would ask the
-        server to cancel requests whose handles happen to look like filenames.
+    def cancel_prepare(self, handle: str, paths: Sequence[str] = ()) -> None:
+        """Withdraw a staging request :meth:`prepare` made, or ``paths`` of it.
+
+        The handle leads the path list - cancelling names the request first
+        and the files second - which is why it is a separate argument rather
+        than one more path: passed as a path it would be resolved against the
+        filesystem's directory and lose its meaning. With no ``paths`` the
+        whole request goes. ``prepare(paths, cancel=True, reqid=handle)`` is
+        the same request.
         """
-        self._router.execute(r.Prepare([handle], int(PrepareFlags.CANCEL), 0))
+        self.prepare(paths, cancel=True, reqid=handle)
 
     # ------------------------------------------------------------------
     # Extended attributes
@@ -1144,6 +856,11 @@ class FileSystem:
         raise _fattr.missing(name, target)
 
     def setxattr(self, path: str, name: str, value: bytes, *, create_only: bool = False) -> None:
+        """Set one attribute (``kXR_fattr`` set), raising if the server refused it.
+
+        ``create_only`` sends ``kXR_fattrIsNew``, so an existing attribute is an
+        error instead of being overwritten - the ``XATTR_CREATE`` of ``setxattr(2)``.
+        """
         target = self._abs(path)
         res = self._router.execute(
             r.Fattr.set(target, name, value, create_only=create_only), path=target
@@ -1151,11 +868,13 @@ class FileSystem:
         _fattr.check(rp.parse_fattr(res.data, values=False), target)
 
     def removexattr(self, path: str, name: str) -> None:
+        """Remove one attribute (``kXR_fattr`` del), raising if refused - an absent one, say."""
         target = self._abs(path)
         res = self._router.execute(r.Fattr.delete(target, name), path=target)
         _fattr.check(rp.parse_fattr(res.data, values=False), target)
 
     def listxattr(self, path: str) -> list[str]:
+        """Every attribute name on ``path`` (``kXR_fattr`` list), in the server's order."""
         target = self._abs(path)
         res = self._router.execute(r.Fattr.list(target), path=target)
         return [item.name for item in rp.parse_fattr_list(res.data).items]
@@ -1224,25 +943,3 @@ class FileSystem:
             # filesystem's connection, to be let go of here.
             lent.close()
             raise
-
-    def read_bytes(self, path: str) -> bytes:
-        """Whole-file read, like :meth:`pathlib.Path.read_bytes`."""
-        with self.open(path, "rb") as fh:
-            data: bytes = fh.read()
-        return data
-
-    def write_bytes(self, path: str, data: bytes) -> int:
-        """Whole-file write, like :meth:`pathlib.Path.write_bytes`."""
-        with self.open(path, "wb") as fh:
-            written: int = fh.write(data)
-        return written
-
-    def read_text(self, path: str, encoding: str = "utf-8") -> str:
-        with self.open(path, "r", encoding=encoding) as fh:
-            text: str = fh.read()
-        return text
-
-    def write_text(self, path: str, text: str, encoding: str = "utf-8") -> int:
-        with self.open(path, "w", encoding=encoding) as fh:
-            written: int = fh.write(text)
-        return written
