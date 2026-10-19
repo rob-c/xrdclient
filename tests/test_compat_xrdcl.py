@@ -20,6 +20,7 @@ import queue
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -541,12 +542,21 @@ def test_locate_over_http_is_a_plain_listing(monkeypatch):
 
 
 class _Kept(logging.Handler):
+    """The names of the records this test's own thread logs under ``xrdclient``.
+
+    Another thread may log meanwhile - the session pool's reaper, a
+    finalizer run by a collection - and its records are not the ones the
+    mask under test was applied to.
+    """
+
     def __init__(self) -> None:
         super().__init__(logging.DEBUG)
         self.names: list[str] = []
+        self._thread = threading.get_ident()
 
     def emit(self, record: logging.LogRecord) -> None:
-        self.names.append(record.name)
+        if record.thread == self._thread:
+            self.names.append(record.name)
 
 
 @pytest.fixture
@@ -593,6 +603,14 @@ def test_a_log_mask_is_read_as_xrdcl_reads_it(kept, mask, left):
     client.SetLogMask("All", mask)
     _emit(logging.WARNING)
     assert kept.names == left
+
+
+def test_another_threads_records_are_not_kept(kept):
+    other = threading.Thread(target=_emit, args=(logging.WARNING,))
+    other.start()
+    other.join()
+    _emit(logging.WARNING)
+    assert len(kept.names) == 3
 
 
 def test_a_log_mask_for_a_level_xrdcl_lacks_is_ignored(kept):
