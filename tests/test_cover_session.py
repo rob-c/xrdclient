@@ -332,6 +332,23 @@ def test_a_read_that_fails_after_the_session_closed_under_it_is_nothing():
         assert session._receive(0, None) is None
 
 
+def test_a_read_that_lands_after_the_session_closed_under_it_is_nothing():
+    """The read succeeds, but the session closed while the lock was let go.
+
+    Otherwise reached only when a close races a read, which the suites do
+    not always hit (Linux, Python 3.11: one run in several).
+    """
+    link = _Hook()
+    session = Session(link, ready(), Config())
+
+    def close() -> None:
+        session._m.state = m.State.CLOSED
+
+    link.action = close
+    with session._lock:
+        assert session._receive(0, None) is None
+
+
 def test_a_tls_read_that_waits_out_the_link_timeout_times_out():
     link = _Hook()
     link.readable = False
