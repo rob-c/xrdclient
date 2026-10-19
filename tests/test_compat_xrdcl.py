@@ -651,8 +651,8 @@ def official():
 
 
 def _plain(text: str) -> str:
-    """A URL or message with XrdCl's per-open request id taken out."""
-    return re.sub(r"[?&]?xrdcl\.requuid=[0-9A-F-]+&?", "", text)
+    """A URL or message with XrdCl's per-open request id (a UUID, in either case) taken out."""
+    return re.sub(r"[?&]?xrdcl\.requuid=[0-9A-Fa-f-]+&?", "", text)
 
 
 def _callback_answer(call: Any) -> tuple[Any, Any, Any]:
