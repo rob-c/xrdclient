@@ -36,8 +36,8 @@ classifiers = [
 # Blowfish and the Kerberos enctypes are XRootD's own and use it here.
 dependencies = [
   "cryptography>=45",
-  "xrdcore>=0.4.0,<0.5",
-  "xrdhttp[s3]>=0.4.0,<0.5",
+  "xrdcore>=0.4.1,<0.5",
+  "xrdhttp[s3]>=0.4.1,<0.5",
   "xrdsec>=0.4.1,<0.5",
 ]
 
@@ -53,12 +53,12 @@ Changelog = "https://github.com/rob-c/xrdclient/blob/main/CHANGELOG.md"
 # pure-Python fallback is a few MB/s. Wheels for CPython 3.11-3.14 on Linux
 # x86_64/aarch64 (manylinux2014) and macOS x86_64/arm64. The CRC lives in
 # xrdcore since 0.4.0, so this is xrdcore's extra (google-crc32c>=1.5).
-fast = ["xrdcore[fast]>=0.4.0,<0.5"]
+fast = ["xrdcore[fast]>=0.4.1,<0.5"]
 # The system Kerberos library through python-gssapi, for xrdsec.krb5.gss
 # (API:/MEMORY: caches, cross-realm, DNS KDC discovery); the GSS layer is
 # xrdsec's since 0.4.0, so this is xrdsec's extra. Native bindings need
 # Kerberos development headers when no wheel is available.
-krb5 = ["xrdsec[krb5]>=0.4.0,<0.5"]
+krb5 = ["xrdsec[krb5]>=0.4.1,<0.5"]
 # The fsspec filesystems (xrdclient.fsspec_impl: root://, dav(s)://), which
 # subclass fsspec's; the fsspec.specs entry points name them.
 fsspec = ["fsspec>=2024.2.0"]
