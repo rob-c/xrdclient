@@ -68,7 +68,7 @@ from xrdhttp.tpc import (
 
 from ..config import Config
 from ..copy.engine import CopyResult
-from ..errors import ProtocolError, kXR_ServerError, raise_for_status
+from ..errors import ProtocolError, ServerError, kXR_ServerError, raise_for_status
 from ..errors import TimeoutError as XRDTimeoutError
 from ..log import get_logger
 from ..url import XRootDURL, parse
@@ -188,15 +188,39 @@ def third_party(
     headers = _lib.copy_headers(_remote_url(far), options)
     started = time.monotonic()
     _log.debug("COPY %s %s -> %s", mode, su, du)
+    withheld_before = len(owned.withheld)
     try:
         size = _run_copy(owned, near, headers, progress, timeout)
     except OSError as exc:
+        _explain_withheld(exc, owned.withheld[withheld_before:])
         _discard_if_ours(du, cfg, exc, overwrite=overwrite, cleanup=cleanup)
         raise
     finally:
         if client is None:
             owned.close()
     return CopyResult(source=str(su), target=str(du), size=size, seconds=time.monotonic() - started)
+
+
+def _explain_withheld(exc: OSError, hosts: list[str]) -> None:
+    """Say why a refused ``COPY`` that was redirected off-site most likely failed.
+
+    The ``TransferHeader*`` headers - the far side's token - follow a
+    redirect only within the site that sent it
+    (:func:`xrdhttp.redirects.relays_transfer_headers`). A site whose gateway
+    hands the ``COPY`` to data nodes under another domain (RAL's Echo:
+    ``webdav.echo.stfc.ac.uk`` to ``ceph-svc*.gridpp.rl.ac.uk``) then pulls
+    without it and is refused, which comes back as a bare ``401``/``403``.
+    The hint names the host and the setting that trusts its domain.
+    """
+    if not hosts or not isinstance(exc, PermissionError) or not isinstance(exc, ServerError):
+        return
+    host = hosts[-1]
+    domain = host.split(".", 1)[1] if host.count(".") >= 2 else host
+    exc.explain(
+        f"the COPY was redirected to {host}, outside the site asked, so the token for the "
+        "far end was not sent there; if it is the same storage, trust its domain with "
+        f"XRD_TRUSTEDREDIRECTDOMAINS={domain}"
+    )
 
 
 def _discard_if_ours(

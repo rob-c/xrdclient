@@ -9,6 +9,7 @@ daemons and require the same statuses, results and handler calls.
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 from typing import Any, Self
@@ -755,6 +756,70 @@ def test_xrd_cp_tpc_passes_coerce_on(monkeypatch):
     )
     assert cp.main(["--tpc", "-F", "-q", "root://a//x", "root://b//y"]) == 0
     assert seen["coerce"] is True
+
+
+def _tpc_call(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> tuple[int, dict[str, Any]]:
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(
+        cp,
+        "third_party",
+        lambda s, t, **kw: (
+            seen.update(kw, src=str(s), dst=str(t)) or CopyResult(str(s), str(t), 0, 0.0)
+        ),
+    )
+    return cp.main([*argv, "-q", "root://a//x", "root://b//y"]), seen
+
+
+@pytest.mark.parametrize(
+    ("argv", "delegate"),
+    [
+        (["--tpc"], False),
+        (["--tpc", "only"], False),
+        (["--tpc", "delegate"], True),
+        (["--tpc", "delegate", "only"], True),
+        (["-f", "--tpc", "delegate", "only", "--verify"], True),
+    ],
+)
+def test_xrdcps_tpc_words_are_understood(monkeypatch, argv, delegate):
+    """``--tpc delegate only`` is how dCache sites are copied between with stock xrdcp."""
+    code, seen = _tpc_call(monkeypatch, argv)
+    assert code == 0
+    assert seen["delegate"] is delegate
+    assert (seen["src"], seen["dst"]) == ("root://a:1094//x", "root://b:1094//y")
+
+
+@pytest.mark.parametrize(
+    "pair",
+    [["https://a/x", "https://b/y"], ["davs://a/x", "DAVS://b/y"], ["root://a//x", "dav://b/y"]],
+)
+def test_tpc_delegate_over_https_is_refused_for_want_of_gridsite(monkeypatch, capsys, pair):
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cp, "third_party", lambda s, t, **kw: seen.update(kw))
+    assert cp.main(["--tpc", "delegate", "only", "-q", *pair]) == 2
+    assert seen == {}
+    assert "--tpc delegate over https needs GridSite delegation" in capsys.readouterr().err
+
+
+def test_tpc_first_is_refused_rather_than_falling_back_quietly(monkeypatch, capsys):
+    code, seen = _tpc_call(monkeypatch, ["--tpc", "delegate", "first"])
+    assert (code, seen) == (2, {})
+    assert "--tpc first falls back to copying through this client" in capsys.readouterr().err
+
+
+def test_tpc_words_default_to_the_command_line(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["xrd-cp", "--tpc", "delegate", "only", "a", "b"])
+    assert cp._tpc_words(None) == ["--tpc", "--tpc-delegate", "a", "b"]
+
+
+def test_only_the_words_right_after_tpc_are_taken():
+    assert cp._tpc_words(["only", "--tpc"]) == ["only", "--tpc"]
+    assert cp._tpc_words(["--tpc", "delegate", "only", "only"]) == [
+        "--tpc",
+        "--tpc-delegate",
+        "only",
+    ]
+    assert cp._tpc_words(["--tpc", "first", "x"]) == ["--tpc", "--tpc-first", "x"]
+    assert cp._tpc_words(["--tpc", "delegate"]) == ["--tpc", "--tpc-delegate"]
 
 
 # ---------------------------------------------------------------------------

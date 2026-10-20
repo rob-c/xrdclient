@@ -91,8 +91,15 @@ def _parser() -> argparse.ArgumentParser:
         help="carry on from what is already at DEST instead of copying it again",
     )
     parser.add_argument(
-        "--tpc", action="store_true", help="third-party copy: let the servers move the data"
+        "--tpc",
+        action="store_true",
+        help="third-party copy: let the servers move the data; xrdcp's "
+        "'--tpc delegate only' delegates your proxy to the destination, "
+        "which dCache needs",
     )
+    # Set by ``--tpc delegate`` (see :func:`_tpc_words`), never typed itself.
+    parser.add_argument("--tpc-delegate", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--tpc-first", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--verify", dest="verify", action="store_true", help="require a checksum match"
     )
@@ -430,10 +437,57 @@ def _transfer_misuse(args: argparse.Namespace) -> str | None:
     return None
 
 
+def _tpc_words(given: Sequence[str] | None) -> list[str]:
+    """The arguments (``given``, else ``sys.argv[1:]``) with xrdcp's ``--tpc`` words as flags.
+
+    Stock ``xrdcp`` takes ``--tpc [delegate] [first|only]``.
+
+    argparse cannot give ``--tpc`` optional words without also swallowing
+    the source URL that follows a bare ``--tpc``, so the words are taken off
+    here: ``delegate`` becomes ``--tpc-delegate``, ``only`` is what ``--tpc``
+    already means, and ``first`` is kept as ``--tpc-first`` to be refused
+    (:func:`_tpc_local_misuse`). Only the words directly after ``--tpc`` are
+    read, ``delegate`` before the mode as xrdcp writes it, so a file named
+    ``only`` elsewhere on the line is still a file.
+    """
+    argv = list(sys.argv[1:] if given is None else given)
+    out: list[str] = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        out.append(arg)
+        index += 1
+        if arg != "--tpc":
+            continue
+        if argv[index : index + 1] == ["delegate"]:
+            out.append("--tpc-delegate")
+            index += 1
+        mode = argv[index] if index < len(argv) else ""
+        if mode in ("only", "first"):
+            out += [] if mode == "only" else ["--tpc-first"]
+            index += 1
+    return out
+
+
+def _is_http(url: str) -> bool:
+    """Whether ``url`` is reached over HTTP (``http``, ``https``, ``dav``, ``davs``)."""
+    return url.split("://", 1)[0].lower() in ("http", "https", "dav", "davs")
+
+
 def _tpc_local_misuse(args: argparse.Namespace) -> str | None:
     """``--tpc`` with a flag that needs the bytes to pass through this client."""
     if args.tpc and (args.dry_run or args.remove_source):
         return "--tpc hands the transfer to the servers; --dry-run and --remove-source cannot"
+    if args.tpc_delegate and any(_is_http(url) for url in (*args.source, args.dest)):
+        return (
+            "--tpc delegate over https needs GridSite delegation, which xrd-cp does not do; "
+            "plain --tpc lets each end authorise the other with a macaroon instead"
+        )
+    if args.tpc_first:
+        return (
+            "--tpc first falls back to copying through this client, which xrd-cp never "
+            "does behind your back; use '--tpc only' (the same as --tpc), or no --tpc"
+        )
     return None
 
 
@@ -552,7 +606,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
     error, including several sources aimed at a DEST that is not a
     directory.
     """
-    args = _parser().parse_args(argv)
+    args = _parser().parse_args(_tpc_words(argv))
     output.identify("copy", sources=args.source, target=args.dest)
     complaint = _misuse(args)
     if complaint is not None:
@@ -806,6 +860,7 @@ def _third_party(
         verify=verify,
         algorithm=args.algorithm,
         coerce=bool(args.coerce),
+        delegate=bool(args.tpc_delegate),
     )
 
 

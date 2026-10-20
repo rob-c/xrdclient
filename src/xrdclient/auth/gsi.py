@@ -29,6 +29,7 @@ working; new code imports the library module.
 
 from __future__ import annotations
 
+import functools
 import os
 
 from xrdsec.gsi.secgsi import BUCKET_CIPHER as BUCKET_CIPHER
@@ -67,6 +68,7 @@ from xrdsec.gsi.secgsi import check_server as check_server
 from xrdsec.gsi.secgsi import choose_digest as choose_digest
 from xrdsec.gsi.secgsi import client_ca_hashes as client_ca_hashes
 from xrdsec.gsi.secgsi import decode_message as decode_message
+from xrdsec.gsi.secgsi import dns_names as dns_names
 from xrdsec.gsi.secgsi import encode_message as encode_message
 from xrdsec.gsi.secgsi import encode_public_blob as encode_public_blob
 from xrdsec.gsi.secgsi import find_bucket as find_bucket
@@ -76,6 +78,7 @@ from xrdsec.gsi.secgsi import read_proxy as read_proxy
 from xrdsec.gsi.secgsi import seal as seal
 from xrdsec.gsi.secgsi import server_names as server_names
 from xrdsec.gsi.secgsi import session_key as session_key
+from xrdsec.gsi.secgsi import trust_dns as trust_dns
 from xrdsec.gsi.secgsi import unseal as unseal
 from xrdsec.rsa import RSAPrivateKey
 from xrdsec.x509 import ProxyCredential
@@ -126,6 +129,7 @@ __all__ = [
     "choose_digest",
     "client_ca_hashes",
     "decode_message",
+    "dns_names",
     "encode_message",
     "encode_public_blob",
     "find_bucket",
@@ -135,6 +139,7 @@ __all__ = [
     "seal",
     "server_names",
     "session_key",
+    "trust_dns",
     "unseal",
 ]
 
@@ -227,7 +232,11 @@ class GSICredential(SecgsiClient, Credential):
             _log.debug("X.509 proxy %s expired", path)
             return None
         options = offer.options()
-        check = ServerCheck(host, config.ca_path, server_names(), _BYPASS)
+        # Stock XrdSecgsi trusts DNS by default: a round-robin alias whose
+        # data servers each hold a certificate in their own name passes on
+        # the name DNS gives the address. Looked up only after a mismatch.
+        resolve = functools.partial(dns_names, host) if trust_dns() else None
+        check = ServerCheck(host, config.ca_path, server_names(), _BYPASS, resolve)
         return cls(
             proxy,
             cryptomod=options.get("c", "ssl"),

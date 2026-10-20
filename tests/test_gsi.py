@@ -204,11 +204,39 @@ def test_the_login_check_is_on_unless_turned_off(monkeypatch, tmp_path, key, val
     assert config.gsi_verify_server is expected
     credential = _present(GSICredential.available(OFFER, config, username="j", host="srv"))
     if expected:
-        assert credential.server_check == ServerCheck(
+        check = _present(credential.server_check)
+        assert dataclasses.replace(check, resolve=None) == ServerCheck(
             "srv", "/certs", ("*.example.org",), "XRD_GSI_VERIFY_SERVER=0"
         )
     else:
         assert credential.server_check is None
+
+
+@pytest.mark.parametrize(("value", "trusted"), [(None, True), ("1", True), ("0", False)])
+def test_dns_names_the_server_unless_trustdns_is_off(monkeypatch, tmp_path, key, value, trusted):
+    """Stock XrdSecgsi's default: CNAF's round-robin alias passes on its nodes' names."""
+    if value is None:
+        monkeypatch.delenv("XrdSecGSITRUSTDNS", raising=False)
+    else:
+        monkeypatch.setenv("XrdSecGSITRUSTDNS", value)
+    asked: list[str] = []
+
+    def resolve(host: str) -> tuple[str, ...]:
+        asked.append(host)
+        return ("node.example.org",)
+
+    monkeypatch.setattr(gsi, "dns_names", resolve)
+    path = write_private(tmp_path / "x509up", proxy_chain(key))
+    credential = _present(
+        GSICredential.available(OFFER, Config(proxy=str(path)), username="j", host="alias")
+    )
+    check = _present(credential.server_check)
+    if trusted:
+        assert asked == []  # looked up only when the certificate does not match
+        assert tuple(_present(check.resolve)()) == ("node.example.org",)
+        assert asked == ["alias"]
+    else:
+        assert check.resolve is None
 
 
 # -- one login, end to end ---------------------------------------------------------

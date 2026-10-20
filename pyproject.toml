@@ -38,7 +38,7 @@ dependencies = [
   "cryptography>=45",
   "xrdcore>=0.4.0,<0.5",
   "xrdhttp[s3]>=0.4.0,<0.5",
-  "xrdsec>=0.4.0,<0.5",
+  "xrdsec>=0.4.1,<0.5",
 ]
 
 [project.urls]

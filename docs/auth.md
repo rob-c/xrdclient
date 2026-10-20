@@ -181,7 +181,15 @@ $ export XrdSecGSISRVNAMES='*.example.org,door-*.site.net'
 
 The patterns (`*` and `?` wildcards, comma-separated) are matched against
 the host name in the certificate's `CN`; the chain and dates are still
-checked in full. For a test setup that cannot pass at all,
+checked in full.
+
+A certificate that names neither the host nor an allowed pattern may still
+name the machine behind it: as in the stock client (`XrdSecGSITRUSTDNS`, on
+by default), the forward-confirmed reverse-DNS names of every address the
+host resolves to are tried too. That is how a round-robin alias whose data
+servers each hold a certificate in their own name passes (CNAF's
+`xrootd-lhcb.cr.cnaf.infn.it`). DNS is asked only after a mismatch, and
+`XrdSecGSITRUSTDNS=0` turns it off. For a test setup that cannot pass at all,
 `Config(gsi_verify_server=False)` or `XRD_GSI_VERIFY_SERVER=0` turns the
 login check off; a proxy is still never *delegated* to a server that fails
 it.

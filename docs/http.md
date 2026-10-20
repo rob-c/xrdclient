@@ -192,6 +192,13 @@ An entry matches that host and every host under it, whatever the port.
 `"*"` trusts every host, which restores the old behaviour, but a
 downgrade from `https` to `http` still drops the token.
 
+A third-party `COPY` meets the same rule for its `TransferHeader*` headers,
+the far end's token: they follow a redirect within the site that sent it,
+and nowhere else unless trusted. RAL's Echo hands every `COPY` from
+`webdav.echo.stfc.ac.uk` to `ceph-*.gridpp.rl.ac.uk`, so a copy into it is
+refused with `401` there; the error then names the host and the setting,
+`XRD_TRUSTEDREDIRECTDOMAINS=gridpp.rl.ac.uk`, that lets the token follow.
+
 ### Query strings
 
 Opaque data is sent exactly as it was written. `authz=Bearer%20abc` stays

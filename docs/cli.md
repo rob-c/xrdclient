@@ -135,6 +135,7 @@ $ xrd-cp root://host//store/f.root /scratch/
 $ xrd-cp -r /tmp/results davs://dav.example.org/store/results
 $ xrd-cp --tpc root://a//store/f.root root://b//store/f.root
 $ xrd-cp --tpc --verify root://a//store/f.root root://b//store/f.root
+$ xrd-cp --tpc delegate only root://a//store/f.root root://b//store/f.root   # xrdcp's spelling
 $ xrd-cp -f /tmp/f.root root://host//store/f.root      # overwrite what is there
 $ xrd-cp --verify -a crc32c /tmp/f.root root://host//store/f.root
 $ xrd-cp --chunk-size 8M --progress root://host//store/big.root /scratch/
@@ -226,6 +227,8 @@ same answer however many times it runs - which is what makes `--sync` and
 So a mirror you will refresh is `xrd-cp -r --sync size tree/ /dest`: the first
 run copies everything, the next copies nothing, and after a change it copies
 just the files that changed.
+
+`--tpc` takes stock `xrdcp`'s words after it: `delegate` delegates your proxy to the destination, which then pulls with it - what dCache sites need for `root://`; `only` is what `--tpc` always means here; `first` is refused, because xrd-cp never falls back to copying through itself unasked. Over `https` there is no `delegate` (GridSite delegation is not implemented), and plain `--tpc` authorises the far end with a macaroon.
 
 `--tpc` asks the servers to move the data, so the flags that tune how bytes
 pass through this process - `--chunk-size`, `--in-flight`, `--stripes`,

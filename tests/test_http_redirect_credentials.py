@@ -83,6 +83,25 @@ def test_a_transfer_credential_does_not_follow_either(dav, elsewhere):
         client.request("GET", dav.url / "d/a.root", headers=headers)
     assert "TransferHeaderAuthorization" not in seen[0]
     assert seen[0]["Overwrite"] == "T"
+    assert client.withheld == [parse(elsewhere_by_name(elsewhere)).host]
+
+
+def test_a_withheld_transfer_credential_is_logged(dav, elsewhere, caplog):
+    dav.redirects["/d/a.root"] = elsewhere_by_name(elsewhere)
+    headers = {"TransferHeaderAuthorization": f"Bearer {TOKEN}"}
+    with caplog.at_level("DEBUG", "xrdclient"), HTTPClient(Config()) as client:
+        client.request("GET", dav.url / "d/a.root", headers=headers)
+    assert "not relaying TransferHeader* from" in caplog.text
+
+
+def test_a_trusted_domain_gets_the_transfer_credential_too(dav, elsewhere):
+    dav.redirects["/d/a.root"] = elsewhere_by_name(elsewhere)
+    seen = recorded(elsewhere)
+    headers = {"TransferHeaderAuthorization": f"Bearer {TOKEN}"}
+    with HTTPClient(Config(), trusted_redirect_domains=("localhost",)) as client:
+        client.request("GET", dav.url / "d/a.root", headers=headers)
+    assert seen[0]["TransferHeaderAuthorization"] == f"Bearer {TOKEN}"
+    assert client.withheld == []
 
 
 def test_a_trusted_domain_gets_the_token(dav, elsewhere):

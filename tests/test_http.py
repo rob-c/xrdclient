@@ -1174,19 +1174,31 @@ def test_a_repr_digest_without_our_algorithm_falls_back_to_digest(dav):
     assert digest(dav.url / "d/a.root", "adler32").value == "0000abcd"
 
 
+#: Digests of the right size for their algorithm, as RFC 9530 byte sequences.
+SHA256 = "ab" * 32
+SHA256_SF = base64.b64encode(bytes.fromhex(SHA256)).decode()
+SHA1 = "cd" * 20
+SHA1_SF = base64.b64encode(bytes.fromhex(SHA1)).decode()
+
+
 @pytest.mark.parametrize(
     ("field", "algorithm", "expected"),
     [
-        ("sha-256=:aGk=:", "sha256", "6869"),
-        ("sha-512=:AA==:, sha-256=:aGk=:", "sha256", "6869"),
-        ("sha-256=:aGk=:;source=cache", "sha256", "6869"),  # parameters say nothing
+        (f"sha-256=:{SHA256_SF}:", "sha256", SHA256),
+        (f"sha-512=:AA==:, sha-256=:{SHA256_SF}:", "sha256", SHA256),
+        (f"sha-256=:{SHA256_SF}:;source=cache", "sha256", SHA256),  # parameters say nothing
         ('note="a, b; c", adler=:AAAAAQ==:', "adler32", "00000001"),
         ('note="say \\"hi\\", ok", crc32c=:AAAAAg==:', "crc32c", "00000002"),
         ("adler32=:AAAAAw==:", "adler32", "00000003"),  # our own name
-        ("sha=:aGk=:", "sha1", "6869"),  # RFC 3230's
+        (f"sha=:{SHA1_SF}:", "sha1", SHA1),  # RFC 3230's
         ("ADLER=:AAAABA==:", "adler32", "00000004"),
         ("adler=0000abcd", "adler32", "0000abcd"),  # a hex token, as some servers send
         ('adler="0000abcd"', "adler32", "0000abcd"),
+        # StoRM WebDAV 1.13: the base64 of the hex *text*, not of the digest.
+        ("adler=:NDU4MjVmZTI=:", "adler32", "45825fe2"),
+        ("adler=:NDU4MjVGRTI=:", "adler32", "45825fe2"),
+        ("sha-256=:aGk=:", "sha256", ""),  # two bytes are no SHA-256: no answer
+        ("adler=:AAAAAAE=:", "adler32", ""),  # five bytes are no adler32 either
         ("sha-256=:not base64!:", "sha256", ""),  # malformed: no value at all
         ("sha-256", "sha256", ""),  # a bare key is ``true``, not a digest
         ("=:aGk=:, , sha-512=:aGk=:", "sha256", ""),
@@ -1195,6 +1207,27 @@ def test_a_repr_digest_without_our_algorithm_falls_back_to_digest(dav):
 )
 def test_repr_digest_fields_are_read_as_structured_dictionaries(field, algorithm, expected):
     assert _pick_repr_digest(field, algorithm) == expected
+
+
+def test_storms_repr_digest_matches_its_digest_header(dav):
+    """CNAF's StoRM sent both; the copy failed on ``expected 45825fe2, got 3435...``."""
+    value = checksum_bytes("adler32", BODY)
+    text = base64.b64encode(value.encode()).decode()
+    dav.handlers["HEAD"] = lambda method, path, headers: (
+        200,
+        b"",
+        {"Digest": f"adler32={value}", "Repr-Digest": f"adler=:{text}:"},
+    )
+    assert digest(dav.url / "d/a.root", "adler32").value == value
+
+
+def test_a_repr_digest_of_the_wrong_size_gives_way_to_digest(dav):
+    dav.handlers["HEAD"] = lambda method, path, headers: (
+        200,
+        b"",
+        {"Digest": "adler32=0000abcd", "Repr-Digest": "adler=:AAAAAAE=:"},
+    )
+    assert digest(dav.url / "d/a.root", "adler32").value == "0000abcd"
 
 
 def test_a_repr_digest_split_over_two_header_lines_is_one_field(dav):
@@ -1521,3 +1554,43 @@ def test_http_reprs_redact_tokens_in_the_query():
 
     fs = HTTPFileSystem("https://example.org/data?authz=SECRETTOKEN")
     assert "SECRETTOKEN" not in repr(fs)
+
+
+# ---------------------------------------------------------------------------
+# A COPY refused after its transfer token stayed behind on a redirect (RAL)
+# ---------------------------------------------------------------------------
+
+
+def test_a_refused_copy_says_its_token_stayed_behind():
+    from xrdclient.errors import PermissionError_, kXR_NotAuthorized
+    from xrdclient.http.tpc import _explain_withheld
+
+    refused = PermissionError_(kXR_NotAuthorized, "HTTP 401 Unauthorized", path="/f")
+    _explain_withheld(refused, ["other.example.org", "ceph-svc22.gridpp.rl.ac.uk"])
+    assert "redirected to ceph-svc22.gridpp.rl.ac.uk" in str(refused)
+    assert str(refused).endswith("XRD_TRUSTEDREDIRECTDOMAINS=gridpp.rl.ac.uk)")
+
+
+@pytest.mark.parametrize("hosts", [[], ["ceph.example.org"]])
+def test_other_failures_keep_their_own_words(hosts):
+    from xrdclient.errors import NotFoundError, PermissionError_, kXR_NotAuthorized, kXR_NotFound
+    from xrdclient.http.tpc import _explain_withheld
+
+    missing = NotFoundError(kXR_NotFound, "HTTP 404", path="/f")
+    _explain_withheld(missing, ["ceph.example.org"])
+    assert missing.hint == ""
+    refused = PermissionError_(kXR_NotAuthorized, "HTTP 401", path="/f")
+    _explain_withheld(refused, [])
+    assert refused.hint == ""
+    plain = PermissionError("local")
+    _explain_withheld(plain, hosts)
+    assert str(plain) == "local"
+
+
+def test_a_bare_host_is_its_own_domain():
+    from xrdclient.errors import PermissionError_, kXR_NotAuthorized
+    from xrdclient.http.tpc import _explain_withheld
+
+    refused = PermissionError_(kXR_NotAuthorized, "HTTP 403", path="/f")
+    _explain_withheld(refused, ["localhost"])
+    assert refused.hint.endswith("XRD_TRUSTEDREDIRECTDOMAINS=localhost")

@@ -4,6 +4,31 @@ Notable user-visible changes are recorded here. This project follows
 [Semantic Versioning](https://semver.org/); compatibility fixes which make the
 client agree more closely with XrdCl are not considered breaking changes.
 
+## [0.4.1] - Unreleased
+
+Fixes found moving data between the LHCb Tier-1 and Tier-2 storage elements
+(2026-10-20). Requires xrdsec 0.4.1.
+
+### Fixed
+
+- `xrd-cp` understands stock `xrdcp`'s `--tpc [delegate] [only|first]`:
+  `delegate` delegates the proxy to the destination, which dCache sites need
+  for `root://` third-party copy; `only` is what `--tpc` means; `first` is
+  refused, since xrd-cp never falls back to copying through itself. Over
+  `https`, `--tpc delegate` is refused (no GridSite delegation); plain
+  `--tpc` authorises the far end with a macaroon.
+- GSI logins trust DNS like the stock client (`XrdSecGSITRUSTDNS`, see
+  xrdsec 0.4.1), so CNAF's round-robin `xrootd-lhcb.cr.cnaf.infn.it` no
+  longer fails on every other connection.
+- A `Repr-Digest` byte sequence that holds the hex *text* of the digest
+  (StoRM WebDAV 1.13: `adler=:NDU4MjVmZTI=:`) is read as that text, and one
+  of the wrong size gives way to `Digest:`; https checksums from CNAF failed
+  with `expected 45825fe2, got 3435383235666532`.
+- A third-party `COPY` refused after its `TransferHeader*` token was withheld
+  on a cross-site redirect (RAL's Echo) now says so, naming the host and
+  `XRD_TRUSTEDREDIRECTDOMAINS=<its domain>`; `HTTPClient.withheld` records
+  the hosts and the withheld headers are logged at debug level.
+
 ## [0.4.0] - 2026-10-19
 
 ### Security
@@ -1071,6 +1096,7 @@ client agree more closely with XrdCl are not considered breaking changes.
 - Retry and cleanup paths preserve the primary transfer error and avoid
   leaking failed connections back into the pool.
 
+[0.4.1]: https://github.com/rob-c/xrdclient/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/rob-c/xrdclient/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/rob-c/xrdclient/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/rob-c/xrdclient/compare/v0.3.0...v0.3.1

@@ -40,10 +40,12 @@ from typing import IO, Any
 
 from xrdcore.safexml import UnsafeXML, fromstring
 from xrdhttp.webdav import DAV as _DAV
+from xrdhttp.webdav import HEX_DIGESTS as _HEX_DIGESTS
 from xrdhttp.webdav import WANT_DIGEST as _WANT_DIGEST
 from xrdhttp.webdav import as_hex as _as_hex
 from xrdhttp.webdav import epoch, resource
 from xrdhttp.webdav import href_path as _href_path
+from xrdhttp.webdav import is_hex as _is_hex
 from xrdhttp.webdav import pick_digest as _pick_digest
 from xrdhttp.webdav import text as _text
 
@@ -302,10 +304,39 @@ def _sf_digest(value: str, algorithm: str) -> str:
     """
     if len(value) >= 2 and value[0] == value[-1] == ":":
         try:
-            return base64.b64decode(value[1:-1], validate=True).hex()
+            return _sf_bytes_as_hex(base64.b64decode(value[1:-1], validate=True), algorithm)
         except (binascii.Error, ValueError):
             return ""
     return _as_hex(value.strip('"'), algorithm) if value else ""
+
+
+def _sf_bytes_as_hex(raw: bytes, algorithm: str) -> str:
+    """A decoded ``Repr-Digest`` byte sequence as hex: the digest's bytes, or its hex text.
+
+    RFC 9530 puts the digest's own bytes there. StoRM WebDAV 1.13 puts the
+    *hex text* of an adler32 there instead (``adler=:NDU4MjVmZTI=:`` is
+    ``45825fe2``), alongside a correct ``Digest:``. Bytes that spell this
+    algorithm's hex form are read as that; bytes of the digest's size are
+    the digest; anything else is no answer, so :func:`_offered_digest` goes
+    on to ``Digest:`` rather than compare a value that cannot be right.
+    """
+    text = raw.decode("ascii", "replace")
+    if _digest_hex(text, algorithm):
+        return text.lower()
+    hexed = raw.hex()
+    return hexed if _digest_hex(hexed, algorithm) else ""
+
+
+def _digest_hex(value: str, algorithm: str) -> bool:
+    """Whether ``value`` is the hex form of an ``algorithm`` digest, its width included.
+
+    :func:`xrdhttp.webdav.is_hex` knows the hashes' widths and the CRC-64s';
+    the 32-bit checksums it leaves out (``as_hex`` never needs to ask about
+    them) are eight hex digits.
+    """
+    if algorithm in _HEX_DIGESTS and algorithm not in ("unixcksum", "cksum"):
+        return len(value) == 8 and all(ch in "0123456789abcdefABCDEF" for ch in value)
+    return _is_hex(value, algorithm)
 
 
 # ---------------------------------------------------------------------------

@@ -309,6 +309,10 @@ class HTTPClient:
     _session: _http.Session = field(init=False, repr=False)
     #: Set by :meth:`abort`, and never cleared.
     _aborted: bool = field(default=False, repr=False)
+    #: Hosts a ``COPY``'s ``TransferHeader*`` headers were withheld from on a
+    #: redirect, in order; :func:`xrdclient.http.third_party` reads it to
+    #: explain the ``401`` such a copy then fails with. Appends only.
+    withheld: list[str] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
         """Make the session, with this package's policy (see the module documentation)."""
@@ -369,8 +373,18 @@ class HTTPClient:
         return trusted
 
     def _relays(self, origin: str, target: str) -> bool:
-        """:func:`relays_transfer_headers` over the session's URL strings."""
-        return relays_transfer_headers(parse(origin), parse(target))
+        """:func:`relays_transfer_headers` over the session's URL strings, recorded when not.
+
+        A withheld header is logged and its host kept in :attr:`withheld`: the
+        far side then sees a request without the token, and the copy fails
+        with a ``401`` that would otherwise say nothing about why.
+        """
+        source, destination = parse(origin), parse(target)
+        relayed = relays_transfer_headers(source, destination)
+        if not relayed:
+            _log.debug("not relaying TransferHeader* from %s to %s", source.host, destination.host)
+            self.withheld.append(destination.host)
+        return relayed
 
     def close(self) -> None:
         """Drop every idle connection; the client stays usable. Idempotent."""
