@@ -83,7 +83,7 @@ def pass_phrase(config: Config, path: str) -> bytes:
                 mechanism="x509",
                 what="the pass phrase of your private key",
                 reason=f"{path} is encrypted",
-                hint="set Config(key_password=...), or decrypt the key with openssl",
+                hint="type it here, or pass -pwstdin to a script",
                 prompt=f"pass phrase for {path}",
                 host=path,
                 secret=True,
@@ -91,8 +91,8 @@ def pass_phrase(config: Config, path: str) -> bytes:
             answer = answer_for(ask, config)
     if not answer:
         raise CredentialError(
-            f"the {KIND} {path} is encrypted and no pass phrase was given: set "
-            "Config(key_password=...), or run where there is a terminal to ask on"
+            f"the {KIND} {path} is encrypted and no pass phrase was given: run where a "
+            "terminal can ask, or supply the key password in code"
         )
     return answer.encode("utf-8") if isinstance(answer, str) else answer
 

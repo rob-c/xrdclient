@@ -463,3 +463,29 @@ def test_a_pinned_router_is_not_reconnected(server, config):
         router.session.close()
         with pytest.raises(XrdConnectionError):
             pinned.execute(r.Ping())
+
+
+def test_a_reopened_file_keeps_the_capability_its_redirect_signed(config):
+    """``reopen`` registers a rendezvous key where the placement landed, capability and all.
+
+    A manager's redirect carries a capability for the disk server it points at
+    (EOS: ``cap.sym``/``cap.msg``) and that server refuses a second open of the
+    same file without them ("capability illegal"). Reopening the placement's own
+    file keeps the connection *and* the capability, so the key arrives in one
+    round trip - and a destination's pull cannot overtake it, which is how two
+    copies in ten used to fail with "3012 sync - TPC open failed".
+    """
+    with FakeServer() as manager, FakeServer(files={"/a": b"A"}) as disk:
+        manager.redirects[c.kXR_open] = (*disk.address, "&cap.sym=SIG&cap.msg=MSG")
+        fh = xrdclient.File(manager.url / "a", config)
+        fh.open("r")
+        assert fh.endpoint == f"{disk.address[0]}:{disk.address[1]}"
+        assert fh.capability == "cap.sym=SIG&cap.msg=MSG"
+        fh.reopen("tpc.stage=copy")
+        fh.close()
+        # Both opens went to that disk server: the placement's plain, the
+        # registration's with the capability and one stage - the placement's
+        # replaced, not repeated.
+        placement, keyed = disk.opened
+        assert placement == "/a?cap.sym=SIG&cap.msg=MSG"
+        assert keyed == "/a?cap.sym=SIG&cap.msg=MSG&tpc.stage=copy"

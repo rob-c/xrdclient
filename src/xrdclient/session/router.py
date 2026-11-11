@@ -362,6 +362,12 @@ class Router:
         #: which are not :attr:`_session` and so need naming for :meth:`abort`
         #: to reach them.
         self._borrowed: set[Session] = set()
+        #: The CGI the last ``kXR_redirect`` added to a request - the capability
+        #: a manager signs for the data server it points at (EOS:
+        #: ``cap.sym``/``cap.msg``). A second open of the same file there has to
+        #: carry it, and a handle reports it as
+        #: :attr:`xrdclient.File.capability`.
+        self.redirected_cgi = ""
 
     # ------------------------------------------------------------------
 
@@ -688,6 +694,7 @@ class Router:
             # retry at the manager, builds on the path this one moved it to.
             _repath(route.original, path)
         _retarget(request, route.original, redirect.target.token)
+        self.redirected_cgi = redirect.target.token
         _hop(route.trace, destination, _base_path(route.original), redirect.target.token)
         _log.debug("redirected to %s:%s", destination.host, destination.port)
 
@@ -925,6 +932,7 @@ class Router:
         """
         pinned = Router(self.url, self.config, reconnect=False)
         pinned.follow_redirects = self.follow_redirects
+        pinned.redirected_cgi = self.redirected_cgi
         with self._lock:
             session = self._session
             if session is None:

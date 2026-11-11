@@ -73,6 +73,8 @@ def test_a_file_reads_the_way_it_does_synchronously(server):
         async with xrdclient.aio.open(server.url / "data/a.root") as handle:
             assert handle.readable() and not handle.writable()
             assert handle.seekable() and not handle.closed
+            # A plain open landed where the URL said, so no redirect signed it.
+            assert handle.capability == ""
             assert await handle.read(5) == b"hello"
             assert await handle.tell() == 5
             await handle.seek(6)

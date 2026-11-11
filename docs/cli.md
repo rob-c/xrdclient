@@ -5,7 +5,9 @@ help/version, progress and binary stdout: use `--output-format json|xml`.
 
 Two commands, `xrd-fs` and `xrd-cp`, both taking whole URLs. Both understand
 `--json`, and both use the same three exit codes: `0` success, `1` a runtime
-failure, `2` a usage error. A third, `xrd-datasets`, is installed by a package
+failure, `2` a usage error (a mis-typed option is answered with the one that
+was meant: `--quiett` gets `did you mean '--quiet'?`, and so is a mis-typed
+command or a value outside its choices). A third, `xrd-datasets`, is installed by a package
 above this one and shares the same flags - see below.
 
 `xrd-proxy` makes, inspects and removes X.509 proxies in `voms-proxy-*`

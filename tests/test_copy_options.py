@@ -811,6 +811,36 @@ def test_tpc_words_default_to_the_command_line(monkeypatch):
     assert cp._tpc_words(None) == ["--tpc", "--tpc-delegate", "a", "b"]
 
 
+@pytest.mark.parametrize(
+    ("word", "meant"),
+    [("delgate", "delegate"), ("onl", "only"), ("frist", "first"), ("DELEGATE", "delegate")],
+)
+def test_a_misspelt_tpc_word_is_named_before_it_becomes_a_source_path(capsys, word, meant):
+    """``--tpc``'s words are read here, not by argparse, so a typo has to be caught here."""
+    with pytest.raises(SystemExit) as stopped:
+        cp.main(["--tpc", word, "a", "b"])
+    assert stopped.value.code == 2
+    assert f"--tpc does not take {word!r} - did you mean {meant!r}?" in capsys.readouterr().err
+
+
+def test_a_url_after_tpc_is_not_mistaken_for_a_misspelt_word(monkeypatch):
+    """``--tpc`` with no words is ``--tpc source dest``; a URL resembles none of them."""
+    code, seen = _tpc_call(monkeypatch, ["--tpc"])
+    assert code == 0 and seen["delegate"] is False
+
+
+def test_a_word_that_resembles_nothing_is_left_alone():
+    assert cp._tpc_misprint(["--tpc", "zzz", "a", "b"]) is None
+    assert cp._tpc_misprint(["--tpc", "delegate", "only", "a", "b"]) is None
+    assert cp._tpc_misprint(["a", "b"]) is None
+    monkeypatch_argv = sys.argv
+    try:
+        sys.argv = ["xrd-cp", "--tpc", "delgate", "a", "b"]
+        assert cp._tpc_misprint(None) is not None
+    finally:
+        sys.argv = monkeypatch_argv
+
+
 def test_only_the_words_right_after_tpc_are_taken():
     assert cp._tpc_words(["only", "--tpc"]) == ["only", "--tpc"]
     assert cp._tpc_words(["--tpc", "delegate", "only", "only"]) == [

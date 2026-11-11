@@ -104,8 +104,10 @@ def test_the_bare_import_loads_nothing_of_the_libraries():
 @pytest.mark.parametrize(
     ("statement", "sec"),
     [
+        # the search order (xrdsec.locations) is part of credential discovery, and is
+        # a small module of its own: os, dataclasses and functools, nothing heavy
         ("import xrdclient.credentials", {"xrdsec.credentials"}),
-        ("from xrdclient import Config", {"xrdsec.credentials"}),
+        ("from xrdclient import Config", {"xrdsec.credentials", "xrdsec.locations"}),
     ],
 )
 def test_credential_discovery_loads_only_xrdsecs_credentials(statement, sec):

@@ -294,7 +294,7 @@ def test_present_loads_the_configs_pair_and_asks_the_configs_password(tmp_path):
     )
     _usercred.present(pki.client_context(anonymous=True), config)
     assert asked == [1]
-    with pytest.raises(errors.CredentialError, match=r"Config\(key_password=\.\.\.\)"):
+    with pytest.raises(errors.CredentialError, match="supply the key password in code"):
         _usercred.present(
             pki.client_context(anonymous=True),
             Config(proxy=None, usercert=str(cert), userkey=str(key), prompt=False),

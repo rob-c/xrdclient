@@ -192,7 +192,17 @@ class BrixProxy:
             _stop(process, self.STOP)
 
     def command(self, command: str) -> str:
-        """Send one control command; its reply, or :class:`RuntimeError` with the tool's error."""
+        """Send one control command; its reply, or :class:`RuntimeError` with the tool's error.
+
+        A command the installed tool does not implement skips the test instead:
+        the command set belongs to ``brix-fault-proxy``, and one older than the
+        fault a test asks for cannot inject it - ``random-hangup`` is not in
+        2.0.0, for one, and the answer there is ``err: unknown command``. That
+        is a capability of this machine, which is what an environmental skip is
+        for (:func:`find_tool` skips for the tool being absent altogether).
+        Anything else the tool reports stays a failure: the fault was asked for
+        and refused.
+        """
         completed = subprocess.run(
             [*self.tool, "ctl", f"127.0.0.1:{self.control_port}", command],
             capture_output=True,
@@ -201,7 +211,12 @@ class BrixProxy:
             check=False,
         )
         if completed.returncode:
-            raise RuntimeError(completed.stderr or completed.stdout)
+            answer = (completed.stderr or completed.stdout).strip()
+            if "unknown command" in answer:
+                raise unittest.SkipTest(
+                    f"{self.tool[0]} does not implement the control command {command!r}: {answer}"
+                )
+            raise RuntimeError(answer)
         return completed.stdout
 
 

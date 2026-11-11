@@ -469,6 +469,52 @@ def _tpc_words(given: Sequence[str] | None) -> list[str]:
     return out
 
 
+#: The words stock ``xrdcp`` accepts after ``--tpc``.
+_TPC_WORDS = ("delegate", "only", "first")
+
+
+def _args(argv: Sequence[str] | None) -> argparse.Namespace:
+    """``argv`` parsed, with xrdcp's ``--tpc`` words taken off first.
+
+    A misspelt word is a usage error before the parser sees the line, because
+    by then it would be a source path (:func:`_tpc_misprint`); it is reported
+    through the parser, so the usage text and the exit status are argparse's.
+    """
+    misprint = _tpc_misprint(argv)
+    if misprint is not None:
+        _parser().error(misprint)
+    return _parser().parse_args(_tpc_words(argv))
+
+
+def _tpc_misprint(given: Sequence[str] | None) -> str | None:
+    """A ``--tpc`` word that looks like one of xrdcp's but is not: ``delgate`` for ``delegate``.
+
+    ``--tpc``'s words are read off the command line by :func:`_tpc_words`,
+    because ``argparse`` cannot take optional words there without swallowing
+    the source URL. A word it does not recognise is therefore left in place and
+    silently becomes a *source path* - ``xrd-cp --tpc delgate a b`` used to say
+    "b is not a directory" rather than that ``delgate`` is not a word. A word
+    close to one of them is named as the likely mistake; a URL after ``--tpc``
+    (``--tpc root://a//f root://b//f``) resembles none of them and is left
+    alone.
+    """
+    from xrdcore import suggest
+
+    argv = list(sys.argv[1:] if given is None else given)
+    for index, arg in enumerate(argv[:-1]):
+        if arg != "--tpc":
+            continue
+        word = argv[index + 1]
+        if word in _TPC_WORDS:
+            continue
+        # Lower case too: xrdcp's words have one spelling, so ``ONLY`` is a typo of
+        # it rather than a different word (options keep their case: -v is not -V).
+        meant = suggest.closest(word, _TPC_WORDS) or suggest.closest(word.lower(), _TPC_WORDS)
+        if meant is not None:
+            return f"--tpc does not take {word!r} - did you mean {meant!r}?"
+    return None
+
+
 def _is_http(url: str) -> bool:
     """Whether ``url`` is reached over HTTP (``http``, ``https``, ``dav``, ``davs``)."""
     return url.split("://", 1)[0].lower() in ("http", "https", "dav", "davs")
@@ -606,7 +652,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
     error, including several sources aimed at a DEST that is not a
     directory.
     """
-    args = _parser().parse_args(_tpc_words(argv))
+    args = _args(argv)
     output.identify("copy", sources=args.source, target=args.dest)
     complaint = _misuse(args)
     if complaint is not None:

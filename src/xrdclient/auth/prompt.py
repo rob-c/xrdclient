@@ -79,10 +79,11 @@ class Ask:
         """The two or three lines a terminal prompter prints above the question."""
         offered = f"{self.mechanism} is offered"
         where = f"{self.host} accepts {self.mechanism}" if self.host else offered
+        # No tool name in front: the same question is asked by every command on
+        # the stack, and "xrd:" in front of an xrd-proxy question reads as a
+        # different program's message.
         return (
-            f"xrd: {where}, but {self.what} is missing\n"
-            f"     why: {self.reason}\n"
-            f"     fix: {self.hint}\n"
+            f"{where}, but {self.what} is missing\n     why: {self.reason}\n     fix: {self.hint}\n"
         )
 
     def question(self) -> str:

@@ -9,7 +9,113 @@ client agree more closely with XrdCl are not considered breaking changes.
 Fixes found moving data between the LHCb Tier-1 and Tier-2 storage elements
 (2026-10-20). Requires xrdsec 0.4.1.
 
+### Added
+
+- `File.reopen(extra)`, a second `kXR_open` of a file **on the connection it
+  already landed on**, with `extra` added to its CGI, and `File.capability`,
+  the token the redirect signed for that connection. A third-party copy needs
+  both: the key that registers its pull belongs where the placement landed,
+  and EOS's disk servers refuse a second open without the capability
+  ("capability illegal"). Keyboard-to-keyboard, the two replace "open a fresh
+  file and hope EOS answers with the same data server", which failed two
+  copies in ten against CERN EOS and none now.
+- A mis-typed option or command is answered with the one that was meant
+  (`did you mean '-valid'?`), from xrdcore 0.4.1's `xrdcore.suggest`: the
+  parser every command here builds asks it, so nothing extra is configured and
+  the suggestion also appears in the `--json`/`--xml` error record.
+- `xrd-proxy info -verify` proves a proxy instead of describing it: every link
+  of the chain signed by the one above it, the outermost issuer present in the
+  CA directory, and each VOMS AC checked by `xrdsec.voms.validate_voms`
+  against its signer, the CA directory, the VO's LSC and its signing policy.
+  The exit code is the answer (`0` proven, `1` not), which is what a script
+  needs before running a job; `-certdir` overrides the CA directory.
+- `xrd-proxy doctor` grew a site admin's half: `--all-vos` sweeps every
+  configured VO's servers in parallel and names the ones nothing answered for,
+  `--strict` makes a warning a failure (for a monitoring check) and
+  `--summary` counts the marks. It also prints `host`, the four-stage map of
+  where every artifact is looked for (`certs:env`/`local`/`cvmfs`/`cwd`, and
+  the same for `vomses`), and each VOMS server's own certificate expiry.
+- `xrd-proxy doctor` (alias `check`) asks everything a proxy needs - the CA
+  directory and its CRLs, the credential `init` would sign with, the `vomses`
+  configuration, a named VO's servers and LSC, the proxy file, where one would
+  be written, any bearer token - in the order the answers bite, and puts the
+  thing to do under each line, saying whether that is `do:` (yours),
+  `ask your admin:` (the machine or the network) or `ask your experiment`
+  (the VO's). It never prompts; `-offline` skips the network, `--json` reports
+  the same lines as data.
+- `xrd-cp --tpc delgate` is refused by name (`did you mean 'delegate'?`) instead
+  of leaving the word to be silently taken as a source path; `--tpc` with no
+  words (`--tpc source dest`) is untouched.
+- `xrd-proxy init` finds a PEM certificate and key in `~/.globus` under names
+  of their own - `cert.pem` with `key.pem`, or one file holding both - when the
+  traditional `usercert.pem`/`userkey.pem` pair is not there; two candidate
+  pairs are never guessed between, and the error says how many were found.
+  `-pub`/`-priv` name `-cert`/`-key`, and a `$X509_USER_P12` that points at a
+  file that is not there is reported and passed over instead of hiding the
+  search that follows.
+- `xrd-proxy init -list-vos` lists every VO this machine has a VOMS server
+  for - the VO, its aliases, its servers and whether the VO's LSC is
+  installed - so choosing `-voms atlas` is not guesswork; `--json` reports the
+  same. A `-voms` name that is not configured is now refused with the ones
+  that are, and with the nearest match when it is a typo
+  (`did you mean 'atlas'?`).
+- `xrd-proxy info` shows everything it can read by default: the
+  `voms-proxy-info` block, the proxy policy and path length, exact validity,
+  the chain certificate by certificate (subject, issuer, serial, validity and
+  what each link is), and one section per VOMS AC with its attributes, times,
+  carrier and decode status. `-short` is the old compact block; `-all` is
+  still accepted because `voms-proxy-info`'s scripts pass it.
+- `xrd-proxy init -p12 myCert.p12` makes a proxy from a PKCS#12 bundle
+  (`.`p12`/`.pfx`, the form a certificate portal delivers) instead of a
+  certificate and key pair, so no `~/.globus/usercert.pem`/`userkey.pem`
+  layout is needed; `$X509_USER_P12` names the bundle for a session, and a
+  `-cert`/`-key` on the command line still wins over it. The bundle's pass
+  phrase is asked for through the same prompter an encrypted PEM key uses
+  (`-pwstdin` included), once. From Python it is
+  `xrdclient.crypto.proxies.load_p12` (xrdsec 0.4.1).
+
 ### Fixed
+
+- A CA directory that cannot be **read** mid-run is now a transient failure,
+  not a server that "did not prove its identity". A shared mount that is
+  remounting — CVMFS did it twice on the machine this was written on — came
+  back `ENOENT`, and the copy died with advice about `$X509_CERT_DIR` and
+  `$XrdSecGSISRVNAMES` for a filesystem hiccup that cleared by itself. It now
+  says so and asks to be retried.
+- `xrd-proxy doctor` says where it looked when no VOMS server is configured —
+  the four stages, as `vomses:<stage>` lines — and, when `/cvmfs` is mounted
+  but carries no `vomses` tree, that re-mounting it is the admin's job
+  (`ask your admin:`), with the `~/.voms/vomses` file as the user's fallback.
+  A mount that answers for `certificates` but never fetched `vomses` reads
+  exactly like "nothing is configured", which is how the LHCb VO's data went
+  missing on a machine where the fix was a remount.
+- `xrd-proxy init -p12` with a bundle that is not there says which bundles are,
+  and where: `no PKCS#12 bundle at ~/certs/myCert.p12; found
+  ~/CERN_cert_2026_2027.p12 - name one with -p12, or point X509_USER_P12 at it`.
+  It used to be a bare `[Errno 2] No such file or directory`, which says
+  nothing about what to type instead.
+
+- `xrd-proxy init` was tens of seconds slow on a machine with the WLCG bundle
+  mounted: the whole `vomses` directory - 126 files, one per VO - was read to
+  find the servers of the one VO asked for, and on a CVMFS FUSE mount every
+  file costs a round trip to open and another to close (~190 ms each). The
+  lookup now reads the files whose names can hold the VO and stops when it has
+  them (`find_vomses(vo=...)`), the servers a command already resolved are
+  passed through instead of being read twice, and `xrd-proxy doctor` counts a
+  large `vomses` directory instead of parsing it (24 s -> 0.5 s). `xrd-proxy
+  init -voms lhcb` on this Mac: 68 s -> 1.3 s.
+- A proxy request to a VOMS-Admin server no longer comes back **406 Not
+  Acceptable**: the answer is asked for as `application/xml, text/xml;q=0.9`,
+  because the servlet declares `text/xml` and refused the former.
+- The VOMS server is now handed a **proxy**, made in memory from the
+  credential if it is a plain user certificate (a PKCS#12 bundle is), as
+  `voms-proxy-init` has always done: servers authenticate a proxy chain, and a
+  bare end-entity certificate is another spelling of the same refusal.
+
+- The fault-injection suites skip a control command the installed
+  `brix-fault-proxy` does not implement (`random-hangup` is not in 2.0.0)
+  instead of failing: an older tool cannot inject that fault, which is a
+  capability of the machine, not a defect of the client.
 
 - `xrd-cp` understands stock `xrdcp`'s `--tpc [delegate] [only|first]`:
   `delegate` delegates the proxy to the destination, which dCache sites need

@@ -394,9 +394,11 @@ directory and the host name. See [Authentication](docs/auth.md).
 **Proxies and VOMS.** `xrd-proxy init -voms atlas` makes a VOMS proxy the way
 `voms-proxy-init` does - the AC fetched over VOMS' REST interface, the proxy
 made in memory and written `0600` - and `xrd-proxy info`/`destroy` stand in
-for `voms-proxy-info`/`voms-proxy-destroy`. From Python, one issuer
-(`xrdclient.crypto.proxies`) makes RFC 3820, ARC, XRootD and legacy Globus
-proxies. See [Proxies and VOMS](docs/proxy.md).
+for `voms-proxy-info`/`voms-proxy-destroy`. The user credential can be a
+PKCS#12 bundle (`xrd-proxy init -p12 myCert.p12`, or `$X509_USER_P12`) as
+well as a certificate and key pair, so no `~/.globus` layout is needed. From
+Python, one issuer (`xrdclient.crypto.proxies`) makes RFC 3820, ARC, XRootD
+and legacy Globus proxies. See [Proxies and VOMS](docs/proxy.md).
 
 Not yet: HTTP/2.
 

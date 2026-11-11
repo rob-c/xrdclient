@@ -25,6 +25,7 @@ _FILE_EXEMPT = {
     "open": "an AsyncFile is born open, by xrdclient.aio.open or AsyncFileSystem.open",
     "handle": "the wire handle is protocol plumbing; AsyncFile.file reaches it",
     "session": "a live sync session is no use from a coroutine; AsyncFile.file reaches it",
+    "reopen": "registering a rendezvous key is protocol plumbing; AsyncFile.file reaches it",
 }
 
 #: Mirrored names whose arguments differ on purpose. ``AsyncFile`` is shaped

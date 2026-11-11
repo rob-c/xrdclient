@@ -33,5 +33,6 @@ from xrdsec.voms_client import fetch_ac as fetch_ac
 from xrdsec.voms_client import find_vomses as find_vomses
 from xrdsec.voms_client import parse_vomses as parse_vomses
 from xrdsec.voms_client import servers_for as servers_for
+from xrdsec.voms_client import vomses_files as vomses_files
 
 sys.modules[__name__] = _sec

@@ -4,15 +4,21 @@ Three subcommands, each spelled like the VOMS command it stands in for so
 that muscle memory and existing scripts carry over:
 
 ``xrd-proxy init``  (``voms-proxy-init``)
-    Load the user certificate and key, fetch a VOMS attribute certificate for
-    each ``-voms VO[:FQAN]``, make a proxy with them and write it ``0600`` to
-    ``-out`` or the default location (``$X509_USER_PROXY``, else
-    ``/tmp/x509up_u<uid>``).
+    Load the user credential - a PKCS#12 bundle (``-p12``, or
+    ``$X509_USER_P12``), or a certificate and key - fetch a VOMS attribute
+    certificate for each ``-voms VO[:FQAN]``, make a proxy with them and
+    write it ``0600`` to ``-out`` or the default location
+    (``$X509_USER_PROXY``, else ``/tmp/x509up_u<uid>``).
 ``xrd-proxy info``  (``voms-proxy-info``)
     Describe a proxy file; ``-exists``, ``-acexists`` and ``-timeleft`` answer
     a script through the exit code or one number.
 ``xrd-proxy destroy``  (``voms-proxy-destroy``)
     Remove the proxy file.
+``xrd-proxy doctor``  (``check``)
+    Ask every question a proxy needs - trust anchors, a credential, the VOMS
+    configuration, the VO's servers and LSC, the proxy file, whether one
+    could be written - in the order the answers bite, and say in plain
+    English what to do about each one (and who to ask, when it is not you).
 
 Options take one dash (``-voms``, ``-valid 24:00``) as the VOMS tools do;
 the two-dash spellings work too. ``--json`` and ``--xml`` give the shared
@@ -29,11 +35,13 @@ arguments are parsed, so ``--help`` stays instant.
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import sys
 import time
+from collections import Counter
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn
 
 from .. import report as output
 from ..errors import XRootDError
@@ -42,9 +50,16 @@ from . import ERROR, OK, fail, version_flag
 if TYPE_CHECKING:
     from xrdsec.proxies import ProxyInfo
     from xrdsec.proxytool import ProxyRequest, VOMSRequest
+    from xrdsec.voms import VOMSEntry
     from xrdsec.voms_client import VOMSServer
+    from xrdsec.x509 import ProxyCredential
+
+    from ..doctor import Report
 
 PROGRAM = "xrd-proxy"
+
+#: The marks a summary counts, in the order they are reported.
+_MARKS = ("ok", "warn", "bad", "skip")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -88,6 +103,7 @@ def _parser() -> argparse.ArgumentParser:
         ("init", _init_parser, "make a proxy (voms-proxy-init)"),
         ("info", _info_parser, "describe a proxy (voms-proxy-info)"),
         ("destroy", _destroy_parser, "remove a proxy (voms-proxy-destroy)"),
+        ("doctor", _doctor_parser, "check everything a proxy needs, and say what is wrong"),
     ):
         build(commands.add_parser(name, help=help_text, allow_abbrev=False))
     return parser
@@ -108,7 +124,20 @@ def _common(parser: argparse.ArgumentParser) -> None:
 def _init_parser(parser: argparse.ArgumentParser) -> None:
     """``init``'s options: ``voms-proxy-init``'s names for the ones it shares."""
     _common(parser)
-    _option(parser, "voms", action="append", default=[], metavar="VO[:FQAN]", help="VO to ask")
+    _option(
+        parser,
+        "voms",
+        action="append",
+        default=[],
+        metavar="VO[:FQAN]",
+        help="VO to ask for an AC; repeat for more VOs or FQANs (-list-vos shows them)",
+    )
+    _option(
+        parser,
+        "list-vos",
+        action="store_true",
+        help="list the VOs with a configured VOMS server, and exit without making a proxy",
+    )
     _option(parser, "vomses", action="append", default=[], metavar="PATH", help="vomses file")
     _option(parser, "valid", type=_duration, metavar="HH:MM", help="proxy lifetime (12:00)")
     _option(parser, "hours", type=float, metavar="H", help="proxy lifetime in hours")
@@ -117,8 +146,17 @@ def _init_parser(parser: argparse.ArgumentParser) -> None:
     _option(parser, "limited", action="store_true", help="make a limited proxy")
     _option(parser, "path_length", type=int, metavar="N", help="limit further delegation")
     _option(parser, "out", metavar="PATH", help="where to write the proxy")
-    _option(parser, "cert", metavar="PATH", help="user certificate")
-    _option(parser, "key", metavar="PATH", help="user private key")
+    _option(
+        parser,
+        "p12",
+        metavar="PATH",
+        help="PKCS#12 bundle (.p12/.pfx) instead of a certificate and key",
+    )
+    _option(parser, "cert", metavar="PATH", help="user certificate (PEM)")
+    _option(parser, "key", metavar="PATH", help="user private key (PEM)")
+    # The same two under the names a PEM pair is usually described by.
+    _option(parser, "pub", dest="cert", metavar="PATH", help="the certificate: -cert's other name")
+    _option(parser, "priv", dest="key", metavar="PATH", help="the private key: -key's other name")
     _option(parser, "pwstdin", action="store_true", help="read the pass phrase from stdin")
     _option(parser, "certdir", metavar="DIR", help="CA directory for the VOMS servers")
     _option(parser, "timeout", type=float, default=30.0, metavar="S", help="per-server timeout")
@@ -137,16 +175,61 @@ def _info_parser(parser: argparse.ArgumentParser) -> None:
     """``info``'s options: ``voms-proxy-info``'s field selectors and tests."""
     _common(parser)
     _option(parser, "file", metavar="PATH", help="proxy file to describe")
-    _option(parser, "all", action="store_true", help="also show the VOMS attributes")
+    _option(
+        parser,
+        "short",
+        action="store_true",
+        help="the compact voms-proxy-info block: no chain, no AC sections",
+    )
+    parser.add_argument("-brief", dest="short", action="store_true", help=argparse.SUPPRESS)
+    _option(
+        parser,
+        "all",
+        action="store_true",
+        help="accepted for voms-proxy-info compatibility; everything is shown by default",
+    )
     for name in _FIELDS:
         _option(
             parser, name, dest="fields", action="append_const", const=name, help=f"print the {name}"
         )
+    _option(
+        parser,
+        "verify",
+        action="store_true",
+        help="check the proxy's signatures and its VOMS AC against the trust files",
+    )
+    _option(
+        parser, "certdir", metavar="DIR", help="with -verify: the CA directory to check against"
+    )
     _option(parser, "exists", action="store_true", help="exit 0 only if a valid proxy exists")
     _option(parser, "valid", type=_duration, metavar="HH:MM", help="with -exists: time left")
     _option(parser, "hours", type=float, metavar="H", help="with -exists: hours left")
     _option(parser, "acexists", metavar="VO", help="exit 0 only if it has an AC for VO")
     parser.set_defaults(handler=_info, fields=None)
+
+
+def _doctor_parser(parser: argparse.ArgumentParser) -> None:
+    """``doctor``'s options: the VO to look at, the proxy file, and whether to phone out."""
+    _common(parser)
+    _option(
+        parser,
+        "voms",
+        action="append",
+        default=[],
+        metavar="VO",
+        help="the VO whose servers and LSC to check (all of them are listed regardless)",
+    )
+    _option(parser, "file", metavar="PATH", help="the proxy file to describe")
+    _option(parser, "offline", action="store_true", help="do not contact the VOMS servers")
+    _option(
+        parser,
+        "all-vos",
+        action="store_true",
+        help="ask every configured VO's servers, not just -voms's (a site admin's sweep)",
+    )
+    _option(parser, "strict", action="store_true", help="fail on warnings too, for monitoring")
+    _option(parser, "summary", action="store_true", help="end with how many of each there were")
+    parser.set_defaults(handler=_doctor)
 
 
 def _destroy_parser(parser: argparse.ArgumentParser) -> None:
@@ -178,11 +261,13 @@ def _duration(text: str) -> float:
 def _init(args: argparse.Namespace) -> int:
     """``xrd-proxy init``: :func:`xrdsec.proxytool.make_proxy`, written - then say until when."""
     from xrdsec import proxytool
-    from xrdsec.proxies import load_credential, write_proxy
+    from xrdsec.proxies import write_proxy
 
-    cert, key = proxytool.find_user_pair(proxytool.VOMS_PROXY_INIT, cert=args.cert, key=args.key)
-    signer = load_credential(cert, key, password=_pass_phrase(args, key))
-    request = _request(args)
+    if args.list_vos:
+        return _list_vos(args)
+    configured = _check_vos(args)
+    signer = _signer(args)
+    request = _request(args, configured)
     proxy = proxytool.make_proxy(signer, request, _Said(args.quiet))
     target = proxytool.proxy_target(args.out)
     written = write_proxy(target.path, proxy, follow_symlinks=target.follow_symlinks)
@@ -195,7 +280,254 @@ def _init(args: argparse.Namespace) -> int:
     return OK
 
 
-def _request(args: argparse.Namespace) -> ProxyRequest:
+def _list_vos(args: argparse.Namespace) -> int:
+    """``init -list-vos``: every VO a VOMS server is configured for here.
+
+    One line per VO, in columns a script can ``cut``: the VO, the aliases it
+    answers to (``-voms`` takes either), its servers' ``host:port``, and
+    whether the VO's LSC is installed - without an LSC an AC can be asked for
+    and carried, but no site can validate it, so "yes" is the VO to pick.
+    """
+    from xrdsec.voms_client import find_vomses
+
+    rows = _vo_rows(find_vomses(args.vomses or None))
+    output.record("result", vos=[row.as_dict() for row in rows])
+    if args.quiet:
+        return OK
+    if not rows:
+        _say(
+            "no VO is configured: install a vomses file in ~/.voms/vomses or /etc/vomses,"
+            " or point -vomses/$X509_VOMSES at one\n"
+        )
+        return OK
+    vo_width = max(len(row.vo) for row in rows)
+    alias_width = max(len(", ".join(row.aliases)) for row in rows)
+    for row in rows:
+        endpoints = ", ".join(row.endpoints)
+        _say(
+            f"{row.vo.ljust(vo_width)}  {', '.join(row.aliases).ljust(alias_width)}  "
+            f"{endpoints.ljust(48)}  LSC: {row.lsc_state}\n"
+        )
+    return OK
+
+
+class _VO(NamedTuple):
+    """One VO as ``init -list-vos`` shows it."""
+
+    vo: str
+    aliases: tuple[str, ...]
+    endpoints: tuple[str, ...]
+    #: Where the VO's LSC is, or ``""`` when ``vomsdir`` has no entry for it.
+    lsc: str
+    #: The ``vomsdir`` searched, or ``""`` when none is configured at all.
+    voms_dir: str
+
+    @property
+    def lsc_state(self) -> str:
+        """``yes``/``no``, or ``?`` when there is no ``vomsdir`` to look in."""
+        if not self.voms_dir:
+            return "? (no X509_VOMS_DIR)"
+        return "yes" if self.lsc else "no"
+
+    def as_dict(self) -> dict[str, Any]:
+        """Plain JSON-ready values."""
+        return {
+            "vo": self.vo,
+            "aliases": list(self.aliases),
+            "endpoints": list(self.endpoints),
+            "lsc": self.lsc or None,
+            "voms_dir": self.voms_dir or None,
+        }
+
+
+def _server_lsc(directory: str, vo: str, members: Sequence[Any]) -> str:
+    """The first LSC in ``vomsdir/<vo>`` that one of ``members`` is validated against, or ``""``."""
+    from xrdsec.voms_client import lsc_names
+
+    folder = os.path.join(directory, vo) if directory else ""
+    if not folder or not os.path.isdir(folder):
+        return ""
+    present = set(os.listdir(folder))
+    for name in lsc_names(members):
+        if name in present:
+            return os.path.join(folder, name)
+    return ""
+
+
+def _vo_rows(servers: Sequence[Any]) -> list[_VO]:
+    """``servers`` grouped by VO and sorted by name, which is how one picks one."""
+    from xrdsec.credentials import grid_voms_dir
+
+    groups: dict[str, list[Any]] = {}
+    for server in servers:
+        groups.setdefault(server.vo, []).append(server)
+    directory = grid_voms_dir() or ""
+    rows = [_vo_row(vo, members, directory) for vo, members in groups.items()]
+    return sorted(rows, key=lambda row: row.vo)
+
+
+def _vo_row(vo: str, members: Sequence[Any], directory: str) -> _VO:
+    """One VO's row: its aliases, its servers' addresses, and the LSC it has, if any.
+
+    The LSC is looked up *by server* - ``vomsdir/<vo>/<host>.lsc`` - because the
+    directory existing says nothing: a ``vomses`` entry that names a server the
+    VO has left finds an empty answer here, which is what makes ``LSC: no``
+    mean something.
+    """
+
+    lsc = _server_lsc(directory, vo, members)
+    return _VO(
+        vo=vo,
+        aliases=tuple(dict.fromkeys(server.alias for server in members)),
+        endpoints=tuple(dict.fromkeys(f"{server.host}:{server.port}" for server in members)),
+        lsc=lsc,  # already the file that exists, or ""
+        voms_dir=directory,
+    )
+
+
+def _check_vos(args: argparse.Namespace) -> tuple[Any, ...] | None:
+    """Refuse a VO that is not configured before a key is read or a pass phrase asked.
+
+    The same lookup :func:`xrdsec.voms_client.fetch_ac` makes later, done first
+    so that ``xrd-proxy init -voms atls`` says which VOs exist even when there
+    is no certificate on the machine yet - discovery would otherwise stop at
+    "no user certificate found" and never mention the typo.
+    """
+    from xrdsec import proxytool
+    from xrdsec.voms_client import find_vomses, servers_for
+
+    if not args.voms:
+        return None
+    configured: list[Any] = []
+    for request in proxytool.voms_requests(args.voms, proxytool.VOMS_PROXY_INIT):
+        for server in find_vomses(args.vomses or None, vo=request.vo):
+            if server not in configured:
+                configured.append(server)
+        servers_for(request.vo, configured)
+    return tuple(configured)
+
+
+def _signer(args: argparse.Namespace) -> ProxyCredential:
+    """The credential to sign the proxy with: one PKCS#12 bundle, or a certificate and key.
+
+    In this order, the first that is there:
+
+    1. ``-p12`` with a bundle; else ``-cert``/``-key`` (``-pub``/``-priv``) with
+       a pair, which win over ``$X509_USER_P12`` because the command line says
+       which files to use;
+    2. ``$X509_USER_P12``, when the file it names exists;
+    3. ``$X509_USER_CERT``/``$X509_USER_KEY``, then ``~/.globus``'s
+       ``usercert.pem``/``userkey.pem`` - :class:`xrdsec.proxytool.VOMS_PROXY_INIT`'s
+       own search;
+    4. any other single ``*.pem`` pair in ``~/.globus`` (:func:`_globus_pem_pair`),
+       because a certificate downloaded under its own name is still a pair.
+    """
+    from xrdsec.proxies import load_credential, load_p12
+
+    bundle, stale = _named_bundle(args)
+    if bundle:
+        try:
+            return load_p12(bundle, password=_pass_phrase(args, bundle))
+        except FileNotFoundError as missing:
+            raise _no_bundle(bundle) from missing
+    cert, key = _pem_pair(args, stale)
+    return load_credential(cert, key, password=_pass_phrase(args, key))
+
+
+def _named_bundle(args: argparse.Namespace) -> tuple[str, str]:
+    """The PKCS#12 bundle to use, and the one a variable named which is not there.
+
+    ``-p12`` always wins; a ``-cert``/``-key`` on the command line beats the
+    variable. ``$X509_USER_P12`` that names a file which is not there is a
+    stale setting rather than a refusal: it is reported, and the search for a
+    certificate and key carries on - returned as the second element so an
+    empty search can say what was skipped.
+    """
+    if args.p12:
+        return str(args.p12), ""
+    if args.cert or args.key:
+        return "", ""
+    named = os.environ.get("X509_USER_P12") or ""
+    if not named or os.path.isfile(named):
+        return named, ""
+    if not args.quiet:
+        _say(f"note: X509_USER_P12 names {named}, which is not there; looking on\n")
+    return "", named
+
+
+#: What a bundle is called in the wild; CERN hands out ``.p12``, Windows ``.pfx``.
+_BUNDLE_PATTERNS = ("*.p12", "*.pfx", "*.P12", "*.PFX")
+
+
+def _walk_up(folder: str, levels: int = 3) -> list[str]:
+    """``folder`` and its parents, ``levels`` of them, outermost last."""
+    walked = [folder]
+    for _ in range(levels):
+        parent = os.path.dirname(walked[-1])
+        if parent == walked[-1]:
+            break
+        walked.append(parent)
+    return walked
+
+
+def _nearby_bundles(path: str) -> list[str]:
+    """PKCS#12 bundles worth naming when ``path`` is not there: beside it, home, ``~/.globus``.
+
+    A stale path has almost always drifted from a bundle one directory away, so
+    the search is the one that would have found it: the directory named, then
+    the home directory, then ``~/.globus``.
+    """
+    named = os.path.dirname(os.path.abspath(path))
+    folders = [*_walk_up(named), os.path.expanduser("~"), os.path.expanduser("~/.globus")]
+    found: dict[str, None] = {}
+    for folder in folders:
+        for pattern in _BUNDLE_PATTERNS:
+            for name in sorted(glob.glob(os.path.join(folder, pattern))):
+                found.setdefault(name, None)
+    return list(found)[:6]
+
+
+def _no_bundle(path: str) -> Exception:
+    """What to say when ``-p12`` names a file that is not there, and which bundles are."""
+    from xrdcore.errors import CredentialError
+
+    found = _nearby_bundles(path)
+    if not found:
+        return CredentialError(f"no PKCS#12 bundle at {path}")
+    names = ", ".join(found)
+    return CredentialError(
+        f"no PKCS#12 bundle at {path}; found {names} - name one with -p12,"
+        " or point X509_USER_P12 at it"
+    )
+
+
+def _pem_pair(args: argparse.Namespace, stale: str) -> tuple[str, str]:
+    """A certificate and key: the documented search's, else a ``*.pem`` pair in ``~/.globus``."""
+    from xrdsec import proxytool
+    from xrdsec.credentials import globus_pem_pair
+
+    try:
+        return proxytool.find_user_pair(proxytool.VOMS_PROXY_INIT, cert=args.cert, key=args.key)
+    except proxytool.NoCredentialError as missing:
+        pair, note = globus_pem_pair()
+        if pair is None:
+            _no_credential(missing, stale, note)
+        return pair
+
+
+def _no_credential(missing: Exception, stale: str, note: str) -> NoReturn:
+    """What to say when nothing was found: the search's message, and what it could not use."""
+    from xrdsec import proxytool
+
+    message = str(missing)
+    if note:
+        message = f"{message}; {note}"
+    if stale:
+        message = f"{message} (X509_USER_P12 names {stale}, which is not there)"
+    raise proxytool.NoCredentialError(message)
+
+
+def _request(args: argparse.Namespace, configured: Sequence[Any] | None = None) -> ProxyRequest:
     """``init``'s options as one :class:`xrdsec.proxytool.ProxyRequest`.
 
     ``-valid HH:MM`` wins over ``-hours``; neither is twelve hours, as for
@@ -211,6 +543,7 @@ def _request(args: argparse.Namespace) -> ProxyRequest:
         path_length=args.path_length,
         profile=args.profile,
         voms=proxytool.voms_requests(args.voms, proxytool.VOMS_PROXY_INIT),
+        configured=configured,
         voms_lifetime=args.vomslife,
         vomses=tuple(args.vomses),
         timeout=args.timeout,
@@ -293,11 +626,100 @@ def _info(args: argparse.Namespace) -> int:
         return ERROR if testing else fail(PROGRAM, exc)
     if testing:
         return _tests(args, info)
+    info, verdict, passed = _judged(args, info, target.path)
     output.record("result", **info.as_dict())
-    lines = _field_lines(info, args.fields) if args.fields else _summary(info, args.all)
+    lines = _field_lines(info, args.fields) if args.fields else _summary(info, args.short)
+    lines += verdict
     if not args.quiet:
         _say("".join(f"{line}\n" for line in lines))
-    return OK
+    return OK if passed else ERROR
+
+
+def _judged(
+    args: argparse.Namespace, info: ProxyInfo, path: str
+) -> tuple[ProxyInfo, list[str], bool]:
+    """The description as it stands, or with ``-verify`` the validator's version of it."""
+    if not args.verify:
+        return info, [], True
+    return _verified(args, info, path)
+
+
+def _verified(
+    args: argparse.Namespace, info: ProxyInfo, path: str
+) -> tuple[ProxyInfo, list[str], bool]:
+    """The proxy as a validator judges it: every signature, and every AC against its VO's rules.
+
+    Describing a proxy (:func:`xrdsec.proxytool.read_proxy_info`) decodes the
+    ACs and says so; this is the other half - ``validate_voms`` checks each AC's
+    signature, its holder, its issuer against the CA directory and its VO's LSC
+    and signing policy, and the chain is checked link by link with
+    :func:`xrdsec.x509.signed_by`. The ACs it returns replace the decoded ones,
+    so the ``status`` line in the report is the verdict rather than a disclaimer.
+    """
+    import dataclasses
+
+    from xrdsec import credentials
+    from xrdsec.proxies import load_credential
+    from xrdsec.voms import validate_voms
+
+    ca_dir = args.certdir or credentials.grid_ca_path() or ""
+    chain = load_credential(path).chain
+    result = validate_voms(chain, ca_path=ca_dir or None)
+    lines, passed = _signature_lines(chain, ca_dir)
+    for entry in result.entries:
+        if entry.verified:
+            lines.append(
+                f"vo        : verified  {entry.vo} (LSC and signing policy in {_lsc_place()})"
+            )
+        else:
+            # the reason is already a ``diagnostic:`` line in the entry's own section
+            lines.append(f"vo        : !! {entry.vo}: {entry.status.value}")
+            passed = False
+    return dataclasses.replace(info, voms=result.entries), lines, passed
+
+
+def _lsc_place() -> str:
+    """Where the LSC that a verified AC was judged against lives, for the line that says so."""
+    from xrdsec import credentials
+
+    return credentials.grid_voms_dir() or "the default vomsdir"
+
+
+def _signature_lines(chain: Sequence[Any], ca_dir: str) -> tuple[list[str], bool]:
+    """Each link signed by the one above it, and the top one issued by a CA in ``ca_dir``."""
+    links, signed = _pair_lines(chain)
+    issuer, trusted = _issuer_line(chain[-1], ca_dir)
+    return [*links, *issuer], signed and trusted
+
+
+def _pair_lines(chain: Sequence[Any]) -> tuple[list[str], bool]:
+    """One line per link that its issuer did not sign, or one saying they all were."""
+    from xrdsec.x509 import certificate_data, signed_by
+
+    data = [certificate_data(certificate.der) for certificate in chain]
+    broken = [
+        f"signature : !! {chain[index].subject} is not signed by {chain[index + 1].subject}"
+        for index in range(len(data) - 1)
+        if not signed_by(
+            data[index].tbs, data[index].signature_oid, data[index].signature, data[index + 1].spki
+        )
+    ]
+    if broken:
+        return broken, False
+    if len(data) > 1:
+        return [f"signature : ok  signed by {chain[1].subject}"], True
+    return ["signature : --  a single certificate, with nothing above it to check"], True
+
+
+def _issuer_line(top: Any, ca_dir: str) -> tuple[list[str], bool]:
+    """Whether the outermost certificate's issuer is one of the CAs in the directory."""
+    from xrdsec.x509 import issuer_hashes
+
+    if not ca_dir:
+        return ["issuer    : --  no CA directory to check the chain against"], True
+    if any(os.path.exists(os.path.join(ca_dir, f"{name}.0")) for name in issuer_hashes(top)):
+        return [f"issuer    : ok  {top.issuer} is in {ca_dir}"], True
+    return [f"issuer    : !! {top.issuer} is not in {ca_dir}"], False
 
 
 def _tests(args: argparse.Namespace, info: ProxyInfo) -> int:
@@ -312,8 +734,16 @@ def _tests(args: argparse.Namespace, info: ProxyInfo) -> int:
     return OK if passed else ERROR
 
 
-def _summary(info: ProxyInfo, every: bool) -> list[str]:
-    """``voms-proxy-info``'s block, plus one section per AC with ``-all``."""
+def _summary(info: ProxyInfo, short: bool) -> list[str]:
+    """Everything known about the credential, or with ``-short`` the VOMS block.
+
+    The default is the whole picture: the leaf's own fields, the chain link by
+    link (subject, issuer, serial, validity, what each link is), and one
+    section per VOMS AC with its attributes, times, carrier and the status of
+    its decoding. ``voms-proxy-info -all``'s block is ``-short``; ``-all`` is
+    still accepted because it is what the VOMS tool's scripts pass, and now
+    asks for what is already the default.
+    """
     lines = [
         f"subject   : {info.subject}",
         f"issuer    : {info.issuer}",
@@ -325,12 +755,69 @@ def _summary(info: ProxyInfo, every: bool) -> list[str]:
     ]
     if info.key_usage:
         lines.append(f"key usage : {', '.join(info.key_usage)}")
-    for entry in info.voms if every else ():
-        lines += [f"=== VO {entry.vo} extension information ===", f"VO        : {entry.vo}"]
-        lines += [f"subject   : {entry.holder}", f"issuer    : {entry.issuer}"]
-        lines += [f"attribute : {fqan}" for fqan in entry.fqans]
-        lines += [f"timeleft  : {_clock(entry.remaining())}", f"uri       : {entry.uri}"]
+    if not short:
+        lines += _detail_lines(info)
+    for entry in () if short else info.voms:
+        lines += _voms_lines(entry)
     return lines
+
+
+def _detail_lines(info: ProxyInfo) -> list[str]:
+    """The extended half: proxy limits, exact validity, and the chain link by link."""
+    lines: list[str] = []
+    if info.is_proxy:
+        lines.append(f"proxy     : {'limited' if info.limited else 'impersonation'}")
+        lines.append(f"path limit: {'unlimited' if info.path_length is None else info.path_length}")
+    lines += [
+        f"not before: {_when(info.not_before)}",
+        f"not after : {_when(info.not_after)}",
+        f"chain     : {len(info.chain)} certificate{'' if len(info.chain) == 1 else 's'}",
+    ]
+    for index, link in enumerate(info.chain):
+        label = f"[{index}]"
+        lines += [
+            f"  {label} {link.subject}",
+            f"  {' ' * len(label)} issuer : {link.issuer}",
+            f"  {' ' * len(label)} serial : {link.serial}",
+            f"  {' ' * len(label)} valid  : {_when(link.not_before)} to {_when(link.not_after)}",
+            f"  {' ' * len(label)} kind   : {link.kind}",
+        ]
+    return lines
+
+
+def _voms_lines(entry: VOMSEntry) -> list[str]:
+    """One VOMS AC: what it claims, from whom, until when, and whether it decoded cleanly."""
+    lines = [
+        f"=== VO {entry.vo} extension information ===",
+        f"VO        : {entry.vo}",
+        f"subject   : {entry.holder}",
+        f"issuer    : {entry.issuer}",
+    ]
+    lines += [f"attribute : {fqan}" for fqan in entry.fqans] or ["attribute : (none)"]
+    lines += [
+        f"uri       : {entry.uri}",
+        f"not before: {_when(entry.not_before)}",
+        f"not after : {_when(entry.not_after)}",
+        f"timeleft  : {_clock(entry.remaining())}",
+        f"carrier   : certificate {entry.carrier}",
+        f"status    : {_status_word(entry)}",
+    ]
+    if entry.digest:
+        lines.append(f"digest    : {entry.digest}")
+    if entry.diagnostics:
+        lines += [f"diagnostic: {issue.message}" for issue in entry.diagnostics]
+    return lines
+
+
+def _status_word(entry: VOMSEntry) -> str:
+    """What describing an AC says about it: decoding, not trust (see the module docstring)."""
+    from xrdsec.voms import VOMSStatus
+
+    if entry.status is VOMSStatus.UNCHECKED:
+        return "decoded (describing does not check trust; xrdsec.voms.validate_voms does)"
+    if entry.status is VOMSStatus.OK:
+        return "ok"
+    return f"{entry.status.value}: {entry.message}"
 
 
 def _field_lines(info: ProxyInfo, fields: Sequence[str]) -> list[str]:
@@ -348,6 +835,57 @@ def _field_lines(info: ProxyInfo, fields: Sequence[str]) -> list[str]:
         "actimeleft": lambda: [str(max(0, int(entry.remaining()))) for entry in info.voms],
     }
     return [line for name in fields for line in values[name]()]
+
+
+# ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+
+
+def _doctor(args: argparse.Namespace) -> int:
+    """``xrd-proxy doctor``: every question a proxy needs, answered in plain English.
+
+    One line per check, and under each one the thing to do about it - by the
+    user, by whoever runs the machine, or by the experiment. Exit ``0`` when
+    nothing would stop a proxy from being made and used, ``1`` when something
+    would; ``--json``/``--xml`` report the same lines as data.
+    """
+    from xrdsec import doctor
+
+    from ..doctor import Check, Report
+
+    checks: list[Check] = []
+
+    class _Sink:
+        """Where :func:`xrdsec.doctor.check` writes: the report's own :class:`Check` lines."""
+
+        def add(self, name: str, state: str, detail: str, hint: str = "") -> None:
+            checks.append(Check(name, state, detail, hint))
+
+    vo = args.voms[0].partition(":")[0] if args.voms else None
+    doctor.check(
+        _Sink(),
+        vo=vo,
+        proxy=args.file,
+        servers=not args.offline,
+        all_vos=args.all_vos,
+    )
+    report = Report(checks=tuple(checks))
+    counts = _counted(report)
+    passing = report.ok and not (args.strict and counts["warn"])
+    if output.current() is not None:
+        output.payload({"ok": passing, "vo": vo, "summary": counts, "checks": report.to_dict()})
+    elif not args.quiet:
+        _say("".join(f"{check}\n" for check in report))
+        if args.summary:
+            _say(f"{counts['ok']} ok, {counts['warn']} warning(s), {counts['bad']} problem(s)\n")
+    return OK if passing else ERROR
+
+
+def _counted(report: Report) -> dict[str, int]:
+    """How many of each mark the report has: what a summary line, or a monitor, wants."""
+    seen = Counter(check.state for check in report)
+    return {state: seen[state] for state in _MARKS}
 
 
 # ---------------------------------------------------------------------------

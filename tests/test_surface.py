@@ -279,6 +279,8 @@ FILE: dict[str, Callable[[File], object]] = {
     "clone": lambda fh: fh.clone(fh, [(0, 2, 4)]),
     "write_pieces": lambda fh: fh.write_pieces([b"ab", b"cd"], 0),
     "abort": lambda fh: fh.abort(),
+    "capability": lambda fh: fh.capability,
+    "reopen": lambda fh: fh.reopen("tpc.stage=copy"),
 }
 
 

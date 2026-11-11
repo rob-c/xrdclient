@@ -32,6 +32,8 @@ args = sys.argv[1:]
 if args[0] == "ctl":
     if args[2] == "fail":
         sys.exit("refused: " + args[2])
+    if args[2] == "unknown":
+        sys.exit("err: unknown command")
     print("ok " + args[2])
     sys.exit(0)
 if MODE == "crash":
@@ -116,6 +118,10 @@ def test_the_proxy_starts_answers_control_commands_and_stops(tmp_path, target, q
         assert proxy.command("clear") == "ok clear\n"
         with pytest.raises(RuntimeError, match="refused: fail"):
             proxy.command("fail")
+        # A command the installed tool does not know is this machine's
+        # capability, not a failure of the code under test.
+        with pytest.raises(unittest.SkipTest, match="unknown command"):
+            proxy.command("unknown")
     assert proxy.process is None
     proxy.__exit__()  # a second stop is harmless
 

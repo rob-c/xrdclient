@@ -97,7 +97,7 @@ def test_a_question_says_what_is_missing_why_and_how_to_fix_it():
         host="eos.example.org",
     )
     assert ask.explain().splitlines() == [
-        "xrd: eos.example.org accepts gsi, but an X.509 proxy is missing",
+        "eos.example.org accepts gsi, but an X.509 proxy is missing",
         "     why: there is no file at /tmp/x509up_u1000",
         "     fix: voms-proxy-init -voms lhcb",
     ]
@@ -107,7 +107,7 @@ def test_a_question_says_what_is_missing_why_and_how_to_fix_it():
 
 def test_a_question_with_no_endpoint_still_reads_as_english():
     ask = Ask("ztn", "a bearer token", "nothing anywhere", "oidc-token", "the token")
-    assert ask.explain().startswith("xrd: ztn is offered, but a bearer token is missing")
+    assert ask.explain().startswith("ztn is offered, but a bearer token is missing")
     assert "not echoed" not in ask.question()
 
 

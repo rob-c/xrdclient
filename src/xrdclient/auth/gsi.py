@@ -74,6 +74,7 @@ from xrdsec.gsi.secgsi import encode_public_blob as encode_public_blob
 from xrdsec.gsi.secgsi import find_bucket as find_bucket
 from xrdsec.gsi.secgsi import parse_dh_parameters as parse_dh_parameters
 from xrdsec.gsi.secgsi import parse_peer_blob as parse_peer_blob
+from xrdsec.gsi.secgsi import random_tag as random_tag
 from xrdsec.gsi.secgsi import read_proxy as read_proxy
 from xrdsec.gsi.secgsi import seal as seal
 from xrdsec.gsi.secgsi import server_names as server_names
@@ -135,6 +136,7 @@ __all__ = [
     "find_bucket",
     "parse_dh_parameters",
     "parse_peer_blob",
+    "random_tag",
     "read_proxy",
     "seal",
     "server_names",

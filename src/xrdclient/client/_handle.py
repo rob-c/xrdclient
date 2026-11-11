@@ -66,6 +66,22 @@ _MAX_AHEAD = 8 << 20
 _NOTHING_AHEAD: tuple[int, bytes] = (0, b"")
 
 
+def _cgi_pieces(cgi: str) -> list[str]:
+    """The non-empty ``key=value`` pieces of a CGI string.
+
+    EOS spells a capability ``&cap.sym=...``, so the pieces are what matter and
+    a leading ``&`` is nothing to keep.
+    """
+    return [piece for piece in cgi.split("&") if piece]
+
+
+def _merge_cgi(query: str, extra: str) -> str:
+    """``query``'s pieces, then ``extra``'s; one named by both comes from ``extra``."""
+    replaced = {piece.partition("=")[0] for piece in _cgi_pieces(extra)}
+    kept = [piece for piece in _cgi_pieces(query) if piece.partition("=")[0] not in replaced]
+    return "&".join([*kept, *_cgi_pieces(extra)])
+
+
 class _Handle:
     """One open file handle on one data server: its state and its lifecycle."""
 
@@ -91,6 +107,8 @@ class _Handle:
         self._compression: tuple[int, str] = (0, "")
         self._size_hint = 0
         self._flags = OpenFlags.NONE
+        #: CGI to add to the next open (:meth:`reopen`); empty for a plain one.
+        self._extra_cgi = ""
         self._mode = 0
         #: ``(optiont, fhtemplt)`` of an open made against a template file:
         #: ``kXR_dup`` or ``kXR_samefs``, and that file's handle.
@@ -365,6 +383,52 @@ class _Handle:
             raise
         return self._stat
 
+    def _reopening_path(self) -> str:
+        """The path to open: the URL's CGI, the capability it landed with, and any extra.
+
+        A key named in the extra (:meth:`reopen`'s argument) replaces the one the
+        URL carried - a file made for placement is reopened for the copy - and
+        everything else, the capability included, is kept.
+        """
+        path, _, query = self.url.path_with_cgi.partition("?")
+        cgi = _merge_cgi(query, f"{self._router.redirected_cgi}&{self._extra_cgi}")
+        return f"{path}?{cgi}" if cgi else path
+
+    @property
+    def capability(self) -> str:
+        """The CGI a redirect added to this handle's requests: a data server's capability.
+
+        EOS signs ``cap.sym``/``cap.msg`` for the disk server a manager redirects
+        to, and that server refuses a second open without them ("capability
+        illegal"). :meth:`reopen` puts it on the request for you.
+        """
+        return self._router.redirected_cgi
+
+    def reopen(self, extra: str = "") -> StatInfo | None:
+        """Open this file again, on the connection it landed on, with ``extra`` added to its CGI.
+
+        A third-party rendezvous opens the source twice - once for placement
+        (``tpc.stage=placement``) and once to register the pull (XrdCl's
+        ``cgiC2Src``) - and the second open belongs on the connection the first
+        landed on, carrying the capability that redirect added. Registering it
+        anywhere else is refused, and registering it on a *new* connection can
+        arrive after the destination has started pulling. This keeps the
+        handle's address, its pinned router and therefore its session, so the
+        registration is one round trip on a live connection.
+
+        The earlier handle stays open on the server; it is reported by
+        :meth:`close` only for the latest one, and a server reaps whatever is
+        left when the connection closes - which is what the reference client
+        does too, with two files rather than two opens.
+        """
+        self._extra_cgi = extra
+        try:
+            self._do_open()
+            self._bind_data_streams()
+        finally:
+            self._extra_cgi = ""
+        return self._stat
+
     def _join(self, template: _Handle, dup: bool) -> None:
         """Move onto ``template``'s connection, where its handle is valid.
 
@@ -393,7 +457,7 @@ class _Handle:
         """Issue the ``kXR_open`` and adopt the handle it returns."""
         optiont, fhtemplt = self._template
         request = r.Open(
-            with_tried(self.url.path_with_cgi, self._tried, LOST),
+            with_tried(self._reopening_path(), self._tried, LOST),
             int(self._flags) | c.kXR_retstat,
             self._mode,
             optiont=optiont,

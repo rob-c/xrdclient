@@ -36,8 +36,10 @@ from xrdsec.credentials import default_proxy_path as default_proxy_path
 from xrdsec.credentials import find_bearer_token as find_bearer_token
 from xrdsec.credentials import find_proxy as find_proxy
 from xrdsec.credentials import find_user_credential as find_user_credential
+from xrdsec.credentials import globus_pem_pair as globus_pem_pair
 from xrdsec.credentials import grid_ca_path as grid_ca_path
 from xrdsec.credentials import grid_voms_dir as grid_voms_dir
+from xrdsec.credentials import machine_grid_security as machine_grid_security
 from xrdsec.credentials import read_private_file as read_private_file
 from xrdsec.credentials import write_private_file as write_private_file
 

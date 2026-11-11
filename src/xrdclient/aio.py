@@ -689,6 +689,14 @@ class AsyncFile(Generic[AnyStr]):
         """Flush and release. Safe to call more than once."""
         await _run(self._sync.close)
 
+    @property
+    def capability(self) -> str:
+        """The CGI a redirect added to this file's requests.
+
+        See :attr:`xrdclient.File.capability`.
+        """
+        return str(getattr(self._sync, "capability", ""))
+
     async def __aenter__(self) -> AsyncFile[AnyStr]:
         """Itself; the file is already open."""
         return self

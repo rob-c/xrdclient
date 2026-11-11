@@ -22,14 +22,17 @@ from xrdsec import proxies as _sec
 from xrdsec.proxies import DEFAULT_LIFETIME as DEFAULT_LIFETIME
 from xrdsec.proxies import NOT_BEFORE_SKEW as NOT_BEFORE_SKEW
 from xrdsec.proxies import PROFILES as PROFILES
+from xrdsec.proxies import ChainLink as ChainLink
 from xrdsec.proxies import ProfileName as ProfileName
 from xrdsec.proxies import ProxyError as ProxyError
 from xrdsec.proxies import ProxyInfo as ProxyInfo
 from xrdsec.proxies import __all__ as __all__
 from xrdsec.proxies import create_proxy as create_proxy
+from xrdsec.proxies import credential_from_p12 as credential_from_p12
 from xrdsec.proxies import describe_proxy as describe_proxy
 from xrdsec.proxies import issue_proxy as issue_proxy
 from xrdsec.proxies import load_credential as load_credential
+from xrdsec.proxies import load_p12 as load_p12
 from xrdsec.proxies import voms_extension as voms_extension
 from xrdsec.proxies import write_proxy as write_proxy
 
