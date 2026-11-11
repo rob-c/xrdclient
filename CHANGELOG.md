@@ -11,6 +11,14 @@ Fixes found moving data between the LHCb Tier-1 and Tier-2 storage elements
 
 ### Added
 
+- `xrd-proxy token providers` lists the named issuers (`lhcb`, `atlas`, `cms`,
+  `alice`, `wlcg`, `cern`, `egi`, `dune`, `fermilab`) and says which issuer is
+  in force and where that came from, and `--provider NAME` selects one for
+  `token init`/`info`. The precedence is the stack's everywhere: what you
+  typed, then `WLCG_TOKEN_ISSUER`/`WLCG_TOKEN_AUDIENCE`/`WLCG_TOKEN_SCOPE`/
+  `WLCG_CLIENT_ID` (or `WLCG_TOKEN_CLIENT_ID`), then the profile.
+
+
 - `xrd-proxy token init|info|destroy`: obtain a WLCG bearer token from an
   issuer and put it where every tool looks. `init` takes `--issuer` (or
   `--from-resource`, which asks a storage element who its issuers are) and one

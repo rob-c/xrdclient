@@ -264,7 +264,7 @@ def test_token_init_by_device_flow_needs_a_client_id(
     monkeypatch.setattr(cli, "_chosen_issuer", lambda args: issuer)
     monkeypatch.delenv("WLCG_CLIENT_ID", raising=False)
     assert cli.main(["token", "init", "--issuer", issuer.url]) == 1
-    assert "needs --client-id" in capsys.readouterr().err
+    assert "needs a client id" in capsys.readouterr().err
 
 
 def test_token_init_by_device_flow_gives_up_when_the_code_expires(
@@ -417,3 +417,138 @@ def test_an_issuer_named_outright_is_discovered(monkeypatch: Any, issuer: Any) -
     monkeypatch.setattr(token_client, "discover", lambda where, **k: [issuer])
     found = cli._chosen_issuer(_args(issuer=issuer.url))
     assert found is issuer
+
+
+# ---------------------------------------------------------------------------
+# The named providers, and the environment winning over them
+# ---------------------------------------------------------------------------
+
+
+def test_token_providers_lists_what_is_known(capsys: Any, monkeypatch: Any) -> None:
+    monkeypatch.delenv("WLCG_TOKEN_ISSUER", raising=False)
+    assert cli.main(["token", "providers"]) == 0
+    said = capsys.readouterr().out
+    assert "lhcb-auth.cern.ch" in said and "wlcg.cloud.cnaf.infn.it" in said
+    assert "In force now: issuer=(none)" in said
+
+
+def test_token_providers_as_json_is_a_table(capsys: Any, monkeypatch: Any) -> None:
+    monkeypatch.delenv("WLCG_TOKEN_ISSUER", raising=False)
+    assert cli.main(["token", "providers", "--json", "-q"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    result = next(record for record in report["records"] if record["kind"] == "result")
+    names = [row["name"] for row in result["providers"]]
+    assert "lhcb" in names and "wlcg" in names
+    assert result["in_force"]["issuer_from"] == ""
+
+
+def test_the_environment_is_in_force_over_a_profile(monkeypatch: Any) -> None:
+    """A session's setting beats a profile, however the profile is named."""
+    monkeypatch.setenv("WLCG_TOKEN_ISSUER", "https://mine.example.org/")
+    asked: list[str] = []
+    found = token_client.Issuer("https://mine.example.org/", "https://x/t", "https://x/j")
+
+    def discovered(where: str, **kwargs: Any) -> list[Any]:
+        asked.append(where)
+        return [found]
+
+    monkeypatch.setattr(token_client, "discover", discovered)
+    assert cli._chosen_issuer(_args(provider="lhcb")) is found
+    assert asked == ["https://mine.example.org/"]
+
+
+def test_a_profile_names_the_issuer_without_a_url(monkeypatch: Any) -> None:
+    asked: list[str] = []
+    found = token_client.Issuer("https://lhcb-auth.cern.ch/", "https://x/token", "https://x/jwk")
+
+    def discovered(where: str, **kwargs: Any) -> list[Any]:
+        asked.append(where)
+        return [found]
+
+    monkeypatch.setattr(token_client, "discover", discovered)
+    monkeypatch.delenv("WLCG_TOKEN_ISSUER", raising=False)
+    assert cli._chosen_issuer(_args(provider="lhcb")) is found
+    assert asked == ["https://lhcb-auth.cern.ch/"]
+
+
+def test_a_profile_that_is_not_known_is_refused(monkeypatch: Any, capsys: Any) -> None:
+    monkeypatch.delenv("WLCG_TOKEN_ISSUER", raising=False)
+    assert cli.main(["token", "init", "--provider", "lhbc", "--flow", "x509"]) == 1
+    assert "did you mean 'lhcb'" in capsys.readouterr().err
+
+
+def test_the_client_id_can_come_from_either_variable(monkeypatch: Any) -> None:
+    monkeypatch.delenv("WLCG_CLIENT_ID", raising=False)
+    monkeypatch.delenv("WLCG_TOKEN_CLIENT_ID", raising=False)
+    assert cli._client_id_from_environment() == ""
+    monkeypatch.setenv("WLCG_TOKEN_CLIENT_ID", " from-token-var ")
+    assert cli._client_id_from_environment() == "from-token-var"
+    monkeypatch.setenv("WLCG_CLIENT_ID", "from-client-var")
+    assert cli._client_id_from_environment() == "from-client-var"
+
+
+def test_a_profile_supplies_the_scope_and_audience(
+    tmp_path: Any, issuer: Any, monkeypatch: Any
+) -> None:
+    monkeypatch.delenv("WLCG_TOKEN_SCOPE", raising=False)
+    monkeypatch.delenv("WLCG_TOKEN_AUDIENCE", raising=False)
+    monkeypatch.setattr(cli, "_chosen_issuer", lambda args: issuer)
+    seen: dict[str, Any] = {}
+
+    def acquired(given: Any, credential: Any, **kwargs: Any) -> token_client.Token:
+        seen.update(kwargs)
+        return token_client.Token(access_token=_jwt(), expires_in=60)
+
+    monkeypatch.setattr(token_client, "acquire", acquired)
+    monkeypatch.setattr(cli, "_signer", lambda args: object())
+    assert (
+        cli.main(
+            [
+                "token",
+                "init",
+                "--flow",
+                "x509",
+                "--provider",
+                "lhcb",
+                "--issuer",
+                issuer.url,
+                "--out",
+                str(tmp_path / "p"),
+            ]
+        )
+        == 0
+    )
+    assert seen["scope"].startswith("storage.read:/")  # the profile's scope
+    assert seen["audience"] == token_client.AUDIENCE
+
+
+def test_the_environment_scope_beats_the_profile(
+    tmp_path: Any, issuer: Any, monkeypatch: Any
+) -> None:
+    monkeypatch.setenv("WLCG_TOKEN_SCOPE", "storage.read:/env-only")
+    monkeypatch.setattr(cli, "_chosen_issuer", lambda args: issuer)
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(
+        token_client,
+        "acquire",
+        lambda *a, **k: seen.update(k) or token_client.Token(access_token=_jwt(), expires_in=60),
+    )
+    monkeypatch.setattr(cli, "_signer", lambda args: object())
+    assert (
+        cli.main(
+            [
+                "token",
+                "init",
+                "--flow",
+                "x509",
+                "--provider",
+                "lhcb",
+                "--issuer",
+                issuer.url,
+                "--out",
+                str(tmp_path / "e"),
+            ]
+        )
+        == 0
+    )
+    assert seen["scope"] == "storage.read:/env-only"

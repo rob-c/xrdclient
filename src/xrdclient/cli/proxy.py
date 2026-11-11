@@ -191,9 +191,15 @@ def _token_parser(parser: argparse.ArgumentParser) -> None:
     )
     _common(init)
     init.add_argument(
+        "--provider",
+        default="",
+        metavar="NAME",
+        help="a named issuer: lhcb, atlas, cms, alice, wlcg, cern, egi, dune, fermilab",
+    )
+    init.add_argument(
         "--issuer",
-        default=os.environ.get("WLCG_TOKEN_ISSUER", ""),
-        help="the issuer's base URL ($WLCG_TOKEN_ISSUER)",
+        default=None,
+        help="the issuer's base URL; beats --provider and $WLCG_TOKEN_ISSUER",
     )
     init.add_argument(
         "--from-resource",
@@ -206,8 +212,8 @@ def _token_parser(parser: argparse.ArgumentParser) -> None:
     )
     init.add_argument(
         "--client-id",
-        default=os.environ.get("WLCG_CLIENT_ID", ""),
-        help="the client registered with the issuer ($WLCG_CLIENT_ID)",
+        default=None,
+        help="the client registered with the issuer ($WLCG_CLIENT_ID or $WLCG_TOKEN_CLIENT_ID)",
     )
     init.add_argument(
         "--scope",
@@ -247,7 +253,10 @@ def _token_parser(parser: argparse.ArgumentParser) -> None:
     _common(info)
     info.add_argument("path", nargs="?", default="", help="a token file (default: the search)")
     info.add_argument("--verify", action="store_true", help="check the signature and times")
-    info.add_argument("--issuer", default=os.environ.get("WLCG_TOKEN_ISSUER", ""))
+    info.add_argument(
+        "--provider", default="", metavar="NAME", help="a named issuer to check against"
+    )
+    info.add_argument("--issuer", default=None, help="the issuer's base URL")
     info.add_argument("--from-resource", default="", metavar="URL")
     info.add_argument("--audience", default=None)
     info.add_argument("-certdir", "--certdir", metavar="DIR")
@@ -260,6 +269,22 @@ def _token_parser(parser: argparse.ArgumentParser) -> None:
         "--dry", action="store_true", help="say what would be removed, and remove nothing"
     )
     destroy.set_defaults(handler=_token_destroy)
+
+    listing = commands.add_parser(
+        "providers",
+        help="the named issuers this knows, and where each one is",
+        description=(
+            "The token issuers a WLCG person actually meets, each probed before it "
+            "was added: they answered their discovery document with a token endpoint, "
+            "a device authorization endpoint and the client-credentials, device-code "
+            "and token-exchange grants. --provider NAME selects one; anything in the "
+            "environment (WLCG_TOKEN_ISSUER, WLCG_TOKEN_AUDIENCE, WLCG_TOKEN_SCOPE, "
+            "WLCG_CLIENT_ID) overrides it."
+        ),
+        allow_abbrev=False,
+    )
+    _common(listing)
+    listing.set_defaults(handler=_token_providers)
 
 
 def _info_parser(parser: argparse.ArgumentParser) -> None:
@@ -970,28 +995,41 @@ def proxytool_unavailable() -> type[Exception]:
     return proxytool.NoCredentialError
 
 
+def _asked(args: argparse.Namespace) -> Any:
+    """What to ask an issuer for: a command-line value, else the environment, else a profile."""
+    from xrdsec import providers
+
+    return providers.resolve(
+        getattr(args, "provider", "") or "",
+        issuer=getattr(args, "issuer", None) or "",
+        audience=getattr(args, "audience", None) or "",
+        scope=getattr(args, "scope", None) or "",
+    )
+
+
 def _chosen_issuer(args: argparse.Namespace) -> Any:
-    """The issuer to ask: named, or discovered from a resource that publishes its issuers."""
+    """The issuer to ask: named, profiled, or discovered from a resource that lists its issuers."""
     from xrdsec import token_client
 
     ca_path = args.certdir or None
     if args.from_resource:
         found = token_client.discover(args.from_resource, ca_path=ca_path)
         return found[0]
-    if not args.issuer:
+    said = _asked(args)
+    if not said.issuer:
         raise token_client.TokenError(
-            "no issuer: pass --issuer URL (or --from-resource, or set WLCG_TOKEN_ISSUER)",
+            "no issuer: pass --provider NAME or --issuer URL (or set WLCG_TOKEN_ISSUER)",
             code="no_issuer",
         )
-    return token_client.discover(args.issuer, ca_path=ca_path)[0]
+    return token_client.discover(said.issuer, ca_path=ca_path)[0]
 
 
 def _asked_for(args: argparse.Namespace, issuer: Any) -> Any:
     """The token, by whichever flow was chosen."""
     from xrdsec import token_client
 
-    scope = args.scope if args.scope is not None else token_client.DEFAULT_SCOPE
-    audience = args.audience if args.audience is not None else token_client.AUDIENCE
+    said = _asked(args)
+    scope, audience = said.scope, said.audience
     ca_path = args.certdir or None
     if args.flow == "x509":
         return token_client.acquire(
@@ -999,7 +1037,7 @@ def _asked_for(args: argparse.Namespace, issuer: Any) -> Any:
             _signer(args),
             audience=audience,
             scope=scope,
-            client_id=args.client_id,
+            client_id=args.client_id or _client_id_from_environment(),
             ca_path=ca_path,
         )
     if args.flow == "exchange":
@@ -1008,7 +1046,7 @@ def _asked_for(args: argparse.Namespace, issuer: Any) -> Any:
             _subject_token(args),
             audience=audience,
             scope=scope,
-            client_id=args.client_id,
+            client_id=args.client_id or _client_id_from_environment(),
             ca_path=ca_path,
         )
     return _by_device_flow(args, issuer, scope, ca_path)
@@ -1027,14 +1065,14 @@ def _by_device_flow(args: argparse.Namespace, issuer: Any, scope: str, ca_path: 
     """RFC 8628: show a code, wait for a person to approve it, and take the token."""
     from xrdsec import token_client
 
-    if not args.client_id:
+    client_id = args.client_id or _client_id_from_environment()
+    if not client_id:
         raise token_client.TokenError(
-            "the device flow needs --client-id: register a public client with the issuer",
+            "the device flow needs a client id: register a public client with the issuer"
+            " and pass --client-id (or set WLCG_CLIENT_ID)",
             code="no_client",
         )
-    started = token_client.device_authorization(
-        issuer, args.client_id, scope=scope, ca_path=ca_path
-    )
+    started = token_client.device_authorization(issuer, client_id, scope=scope, ca_path=ca_path)
     where = started.get("verification_uri_complete") or started.get("verification_uri")
     if not args.quiet:
         _say(f"To approve this request, open:\n\n    {where}\n\n")
@@ -1044,7 +1082,7 @@ def _by_device_flow(args: argparse.Namespace, issuer: Any, scope: str, ca_path: 
     while time.time() < deadline:
         time.sleep(interval)
         token = token_client.device_poll(
-            issuer, args.client_id, str(started.get("device_code") or ""), ca_path=ca_path
+            issuer, client_id, str(started.get("device_code") or ""), ca_path=ca_path
         )
         if token is not None:
             return token
@@ -1136,6 +1174,41 @@ def _token_destroy(args: argparse.Namespace) -> int:
     output.record("result", path=path, removed=not args.dry)
     if not args.quiet:
         _say(f"{'Would remove' if args.dry else 'Removed'} {path}\n")
+    return OK
+
+
+def _client_id_from_environment() -> str:
+    """The client id a session configured, under either name the WLCG tools use."""
+    for name in ("WLCG_CLIENT_ID", "WLCG_TOKEN_CLIENT_ID"):
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _token_providers(args: argparse.Namespace) -> int:
+    """``xrd-proxy token providers``: the named issuers, and which one is in force."""
+    from xrdsec import providers
+
+    said = providers.resolve(environ=os.environ)
+    rows = [
+        {
+            "name": one.name,
+            "issuer": one.issuer,
+            "scope": one.scope,
+            "storage": one.storage,
+            "who": one.who,
+        }
+        for one in (providers.PROVIDERS[name] for name in providers.names())
+    ]
+    output.record("result", providers=rows, in_force=said.as_dict())
+    if not args.quiet:
+        for line in providers.describe():
+            _say(f"{line}\n")
+        _say(
+            f"\nIn force now: issuer={said.issuer or '(none)'} ({said.from_issuer or 'unset'}), "
+            f"scope from {said.from_scope}, audience from {said.from_audience}\n"
+        )
     return OK
 
 
