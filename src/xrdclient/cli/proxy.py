@@ -104,6 +104,7 @@ def _parser() -> argparse.ArgumentParser:
         ("info", _info_parser, "describe a proxy (voms-proxy-info)"),
         ("destroy", _destroy_parser, "remove a proxy (voms-proxy-destroy)"),
         ("doctor", _doctor_parser, "check everything a proxy needs, and say what is wrong"),
+        ("token", _token_parser, "get, inspect and remove a WLCG bearer token"),
     ):
         build(commands.add_parser(name, help=help_text, allow_abbrev=False))
     return parser
@@ -169,6 +170,96 @@ def _init_parser(parser: argparse.ArgumentParser) -> None:
         "--profile", choices=("rfc3820", "arc", "xrootd", "globus-legacy"), help="proxy profile"
     )
     parser.set_defaults(handler=_init, profile="rfc3820")
+
+
+def _token_parser(parser: argparse.ArgumentParser) -> None:
+    """``token`` and its three commands: get one, describe one, remove one."""
+    _common(parser)
+    commands = parser.add_subparsers(
+        dest="token_command", required=True, parser_class=output.Parser
+    )
+    init = commands.add_parser(
+        "init",
+        help="ask a WLCG issuer for a token",
+        description=(
+            "Get a WLCG bearer token from an issuer, by the flow that fits: the "
+            "device flow (a browser and a code, no certificate), X.509 client "
+            "credentials (the certificate from your PKCS#12 is the client), or "
+            "an RFC 8693 exchange that narrows a token you already hold."
+        ),
+        allow_abbrev=False,
+    )
+    _common(init)
+    init.add_argument(
+        "--issuer",
+        default=os.environ.get("WLCG_TOKEN_ISSUER", ""),
+        help="the issuer's base URL ($WLCG_TOKEN_ISSUER)",
+    )
+    init.add_argument(
+        "--from-resource",
+        default="",
+        metavar="URL",
+        help="find the issuer from a storage element that publishes /.well-known/wlcg-token",
+    )
+    init.add_argument(
+        "--flow", choices=("device", "x509", "exchange"), default="device", help="how to ask"
+    )
+    init.add_argument(
+        "--client-id",
+        default=os.environ.get("WLCG_CLIENT_ID", ""),
+        help="the client registered with the issuer ($WLCG_CLIENT_ID)",
+    )
+    init.add_argument(
+        "--scope",
+        default=None,
+        help="the scope to ask for (storage.read:/ storage.modify:/ wlcg.groups)",
+    )
+    init.add_argument("--audience", default=None, help="the audience to ask for (the WLCG one)")
+    init.add_argument(
+        "--from-token", default="", metavar="TOKEN", help="the token to narrow (--flow exchange)"
+    )
+    init.add_argument(
+        "--out", metavar="PATH", help="where to write it ($BEARER_TOKEN_FILE, else bt_u)"
+    )
+    init.add_argument("-p12", "--p12", metavar="PATH", help="PKCS#12 bundle for --flow x509")
+    init.add_argument("-cert", "--cert", metavar="PATH", help="user certificate for --flow x509")
+    init.add_argument("-key", "--key", metavar="PATH", help="user private key for --flow x509")
+    init.add_argument(
+        "-pub", "--pub", dest="cert", metavar="PATH", help="the certificate: -cert's other name"
+    )
+    init.add_argument(
+        "-priv", "--priv", dest="key", metavar="PATH", help="the private key: -key's other name"
+    )
+    init.add_argument("-pwstdin", "--pwstdin", action="store_true", help="pass phrase on stdin")
+    init.add_argument("-certdir", "--certdir", metavar="DIR", help="CA directory to trust")
+    init.set_defaults(handler=_token_init)
+
+    info = commands.add_parser(
+        "info",
+        help="describe a token a client would present",
+        description=(
+            "Read the bearer token the tools would present, and say what it claims: "
+            "its issuer, audience, scope, VO groups and how long is left. --verify "
+            "checks the signature against the issuer's keys and the times."
+        ),
+        allow_abbrev=False,
+    )
+    _common(info)
+    info.add_argument("path", nargs="?", default="", help="a token file (default: the search)")
+    info.add_argument("--verify", action="store_true", help="check the signature and times")
+    info.add_argument("--issuer", default=os.environ.get("WLCG_TOKEN_ISSUER", ""))
+    info.add_argument("--from-resource", default="", metavar="URL")
+    info.add_argument("--audience", default=None)
+    info.add_argument("-certdir", "--certdir", metavar="DIR")
+    info.set_defaults(handler=_token_info)
+
+    destroy = commands.add_parser("destroy", help="remove a token file", allow_abbrev=False)
+    _common(destroy)
+    destroy.add_argument("--out", metavar="PATH", help="the token file (default: the search)")
+    destroy.add_argument(
+        "--dry", action="store_true", help="say what would be removed, and remove nothing"
+    )
+    destroy.set_defaults(handler=_token_destroy)
 
 
 def _info_parser(parser: argparse.ArgumentParser) -> None:
@@ -835,6 +926,217 @@ def _field_lines(info: ProxyInfo, fields: Sequence[str]) -> list[str]:
         "actimeleft": lambda: [str(max(0, int(entry.remaining()))) for entry in info.voms],
     }
     return [line for name in fields for line in values[name]()]
+
+
+# ---------------------------------------------------------------------------
+# token
+# ---------------------------------------------------------------------------
+
+
+def _token_init(args: argparse.Namespace) -> int:
+    """``xrd-proxy token init``: ask an issuer for a token, then put it where a client looks."""
+    from xrdsec import token_client
+
+    try:
+        issuer = _chosen_issuer(args)
+        token = _asked_for(args, issuer)
+        path = token_client.write_token(token.access_token, args.out)
+    except (token_client.TokenError, proxytool_unavailable()) as refused:
+        return fail(PROGRAM, refused)
+    said = token.claims
+    output.record(
+        "result",
+        path=path,
+        issuer=said.get("iss"),
+        audience=said.get("aud"),
+        scope=said.get("scope"),
+        groups=said.get("wlcg.groups"),
+        time_left=int(token.time_left()),
+    )
+    if not args.quiet:
+        _say(f"Wrote a token to {path}.\n\n")
+        _say(f"issuer    : {said.get('iss')}\n")
+        _say(f"audience  : {said.get('aud')}\n")
+        _say(f"scope     : {said.get('scope')}\n")
+        _say(f"groups    : {said.get('wlcg.groups')}\n")
+        _say(f"valid for : {_clock(token.time_left())}\n")
+    return OK
+
+
+def proxytool_unavailable() -> type[Exception]:
+    """The error a credential search raises when there is nothing to present."""
+    from xrdsec import proxytool
+
+    return proxytool.NoCredentialError
+
+
+def _chosen_issuer(args: argparse.Namespace) -> Any:
+    """The issuer to ask: named, or discovered from a resource that publishes its issuers."""
+    from xrdsec import token_client
+
+    ca_path = args.certdir or None
+    if args.from_resource:
+        found = token_client.discover(args.from_resource, ca_path=ca_path)
+        return found[0]
+    if not args.issuer:
+        raise token_client.TokenError(
+            "no issuer: pass --issuer URL (or --from-resource, or set WLCG_TOKEN_ISSUER)",
+            code="no_issuer",
+        )
+    return token_client.discover(args.issuer, ca_path=ca_path)[0]
+
+
+def _asked_for(args: argparse.Namespace, issuer: Any) -> Any:
+    """The token, by whichever flow was chosen."""
+    from xrdsec import token_client
+
+    scope = args.scope if args.scope is not None else token_client.DEFAULT_SCOPE
+    audience = args.audience if args.audience is not None else token_client.AUDIENCE
+    ca_path = args.certdir or None
+    if args.flow == "x509":
+        return token_client.acquire(
+            issuer,
+            _signer(args),
+            audience=audience,
+            scope=scope,
+            client_id=args.client_id,
+            ca_path=ca_path,
+        )
+    if args.flow == "exchange":
+        return token_client.exchange(
+            issuer,
+            _subject_token(args),
+            audience=audience,
+            scope=scope,
+            client_id=args.client_id,
+            ca_path=ca_path,
+        )
+    return _by_device_flow(args, issuer, scope, ca_path)
+
+
+def _subject_token(args: argparse.Namespace) -> str:
+    """The token an exchange narrows: the one named, or the one this session holds."""
+    from xrdsec import token_client
+
+    if args.from_token:
+        return str(args.from_token)
+    return token_client.read_token()[0]
+
+
+def _by_device_flow(args: argparse.Namespace, issuer: Any, scope: str, ca_path: str | None) -> Any:
+    """RFC 8628: show a code, wait for a person to approve it, and take the token."""
+    from xrdsec import token_client
+
+    if not args.client_id:
+        raise token_client.TokenError(
+            "the device flow needs --client-id: register a public client with the issuer",
+            code="no_client",
+        )
+    started = token_client.device_authorization(
+        issuer, args.client_id, scope=scope, ca_path=ca_path
+    )
+    where = started.get("verification_uri_complete") or started.get("verification_uri")
+    if not args.quiet:
+        _say(f"To approve this request, open:\n\n    {where}\n\n")
+        _say(f"and enter the code: {started.get('user_code')}\n\nwaiting for approval...\n")
+    interval = _numbers(started.get("interval"), 5.0)
+    deadline = time.time() + _numbers(started.get("expires_in"), 600.0)
+    while time.time() < deadline:
+        time.sleep(interval)
+        token = token_client.device_poll(
+            issuer, args.client_id, str(started.get("device_code") or ""), ca_path=ca_path
+        )
+        if token is not None:
+            return token
+    raise token_client.TokenError("the code expired before it was approved; run it again")
+
+
+def _numbers(value: Any, default: float) -> float:
+    """A number from a JSON answer, or ``default`` when the issuer left it out."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _token_info(args: argparse.Namespace) -> int:
+    """``xrd-proxy token info``: what the token says, and with ``--verify`` whether it holds."""
+    from xrdsec import token_client
+
+    try:
+        token, source = _read_here(args)
+        said = _token_claims(args, token)
+    except (token_client.TokenError, proxytool_unavailable()) as refused:
+        return fail(PROGRAM, refused)
+    output.record("result", path=source, claims=said)
+    if args.quiet:
+        return OK
+    _say(f"token     : from {source}\n")
+    for name in ("iss", "sub", "aud", "scope", "wlcg.groups", "wlcg.ver", "exp", "iat"):
+        if name in said:
+            _say(f"{name:<10}: {said[name]}\n")
+    expiry = said.get("exp")
+    if expiry:
+        left = float(expiry) - time.time()
+        _say(f"{'timeleft':<10}: {_clock(max(0.0, left))}\n")
+    return OK
+
+
+def _token_claims(args: argparse.Namespace, token: str) -> dict[str, Any]:
+    """The token's claims: decoded, or with ``--verify`` proved first.
+
+    Describing a token is what a person does before using it, so the default is
+    decoding - the same division ``info`` makes between describing and proving
+    a proxy. ``--verify`` needs the issuer (or ``--from-resource``) because
+    that is where the keys are.
+    """
+    from xrdsec import token_client
+    from xrdsec.tokens import token_claims
+
+    if not args.verify:
+        return token_claims(token)
+    return token_client.verify(
+        token,
+        issuer=_chosen_issuer(args) if (args.issuer or args.from_resource) else None,
+        audience=args.audience if args.audience is not None else token_client.AUDIENCE,
+        ca_path=args.certdir or None,
+    )
+
+
+def _read_here(args: argparse.Namespace) -> tuple[str, str]:
+    """The token to describe and where it came from: the file named, else the search."""
+    from xrdsec import token_client
+
+    if args.path:
+        import pathlib
+
+        try:
+            return pathlib.Path(args.path).read_text().strip(), args.path
+        except OSError as exc:
+            raise token_client.TokenError(f"cannot read {args.path}: {exc}") from exc
+    return token_client.read_token()
+
+
+def _token_destroy(args: argparse.Namespace) -> int:
+    """``xrd-proxy token destroy``: remove the token file, refusing somebody else's."""
+    from xrdsec import token_client
+
+    try:
+        path = args.out or token_client.token_file_path()
+    except token_client.TokenError as refused:
+        return fail(PROGRAM, refused)
+    try:
+        owner = os.lstat(path).st_uid
+    except FileNotFoundError:
+        return fail(PROGRAM, FileNotFoundError(f"there is no token at {path}"))
+    if owner != os.geteuid():
+        return fail(PROGRAM, PermissionError(f"{path} belongs to uid {owner}; not removed"))
+    if not args.dry:
+        os.unlink(path)
+    output.record("result", path=path, removed=not args.dry)
+    if not args.quiet:
+        _say(f"{'Would remove' if args.dry else 'Removed'} {path}\n")
+    return OK
 
 
 # ---------------------------------------------------------------------------

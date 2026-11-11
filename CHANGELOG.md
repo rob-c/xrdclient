@@ -11,6 +11,19 @@ Fixes found moving data between the LHCb Tier-1 and Tier-2 storage elements
 
 ### Added
 
+- `xrd-proxy token init|info|destroy`: obtain a WLCG bearer token from an
+  issuer and put it where every tool looks. `init` takes `--issuer` (or
+  `--from-resource`, which asks a storage element who its issuers are) and one
+  of three flows - `--flow device` (a code and a browser, no certificate),
+  `--flow x509` (mutual TLS with the certificate from your PKCS#12, which is
+  the profile's "from X.509 to tokens") or `--flow exchange` (RFC 8693, to
+  narrow a token you hold); `info` describes the token a client would present
+  (`--verify` proves it against the issuer's keys); `destroy` removes it.
+  `$WLCG_TOKEN_ISSUER` and `$WLCG_CLIENT_ID` carry the two settings a session
+  needs, and nothing in the chain needs any tool outside this stack and the
+  standard library.
+
+
 - `File.reopen(extra)`, a second `kXR_open` of a file **on the connection it
   already landed on**, with `extra` added to its CGI, and `File.capability`,
   the token the redirect signed for that connection. A third-party copy needs
