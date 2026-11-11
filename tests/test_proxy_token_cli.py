@@ -552,3 +552,19 @@ def test_the_environment_scope_beats_the_profile(
         == 0
     )
     assert seen["scope"] == "storage.read:/env-only"
+
+
+def test_token_info_reads_the_block_a_dirac_proxy_carries(tmp_path: Any, capsys: Any) -> None:
+    """An LHCb DIRAC proxy holds both credentials in one file: describe the token it carries."""
+    payload = base64.b64encode(
+        json.dumps({"access_token": _jwt(), "expires_in": 3600}).encode()
+    ).decode()
+    pem = tmp_path / "x509up"
+    pem.write_text(
+        "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+        f"-----BEGIN DIRACX-----\n{payload}\n-----END DIRACX-----\n"
+    )
+    pem.chmod(0o600)
+    assert cli.main(["token", "info", str(pem)]) == 0
+    said = capsys.readouterr().out
+    assert "(DIRACX block)" in said and "storage.read:/eos/user/r/rcurrie" in said

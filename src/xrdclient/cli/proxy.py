@@ -1149,9 +1149,15 @@ def _read_here(args: argparse.Namespace) -> tuple[str, str]:
         import pathlib
 
         try:
-            return pathlib.Path(args.path).read_text().strip(), args.path
+            text = pathlib.Path(args.path).read_text()
         except OSError as exc:
             raise token_client.TokenError(f"cannot read {args.path}: {exc}") from exc
+        # A DIRAC proxy carries its token in a block of its own: read that first,
+        # so `xrd-proxy token info ~/.x509up` works on an LHCb DIRAC login.
+        block = token_client.embedded(text)
+        if block is not None:
+            return str(block["access_token"]), f"{args.path} (DIRACX block)"
+        return text.strip(), args.path
     return token_client.read_token()
 
 
