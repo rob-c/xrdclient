@@ -6,6 +6,13 @@ client agree more closely with XrdCl are not considered breaking changes.
 
 ## [0.4.1] - Unreleased
 
+### Tested
+
+- `root://` and third-party copy are exercised end to end on **macOS**
+  (Apple Silicon) with X.509 authentication: LHCb DIRAC job submission and
+  tracking, CERN EOS and PIC Tier-1 transfers, cross-protocol copies and
+  multi-GB third-party copies with server-side checksums.
+
 Fixes found moving data between the LHCb Tier-1 and Tier-2 storage elements
 (2026-10-20). Requires xrdsec 0.4.1.
 
