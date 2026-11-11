@@ -518,7 +518,7 @@ def test_a_profile_supplies_the_scope_and_audience(
         )
         == 0
     )
-    assert seen["scope"].startswith("storage.read:/")  # the profile's scope
+    assert seen["scope"].startswith("openid")  # the profile's scope, as its issuer advertises
     assert seen["audience"] == token_client.AUDIENCE
 
 
