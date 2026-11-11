@@ -208,7 +208,23 @@ def _token_parser(parser: argparse.ArgumentParser) -> None:
         help="find the issuer from a storage element that publishes /.well-known/wlcg-token",
     )
     init.add_argument(
-        "--flow", choices=("device", "x509", "exchange"), default="device", help="how to ask"
+        "--flow",
+        choices=("device", "x509", "exchange", "dirac"),
+        default="device",
+        help="how to ask (dirac delegates to DIRAC's own client, which has the token exchange)",
+    )
+    init.add_argument(
+        "--proxy",
+        metavar="PATH",
+        help="the proxy to trade at a DIRAC server (--flow dirac; $X509_USER_PROXY)",
+    )
+    init.add_argument(
+        "--group", metavar="NAME", help="the DIRAC group the token is for (--flow dirac)"
+    )
+    init.add_argument(
+        "--dirac-server",
+        metavar="URL",
+        help="the DIRAC server to ask (--flow dirac; DIRAC's own configuration decides by default)",
     )
     init.add_argument(
         "--client-id",
@@ -963,8 +979,9 @@ def _token_init(args: argparse.Namespace) -> int:
     from xrdsec import token_client
 
     try:
-        issuer = _chosen_issuer(args)
-        token = _asked_for(args, issuer)
+        # `--flow dirac` has no issuer to resolve: DIRAC's own configuration says
+        # which server to ask, and its client performs the exchange.
+        token = _by_dirac(args) if args.flow == "dirac" else _asked_for(args, _chosen_issuer(args))
         path = token_client.write_token(token.access_token, args.out)
     except (token_client.TokenError, proxytool_unavailable()) as refused:
         return fail(PROGRAM, refused)
@@ -1050,6 +1067,59 @@ def _asked_for(args: argparse.Namespace, issuer: Any) -> Any:
             ca_path=ca_path,
         )
     return _by_device_flow(args, issuer, scope, ca_path)
+
+
+def _proxy_for_dirac(args: argparse.Namespace) -> str:
+    """The proxy a DIRAC server trades for a token: the one named, else the session's."""
+    named = args.proxy or os.environ.get("X509_USER_PROXY") or ""
+    if not named:
+        import tempfile
+
+        named = os.path.join(tempfile.gettempdir(), f"x509up_u{os.geteuid()}")
+    if not os.path.isfile(named):
+        raise _no_dirac(f"there is no proxy at {named}: make one with 'xrd-proxy init -voms lhcb'")
+    return named
+
+
+def _by_dirac(args: argparse.Namespace) -> Any:
+    """A DIRAC token, by the exchange only a DIRAC client can perform.
+
+    ``dirac-login`` trades the proxy at ``Framework/ProxyManager``'s
+    ``exchangeProxyForToken`` for an access token and writes it into the proxy
+    file; the server, not the client, talks to DiracX (its ``legacy-exchange``
+    needs the *server's* API key). Reproducing that RPC here would mean
+    reimplementing DISET - DIRAC's GPL-3.0 protocol - inside an LGPL package,
+    which this deliberately does not do: the installed DIRAC client performs it,
+    and this only reads the result out of the file.
+    """
+    from xrdsec import token_client
+
+    if not args.group:
+        raise token_client.TokenError(
+            "a DIRAC token is minted for a DIRAC group: pass --group (e.g. lhcb_user)",
+            code="no_group",
+        )
+    proxy = _proxy_for_dirac(args)
+    try:
+        from DIRAC.Core.Security.DiracX import (  # type: ignore[import-not-found]  # optional
+            addTokenToPEM,
+        )
+    except ImportError as exc:
+        raise _no_dirac(
+            "DIRAC's own client is not installed, and it is the only thing that can perform"
+            " the exchange: use 'dirac-login --token', or install DIRAC"
+        ) from exc
+    addTokenToPEM(proxy, args.group)
+    import pathlib
+
+    return token_client.from_pem(pathlib.Path(proxy).read_text())
+
+
+def _no_dirac(said: str) -> Exception:
+    """The refusal a ``--flow dirac`` run gives when it cannot delegate."""
+    from xrdsec import token_client
+
+    return token_client.TokenError(said, code="no_dirac")
 
 
 def _subject_token(args: argparse.Namespace) -> str:

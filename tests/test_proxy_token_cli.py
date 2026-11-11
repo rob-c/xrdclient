@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import stat
+import sys
 import time
 from typing import Any
 
@@ -568,3 +569,94 @@ def test_token_info_reads_the_block_a_dirac_proxy_carries(tmp_path: Any, capsys:
     assert cli.main(["token", "info", str(pem)]) == 0
     said = capsys.readouterr().out
     assert "(DIRACX block)" in said and "storage.read:/eos/user/r/rcurrie" in said
+
+
+# ---------------------------------------------------------------------------
+# --flow dirac: delegating the exchange a client is not allowed to do
+# ---------------------------------------------------------------------------
+
+
+def test_the_dirac_flow_delegates_to_the_installed_client(
+    tmp_path: Any, monkeypatch: Any, capsys: Any
+) -> None:
+    """DIRAC's client performs the exchange; this reads the token out of the proxy it wrote."""
+    proxy = tmp_path / "x509up_u501"
+    proxy.write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+    out = tmp_path / "bt"
+    written: dict[str, Any] = {}
+
+    def add_token_to_pem(path: str, group: str) -> None:
+        """What DIRAC's addTokenToPEM does: write the token block into the proxy file."""
+        written.update(path=path, group=group)
+        payload = base64.b64encode(
+            json.dumps({"access_token": _jwt(), "expires_in": 60}).encode()
+        ).decode()
+        with open(path, "a") as handle:
+            handle.write(f"-----BEGIN DIRACX-----\n{payload}\n-----END DIRACX-----\n")
+
+    module: Any = type(sys)("DIRAC.Core.Security.DiracX")
+    module.addTokenToPEM = add_token_to_pem
+    monkeypatch.setitem(sys.modules, "DIRAC.Core.Security.DiracX", module)
+    monkeypatch.setattr(
+        cli,
+        "_chosen_issuer",
+        lambda args: pytest.fail("--flow dirac talks to DIRAC, not an issuer"),
+    )
+    assert (
+        cli.main(
+            [
+                "token",
+                "init",
+                "--flow",
+                "dirac",
+                "--proxy",
+                str(proxy),
+                "--group",
+                "lhcb_user",
+                "--out",
+                str(out),
+            ]
+        )
+        == 0
+    )
+    assert written == {"path": str(proxy), "group": "lhcb_user"}
+    assert out.exists() and "iss" in capsys.readouterr().out
+
+
+def test_the_dirac_flow_needs_a_group(monkeypatch: Any, capsys: Any) -> None:
+    assert cli.main(["token", "init", "--flow", "dirac"]) == 1
+    assert "minted for a DIRAC group" in capsys.readouterr().err
+
+
+def test_the_dirac_flow_says_so_when_there_is_no_proxy(
+    tmp_path: Any, monkeypatch: Any, capsys: Any
+) -> None:
+    monkeypatch.setenv("X509_USER_PROXY", str(tmp_path / "gone"))
+    assert cli.main(["token", "init", "--flow", "dirac", "--group", "lhcb_user"]) == 1
+    assert "there is no proxy" in capsys.readouterr().err
+
+
+def test_the_dirac_flow_says_so_when_dirac_is_not_installed(
+    tmp_path: Any, monkeypatch: Any, capsys: Any
+) -> None:
+    """No DIRAC, no exchange: the protocol is DIRAC's, and not one this package reimplements."""
+    proxy = tmp_path / "p"
+    proxy.write_text("x")
+    monkeypatch.setitem(sys.modules, "DIRAC.Core.Security.DiracX", None)
+    assert (
+        cli.main(
+            ["token", "init", "--flow", "dirac", "--proxy", str(proxy), "--group", "lhcb_user"]
+        )
+        == 1
+    )
+    said = capsys.readouterr().err
+    assert "DIRAC's own client is not installed" in said and "dirac-login" in said
+
+
+def test_the_dirac_flow_falls_back_to_the_usual_proxy_location(
+    monkeypatch: Any, capsys: Any
+) -> None:
+    """No --proxy and no $X509_USER_PROXY means the location every grid tool defaults to."""
+    monkeypatch.delenv("X509_USER_PROXY", raising=False)
+    assert cli.main(["token", "init", "--flow", "dirac", "--group", "lhcb_user"]) == 1
+    assert f"x509up_u{os.geteuid()}" in capsys.readouterr().err
