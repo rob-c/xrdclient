@@ -548,3 +548,25 @@ _CONDOR_SEC_CLIENT_AUTHENTICATION_METHODS=SCITOKEN condor_status -pool condorce0
 Environment beats profiles, and flags beat both: `WLCG_TOKEN_ISSUER`,
 `WLCG_TOKEN_AUDIENCE`, `WLCG_TOKEN_SCOPE`, `WLCG_CLIENT_ID` (or
 `WLCG_TOKEN_CLIENT_ID`).
+
+## LHCb's own issuer (DiracX)
+
+LHCb runs a DiracX at `https://lhcbdiracx.app.cern.ch` — the issuer their own clients
+use, and the one their CEs are configured to believe. It has a device flow:
+
+```sh
+xrd-auth token providers                    # lhcbdiracx is now among them
+xrd-auth token init --provider lhcbdiracx --flow device --client-id <lhcb-client-id>
+```
+
+`DIRACX_URL` and `DIRACX_CLIENT_ID` — the variables LHCb's own client sets — are
+honoured, so a session set up for their tools needs no second configuration here.
+
+Two details found by reading their client and trying it:
+
+- **DiracX reads `client_id`/`scope` from the query string**, not the form body
+  RFC 8628 specifies; the request now carries both, so the same client works at
+  either kind of issuer.
+- The **client id is per deployment** and is not in the CVMFS client's configuration.
+  Their own client has it; a generic one has to be told. Without it DiracX answers
+  `Unrecognised client ID`, which is what "not configured" looks like.
