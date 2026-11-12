@@ -733,3 +733,53 @@ def test_token_register_quiet_says_nothing(
     )
     assert cli.main(["token", "register", "--issuer", issuer.url, "-quiet"]) == 0
     assert capsys.readouterr().out == ""
+
+
+def test_the_device_flow_uses_the_client_a_profile_publishes(
+    issuer: Any, monkeypatch: Any, tmp_path: Any
+) -> None:
+    """An issuer whose own tools ship a public client needs no id from a person."""
+    from xrdsec import providers
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("WLCG_CLIENT_ID", raising=False)
+    monkeypatch.setattr(cli, "_chosen_issuer", lambda args: issuer)
+    monkeypatch.setattr(
+        providers,
+        "chosen",
+        lambda name: providers.Provider(
+            name="lhcbdiracx",
+            issuer="https://lhcbdiracx.app.cern.ch/",
+            scope="vo:lhcb",
+            storage=False,
+            who="LHCb's DiracX",
+            client_id="myDIRACClientID",
+        ),
+    )
+    asked: list[str] = []
+
+    def started(_issuer: Any, client_id: str, **k: Any) -> dict[str, Any]:
+        asked.append(client_id)
+        return {
+            "device_code": "d",
+            "user_code": "U",
+            "verification_uri": "https://x",
+            "interval": 0,
+            "expires_in": 5,
+        }
+
+    monkeypatch.setattr(token_client, "device_authorization", started)
+    monkeypatch.setattr(token_client, "device_poll", lambda *a, **k: None)
+    cli.main(
+        [
+            "token",
+            "init",
+            "--provider",
+            "lhcbdiracx",
+            "--issuer",
+            issuer.url,
+            "--out",
+            str(tmp_path / "t"),
+        ]
+    )
+    assert asked == ["myDIRACClientID"]

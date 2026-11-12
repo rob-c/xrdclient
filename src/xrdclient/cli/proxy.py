@@ -1227,6 +1227,19 @@ def _subject_token(args: argparse.Namespace) -> str:
     return token_client.read_token()[0]
 
 
+def _profile_client_id(args: argparse.Namespace) -> str:
+    """The client id the named profile publishes, if it publishes one."""
+    from xrdsec import providers
+
+    named = getattr(args, "provider", "") or ""
+    if not named:
+        return ""
+    try:
+        return providers.chosen(named).client_id
+    except providers.ProviderError:
+        return ""
+
+
 def _by_device_flow(args: argparse.Namespace, issuer: Any, scope: str, ca_path: str | None) -> Any:
     """RFC 8628: show a code, wait for a person to approve it, and take the token."""
     from xrdsec import clientstore, token_client
@@ -1234,6 +1247,10 @@ def _by_device_flow(args: argparse.Namespace, issuer: Any, scope: str, ca_path: 
     client_id = args.client_id or _client_id_from_environment()
     if not client_id:
         client_id = clientstore.remembered(issuer.url)
+    if not client_id:
+        # An issuer whose own tools ship a public client: use that, rather than
+        # asking a person to invent an identifier the issuer already knows.
+        client_id = _profile_client_id(args)
     if not client_id:
         raise token_client.TokenError(
             "the device flow needs a client id: run `" + program_name() + " token register`"
