@@ -18,7 +18,7 @@ keyword arguments and flags, returning the same `(XRootDStatus, response)`
 pairs with the same field names and the same numbers in them:
 
 ```python
-from xrdclient.compat import client        # was: from XRootD import client
+from xrdclient.compat import client  # was: from XRootD import client
 
 fs = client.FileSystem("root://eos.example.org")
 status, info = fs.stat("/store/f.root")
@@ -28,7 +28,7 @@ print(info.size, info.modtimestr, info.modeoctstr)
 
 with client.File() as f:
     f.open("root://eos.example.org//store/f.root")
-    status, head = f.read(0, 1024)          # offset, then size - as in the bindings
+    status, head = f.read(0, 1024)  # offset, then size - as in the bindings
     for line in f:
         ...
 
@@ -53,6 +53,7 @@ change is deleting the status checks.
 ```python
 # XRootD.client, or xrdclient.compat.client
 from XRootD import client
+
 fs = client.FileSystem("root://host")
 status, info = fs.stat("/store/f.root")
 if not status.ok:
@@ -63,6 +64,7 @@ size = info.size
 ```python
 # native
 import xrdclient
+
 fs = xrdclient.FileSystem("root://host")
 size = fs.stat("/store/f.root").st_size
 ```
@@ -153,9 +155,9 @@ process.run()
 
 ```python
 # here
-xrdclient.copy(source, target)                    # returns a CopyResult
-xrdclient.copy_tree(source_dir, target_dir)       # recursive
-xrdclient.third_party(source, target)             # server-to-server
+xrdclient.copy(source, target)  # returns a CopyResult
+xrdclient.copy_tree(source_dir, target_dir)  # recursive
+xrdclient.third_party(source, target)  # server-to-server
 ```
 
 Progress is a callback, not a handler class:

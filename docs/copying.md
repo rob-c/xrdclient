@@ -11,11 +11,11 @@ binary file object. That covers every direction without a separate function
 per case:
 
 ```python
-xrdclient.copy("root://host//store/f.root", "/scratch/f.root")     # download
-xrdclient.copy("/scratch/f.root", "root://host//store/f.root")     # upload
-xrdclient.copy("root://a//store/f", "davs://b/store/f")            # across, via here
+xrdclient.copy("root://host//store/f.root", "/scratch/f.root")  # download
+xrdclient.copy("/scratch/f.root", "root://host//store/f.root")  # upload
+xrdclient.copy("root://a//store/f", "davs://b/store/f")  # across, via here
 with open("/scratch/f", "wb") as fh:
-    xrdclient.copy("root://host//store/f.root", fh)                # into a stream
+    xrdclient.copy("root://host//store/f.root", fh)  # into a stream
 ```
 
 The result says what happened:
@@ -23,7 +23,7 @@ The result says what happened:
 ```python
 r = xrdclient.copy(src, dst)
 r.size, r.seconds, r.rate, r.checksum, r.verified
-print(r)   # root://... -> /scratch/f.root (4194304 bytes, 212.4 MB/s)
+print(r)  # root://... -> /scratch/f.root (4194304 bytes, 212.4 MB/s)
 ```
 
 ## Verification
@@ -104,6 +104,7 @@ checkpoint. The command-line forms are `xrd-cp --zip MEMBER` and
 def bar(done, total):
     print(f"\r{done * 100 // total}%", end="")
 
+
 xrdclient.copy(src, dst, progress=bar)
 ```
 
@@ -113,7 +114,7 @@ zero.
 ## Moving, and rehearsing
 
 ```python
-xrdclient.copy(src, dst, dry_run=True)        # what it would be: size, nothing sent
+xrdclient.copy(src, dst, dry_run=True)  # what it would be: size, nothing sent
 xrdclient.copy(src, dst, remove_source=True)  # a move: the source goes after verify
 ```
 
@@ -144,7 +145,7 @@ onto bytes already copied.
 A transfer that died half way through does not have to start again:
 
 ```python
-xrdclient.copy(src, dst, resume=True)     # keep what is at dst, carry on from there
+xrdclient.copy(src, dst, resume=True)  # keep what is at dst, carry on from there
 ```
 
 Whatever is already at the target is kept and the copy begins at the end of
@@ -177,8 +178,8 @@ turn spends each one waiting out the other. Every transfer therefore reads
 own, so the copy goes at the slower of its two ends rather than at their sum:
 
 ```python
-xrdclient.copy(src, dst, config=xrdclient.Config(in_flight=4))   # four chunks in hand
-xrdclient.copy(src, dst, config=xrdclient.Config(in_flight=1))   # strictly one at a time
+xrdclient.copy(src, dst, config=xrdclient.Config(in_flight=4))  # four chunks in hand
+xrdclient.copy(src, dst, config=xrdclient.Config(in_flight=1))  # strictly one at a time
 ```
 
 It costs `in_flight` buffers of `chunk_size` and one thread per transfer, which
@@ -206,8 +207,8 @@ because a session serialises its own calls - two spans are only ever in flight
 together if there are two sessions to put them on.
 
 ```python
-xrdclient.copy(src, dst, config=xrdclient.Config(parallel_chunks=8))   # eight spans
-xrdclient.copy(src, dst, config=xrdclient.Config(parallel_chunks=1))   # one stream
+xrdclient.copy(src, dst, config=xrdclient.Config(parallel_chunks=8))  # eight spans
+xrdclient.copy(src, dst, config=xrdclient.Config(parallel_chunks=1))  # one stream
 ```
 
 When one span fails, the copy fails with that span's error - its own type, so
@@ -279,9 +280,9 @@ xrdclient.copy("root://host//store/live.log", "/scratch/live.log", dynamic_sourc
 ## Rate limits and deadlines
 
 ```python
-xrdclient.copy(src, dst, max_rate=50 << 20)    # at most 50 MiB/s
-xrdclient.copy(src, dst, min_rate=1 << 20)     # fail below 1 MiB/s
-xrdclient.copy(src, dst, timeout=600)          # fail after ten minutes
+xrdclient.copy(src, dst, max_rate=50 << 20)  # at most 50 MiB/s
+xrdclient.copy(src, dst, min_rate=1 << 20)  # fail below 1 MiB/s
+xrdclient.copy(src, dst, timeout=600)  # fail after ten minutes
 ```
 
 These are XrdCl's `xrate`, `xrateThreshold` and `cpTimeout`, and are measured
@@ -329,7 +330,7 @@ to `copy()` for each file.
 ### Several files at once
 
 ```python
-xrdclient.copy_tree(src, dst, workers=8)          # eight transfers in flight
+xrdclient.copy_tree(src, dst, workers=8)  # eight transfers in flight
 ```
 
 `workers` files are copied at once, defaulting to `config.parallel_files`
@@ -359,9 +360,9 @@ wins over it.
 ### Only what has changed
 
 ```python
-xrdclient.copy_tree(src, dst, sync="size")       # stat both sides
-xrdclient.copy_tree(src, dst, sync="mtime")      # size, and no newer than the target
-xrdclient.copy_tree(src, dst, sync="checksum")   # ask both endpoints for a digest
+xrdclient.copy_tree(src, dst, sync="size")  # stat both sides
+xrdclient.copy_tree(src, dst, sync="mtime")  # size, and no newer than the target
+xrdclient.copy_tree(src, dst, sync="checksum")  # ask both endpoints for a digest
 ```
 
 `sync` (a `SyncMode`) skips a file already at the target. Length is checked
@@ -373,7 +374,7 @@ stat each.
 
 ```python
 xrdclient.copy_tree(src, dst, delete=True)
-xrdclient.copy_tree(src, dst, delete=True, dry_run=True)   # says what it would remove
+xrdclient.copy_tree(src, dst, delete=True, dry_run=True)  # says what it would remove
 ```
 
 `delete` removes files under the target that the source does not have. What
@@ -448,11 +449,15 @@ error if either end cannot answer.
 ### Watching, cancelling and delegating a pull
 
 ```python
-stop = threading.Event()                    # set it - from a signal handler, a GUI -
-xrdclient.third_party(src, dst,             # and the pull is called off
-                      cancel=stop,
-                      progress=lambda done, total: print(done, total),
-                      delegate=True, streams=4)
+stop = threading.Event()  # set it - from a signal handler, a GUI -
+xrdclient.third_party(
+    src,
+    dst,  # and the pull is called off
+    cancel=stop,
+    progress=lambda done, total: print(done, total),
+    delegate=True,
+    streams=4,
+)
 ```
 
 `cancel` (an event, or a callable answering "stop now?") is asked between the
@@ -489,9 +494,19 @@ XrdCl's `initTimeout` is, raising `CopyTimeoutError`. HTTP takes
 rather more, because the header set is the protocol:
 
 ```python
-xrdclient.http.third_party(src, dst, mode="pull", overwrite=True, delegate=False,
-                     verify=None, streams=None, remote_token=None,
-                     transfer_headers={}, progress=None, timeout=None)
+xrdclient.http.third_party(
+    src,
+    dst,
+    mode="pull",
+    overwrite=True,
+    delegate=False,
+    verify=None,
+    streams=None,
+    remote_token=None,
+    transfer_headers={},
+    progress=None,
+    timeout=None,
+)
 ```
 
 - **`mode`** - `"pull"` sends the `COPY` to the destination with a `Source:`

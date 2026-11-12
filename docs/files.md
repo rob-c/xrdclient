@@ -34,10 +34,10 @@ The signature is overloaded the way typeshed overloads the builtin, so a type
 checker knows what came back:
 
 ```python
-xrdclient.open(url, "rb").read()               # bytes
-xrdclient.open(url, "r").read()                # str
-xrdclient.open(url, "rb", buffering=0)         # XRootDRawIO, so .file is there
-xrdclient.open(url, mode_from_config).read()   # Any - a non-literal mode is the escape hatch
+xrdclient.open(url, "rb").read()  # bytes
+xrdclient.open(url, "r").read()  # str
+xrdclient.open(url, "rb", buffering=0)  # XRootDRawIO, so .file is there
+xrdclient.open(url, mode_from_config).read()  # Any - a non-literal mode is the escape hatch
 ```
 
 The package ships a `py.typed` marker, so this reaches your code without a
@@ -69,15 +69,15 @@ the operations that have no `io` equivalent live:
 
 ```python
 handle = fh.raw.file
-head, tail = handle.readv([(0, 4096), (1 << 30, 4096)])   # kXR_readv
-page = handle.pgread(1 << 20, 0)                          # CRC32c per 4 KiB
-print(page.corrupt_pages)                                 # [] when clean
-handle.writev([(0, b"first"), (4096, b"second")])         # kXR_writev
-handle.clone(other, [(0, 4096, 0)])                       # kXR_clone, server-side
+head, tail = handle.readv([(0, 4096), (1 << 30, 4096)])  # kXR_readv
+page = handle.pgread(1 << 20, 0)  # CRC32c per 4 KiB
+print(page.corrupt_pages)  # [] when clean
+handle.writev([(0, b"first"), (4096, b"second")])  # kXR_writev
+handle.clone(other, [(0, 4096, 0)])  # kXR_clone, server-side
 handle.sync()
 handle.truncate(1 << 20)
-print(handle.checksum())                                  # adler32:1a0b045d
-print(handle.compression)                                 # (0, '') - stored whole
+print(handle.checksum())  # adler32:1a0b045d
+print(handle.compression)  # (0, '') - stored whole
 ```
 
 `compression` is the page size and algorithm the server reported when the
@@ -91,8 +91,8 @@ rather than assume.
 from xrdclient import File
 
 handle = File("root://host//store/f.root")
-handle.open("x")                    # the builtin's letters, or the protocol's
-try:                                # own names: handle.open("update new")
+handle.open("x")  # the builtin's letters, or the protocol's
+try:  # own names: handle.open("update new")
     handle.write(b"...", 0)
 finally:
     handle.close()
@@ -135,9 +135,9 @@ flight back to back from an offset and tells you what the server confirmed:
 ```python
 done = handle.write_pieces(
     iter(lambda: source.read(1 << 20), b""),
-    acknowledged=lambda at, n: progress(at + n),   # only confirmed bytes
-    waited=lambda at, n: again.append((at, n)),    # "not now": yours to resend
-    check=raise_if_cancelled,                      # asked after every piece
+    acknowledged=lambda at, n: progress(at + n),  # only confirmed bytes
+    waited=lambda at, n: again.append((at, n)),  # "not now": yours to resend
+    check=raise_if_cancelled,  # asked after every piece
 )
 for at, n in again:
     handle.write(source_bytes(at, n), at)
@@ -165,7 +165,7 @@ dropped too. `FileSystem.abort()` is the same for a namespace; the bulk
 transfers and `third_party()` take `cancel=` and do this for you.
 
 ```python
-timer = threading.Timer(30, handle.abort)   # a watchdog of your own
+timer = threading.Timer(30, handle.abort)  # a watchdog of your own
 timer.start()
 try:
     data = handle.read(1 << 20, 0)
@@ -217,13 +217,15 @@ one open file and into another. The data never leaves the server, which makes
 it the cheap way to build a file out of pieces of another one:
 
 ```python
-with xrdclient.FileSystem("root://host") as fs, \
-     fs.open("/store/src.root", "rb") as reader, \
-     fs.open("/store/dst.root", "wb") as writer:
+with (
+    xrdclient.FileSystem("root://host") as fs,
+    fs.open("/store/src.root", "rb") as reader,
+    fs.open("/store/dst.root", "wb") as writer,
+):
     src, dst = reader.raw.file, writer.raw.file
-    dst.clone(src)                            # all of it, at the same offsets
-    dst.clone(src, [(4096, 1024, 0)])         # one range, moved to the front
-    dst.clone(src, [CloneRange(0, 8192)])     # or the dataclass, if you prefer
+    dst.clone(src)  # all of it, at the same offsets
+    dst.clone(src, [(4096, 1024, 0)])  # one range, moved to the front
+    dst.clone(src, [CloneRange(0, 8192)])  # or the dataclass, if you prefer
 ```
 
 `clone` is a protocol operation, not an `io` one, so it sees the file as the
@@ -291,7 +293,7 @@ plug-in's business. A stock xrootd has none, and says so:
 try:
     answer = handle.fcntl(b"my-plugin-command")
 except xrdclient.UnsupportedError:
-    ...    # [3013] fctl operation not supported
+    ...  # [3013] fctl operation not supported
 ```
 
 ### A second connection for the bytes
@@ -304,8 +306,8 @@ the data path.
 
 ```python
 handle = fh.raw.file
-handle.bind_data_path()          # returns the path id the server assigned
-print(handle.data_path)          # 1
+handle.bind_data_path()  # returns the path id the server assigned
+print(handle.data_path)  # 1
 data = handle.read(64 << 20, 0)  # the request on one socket, the data on the other
 ```
 
@@ -332,7 +334,7 @@ with xrdclient.File("root://host//store/f.root") as handle:
     with handle.checkpoint() as cp:
         handle.write(header, 0)
         handle.truncate(new_length)
-        print(cp.query().free)      # bytes the journal still has room for
+        print(cp.query().free)  # bytes the journal still has room for
     # left cleanly -> committed; raised -> rolled back, and the error re-raised
 ```
 
@@ -375,7 +377,7 @@ p.iterdir(), p.glob("**/*.root"), p.rglob("*.root"), p.walk()
 p.mkdir(parents=True, exist_ok=True)
 p.touch(), p.unlink(), p.rmdir(), p.rename(other), p.replace(other)
 p.read_bytes(), p.write_text("hi"), p.open("rb")
-p.checksum(), p.chmod(0o640), p.locate()      # chmod also takes "rw-r-----"
+p.checksum(), p.chmod(0o640), p.locate()  # chmod also takes "rw-r-----"
 ```
 
 `relative_to` follows `pathlib`: it raises `ValueError` when the base is not
@@ -393,7 +395,7 @@ Present on both `File` and `FileSystem`:
 fs.setxattr("/store/f.root", "user.experiment", b"atlas")
 fs.getxattr("/store/f.root", "user.experiment")
 fs.listxattr("/store/f.root")
-fs.xattrs("/store/f.root")          # the whole mapping
+fs.xattrs("/store/f.root")  # the whole mapping
 fs.removexattr("/store/f.root", "user.experiment")
 ```
 

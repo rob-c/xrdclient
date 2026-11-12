@@ -7,6 +7,7 @@ generator.
 ```python
 import asyncio, xrdclient.aio
 
+
 async def main():
     async with xrdclient.aio.FileSystem("root://eos.example.org") as fs:
         info = await fs.stat("/store/f.root")
@@ -14,6 +15,7 @@ async def main():
             print(entry.name)
         async with fs.open("/store/f.root") as fh:
             head, tail = await fh.readv([(0, 4096), (1 << 20, 4096)])
+
 
 asyncio.run(main())
 ```
@@ -46,6 +48,7 @@ async def read_all(urls):
     async def one(url):
         async with xrdclient.aio.open(url, "rb") as fh:
             return await fh.read()
+
     return await asyncio.gather(*(one(u) for u in urls))
 ```
 
@@ -77,8 +80,8 @@ async with xrdclient.aio.FileSystem("root://eos.example.org") as fs:
         async with asyncio.timeout(5):
             info = await fs.stat("/store/slow.root")
     except TimeoutError:
-        info = None          # the stat is abandoned, the connection still good
-    await fs.ping()          # same connection, no reconnect
+        info = None  # the stat is abandoned, the connection still good
+    await fs.ping()  # same connection, no reconnect
 ```
 
 Nothing more is sent for a cancelled call: a `copy` reads and writes no
@@ -122,7 +125,7 @@ import xrdclient.aio as aio
 
 if await aio.exists("root://host//store/f.root"):
     blob = await aio.read_bytes("root://host//store/f.root")
-paths = await aio.glob("root://host//store/run7/**/*.root")   # a list, not an iterator
+paths = await aio.glob("root://host//store/run7/**/*.root")  # a list, not an iterator
 await aio.mkdir("root://host//store/out")
 await aio.move("root://host//store/tmp.root", "root://host//store/out/f.root")
 request = await aio.stage(paths, priority=1)
@@ -136,11 +139,11 @@ mix `pwrite` with cursor reads of the same range.
 
 ```python
 async with xrdclient.aio.open(url, "r+b") as fh:
-    header = await fh.pread(64, 0)       # the cursor has not moved
+    header = await fh.pread(64, 0)  # the cursor has not moved
     await fh.pwrite(b"v2", 4)
-    await fh.setxattr("run", b"7")       # on the open handle, not the path
+    await fh.setxattr("run", b"7")  # on the open handle, not the path
     print(await fh.listxattr(), await fh.size())
-    await fh.verify("1a0b045d")          # adler32 unless told otherwise
+    await fh.verify("1a0b045d")  # adler32 unless told otherwise
 ```
 
 `File.size` is a property synchronously and a coroutine here, `await fh.size()`,
@@ -151,8 +154,9 @@ reachable through `fh.file`. `fs.walk` takes `os.walk`'s arguments; its
 
 ```python
 result = await xrdclient.aio.copy("root://a//store/f.root", "/scratch/f.root")
-results = await xrdclient.aio.copy_tree("root://a//store/run7", "/scratch/run7",
-                                  exclude=("*.log",), sync="size", delete=True)
+results = await xrdclient.aio.copy_tree(
+    "root://a//store/run7", "/scratch/run7", exclude=("*.log",), sync="size", delete=True
+)
 ```
 
 Checkpoints are an `async with`, and the link family is there too:
@@ -161,7 +165,7 @@ Checkpoints are an `async with`, and the link family is there too:
 async with xrdclient.aio.open(url, "r+b") as fh:
     async with fh.checkpoint() as cp:
         await fh.write(header)
-        await fh.flush()           # the journal only sees what was sent
+        await fh.flush()  # the journal only sees what was sent
         print((await cp.query()).free)
 
 await fs.symlink("/store/f.root", "/store/latest")
@@ -170,17 +174,16 @@ await fs.is_symlink("/store/latest")
 await fs.lstat("/store/latest")
 await fs.utime("/store/f.root", ns=(atime_ns, mtime_ns))
 await fs.chown("/store/f.root", uid, gid)
-await fs.listxattr_tree("/store/run7")   # attribute names for a subtree
-await fs.extensions()                    # which of these the server has
+await fs.listxattr_tree("/store/run7")  # attribute names for a subtree
+await fs.extensions()  # which of these the server has
 ```
 
 So are server-side range copies, which take either an `AsyncFile` or the
 `xrdclient.File` under one:
 
 ```python
-async with fs.open("/store/dst.root", "r+b") as dst, \
-           fs.open("/store/src.root") as src:
-    await dst.flush()                    # the server can only clone what it has
+async with fs.open("/store/dst.root", "r+b") as dst, fs.open("/store/src.root") as src:
+    await dst.flush()  # the server can only clone what it has
     await dst.clone(src, [(0, 4096, 0)])  # kXR_clone; see Files -> copying ranges
 ```
 
@@ -189,8 +192,8 @@ it is a round trip:
 
 ```python
 async with xrdclient.aio.open(url, "rb") as fh:
-    await fh.bind_data_path()      # kXR_bind; see Files -> a second connection
-    print(fh.data_path)            # 1, and 0 on an http(s) endpoint
+    await fh.bind_data_path()  # kXR_bind; see Files -> a second connection
+    print(fh.data_path)  # 1, and 0 on an http(s) endpoint
     blob = await fh.read()
 ```
 
@@ -215,6 +218,7 @@ async def fetch(name):
     async with xrdclient.aio.FileSystem("root://host") as fs:
         return await fs.read_bytes(f"/store/{name}")
 
+
 blobs = await asyncio.gather(*(fetch(n) for n in names))
 ```
 
@@ -228,12 +232,12 @@ names. See [Pooling](config.md#pooling).
 The sync surface is mirrored whole, including the corners:
 
 ```python
-space = await fs.query_space("/store")      # SpaceInfo, in bytes
-stats = await fs.query_stats("a")           # the XML summary
-await fs.appid("higgs-skim")                # label this connection
+space = await fs.query_space("/store")  # SpaceInfo, in bytes
+stats = await fs.query_stats("a")  # the XML summary
+await fs.appid("higgs-skim")  # label this connection
 await fs.set_property("monitor off")
-await fs.query_prepare(handle, paths)       # how the staging is going
-await fs.cancel_prepare(handle)             # withdraw a staging request
-await fs.archive_info(paths)                # on disk, or still on tape
+await fs.query_prepare(handle, paths)  # how the staging is going
+await fs.cancel_prepare(handle)  # withdraw a staging request
+await fs.archive_info(paths)  # on disk, or still on tape
 await fs.checksum_cancel("/store/big.root")
 ```

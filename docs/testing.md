@@ -24,7 +24,7 @@ with FakeServer(files={"/store/f.root": b"payload"}, dirs=["/store/empty"]) as s
     assert fs.read_bytes("/store/f.root") == b"payload"
     fs.write_bytes("/store/g.root", b"new")
 
-    assert bytes(srv.files["/store/g.root"]) == b"new"     # the test can look
+    assert bytes(srv.files["/store/g.root"]) == b"new"  # the test can look
 ```
 
 A real server, in the sense that matters: it speaks the binary protocol,
@@ -79,8 +79,8 @@ And for assertions:
 from xrdclient.proto import constants as c
 
 with FakeServer(files={"/f": b"x" * (1 << 20)}) as srv:
-    srv.chunk_reads = 8192               # force reassembly
-    srv.waits[c.kXR_open] = 1            # and one wait first
+    srv.chunk_reads = 8192  # force reassembly
+    srv.waits[c.kXR_open] = 1  # and one wait first
     assert xrdclient.Path(f"{srv.url}/f").read_bytes() == b"x" * (1 << 20)
     assert c.kXR_open in srv.seen
 ```
@@ -95,12 +95,14 @@ with FakeServer(files={"/f": b"x" * (1 << 20)}) as srv:
 from xrdclient.testing import FakeServer, error, frame
 from xrdclient.proto import constants as c
 
+
 def truncated(conn, sid, params, body):
-    yield frame(sid, c.kXR_ok, b"short")      # fewer bytes than were asked for
+    yield frame(sid, c.kXR_ok, b"short")  # fewer bytes than were asked for
+
 
 with FakeServer(files={"/f": b"payload"}) as srv:
     srv.handlers[c.kXR_read] = truncated
-    ...                                        # your retry loop, under a liar
+    ...  # your retry loop, under a liar
 ```
 
 A handler that yields nothing and closes `conn.sock` is a server that crashed
@@ -129,7 +131,7 @@ Python, and takes the same arguments:
 from xrdclient.testing import from_directory
 
 with from_directory("datasets", port=21094, pattern="*.root") as server:
-    with xrdroot.open_root(f"{server.url}mnist.root") as f:   # pip install xrdroot
+    with xrdroot.open_root(f"{server.url}mnist.root") as f:  # pip install xrdroot
         print(f["train_7"])
 ```
 
@@ -151,7 +153,7 @@ vocabulary this package keeps on top.
 
 ```python
 with FakeDAVServer(files={"/store/f.root": b"payload"}) as dav:
-    fs = xrdclient.FileSystem(str(dav.url))          # already http://host:port/
+    fs = xrdclient.FileSystem(str(dav.url))  # already http://host:port/
     fs.stat("/store/f.root")
     assert ("PROPFIND", "/store/f.root") in dav.seen
 ```
@@ -184,7 +186,7 @@ with FakeDAVServer(files={"/store/f.root": b"payload"}) as dav:
     fs = xrdclient.FileSystem(str(dav.url))
     handle = fs.prepare(["/store/f.root"])
     assert not fs.query_prepare(handle, ["/store/f.root"])[0]
-    dav.nearline.clear()                       # the tape robot got there
+    dav.nearline.clear()  # the tape robot got there
     assert fs.query_prepare(handle, ["/store/f.root"])[0].online
 ```
 
@@ -195,6 +197,7 @@ request, or `None` to record it and let the real implementation reply.
 ```python
 def hostile(method, path, headers):
     return 207, b"<not xml", {"Content-Type": 'text/xml; charset="utf-8"'}
+
 
 with FakeDAVServer(files={"/d/f.root": b"payload"}) as dav:
     dav.handlers["PROPFIND"] = hostile
@@ -254,8 +257,8 @@ from xrdclient.testing import FakeServer, FaultProxy
 with FakeServer(files={"/big": b"payload" * 1000}) as srv, FaultProxy(srv) as proxy:
     with xrdclient.open(proxy.url.with_path("/big"), "rb") as fh:
         head = fh.read(32)
-        proxy.cut()                      # the data server goes away mid-read
-        assert fh.read(32)               # re-opened underneath, no error
+        proxy.cut()  # the data server goes away mid-read
+        assert fh.read(32)  # re-opened underneath, no error
 ```
 
 That is `recover_handles` doing its job: an open read-only handle whose
@@ -280,10 +283,10 @@ Every arming method returns the proxy, so they chain. Counters
 and `proxy.armed` are there for the assertion.
 
 ```python
-proxy.chop(64).delay(0.01)               # slow and fragmented, still correct
+proxy.chop(64).delay(0.01)  # slow and fragmented, still correct
 assert xrdclient.FileSystem(str(proxy.url)).stat("/big").st_size == 7000
 
-proxy.refuse()                           # now the endpoint is simply down
+proxy.refuse()  # now the endpoint is simply down
 with pytest.raises(xrdclient.TransientError):
     xrdclient.FileSystem(str(proxy.url)).stat("/big")
 proxy.accept().heal()
@@ -361,11 +364,11 @@ where they read `DC=xrdclient`; set the `*_SUBJECT` class attributes on a
 ```python
 from xrdclient.testing.pki import create_pki, test_key, test_key_pem
 
-pki = create_pki(tmp_path)                 # CA, host (localhost/127.0.0.1/::1), user, proxy
-server_ctx = pki.server_context()          # host cert; demands and verifies a client proxy
-client_ctx = pki.client_context()          # presents pki.proxy_path, trusts the CA
-os.environ.update(pki.environment())       # X509_USER_PROXY, X509_CERT_DIR
-pki.proxy("limited", lifetime=600)         # rfc | limited | legacy; issuer= for proxy-of-proxy
+pki = create_pki(tmp_path)  # CA, host (localhost/127.0.0.1/::1), user, proxy
+server_ctx = pki.server_context()  # host cert; demands and verifies a client proxy
+client_ctx = pki.client_context()  # presents pki.proxy_path, trusts the CA
+os.environ.update(pki.environment())  # X509_USER_PROXY, X509_CERT_DIR
+pki.proxy("limited", lifetime=600)  # rfc | limited | legacy; issuer= for proxy-of-proxy
 pki.install_crl([pki.host.serial_number])  # <hash>.r0 beside <hash>.0
 ```
 
@@ -401,9 +404,9 @@ names.
 ```python
 from xrdclient.testing.voms import ACSpec, FakeVOMSServer, make_ac, voms_proxy, write_lsc
 
-voms = pki.host_signer                                  # any certificate + key
+voms = pki.host_signer  # any certificate + key
 ac = make_ac(pki.user, voms.der, voms.key, ACSpec(fqans=("/atlas", "/atlas/higgs")))
-proxy = voms_proxy(pki, [ac])                           # a proxy carrying the AC extension
+proxy = voms_proxy(pki, [ac])  # a proxy carrying the AC extension
 write_lsc(tmp_path / "vomsdir", "atlas", "voms.example", voms.chain)
 ```
 
@@ -440,8 +443,8 @@ from xrdclient.testing.http import FakeHTTPSServer, Fault, Response, ranged_repl
 with FakeHTTPSServer(tls=pki.server_context()) as srv:
     srv.route("GET", r"/data/(?P<name>.+)", lambda req: ranged_reply(blob, req.header("Range")))
     srv.add_fault(Fault("GET", r"/data/big", status=None, truncate=100))  # dies 100 bytes in
-    ...                                                                   # client at srv.url
-    srv.requests[-1].peer.identity    # '/DC=org/DC=xrdsec/OU=People/CN=Test User'
+    ...  # client at srv.url
+    srv.requests[-1].peer.identity  # '/DC=org/DC=xrdsec/OU=People/CN=Test User'
 ```
 
 | | |

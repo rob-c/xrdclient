@@ -68,9 +68,9 @@ same on both schemes, so a caller that knows one knows the other:
 
 ```python
 fs = xrdclient.FileSystem("davs://tape.example.org")
-handle = fs.prepare(["/store/a.root"])       # POST /api/v1/stage
+handle = fs.prepare(["/store/a.root"])  # POST /api/v1/stage
 while not all(fs.query_prepare(handle, ["/store/a.root"])):
-    time.sleep(60)                           # GET /api/v1/stage/{id}
+    time.sleep(60)  # GET /api/v1/stage/{id}
 ```
 
 `prepare()` here only stages: the API has no equivalent of the other
@@ -130,8 +130,8 @@ byte sequence belongs is read rather than discarded.
 ## Authentication
 
 ```python
-Config(token="eyJ...")                # Authorization: Bearer ...
-Config(proxy="/tmp/x509up_u1000")     # mutual TLS with the X.509 proxy
+Config(token="eyJ...")  # Authorization: Bearer ...
+Config(proxy="/tmp/x509up_u1000")  # mutual TLS with the X.509 proxy
 ```
 
 A bearer token goes in the `Authorization` header; an X.509 proxy is
@@ -247,10 +247,14 @@ did not answer in the time allowed would only be given the time again.
 ```python
 from xrdclient.http import macaroon
 
-token = macaroon("davs://dav.example.org/store/user/me",
-                 caveats=["activity:DOWNLOAD"], validity="PT10M")
-xrdclient.copy("davs://dav.example.org/store/user/me/f.root", "/tmp/f.root",
-         config=xrdclient.Config(token=token))
+token = macaroon(
+    "davs://dav.example.org/store/user/me", caveats=["activity:DOWNLOAD"], validity="PT10M"
+)
+xrdclient.copy(
+    "davs://dav.example.org/store/user/me/f.root",
+    "/tmp/f.root",
+    config=xrdclient.Config(token=token),
+)
 ```
 
 `validity` is an ISO 8601 duration, the spelling dCache and XRootD both use.
@@ -260,8 +264,7 @@ goes wherever `Config.token` goes.
 ## Third-party copy
 
 ```python
-xrdclient.third_party("davs://a.example.org/store/f.root",
-                "davs://b.example.org/store/f.root")
+xrdclient.third_party("davs://a.example.org/store/f.root", "davs://b.example.org/store/f.root")
 ```
 
 `COPY` with a `Source:` header, the dialect FTS and Rucio speak, so the two
@@ -281,9 +284,9 @@ from xrdclient.http import HTTPClient, propfind, digest, open_http, status_code
 
 client = HTTPClient(xrdclient.Config())
 response = client.request("HEAD", url)
-props = propfind(xrdclient.parse(url), depth=1, config=cfg)   # [(path, StatInfo)]
-info = digest(url, "adler32", config=cfg)               # ChecksumInfo
-status_code(403)                                        # the kXR_* code it means
+props = propfind(xrdclient.parse(url), depth=1, config=cfg)  # [(path, StatInfo)]
+info = digest(url, "adler32", config=cfg)  # ChecksumInfo
+status_code(403)  # the kXR_* code it means
 ```
 
 These exist because WebDAV endpoints differ, and being able to send one

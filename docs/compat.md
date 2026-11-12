@@ -4,7 +4,7 @@
 on this library instead of `libXrdCl`. Porting a script is one line:
 
 ```python
-from xrdclient.compat import client        # was: from XRootD import client
+from xrdclient.compat import client  # was: from XRootD import client
 ```
 
 Everything else stays as it was: the classes, the method names, the
@@ -18,9 +18,10 @@ run:
 
 ```python
 import xrdclient.compat
-xrdclient.compat.install()   # before anything imports XRootD
 
-from XRootD import client    # now this package
+xrdclient.compat.install()  # before anything imports XRootD
+
+from XRootD import client  # now this package
 ```
 
 `install()` refuses if the real bindings are already imported, rather than
@@ -129,8 +130,8 @@ Every compat `FileSystem` and open `File` keeps its native object as
 
 ```python
 fs = client.FileSystem("root://host")
-status, info = fs.stat("/store/f.root")          # the bindings' shape
-for entry in fs.native.walk("/store/run7"):      # something they never had
+status, info = fs.stat("/store/f.root")  # the bindings' shape
+for entry in fs.native.walk("/store/run7"):  # something they never had
     ...
 ```
 

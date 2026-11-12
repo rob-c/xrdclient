@@ -11,7 +11,7 @@ dozen more, each of them one line.
 ```python
 with xrdclient.open("root://eos.example.org//store/data.root", "rb") as fh:
     header = fh.read(1024)
-    fh.seek(-4096, 2)          # relative to the end
+    fh.seek(-4096, 2)  # relative to the end
     trailer = fh.read()
 ```
 
@@ -69,9 +69,9 @@ sizes = {child.name: child.stat().st_size for child in p.iterdir()}
 ## Copy something
 
 ```python
-xrdclient.copy("root://a//store/f.root", "/scratch/f.root")            # download
-xrdclient.copy("/scratch/f.root", "root://b//store/f.root")            # upload
-xrdclient.copy_tree("root://a//store/run7", "/scratch/run7")           # recursive
+xrdclient.copy("root://a//store/f.root", "/scratch/f.root")  # download
+xrdclient.copy("/scratch/f.root", "root://b//store/f.root")  # upload
+xrdclient.copy_tree("root://a//store/run7", "/scratch/run7")  # recursive
 xrdclient.third_party("root://a//store/f.root", "root://b//store/f.root")
 ```
 
@@ -95,10 +95,12 @@ There is no status object to inspect and no return value to forget to check.
 ```python
 import asyncio, xrdclient.aio
 
+
 async def main():
     async with xrdclient.aio.FileSystem("root://eos.example.org") as fs:
         names = await fs.listdir("/store")
         sizes = await asyncio.gather(*(fs.getsize(f"/store/{n}") for n in names))
+
 
 asyncio.run(main())
 ```
@@ -109,7 +111,7 @@ asyncio.run(main())
 cfg = xrdclient.Config(request_timeout=60.0, verify_checksums=False)
 fs = xrdclient.FileSystem("root://host", cfg)
 
-with xrdclient.override(chunk_size=1 << 20):   # for this block only
+with xrdclient.override(chunk_size=1 << 20):  # for this block only
     ...
 ```
 
@@ -118,7 +120,7 @@ client uses, and settings you always want can live in
 `~/.config/xrd/config.ini`:
 
 ```python
-cfg = xrdclient.Config.from_file(alias="eos")     # [defaults], then [alias eos]
+cfg = xrdclient.Config.from_file(alias="eos")  # [defaults], then [alias eos]
 ```
 
 See [Configuration](config.md).

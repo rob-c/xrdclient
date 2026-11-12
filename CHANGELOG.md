@@ -1,3 +1,4 @@
+
 # Changelog
 
 Notable user-visible changes are recorded here. This project follows
@@ -5,6 +6,12 @@ Notable user-visible changes are recorded here. This project follows
 client agree more closely with XrdCl are not considered breaking changes.
 
 ## [0.4.1] - Unreleased
+
+### Added
+
+- **`xrd-auth`**: the same command as `xrd-proxy`, under the name that matches what
+  it has grown into - credentials, tokens and the doctor that explains them. Its
+  usage line and one-line description now say so, and `xrd-auth` reports itself.
 
 ### Tested
 

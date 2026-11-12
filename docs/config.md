@@ -167,8 +167,8 @@ pays for one bring-up rather than a hundred.
 ```python
 from xrdclient.session import SESSIONS
 
-len(SESSIONS)      # connections being held open right now
-SESSIONS.clear()   # end them all, politely
+len(SESSIONS)  # connections being held open right now
+SESSIONS.clear()  # end them all, politely
 ```
 
 Reuse is deliberately narrow, because sharing an authenticated connection with
@@ -334,9 +334,9 @@ preferred_checksum = adler32
 ```
 
 ```python
-cfg = xrdclient.Config.from_file()                  # the usual places
-cfg = xrdclient.Config.from_file(alias="eos")       # [defaults], then [alias eos]
-cfg = xrdclient.Config.from_file("./job.ini")       # exactly this file
+cfg = xrdclient.Config.from_file()  # the usual places
+cfg = xrdclient.Config.from_file(alias="eos")  # [defaults], then [alias eos]
+cfg = xrdclient.Config.from_file("./job.ini")  # exactly this file
 ```
 
 ```console

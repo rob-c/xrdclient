@@ -9,8 +9,8 @@ Every recipe starts with the same two names; change them to your server and a
 directory you can write to:
 
 ```python
-SERVER = "root://eos.example.org"          # no trailing slash
-BASE = "/store/user/me/cookbook"          # absolute path on that server
+SERVER = "root://eos.example.org"  # no trailing slash
+BASE = "/store/user/me/cookbook"  # absolute path on that server
 ```
 
 A file's URL is then `f"{SERVER}/{BASE}/name"` - `root://host//store/...`,
@@ -122,14 +122,14 @@ from xrdclient.compat import client
 SERVER = "root://eos.example.org"
 BASE = "/store/user/me/cookbook"
 
-ranges = [(0, 7), (70, 7), (700, 8)]           # (offset, length)
+ranges = [(0, 7), (70, 7), (700, 8)]  # (offset, length)
 with client.File() as f:
     f.open(f"{SERVER}/{BASE}/lines.txt")
     status, answer = f.vector_read(ranges)
     if not status.ok:
         raise SystemExit(status.message)
     print(answer.size, "bytes in", len(answer.chunks), "chunks")
-    for chunk in answer:                        # ChunkInfo, in the order asked
+    for chunk in answer:  # ChunkInfo, in the order asked
         print(chunk.offset, chunk.length, chunk.buffer)
 ```
 
@@ -164,7 +164,7 @@ with client.File() as f:
 
 with client.File() as f:
     f.open(url)
-    print(f.read()[1])            # b'header\nbody\nappended\n'
+    print(f.read()[1])  # b'header\nbody\nappended\n'
 ```
 
 `write` takes `bytes` or `str` (written as UTF-8). Opening with `NEW` or
@@ -251,7 +251,7 @@ status, answer = fs.query(QueryCode.CHECKSUM, f"{BASE}/lines.txt")
 if not status.ok:
     raise SystemExit(status.message)
 algorithm, value = answer.decode().strip("\x00\n ").split()
-print(algorithm, value)                            # adler32 c9e96f74
+print(algorithm, value)  # adler32 c9e96f74
 
 # A particular algorithm, if the server is configured with it:
 status, answer = fs.query(QueryCode.CHECKSUM, f"{BASE}/lines.txt?cks.type=crc32")
@@ -317,7 +317,9 @@ status, endpoint = tapes.discover(ENDPOINT)
 print(status.ok and endpoint.uri, status.ok and endpoint.sitename)
 
 status, request = tapes.stage(
-    ENDPOINT, files, disk_lifetime=86400,        # seconds, or "P1D"
+    ENDPOINT,
+    files,
+    disk_lifetime=86400,  # seconds, or "P1D"
     targeted_metadata={"my-site": {"activity": "reprocessing"}},
 )
 status.raise_on_error()
@@ -332,7 +334,7 @@ while True:
     print("waiting for", waiting)
     time.sleep(60)
 
-tapes.release(ENDPOINT, request.request_id, files)   # done with the disk copies
+tapes.release(ENDPOINT, request.request_id, files)  # done with the disk copies
 
 status, infos = tapes.archive_info(files)
 for info in infos:
@@ -411,14 +413,20 @@ class Progress(client.utils.CopyProgressHandler):
             print("  checksum", results["sourceCheckSum"])
 
     def should_cancel(self, jobId):
-        return False                       # return True to stop this job
+        return False  # return True to stop this job
 
 
 process = client.CopyProcess()
-process.add_job(f"{SERVER}/{BASE}/lines.txt", "/tmp/cookbook/lines.txt",
-                force=True, mkdir=True, checksummode="end2end")
-process.add_job(f"{SERVER}/{BASE}/written.dat", "/tmp/cookbook/written.dat",
-                force=True)                  # the file itself: its directory is made
+process.add_job(
+    f"{SERVER}/{BASE}/lines.txt",
+    "/tmp/cookbook/lines.txt",
+    force=True,
+    mkdir=True,
+    checksummode="end2end",
+)
+process.add_job(
+    f"{SERVER}/{BASE}/written.dat", "/tmp/cookbook/written.dat", force=True
+)  # the file itself: its directory is made
 process.parallel(2)
 
 status = process.prepare()
@@ -448,7 +456,7 @@ BASE = "/store/user/me/cookbook"
 fs = client.FileSystem(SERVER)
 handler = client.utils.AsyncResponseHandler()
 submitted = fs.stat(f"{BASE}/lines.txt", callback=handler)
-assert submitted.ok                       # it was sent, not that it worked
+assert submitted.ok  # it was sent, not that it worked
 status, info, hosts = handler.wait()
 print(status.ok, info.size, [str(h.url) for h in hosts])
 ```
@@ -544,7 +552,7 @@ $ XRD_REQUESTTIMEOUT=60 XRD_CONNECTIONWINDOW=15 python analysis.py
 ```python
 from xrdclient.compat import client
 
-client.EnvPutInt("RequestTimeout", 60)       # objects created from now on
+client.EnvPutInt("RequestTimeout", 60)  # objects created from now on
 client.EnvPutInt("ConnectionWindow", 15)
 fs = client.FileSystem("root://eos.example.org")
 ```
@@ -589,10 +597,10 @@ SERVER = "root://eos.example.org"
 BASE = "/store/user/me/cookbook"
 
 fs = client.FileSystem(SERVER)
-status, _ = fs.mkdir(f"{BASE}/lines.txt")        # a file is already there
+status, _ = fs.mkdir(f"{BASE}/lines.txt")  # a file is already there
 if not status.ok:
     print(status.message.strip(), file=sys.stderr)
-    sys.exit(status.shellcode)                    # 54 for a server refusal
+    sys.exit(status.shellcode)  # 54 for a server refusal
 ```
 
 ### Raising instead of checking
@@ -613,13 +621,13 @@ try:
     status, info = fs.stat(f"{BASE}/missing")
     status.raise_on_error()
 except client.XRootDNotFoundError as exc:
-    print("no such file:", exc.status.errno)          # 3011
+    print("no such file:", exc.status.errno)  # 3011
 except client.XRootDAuthorizationError:
-    print("permission denied")                        # 3010, 3030, auth/login
+    print("permission denied")  # 3010, 3030, auth/login
 except client.XRootDTimeoutError:
-    print("timed out")                                # socket or operation expiry
-except client.XRootDError as exc:                     # checksum, anything else
-    print(exc.status.error_name, exc)                 # "errErrorResponse", message
+    print("timed out")  # socket or operation expiry
+except client.XRootDError as exc:  # checksum, anything else
+    print(exc.status.error_name, exc)  # "errErrorResponse", message
 ```
 
 `status.exception()` returns that exception without raising it (`None` for
@@ -688,15 +696,14 @@ import with this package:
 ```python
 import xrdclient.compat
 
-xrdclient.compat.install()                  # before uproot imports XRootD
+xrdclient.compat.install()  # before uproot imports XRootD
 
 import uproot
 
 SERVER = "root://eos.example.org"
 BASE = "/store/user/me/cookbook"
 
-with uproot.open(f"{SERVER}/{BASE}/ntuple.root:Events",
-                 handler=uproot.XRootDSource) as tree:
+with uproot.open(f"{SERVER}/{BASE}/ntuple.root:Events", handler=uproot.XRootDSource) as tree:
     print(tree.num_entries)
     arrays = tree.arrays(["Muon_pt", "Muon_eta"], entry_stop=1000)
 ```
@@ -739,7 +746,7 @@ from xrdclient.compat import client
 
 os.environ["BEARER_TOKEN_FILE"] = os.path.expanduser("~/.tokens/eos.jwt")
 
-fs = client.FileSystem("roots://eos.example.org")   # TLS: see below
+fs = client.FileSystem("roots://eos.example.org")  # TLS: see below
 status, info = fs.stat("/store/user/me/cookbook/lines.txt")
 print(status.message if not status.ok else info.size)
 ```
@@ -819,8 +826,8 @@ from xrdclient.compat import client
 
 fs = client.FileSystem("root://eos.example.org")
 status, info = fs.stat("/store/user/me/cookbook/lines.txt")
-if status.code == 204:                  # errAuthFailed: every mechanism refused
-    print(status.message)               # names each mechanism and why
+if status.code == 204:  # errAuthFailed: every mechanism refused
+    print(status.message)  # names each mechanism and why
 else:
     print(info.size if status.ok else status.message)
 ```

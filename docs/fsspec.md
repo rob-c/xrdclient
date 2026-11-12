@@ -55,14 +55,14 @@ Check which one you have, and choose explicitly where it matters:
 import fsspec
 from xrdclient.fsspec_impl import XRootDFileSystem
 
-fsspec.get_filesystem_class("root")       # who won, in this environment
+fsspec.get_filesystem_class("root")  # who won, in this environment
 
 # This package for every root:// URL from here on, whoever won at import:
 fsspec.register_implementation("root", XRootDFileSystem, clobber=True)
 
 # Or for one filesystem, without touching the registry:
 fs = XRootDFileSystem("root://eos.example.org")
-fsspec.open("xroot://eos.example.org//store/f.root")   # always this package
+fsspec.open("xroot://eos.example.org//store/f.root")  # always this package
 ```
 
 `register_implementation` with a class puts it in fsspec's registry proper,
@@ -77,7 +77,7 @@ dask client and each of its workers, say):
 ```python
 from xrdclient.fsspec_impl import register_fsspec
 
-register_fsspec()   # ['dav', 'davs', 'root', 'roots', 'webdav', 'xroot']
+register_fsspec()  # ['dav', 'davs', 'root', 'roots', 'webdav', 'xroot']
 ```
 
 It registers the classes named by this package's own `fsspec.specs` entry
@@ -93,8 +93,13 @@ cache, and reads go through it instead, built exactly as fsspec's own files
 build theirs:
 
 ```python
-fs.open("/store/f.root", "rb", cache_type="blockcache",
-        block_size=1 << 20, cache_options={"maxblocks": 64})
+fs.open(
+    "/store/f.root",
+    "rb",
+    cache_type="blockcache",
+    block_size=1 << 20,
+    cache_options={"maxblocks": 64},
+)
 ```
 
 Every key of `fsspec.caching.caches` is accepted - `"none"`, `"bytes"`,

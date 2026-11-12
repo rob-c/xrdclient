@@ -4,7 +4,7 @@ The server offers mechanisms; the client tries the ones it has, in
 `config.auth_order`, and stops at the first that is accepted.
 
 ```python
-Config(auth_order=("gsi", "ztn", "krb5", "sss", "unix", "host"))   # the default
+Config(auth_order=("gsi", "ztn", "krb5", "sss", "unix", "host"))  # the default
 ```
 
 If everything is refused you get one `NoMechanismError` that names each
@@ -58,6 +58,7 @@ is a sentence and not a mystery timeout an hour into a batch job.
 
 ```python
 from xrdclient.crypto.x509 import load_proxy
+
 proxy = load_proxy("/tmp/x509up_u1000")
 print(proxy.identity, proxy.remaining() / 3600, "hours left")
 ```
@@ -203,7 +204,7 @@ and sends a certificate request, and the client signs it into a proxy one
 link below yours.
 
 ```python
-Config(gsi_delegate=True)          # or: export XrdSecGSIDELEGPROXY=1
+Config(gsi_delegate=True)  # or: export XrdSecGSIDELEGPROXY=1
 ```
 
 It is off by default, as in the stock client, and the same environment
@@ -445,7 +446,7 @@ intra-site endpoint usually wants, and they are last in the order for that
 reason.
 
 ```python
-Config(auth_order=("unix", "host"))     # skip the ladder entirely
+Config(auth_order=("unix", "host"))  # skip the ladder entirely
 ```
 
 This is worth setting explicitly for a local daemon: the default order tries
@@ -464,8 +465,8 @@ Defaults to the local login name. A URL may also carry one:
 
 ```python
 Config(
-    require_tls=True,        # refuse a server that will not upgrade
-    verify_tls=True,         # the default; never turned off implicitly
+    require_tls=True,  # refuse a server that will not upgrade
+    verify_tls=True,  # the default; never turned off implicitly
     ca_file="/etc/ssl/certs/ca-bundle.crt",
     ca_path="/etc/grid-security/certificates",
 )
@@ -528,9 +529,9 @@ a request asks - a second one means the credential was refused, not absent.
 Turning it off, or putting the question somewhere else:
 
 ```python
-Config(prompt=False)          # never ask; fail with the usual error
-Config(prompt=True)           # ask even when this is not a terminal
-Config(prompter=my_dialog)    # a GUI, a notebook widget, a secrets manager
+Config(prompt=False)  # never ask; fail with the usual error
+Config(prompt=True)  # ask even when this is not a terminal
+Config(prompter=my_dialog)  # a GUI, a notebook widget, a secrets manager
 ```
 
 `$XRD_PROMPT=0` does the same for a whole job, and `--no-prompt` for one

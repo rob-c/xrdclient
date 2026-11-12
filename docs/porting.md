@@ -15,7 +15,7 @@ complete programs for the common jobs, and
 ## The one-line change
 
 ```python
-from xrdclient.compat import client        # was: from XRootD import client
+from xrdclient.compat import client  # was: from XRootD import client
 ```
 
 Nothing else in the file changes. `xrdclient.compat.client` has the same
@@ -39,7 +39,7 @@ Imports of submodules port the same way:
 A complete program, before and after, differs in one line:
 
 ```python
-from xrdclient.compat import client        # was: from XRootD import client
+from xrdclient.compat import client  # was: from XRootD import client
 from xrdclient.compat.client.flags import OpenFlags
 
 fs = client.FileSystem("root://eos.example.org")
@@ -62,9 +62,10 @@ resolve to this package, for the rest of the process:
 
 ```python
 import xrdclient.compat
-xrdclient.compat.install()      # before anything imports XRootD
 
-from XRootD import client       # this is now xrdclient.compat.client
+xrdclient.compat.install()  # before anything imports XRootD
+
+from XRootD import client  # this is now xrdclient.compat.client
 ```
 
 It registers `XRootD`, `XRootD.client` and the submodules `flags`,
@@ -86,6 +87,7 @@ uproot opens `root://` URLs through one of two handlers. With
 
 ```python
 import xrdclient.compat
+
 xrdclient.compat.install()
 
 import uproot
@@ -365,7 +367,7 @@ running port:
 from xrdclient.compat import client
 
 fs = client.FileSystem("root://eos.example.org")
-status, info = fs.stat("/store/run7/f.root")          # still the bindings' shape
+status, info = fs.stat("/store/run7/f.root")  # still the bindings' shape
 
 for top, dirs, files in fs.native.walk("/store/run7"):  # native: raises on failure
     for name in files:
@@ -373,7 +375,7 @@ for top, dirs, files in fs.native.walk("/store/run7"):  # native: raises on fail
 
 with client.File() as f:
     f.open("root://eos.example.org//store/run7/f.root")
-    ranges = f.native.readv([(0, 100), (4096, 100)])   # native: a list of bytes
+    ranges = f.native.readv([(0, 100), (4096, 100)])  # native: a list of bytes
 ```
 
 `File.native` is `None` until `open` succeeds and again after `close`.

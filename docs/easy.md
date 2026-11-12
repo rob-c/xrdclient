@@ -18,12 +18,12 @@ is what you want once a script grows. Nothing is lost by starting here.
 ## What is there?
 
 ```python
-xrdclient.ls("root://host//store/run7")            # the directory, sorted
+xrdclient.ls("root://host//store/run7")  # the directory, sorted
 xrdclient.glob("root://host//store/run7/**/*.root")  # ** crosses directories, * does not
-xrdclient.exists("root://host//store/f.root")      # True or False
-xrdclient.size("root://host//store/f.root")        # bytes
-xrdclient.stat("root://host//store/f.root")        # size, times, permissions
-xrdclient.checksum("root://host//store/f.root")    # the digest the server already has
+xrdclient.exists("root://host//store/f.root")  # True or False
+xrdclient.size("root://host//store/f.root")  # bytes
+xrdclient.stat("root://host//store/f.root")  # size, times, permissions
+xrdclient.checksum("root://host//store/f.root")  # the digest the server already has
 ```
 
 A `?` in a `glob` pattern is the one-character wildcard, even though a URL
@@ -66,7 +66,7 @@ Directories above a file are created for you when you write.
 ## Moving things around
 
 ```python
-xrdclient.mkdir("root://host//store/user/me/run7")     # parents and all
+xrdclient.mkdir("root://host//store/user/me/run7")  # parents and all
 xrdclient.move("root://host//store/a.root", "root://host//store/b.root")
 xrdclient.remove("root://host//store/b.root")
 xrdclient.remove("root://host//store/run7", recursive=True)
@@ -93,8 +93,9 @@ before anything can read it. That takes minutes to hours, so you ask, and
 then you wait:
 
 ```python
-request = xrdclient.stage(["root://tape.example.org//store/f.root",
-                     "root://tape.example.org//store/g.root"])
+request = xrdclient.stage(
+    ["root://tape.example.org//store/f.root", "root://tape.example.org//store/g.root"]
+)
 
 while not xrdclient.is_online("root://tape.example.org//store/f.root"):
     time.sleep(60)

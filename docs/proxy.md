@@ -346,7 +346,7 @@ or used as a delegation signer unchanged:
 ```python
 from xrdclient.crypto.proxies import load_p12
 
-user = load_p12("~/certs/myCert.p12", password=ask)   # or credential_from_p12(bytes)
+user = load_p12("~/certs/myCert.p12", password=ask)  # or credential_from_p12(bytes)
 proxy = create_proxy(user, lifetime=12 * 3600)
 ```
 
@@ -362,8 +362,8 @@ from xrdclient.voms_client import fetch_ac, find_vomses, servers_for
 
 user = load_credential("~/.globus/usercert.pem", "~/.globus/userkey.pem", password=ask)
 ac = fetch_ac(servers_for("atlas", find_vomses()), user, fqans=["/atlas/Role=production"])
-proxy = create_proxy(user, voms_acs=[ac])          # in memory: certificate, fresh key, chain
-write_proxy("/tmp/x509up_u1000", proxy)            # atomic, 0600, links refused
+proxy = create_proxy(user, voms_acs=[ac])  # in memory: certificate, fresh key, chain
+write_proxy("/tmp/x509up_u1000", proxy)  # atomic, 0600, links refused
 print(describe_proxy(proxy).time_left)
 ```
 
@@ -470,3 +470,59 @@ The test suite checks, where the tools are installed: `openssl verify
 `arcproxy` made is read and described; and that `arcproxy -S ... -H` obtains an
 AC from the test VOMS server, so the fake speaks the real protocol.
 `voms-proxy-info -all` is checked the same way when it is present.
+
+## Two names: `xrd-auth` and `xrd-proxy`
+
+The command is installed as both. `xrd-auth` is the name that matches what it has
+become - credentials of every kind, and the doctor that explains them:
+
+```sh
+xrd-auth --version          # the same program
+xrd-auth doctor --summary   # every check, one line each
+```
+
+Either name takes the same subcommands (`init`, `info`, `destroy`, `doctor`,
+`token`), and the usage line shows whichever you typed.
+
+## Getting a WLCG bearer token (a SCITOKEN)
+
+```sh
+xrd-auth token providers                     # the issuers it knows, and their scopes
+xrd-auth token init --provider lhcb --flow device --client-id <client>
+```
+
+The device flow prints a URL and a code to approve in a browser; it is the flow
+with no certificate. `--client-id` must be a public client registered with that
+issuer (or set `WLCG_CLIENT_ID`). `xrd-auth token init --from-resource
+https://eosuser.cern.ch` finds the issuer from a storage element instead of naming
+it.
+
+The other flows, when a browser is not the right tool:
+
+| flow | command | what it needs |
+| --- | --- | --- |
+| `x509` | `xrd-auth token init --provider lhcb --flow x509 --p12 cert.p12 --pwstdin` | your certificate as the OAuth client; a client id registered at the issuer |
+| `exchange` | `xrd-auth token init --flow exchange --from-token "$TOKEN" --scope storage.read:/` | a token you already hold, narrowed |
+| `dirac` | `xrd-auth token init --provider lhcb --flow dirac --proxy ~/.x509up` | DIRAC installed: it asks DIRAC for the token and embeds it |
+
+Where it goes: `--out PATH`, else `$BEARER_TOKEN_FILE`, else `bt_u<uid>` in the
+current directory - written `0600`, and never through a symlink.
+
+Reading and removing it:
+
+```sh
+xrd-auth token info                          # who it is for, its scope, expiry
+xrd-auth token info ~/.x509up                # a token embedded in a DIRAC proxy
+xrd-auth token destroy                       # remove it
+```
+
+For an HTCondor client use `SCITOKEN` instead of GSI, pointing it at the file:
+
+```sh
+mkdir -p ~/.condor/tokens.d && cp bt_u$(id -u) ~/.condor/tokens.d/lhcb
+_CONDOR_SEC_CLIENT_AUTHENTICATION_METHODS=SCITOKEN condor_status -pool condorce01.cern.ch
+```
+
+Environment beats profiles, and flags beat both: `WLCG_TOKEN_ISSUER`,
+`WLCG_TOKEN_AUDIENCE`, `WLCG_TOKEN_SCOPE`, `WLCG_CLIENT_ID` (or
+`WLCG_TOKEN_CLIENT_ID`).

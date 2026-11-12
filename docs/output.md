@@ -188,7 +188,9 @@ import subprocess
 
 completed = subprocess.run(
     ["gfal-bringonline", "--output-format", "json", "--from-file", "urls.txt"],
-    capture_output=True, text=True, check=False,
+    capture_output=True,
+    text=True,
+    check=False,
 )
 report = json.loads(completed.stdout)
 assert (report["schema"], report["version"]) == ("storage-client-report", 1)

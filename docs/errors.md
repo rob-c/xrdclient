@@ -145,11 +145,11 @@ are - which is what a tool parsing a certificate wants - and
 try:
     fs.stat("/store/missing")
 except xrdclient.ServerError as exc:
-    exc.code        # 3011, the kXR_ code
-    exc.message     # the server's own text
-    exc.path        # what we asked about
-    exc.errno       # errno.ENOENT
-    str(exc)        # plain explanation, path, server detail and numeric XRootD code
+    exc.code  # 3011, the kXR_ code
+    exc.message  # the server's own text
+    exc.path  # what we asked about
+    exc.errno  # errno.ENOENT
+    str(exc)  # plain explanation, path, server detail and numeric XRootD code
 ```
 
 `str()` starts with a plain explanation and a safe next step, then includes
@@ -186,7 +186,7 @@ for attempt in range(5):
     try:
         return xrdclient.Path(url).read_bytes()
     except xrdclient.TransientError:
-        time.sleep(2 ** attempt)
+        time.sleep(2**attempt)
 raise
 ```
 

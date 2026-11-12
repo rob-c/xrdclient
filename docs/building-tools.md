@@ -59,10 +59,10 @@ configured", never "the current directory".
 ```python
 from xrdclient import credentials
 
-proxy = credentials.find_proxy()                 # $X509_USER_PROXY, else /tmp/x509up_u<uid>
+proxy = credentials.find_proxy()  # $X509_USER_PROXY, else /tmp/x509up_u<uid>
 pair = credentials.find_user_credential(dirs=("~/.arc", "~/.globus"))
 token = credentials.find_bearer_token(explicit=args.token, token_file=args.token_file)
-ca_dir = credentials.grid_ca_path()              # None: use the system store
+ca_dir = credentials.grid_ca_path()  # None: use the system store
 ```
 
 - **Named beats guessed.** `find_proxy` returns `$X509_USER_PROXY` as
@@ -95,9 +95,9 @@ The full reference is under [API: building blocks](api.md#building-blocks-for-ot
 from xrdclient import credentials, tls
 
 context = tls.client_context(
-    cert=credentials.find_proxy(),           # or cert=..., key=... for a separate key
+    cert=credentials.find_proxy(),  # or cert=..., key=... for a separate key
     ca_path=credentials.grid_ca_path(),
-    check_crl="leaf",                        # the CA directory's <hash>.r0 files
+    check_crl="leaf",  # the CA directory's <hash>.r0 files
 )
 ```
 
@@ -124,13 +124,15 @@ worrying about the cost; `tls.clear_cache()` forgets them.
 ```python
 from xrdclient import report
 
+
 def main(argv):
     parser = report.Parser(prog="mytool")
-    report.flags(parser)                     # --json, --xml, --output-format
+    report.flags(parser)  # --json, --xml, --output-format
     args = parser.parse_args(argv)
     report.identify("submit", ce=args.ce)
     report.record(job=job_id, status="queued")
     return 0
+
 
 raise SystemExit(report.run_cli("mytool", sys.argv[1:], lambda: main(sys.argv[1:])))
 ```

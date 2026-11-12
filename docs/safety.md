@@ -12,7 +12,7 @@ mean it" that takes one flag or one argument.
 ## A read that never said how much it wanted is bounded
 
 ```python
-data = fs.read_bytes("/store/dataset.root")     # 90 GB, and your laptop has 16
+data = fs.read_bytes("/store/dataset.root")  # 90 GB, and your laptop has 16
 ```
 
 That line is the classic first afternoon. Here it raises
@@ -35,16 +35,16 @@ It never applies to a read that named one:
 
 ```python
 with xrdclient.open(url, "rb") as fh:
-    header = fh.read(1 << 20)       # a size is a decision, and is honoured
-    for block in fh:                # so is streaming, at any length
+    header = fh.read(1 << 20)  # a size is a decision, and is honoured
+    for block in fh:  # so is streaming, at any length
         ...
-xrdclient.copy(url, "/scratch/f.root")    # and so is a copy, which never buffers
+xrdclient.copy(url, "/scratch/f.root")  # and so is a copy, which never buffers
 ```
 
 To lift it, say so once:
 
 ```python
-xrdclient.configure(max_read_size=0)                       # process-wide
+xrdclient.configure(max_read_size=0)  # process-wide
 fs = xrdclient.FileSystem(url, xrdclient.Config(max_read_size=0))  # or for one endpoint
 ```
 

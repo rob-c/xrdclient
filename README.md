@@ -23,7 +23,7 @@ exactly that. Code written for the official bindings runs by changing one
 import:
 
 ```python
-from xrdclient.compat import client        # was: from XRootD import client
+from xrdclient.compat import client  # was: from XRootD import client
 
 status, info = client.FileSystem("root://eos.example.org").stat("/store/f.root")
 ```
@@ -129,7 +129,7 @@ when you want them.
 
 ```python
 with xrdclient.open("root://host//store/f.root", "rb") as fh:
-    for line in fh:            # buffered, like any other file
+    for line in fh:  # buffered, like any other file
         ...
     fh.seek(-4096, 2)
     tail = fh.read()
@@ -147,7 +147,7 @@ which `extensions()` asks about before sending.
 ```python
 fs = xrdclient.FileSystem("davs://dav.example.org")
 fs.makedirs("/store/user/me/2026", exist_ok=True)
-print(fs.checksum("/store/user/me/f.root"))     # adler32:1a0b045d
+print(fs.checksum("/store/user/me/f.root"))  # adler32:1a0b045d
 ```
 
 **Paths.** `xrdclient.Path` is a `PurePosixPath` that knows its endpoint:
@@ -241,6 +241,7 @@ resolved on first use.
 ```python
 import asyncio, xrdclient.aio
 
+
 async def main():
     async with xrdclient.aio.FileSystem("root://eos.example.org") as fs:
         async for entry in fs.iterdir("/store"):
@@ -249,6 +250,7 @@ async def main():
         sizes = await asyncio.gather(*(fs.getsize(f"/store/{n}") for n in names))
         async with fs.open("/store/f.root") as fh:
             head, tail = await fh.readv([(0, 4096), (1 << 20, 4096)])
+
 
 asyncio.run(main())
 ```
@@ -325,6 +327,7 @@ schemes, with nothing to import:
 
 ```python
 import pandas as pd
+
 df = pd.read_parquet("root://eos.example.org//store/t.parquet")
 ```
 

@@ -7,6 +7,7 @@ import io
 import json
 import os
 import stat
+import sys
 from typing import Any
 
 import pytest
@@ -864,3 +865,24 @@ def test_a_certificate_without_key_usage_has_no_such_line(voms_proxy):
     info = dataclasses.replace(describe_proxy(load_credential(voms_proxy)), key_usage=())
     assert not any(line.startswith("key usage") for line in cli._summary(info, False))
     assert cli._clock(-5) == "0:00:00" and cli._clock(90061) == "25:01:01"
+
+
+@pytest.mark.parametrize("invoked", ["xrd-auth", "xrd-proxy"])
+def test_the_command_answers_to_each_name_it_is_installed_under(
+    monkeypatch: pytest.MonkeyPatch, invoked: str
+) -> None:
+    """``xrd-auth`` and ``xrd-proxy`` are one program, and say which they were."""
+    monkeypatch.setattr(sys, "argv", [f"/opt/homebrew/bin/{invoked}"])
+    assert cli.program_name() == invoked
+
+
+def test_another_name_leaves_the_usage_line_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A test runner or an unrelated alias must not rename the command's usage."""
+    monkeypatch.setattr(sys, "argv", ["/usr/bin/pytest"])
+    assert cli.program_name() == cli.PROGRAM
+
+
+def test_the_one_line_says_what_the_command_now_does() -> None:
+    """It is no longer only proxies: tokens and the doctor are part of it."""
+    assert "proxies" in cli.DESCRIPTION
+    assert "tokens" in cli.DESCRIPTION

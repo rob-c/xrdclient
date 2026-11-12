@@ -58,6 +58,26 @@ if TYPE_CHECKING:
 
 PROGRAM = "xrd-proxy"
 
+#: The names this command is installed under. ``xrd-auth`` is the same program:
+#: it has grown past proxies, to tokens and to the doctor that explains both.
+NAMES = ("xrd-proxy", "xrd-auth")
+
+#: What the command is for, in one line, for argparse.
+DESCRIPTION = (
+    "Make, inspect and remove X.509 proxies, and acquire, inspect and remove WLCG bearer tokens."
+)
+
+
+def program_name() -> str:
+    """The name this was invoked as, when it is one of ours, else ``PROGRAM``.
+
+    ``xrd-auth --help`` should say ``xrd-auth``; a test run or an odd alias should
+    not put its own name in the usage line.
+    """
+    invoked = os.path.basename(sys.argv[0] or "")
+    return invoked if invoked in NAMES else PROGRAM
+
+
 #: The marks a summary counts, in the order they are reported.
 _MARKS = ("ok", "warn", "bad", "skip")
 
@@ -93,9 +113,7 @@ def _parser() -> argparse.ArgumentParser:
     """
     # No abbreviations: with one-dash long options, argparse would otherwise
     # read ``-vo`` as an abbreviation of ``-voms`` (or ``-valid``).
-    parser = output.Parser(
-        prog=PROGRAM, description="Make, inspect and remove X.509 proxies.", allow_abbrev=False
-    )
+    parser = output.Parser(prog=program_name(), description=DESCRIPTION, allow_abbrev=False)
     version_flag(parser)
     output.flags(parser)
     commands = parser.add_subparsers(dest="command", required=True, parser_class=output.Parser)

@@ -227,13 +227,13 @@ move:
 
 ```python
 class SessionMachine:
-    def submit(self, req: Request) -> StreamId: ...      # allocate streamid, queue frame
-    def data_to_send(self) -> bytes: ...                 # drain the outbound queue
+    def submit(self, req: Request) -> StreamId: ...  # allocate streamid, queue frame
+    def data_to_send(self) -> bytes: ...  # drain the outbound queue
     def receive_data(self, data: bytes | None) -> None: ...  # feed inbound; None = EOF
-    def next_event(self) -> Event | None: ...            # pop a completed event
+    def next_event(self) -> Event | None: ...  # pop a completed event
     @property
-    def wants_tls(self) -> bool: ...                     # negotiated upgrade request
-    def timers(self) -> Timers: ...                      # deadlines the driver must honor
+    def wants_tls(self) -> bool: ...  # negotiated upgrade request
+    def timers(self) -> Timers: ...  # deadlines the driver must honor
 ```
 
 Events: `ResponseReady(streamid, payload)`, `PartialData(streamid, chunk)`,
@@ -379,11 +379,11 @@ from xrdclient import XRootDPath
 
 store = XRootDPath("root://eos.example.org//store/data")
 
-for p in (store / "2026").iterdir():          # lazy, streams the dirlist
+for p in (store / "2026").iterdir():  # lazy, streams the dirlist
     if p.suffix == ".root" and p.stat().st_size > 1 << 30:
         print(p.name, p.stat().st_mtime)
 
-for p in store.glob("run*/*.root"):           # server-side dirlist, client-side match
+for p in store.glob("run*/*.root"):  # server-side dirlist, client-side match
     ...
 
 (store / "new").mkdir(parents=True, exist_ok=True)
@@ -392,7 +392,9 @@ data = (store / "note.txt").read_bytes()
 (store / "note.txt").rename(store / "note.bak")
 (store / "note.bak").unlink(missing_ok=True)
 
-store.exists(); store.is_dir(); store.is_file()
+store.exists()
+store.is_dir()
+store.is_file()
 ```
 
 **As built:** a standalone class, deliberately *not* a `pathlib.PurePath`
@@ -424,27 +426,27 @@ inspects stat results works unmodified.
 When you need the operations that have no `pathlib` analogue:
 
 ```python
-with xrdclient.FileSystem("root://eos.example.org") as fs:      # connects lazily
+with xrdclient.FileSystem("root://eos.example.org") as fs:  # connects lazily
     fs.ping()
-    info      = fs.stat("/store/f.root")
-    entries   = fs.iterdir("/store")                      # generator
-    cksum     = fs.checksum("/store/f.root", "adler32")   # -> ChecksumInfo
+    info = fs.stat("/store/f.root")
+    entries = fs.iterdir("/store")  # generator
+    cksum = fs.checksum("/store/f.root", "adler32")  # -> ChecksumInfo
     locations = fs.deep_locate("/store/f.root")
-    space     = fs.statvfs("/store")
-    fs.prepare(["/store/a.root", "/store/b.root"])         # stages by default
-    settings  = fs.query_config("role", "version")        # kXR_Qconfig
+    space = fs.statvfs("/store")
+    fs.prepare(["/store/a.root", "/store/b.root"])  # stages by default
+    settings = fs.query_config("role", "version")  # kXR_Qconfig
 
     fs.setxattr("/store/f.root", "user.run", b"42")
-    attrs = fs.xattrs("/store/f.root")                    # name -> value
+    attrs = fs.xattrs("/store/f.root")  # name -> value
 
 f = xrdclient.File("root://eos.example.org//store/f.root")
-f.open(OpenFlags.UPDATE)                                  # READ if you omit it
-with f:                                                   # closes on exit
+f.open(OpenFlags.UPDATE)  # READ if you omit it
+with f:  # closes on exit
     # vector read: one round trip for many scattered ranges
     chunks = f.readv([(0, 4096), (1 << 30, 4096), (2 << 30, 8192)])
     # paged read with per-4KiB CRC32c verification, protocol v5
-    pages = f.pgread(1 << 20, 0, verify=True)             # -> PageResult
-    with f.checkpoint():                                  # commit or roll back
+    pages = f.pgread(1 << 20, 0, verify=True)  # -> PageResult
+    with f.checkpoint():  # commit or roll back
         f.pwrite(b"...", 0)
 ```
 
@@ -470,7 +472,7 @@ async with xrdclient.aio.FileSystem("root://host") as fs:
         ...
     sizes = await asyncio.gather(*(fs.getsize(p) for p in paths))
 
-    async with fs.open("/store/f.root") as f:            # or: f = await fs.open(...)
+    async with fs.open("/store/f.root") as f:  # or: f = await fs.open(...)
         head, tail = await f.readv([(0, 4096), (1 << 20, 4096)])
 
 await xrdclient.aio.copy("root://a//store/f.root", "davs://b/store/f.root")
@@ -484,9 +486,11 @@ never mentions it never imports `asyncio`.
 ```python
 # fsspec — unlocks uproot, pandas, dask, pyarrow, and fsspec's own caching
 import fsspec
+
 with fsspec.open("root://eos.example.org//store/f.root", "rb") as f:
     ...
 import uproot
+
 tree = uproot.open("root://eos.example.org//store/f.root")["Events"]
 ```
 
@@ -548,11 +552,12 @@ a self-contained plugin rather than a branch in a `connect()` function:
 
 ```python
 class AuthMechanism(Protocol):
-    name: str                     # wire name: "unix", "ztn", "sss", "gsi", "krb5", "host"
+    name: str  # wire name: "unix", "ztn", "sss", "gsi", "krb5", "host"
+
     def available(self, cfg: Config) -> bool: ...
     def initiate(self, params: str, ctx: AuthContext) -> bytes: ...
     def respond(self, challenge: bytes, ctx: AuthContext) -> bytes | None: ...
-    def session_key(self) -> bytes | None: ...        # feeds kXR_sigver
+    def session_key(self) -> bytes | None: ...  # feeds kXR_sigver
 ```
 
 Negotiation parses the `&P=...` security trailer from the login response and
@@ -703,10 +708,10 @@ deployment reachable from here exercises.
 scheme picks the implementation and nothing else changes.
 
 ```python
-xrdclient.open("davs://dav.example.org/store/f.root")          # → HTTPRawIO
+xrdclient.open("davs://dav.example.org/store/f.root")  # → HTTPRawIO
 xrdclient.FileSystem("davs://dav.example.org").listdir("/store")  # → HTTPFileSystem
 xrdclient.XRootDPath("https://dav.example.org/store/f.root").read_bytes()
-xrdclient.copy("davs://a/f.root", "root://b//store/f.root")    # either direction
+xrdclient.copy("davs://a/f.root", "root://b//store/f.root")  # either direction
 ```
 
 The dispatch is `FileSystem.__new__` and `io.open_url`, chosen for the same
@@ -944,7 +949,7 @@ binaries or credentials.
    with FakeServer(files={"/data/a.root": b"hello"}, dirs=["/data/empty"]) as srv:
        with xrdclient.FileSystem(srv.url) as fs:
            assert fs.read_bytes("/data/a.root") == b"hello"
-       assert srv.contents("/data/a.root") == b"hello"   # the server's own view
+       assert srv.contents("/data/a.root") == b"hello"  # the server's own view
    ```
 
    Contents are plain attributes (`files`, `dirs`, `xattrs`, `config_values`),

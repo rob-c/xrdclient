@@ -64,8 +64,8 @@ A listing asks the server for a stat per entry, which is what you almost
 always want and is one flag on the request. Say so in words rather than bits:
 
 ```python
-fs.scandir("/store", stat=False)     # names only, and cheaper for a huge directory
-fs.scandir("/store", online=True)    # ask which entries are on disk rather than on tape
+fs.scandir("/store", stat=False)  # names only, and cheaper for a huge directory
+fs.scandir("/store", online=True)  # ask which entries are on disk rather than on tape
 ```
 
 A server can also digest every file as it lists, which turns a directory's
@@ -73,7 +73,7 @@ worth of `checksum` calls into one round trip:
 
 ```python
 for entry in fs.scandir("/store", algorithm="adler32"):
-    print(entry.name, entry.checksum)       # ChecksumInfo, or None
+    print(entry.name, entry.checksum)  # ChecksumInfo, or None
 ```
 
 `entry.checksum` is `None` for anything the server had no digest for - a
@@ -86,9 +86,9 @@ Parsing is most of what a long listing costs - every entry becomes a
 unparsed and pay only for what it reads:
 
 ```python
-raw = fs.dirlist("/store", stat=True)    # same request scandir sends
+raw = fs.dirlist("/store", stat=True)  # same request scandir sends
 lines = [line for line in raw.rstrip(b"\0").decode().split("\n") if line]
-if lines[:1] == ["."]:                   # the server honoured kXR_dstat
+if lines[:1] == ["."]:  # the server honoured kXR_dstat
     for name, stat in zip(lines[2::2], lines[3::2]):
         ident, size, flags, mtime = stat.split()[:4]
 ```
@@ -105,8 +105,8 @@ The pattern language is `pathlib.Path.glob`'s, not `fnmatch`'s: `*` and `?`
 and `[...]` stop at a `/`, and `**/` is *zero or more* directories.
 
 ```python
-fs.glob("/store/user/me/*.root")        # one level
-fs.glob("/store/user/me/**/*.root")     # any depth, including none
+fs.glob("/store/user/me/*.root")  # one level
+fs.glob("/store/user/me/**/*.root")  # any depth, including none
 fs.glob("run[0-9]*/*.root", root="/store/user/me")
 ```
 
@@ -130,7 +130,7 @@ ranged reads, whatever the archive's size.
 
 ```python
 for entry in fs.list_archive("/store/run7/logs.zip"):
-    print(entry.name, entry.stat.st_size)       # "sub/", "sub/run.log", ...
+    print(entry.name, entry.stat.st_size)  # "sub/", "sub/run.log", ...
 ```
 
 Names are as the archive stores them, directories with their trailing `/`,
@@ -159,15 +159,15 @@ fs.mkdir("/store/user/me/2026")
 fs.makedirs("/store/a/b/c", exist_ok=True)
 fs.touch("/store/f.root", exist_ok=True)
 fs.rename("/store/a.root", "/store/b.root")
-fs.remove("/store/b.root")          # also spelled unlink
+fs.remove("/store/b.root")  # also spelled unlink
 fs.rmdir("/store/empty")
 fs.rmtree("/store/user/me/scratch")
 fs.truncate("/store/f.root", 4096)
-fs.chmod("/store/f.root", 0o640)                 # or "rw-r-----"
-fs.utime("/store/f.root")                       # os.utime: both times, now
-fs.utime("/store/f.root", (atime, mtime))       # seconds, as floats
+fs.chmod("/store/f.root", 0o640)  # or "rw-r-----"
+fs.utime("/store/f.root")  # os.utime: both times, now
+fs.utime("/store/f.root", (atime, mtime))  # seconds, as floats
 fs.utime("/store/f.root", ns=(atime_ns, mtime_ns))
-fs.chown("/store/f.root", uid, gid)             # -1 leaves an id alone
+fs.chown("/store/f.root", uid, gid)  # -1 leaves an id alone
 ```
 
 !!! warning "`utime` and `chown` are the same vendor extension the links are"
@@ -181,13 +181,13 @@ fs.chown("/store/f.root", uid, gid)             # -1 leaves an id alone
 ### Links
 
 ```python
-fs.symlink("/store/f.root", "/store/latest")    # os.symlink order: target, link
-fs.readlink("/store/latest")                    # '/store/f.root'
-fs.link("/store/f.root", "/store/second")       # os.link order; also fs.hardlink
+fs.symlink("/store/f.root", "/store/latest")  # os.symlink order: target, link
+fs.readlink("/store/latest")  # '/store/f.root'
+fs.link("/store/f.root", "/store/second")  # os.link order; also fs.hardlink
 
-fs.is_symlink("/store/latest")                  # True
-fs.lstat("/store/latest")                       # the link, not its target
-fs.stat("/store/latest", follow_symlinks=False) # the same thing, spelled os's way
+fs.is_symlink("/store/latest")  # True
+fs.lstat("/store/latest")  # the link, not its target
+fs.stat("/store/latest", follow_symlinks=False)  # the same thing, spelled os's way
 ```
 
 `is_symlink` asks the server for a `readlink` rather than comparing two
@@ -220,29 +220,29 @@ fs.write_bytes("/store/f.root", payload)
 data = fs.read_bytes("/store/f.root")
 fs.write_text("/store/note.txt", "hello")
 text = fs.read_text("/store/note.txt")
-fh = fs.open("/store/f.root", "rb")     # shares this connection
+fh = fs.open("/store/f.root", "rb")  # shares this connection
 ```
 
 ## Asking the server about itself
 
 ```python
-fs.ping()                     # returns None; raises if it is not there
-fs.protocol()                 # ProtocolInfo: version, flags, capabilities
+fs.ping()  # returns None; raises if it is not there
+fs.protocol()  # ProtocolInfo: version, flags, capabilities
 fs.query_config("version", "role", "sitename")
-fs.query("space", "/store")   # or QueryCode.SPACE
-fs.checksum("/store/f.root")            # ChecksumInfo(algorithm, value)
-fs.locate("/store/f.root")              # which servers hold it
+fs.query("space", "/store")  # or QueryCode.SPACE
+fs.checksum("/store/f.root")  # ChecksumInfo(algorithm, value)
+fs.locate("/store/f.root")  # which servers hold it
 fs.locate("/store/f.root", refresh=True)  # ignore whatever the redirector cached
-fs.locate("/store/run7", flags="for_dirlist")     # about to list it
+fs.locate("/store/run7", flags="for_dirlist")  # about to list it
 fs.locate("/store/new.root", create=True)  # where it would go, before it exists
-fs.deep_locate("/store/f.root")         # follow managers to the data servers
-fs.prepare(["/store/a.root", "/store/b.root"])   # stage from tape
-fs.prepare(["/store/a.root"], notify=True)       # and mail me when it lands
-fs.evict(["/store/a.root"])                     # prepare(evict=True), spelled out
+fs.deep_locate("/store/f.root")  # follow managers to the data servers
+fs.prepare(["/store/a.root", "/store/b.root"])  # stage from tape
+fs.prepare(["/store/a.root"], notify=True)  # and mail me when it lands
+fs.evict(["/store/a.root"])  # prepare(evict=True), spelled out
 fs.statvfs("/store")
-fs.query_space("/store")      # SpaceInfo: one space token, in bytes
-fs.query_stats("a")           # the server's XML statistics summary
-fs.extensions()               # which vendor opcodes it admits to having
+fs.query_space("/store")  # SpaceInfo: one space token, in bytes
+fs.query_stats("a")  # the server's XML statistics summary
+fs.extensions()  # which vendor opcodes it admits to having
 ```
 
 ### Asking before sending a vendor opcode
@@ -274,8 +274,8 @@ bytes, and reports its quota:
 
 ```python
 space = fs.query_space("/store")
-space.free, space.total, space.largest_free      # bytes
-space.unlimited                                  # quota is -1, not zero
+space.free, space.total, space.largest_free  # bytes
+space.unlimited  # quota is -1, not zero
 ```
 
 `prepare()` hands back a request handle. It returns as soon as the server has
@@ -285,10 +285,10 @@ readable, so the handle is what the interesting question is asked with:
 ```python
 handle = fs.prepare(["/store/a.root", "/store/b.root"])
 for status in fs.query_prepare(handle, ["/store/a.root", "/store/b.root"]):
-    print(status)                # /store/a.root: online
-    status.online                # on disk, and readable now
-    status.on_tape               # still only on tape
-    status.requested             # this request is the one that asked for it
+    print(status)  # /store/a.root: online
+    status.online  # on disk, and readable now
+    status.on_tape  # still only on tape
+    status.requested  # this request is the one that asked for it
 ```
 
 One `PrepareStatus` per path, in the order asked, and each is true when its
@@ -302,7 +302,7 @@ it, or some of its files:
 ```python
 fs.cancel_prepare(handle)
 fs.cancel_prepare(handle, ["/store/b.root"])
-fs.prepare(["/store/b.root"], cancel=True, reqid=handle)   # the same request
+fs.prepare(["/store/b.root"], cancel=True, reqid=handle)  # the same request
 ```
 
 Over `root://` that is `kXR_prepare` with `kXR_cancel`, the request id leading
@@ -315,8 +315,8 @@ Where a file is *now* is a separate question, and asking it stages nothing:
 
 ```python
 for report in fs.archive_info(["/store/a.root", "/store/b.root"]):
-    print(report.path, report.state)         # /store/a.root NEARLINE
-    report.online                            # readable without a wait
+    print(report.path, report.state)  # /store/a.root NEARLINE
+    report.online  # readable without a wait
 ```
 
 That is one `statx` over `root://` - the protocol's offline flag is the whole
@@ -340,8 +340,8 @@ Site monitoring records who is doing what, and "python" is not an answer
 anybody can act on:
 
 ```python
-fs.appid("higgs-skim")               # shows up in the server's monitoring
-fs.set_property("monitor off")       # kXR_set, for anything else
+fs.appid("higgs-skim")  # shows up in the server's monitoring
+fs.set_property("monitor off")  # kXR_set, for anything else
 ```
 
 `appid()` is `set_property("appid ...")` with the string built for you. The
@@ -353,11 +353,11 @@ question per property rather than a flags word to mask by hand:
 
 ```python
 info = fs.protocol()
-info.version_str                    # '5.6.0'
-info.is_server, info.is_manager     # a data server, or something that redirects
+info.version_str  # '5.6.0'
+info.is_server, info.is_manager  # a data server, or something that redirects
 info.is_meta, info.is_supervisor, info.is_proxy, info.is_cache
-info.supports_pgio                  # pgread/pgwrite, with a CRC per page
-info.supports_posc                  # a failed write leaves no file behind
+info.supports_pgio  # pgread/pgwrite, with a CRC per page
+info.supports_posc  # a failed write leaves no file behind
 info.supports_gpfile, info.allows_anonymous_gpfile
 info.has_tls, info.requires_tls_for_data
 ```
@@ -377,7 +377,7 @@ also spelled `crc64xz`), `crc64nvme` and the `hashlib` digests -
 
 ```python
 fs.setxattr(path, "user.experiment", b"atlas")
-fs.setxattr(path, "user.run", b"1", create_only=True)   # refuses to overwrite
+fs.setxattr(path, "user.run", b"1", create_only=True)  # refuses to overwrite
 fs.getxattr(path, "user.experiment")
 fs.listxattr(path)
 fs.xattrs(path)
@@ -420,7 +420,7 @@ come too late:
 threading.Timer(30, fs.abort).start()
 try:
     fs.stat("/store/slow.root")
-except xrdclient.AbortedError as exc:        # an OSError, errno ECANCELED
+except xrdclient.AbortedError as exc:  # an OSError, errno ECANCELED
     ...
 ```
 

@@ -86,6 +86,9 @@ docs = [
 xrd-cp = "xrdclient.cli.cp:main"
 xrd-fs = "xrdclient.cli.fs:main"
 xrd-proxy = "xrdclient.cli.proxy:main"
+# The same command under the name it has grown into: credentials, tokens and
+# doctors, not only proxies.
+xrd-auth = "xrdclient.cli.proxy:main"
 
 [project.entry-points."fsspec.specs"]
 root = "xrdclient.fsspec_impl:XRootDFileSystem"

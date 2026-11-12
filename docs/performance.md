@@ -254,11 +254,11 @@ per request is less than half what it was.
 
 ```python
 cfg = xrdclient.Config(
-    chunk_size=8 << 20,        # bigger writes, fewer round trips
-    readahead=4 << 20,         # first window a sequential File.read fetches ahead
-    parallel_chunks=8,         # spans of a copy moved at once, one connection each
-    parallel_files=4,          # files of a tree copied at once
-    in_flight=4,               # chunks read ahead of the write in flight
+    chunk_size=8 << 20,  # bigger writes, fewer round trips
+    readahead=4 << 20,  # first window a sequential File.read fetches ahead
+    parallel_chunks=8,  # spans of a copy moved at once, one connection each
+    parallel_files=4,  # files of a tree copied at once
+    in_flight=4,  # chunks read ahead of the write in flight
 )
 ```
 
@@ -288,7 +288,7 @@ For one file being streamed hard, give its bytes a socket of their own:
 
 ```python
 handle = fh.raw.file
-handle.bind_data_path()        # kXR_bind; see Files -> a second connection
+handle.bind_data_path()  # kXR_bind; see Files -> a second connection
 ```
 
 The reads still go out on the control link and the data comes back on the new

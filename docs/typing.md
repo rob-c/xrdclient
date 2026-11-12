@@ -32,9 +32,9 @@ element type statically, `xrdclient.open` is the one that knows. The whole-file
 helpers are precise either way:
 
 ```python
-fs.read_bytes(path)   # bytes
-fs.read_text(path)    # str
-fs.stat(path)         # StatInfo
+fs.read_bytes(path)  # bytes
+fs.read_text(path)  # str
+fs.stat(path)  # StatInfo
 ```
 
 ## Flags are enums, not integers

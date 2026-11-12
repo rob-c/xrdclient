@@ -238,7 +238,7 @@ import logging
 from xrdclient.compat import client
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(name)s %(message)s")
-client.SetLogLevel("Debug")        # the same as logging.getLogger("xrdclient").setLevel(DEBUG)
+client.SetLogLevel("Debug")  # the same as logging.getLogger("xrdclient").setLevel(DEBUG)
 ```
 
 `SetLogLevel` takes XrdCl's words - `"Error"`, `"Warning"`, `"Info"`,
