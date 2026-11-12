@@ -84,7 +84,7 @@ _MARKS = ("ok", "warn", "bad", "skip")
 
 def main(argv: Sequence[str] | None = None) -> int:
     """The ``xrd-proxy`` entry point; returns the exit code (``0``, ``1``, or ``2`` for usage)."""
-    return output.run_cli(PROGRAM, argv, lambda: _main(argv))
+    return output.run_cli(program_name(), argv, lambda: _main(argv))
 
 
 def _main(argv: Sequence[str] | None) -> int:
@@ -97,7 +97,7 @@ def _main(argv: Sequence[str] | None) -> int:
     try:
         return int(args.handler(args))
     except (XRootDError, OSError, ValueError) as exc:
-        return fail(PROGRAM, exc)
+        return fail(program_name(), exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1002,7 +1002,7 @@ def _token_init(args: argparse.Namespace) -> int:
         token = _by_dirac(args) if args.flow == "dirac" else _asked_for(args, _chosen_issuer(args))
         path = token_client.write_token(token.access_token, args.out)
     except (token_client.TokenError, proxytool_unavailable()) as refused:
-        return fail(PROGRAM, refused)
+        return fail(program_name(), refused)
     said = token.claims
     output.record(
         "result",
@@ -1193,7 +1193,7 @@ def _token_info(args: argparse.Namespace) -> int:
         token, source = _read_here(args)
         said = _token_claims(args, token)
     except (token_client.TokenError, proxytool_unavailable()) as refused:
-        return fail(PROGRAM, refused)
+        return fail(program_name(), refused)
     output.record("result", path=source, claims=said)
     if args.quiet:
         return OK
@@ -1256,13 +1256,13 @@ def _token_destroy(args: argparse.Namespace) -> int:
     try:
         path = args.out or token_client.token_file_path()
     except token_client.TokenError as refused:
-        return fail(PROGRAM, refused)
+        return fail(program_name(), refused)
     try:
         owner = os.lstat(path).st_uid
     except FileNotFoundError:
-        return fail(PROGRAM, FileNotFoundError(f"there is no token at {path}"))
+        return fail(program_name(), FileNotFoundError(f"there is no token at {path}"))
     if owner != os.geteuid():
-        return fail(PROGRAM, PermissionError(f"{path} belongs to uid {owner}; not removed"))
+        return fail(program_name(), PermissionError(f"{path} belongs to uid {owner}; not removed"))
     if not args.dry:
         os.unlink(path)
     output.record("result", path=path, removed=not args.dry)
@@ -1375,9 +1375,9 @@ def _destroy(args: argparse.Namespace) -> int:
     try:
         owner = os.lstat(path).st_uid
     except FileNotFoundError:
-        return fail(PROGRAM, FileNotFoundError(f"there is no proxy at {path}"))
+        return fail(program_name(), FileNotFoundError(f"there is no proxy at {path}"))
     if owner != os.geteuid():
-        return fail(PROGRAM, PermissionError(f"{path} belongs to uid {owner}; not removed"))
+        return fail(program_name(), PermissionError(f"{path} belongs to uid {owner}; not removed"))
     if not args.dry:
         os.unlink(path)
     output.record("result", path=path, removed=not args.dry)

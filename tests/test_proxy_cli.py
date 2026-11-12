@@ -886,3 +886,13 @@ def test_the_one_line_says_what_the_command_now_does() -> None:
     """It is no longer only proxies: tokens and the doctor are part of it."""
     assert "proxies" in cli.DESCRIPTION
     assert "tokens" in cli.DESCRIPTION
+
+
+def test_an_error_is_prefixed_with_the_name_that_was_used(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`xrd-auth`'s complaints are `xrd-auth:`'s, not `xrd-proxy:`'s."""
+    monkeypatch.setattr(sys, "argv", ["/opt/homebrew/bin/xrd-auth"])
+    monkeypatch.setenv("WLCG_CLIENT_ID", "")
+    assert cli.main(["token", "init", "--provider", "lhcb", "--flow", "device"]) != 0
+    assert "xrd-auth:" in capsys.readouterr().err
