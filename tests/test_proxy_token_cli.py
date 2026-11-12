@@ -660,3 +660,76 @@ def test_the_dirac_flow_falls_back_to_the_usual_proxy_location(
     monkeypatch.delenv("X509_USER_PROXY", raising=False)
     assert cli.main(["token", "init", "--flow", "dirac", "--group", "lhcb_user"]) == 1
     assert f"x509up_u{os.geteuid()}" in capsys.readouterr().err
+
+
+def test_token_register_keeps_the_client_id_for_later(
+    tmp_path: Any, issuer: Any, monkeypatch: Any, capsys: Any
+) -> None:
+    """Registering is a one-time act: the id is kept, and the next flow finds it."""
+    from xrdsec import clientstore
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "_chosen_issuer", lambda args: issuer)
+    monkeypatch.setattr(
+        token_client,
+        "register",
+        lambda *a, **k: {"client_id": "dyn-1", "client_name": "xrd-auth"},
+    )
+    assert cli.main(["token", "register", "--issuer", issuer.url]) == 0
+
+    said = capsys.readouterr().out
+    assert "dyn-1" in said and "kept in" in said
+    assert clientstore.remembered(issuer.url) == "dyn-1"
+
+
+def test_token_register_reports_a_refusal(issuer: Any, monkeypatch: Any, capsys: Any) -> None:
+    """An issuer that will not register this tool says why, and that is the answer."""
+    monkeypatch.setattr(cli, "_chosen_issuer", lambda args: issuer)
+
+    def refused(*a: Any, **k: Any) -> dict[str, Any]:
+        raise token_client.TokenError("not enough privileges to register", code="no_client")
+
+    monkeypatch.setattr(token_client, "register", refused)
+    assert cli.main(["token", "register", "--issuer", issuer.url]) == 1
+    assert "not enough privileges" in capsys.readouterr().err
+
+
+def test_the_device_flow_uses_a_remembered_client_id(
+    tmp_path: Any, issuer: Any, monkeypatch: Any, capsys: Any
+) -> None:
+    """A registered client is used without the id being typed or exported again."""
+    from xrdsec import clientstore
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("WLCG_CLIENT_ID", raising=False)
+    clientstore.remember(issuer.url, "remembered-1")
+    monkeypatch.setattr(cli, "_chosen_issuer", lambda args: issuer)
+    asked: list[str] = []
+
+    def started(_issuer: Any, client_id: str, **k: Any) -> dict[str, Any]:
+        asked.append(client_id)
+        return {
+            "device_code": "dev-1",
+            "user_code": "ABCD",
+            "verification_uri": "https://example.org/device",
+            "interval": 0,
+            "expires_in": 5,
+        }
+
+    monkeypatch.setattr(token_client, "device_authorization", started)
+    monkeypatch.setattr(token_client, "device_poll", lambda *a, **k: None)
+    cli.main(["token", "init", "--issuer", issuer.url, "--out", str(tmp_path / "t")])
+    assert asked == ["remembered-1"]
+
+
+def test_token_register_quiet_says_nothing(
+    tmp_path: Any, issuer: Any, monkeypatch: Any, capsys: Any
+) -> None:
+    """--quiet leaves the machine-readable record and no prose."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "_chosen_issuer", lambda args: issuer)
+    monkeypatch.setattr(
+        token_client, "register", lambda *a, **k: {"client_id": "dyn-2", "client_name": "xrd-auth"}
+    )
+    assert cli.main(["token", "register", "--issuer", issuer.url, "-quiet"]) == 0
+    assert capsys.readouterr().out == ""

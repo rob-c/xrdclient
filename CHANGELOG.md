@@ -9,6 +9,11 @@ client agree more closely with XrdCl are not considered breaking changes.
 
 ### Added
 
+- **`xrd-auth token register`**: register this tool as a public client at an issuer
+  that allows it (RFC 7591), keeping the client id in
+  `~/.config/xrdsec/token-clients.json` so `token init --flow device` finds it.
+  The WLCG reference IAM allows it with no approval; LHCb's IAM refuses with
+  `403 You do not have enough privileges`. That refusal is quoted, not hidden.
 - **`xrd-auth`**: the same command as `xrd-proxy`, under the name that matches what
   it has grown into - credentials, tokens and the doctor that explains them. Its
   usage line and one-line description now say so, and `xrd-auth` reports itself.

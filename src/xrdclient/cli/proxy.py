@@ -320,6 +320,50 @@ def _token_parser(parser: argparse.ArgumentParser) -> None:
     _common(listing)
     listing.set_defaults(handler=_token_providers)
 
+    register = commands.add_parser(
+        "register",
+        help="register this tool as a public client, so the device flow can be used",
+        description=(
+            "Register a public client at an issuer that allows it (RFC 7591), and keep "
+            "the client id it hands back. The WLCG reference IAM allows this without "
+            "asking anyone; an IAM that does not answers with its own refusal, which "
+            "is then what you are told. A public client holds no secret - a person "
+            "still has to approve each device code."
+        ),
+        allow_abbrev=False,
+    )
+    _common(register)
+    register.add_argument(
+        "--provider",
+        default="",
+        metavar="NAME",
+        help="a named issuer: lhcb, atlas, cms, alice, wlcg, cern, egi, dune, fermilab",
+    )
+    register.add_argument(
+        "--issuer", default=None, help="the issuer's base URL; beats --provider and the environment"
+    )
+    register.add_argument(
+        "--from-resource",
+        default="",
+        metavar="URL",
+        help="find the issuer from a storage element that publishes /.well-known/wlcg-token",
+    )
+    register.add_argument(
+        "--name", default="xrd-auth", help="the client name the issuer will show people"
+    )
+    register.add_argument(
+        "--scope", default="", help="the scopes to register for (default: what the tool uses)"
+    )
+    register.add_argument(
+        "--contact",
+        action="append",
+        default=[],
+        metavar="EMAIL",
+        help="a contact address the issuer may use (repeatable)",
+    )
+    _option(register, "certdir", metavar="DIR", help="CA directory to trust")
+    register.set_defaults(handler=_token_register)
+
 
 def _info_parser(parser: argparse.ArgumentParser) -> None:
     """``info``'s options: ``voms-proxy-info``'s field selectors and tests."""
@@ -992,6 +1036,40 @@ def _field_lines(info: ProxyInfo, fields: Sequence[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _token_register(args: argparse.Namespace) -> int:
+    """``xrd-auth token register``: be a public client, and keep the id it hands back."""
+    from xrdsec import clientstore, token_client
+
+    try:
+        issuer = _chosen_issuer(args)
+        # Register for what this issuer is asked for anyway, or the device flow
+        # would then be refused for scopes the client was not registered with.
+        wanted = args.scope or _asked(args).scope or token_client.PUBLIC_SCOPES
+        registered = token_client.register(
+            issuer,
+            name=args.name,
+            scope=wanted,
+            contacts=args.contact,
+            ca_path=args.certdir or None,
+        )
+        kept = clientstore.remember(issuer.url, str(registered["client_id"]), name=args.name)
+    except (token_client.TokenError, OSError) as refused:
+        return fail(program_name(), refused)
+    output.record(
+        "result",
+        issuer=issuer.url,
+        client_id=registered["client_id"],
+        client_name=registered.get("client_name"),
+        store=kept,
+    )
+    if not args.quiet:
+        _say(f"Registered a public client at {issuer.name}.\n\n")
+        _say(f"client id : {registered['client_id']}\n")
+        _say(f"kept in   : {kept}\n")
+        _say("\nGet a token with: " + program_name() + " token init --flow device\n")
+    return OK
+
+
 def _token_init(args: argparse.Namespace) -> int:
     """``xrd-proxy token init``: ask an issuer for a token, then put it where a client looks."""
     from xrdsec import token_client
@@ -1151,13 +1229,16 @@ def _subject_token(args: argparse.Namespace) -> str:
 
 def _by_device_flow(args: argparse.Namespace, issuer: Any, scope: str, ca_path: str | None) -> Any:
     """RFC 8628: show a code, wait for a person to approve it, and take the token."""
-    from xrdsec import token_client
+    from xrdsec import clientstore, token_client
 
     client_id = args.client_id or _client_id_from_environment()
     if not client_id:
+        client_id = clientstore.remembered(issuer.url)
+    if not client_id:
         raise token_client.TokenError(
-            "the device flow needs a client id: register a public client with the issuer"
-            " and pass --client-id (or set WLCG_CLIENT_ID)",
+            "the device flow needs a client id: run `" + program_name() + " token register`"
+            " for an issuer that allows it, or register a public client yourself and pass"
+            " --client-id (or set WLCG_CLIENT_ID)",
             code="no_client",
         )
     started = token_client.device_authorization(issuer, client_id, scope=scope, ca_path=ca_path)

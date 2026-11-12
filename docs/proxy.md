@@ -486,10 +486,32 @@ Either name takes the same subcommands (`init`, `info`, `destroy`, `doctor`,
 
 ## Getting a WLCG bearer token (a SCITOKEN)
 
+An issuer will not hand a token to an unnamed client. Some IAMs let a public
+client register itself (RFC 7591) and some do not, so `xrd-auth` can ask:
+
 ```sh
 xrd-auth token providers                     # the issuers it knows, and their scopes
-xrd-auth token init --provider lhcb --flow device --client-id <client>
+xrd-auth token register --provider wlcg      # register this tool, keep the client id
+xrd-auth token init --provider wlcg --flow device
 ```
+
+`token register` writes the client id to `~/.config/xrdsec/token-clients.json`
+(owner-only; a public client holds no secret) and later runs pick it up, so the id
+never has to be typed or exported. The WLCG reference IAM allows this with no
+approval; **LHCb's IAM does not**, and says so in its own words:
+
+```
+$ xrd-auth token register --provider lhcb
+xrd-auth: https://lhcb-auth.cern.ch/iam/api/client-registration refused the request (403):
+          You do not have enough privileges to access this client registration API
+```
+
+If the issuer you need refuses, register a client there by hand (`--client-id`), or
+use an issuer that allows it - `--provider wlcg` advertises `storage.read:/`,
+`storage.modify:/`, `storage.stage:/` and `wlcg.groups`, and CERN's HTCondor-CEs
+accept tokens from WLCG issuers.
+
+The device flow then prints a URL and a code to approve in a browser:
 
 The device flow prints a URL and a code to approve in a browser; it is the flow
 with no certificate. `--client-id` must be a public client registered with that
