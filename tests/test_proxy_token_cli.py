@@ -783,3 +783,91 @@ def test_the_device_flow_uses_the_client_a_profile_publishes(
         ]
     )
     assert asked == ["myDIRACClientID"]
+
+
+def test_the_algorithm_asked_for_is_rs256_unless_told_otherwise(
+    tmp_path: Any, issuer: Any, monkeypatch: Any
+) -> None:
+    """The default request is RS256; WLCG_TOKEN_ALGORITHM and --algorithm beat it."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "_chosen_issuer", lambda args: issuer)
+    asked: list[str] = []
+
+    def started(_issuer: Any, _client: str, **kwargs: Any) -> dict[str, Any]:
+        asked.append(str(kwargs.get("algorithm")))
+        return {
+            "device_code": "d",
+            "user_code": "U",
+            "verification_uri": "https://x",
+            "interval": 0,
+            "expires_in": 5,
+        }
+
+    monkeypatch.setattr(token_client, "device_authorization", started)
+    monkeypatch.setattr(token_client, "device_poll", lambda *a, **k: None)
+
+    def run(*extra: str) -> None:
+        cli.main(
+            [
+                "token",
+                "init",
+                "--issuer",
+                issuer.url,
+                "--client-id",
+                "c",
+                "--out",
+                str(tmp_path / "t"),
+                *extra,
+            ]
+        )
+
+    run()
+    monkeypatch.setenv("WLCG_TOKEN_ALGORITHM", "ES256")
+    run()
+    monkeypatch.delenv("WLCG_TOKEN_ALGORITHM")
+    run("--algorithm", "EdDSA")
+    assert asked == ["RS256", "ES256", "EdDSA"]
+
+
+def test_a_token_that_htcondor_cannot_check_is_named(
+    tmp_path: Any, issuer: Any, monkeypatch: Any, capsys: Any
+) -> None:
+    """Ed25519 is a wall, not a detail: say so where the token is minted."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "_chosen_issuer", lambda args: issuer)
+    monkeypatch.setattr(
+        token_client,
+        "device_authorization",
+        lambda *a, **k: {
+            "device_code": "d",
+            "user_code": "U",
+            "verification_uri": "https://x",
+            "interval": 0,
+            "expires_in": 5,
+        },
+    )
+    header_alg = _b64(json.dumps({"alg": "Ed25519"}).encode())
+    monkeypatch.setattr(
+        token_client,
+        "device_poll",
+        lambda *a, **k: token_client.Token(access_token=f"{header_alg}.payload.sig", expires_in=60),
+    )
+    out = tmp_path / "tok"
+    assert (
+        cli.main(["token", "init", "--issuer", issuer.url, "--client-id", "c", "--out", str(out)])
+        == 0
+    )
+    said = capsys.readouterr().out
+    assert "Ed25519" in said and "cannot accept it" in said
+
+
+def test_a_profile_that_publishes_no_client_id_offers_none() -> None:
+    """A profile without a public client returns nothing, rather than raising."""
+    parsed = cli._parser().parse_args(["token", "init", "--provider", "wlcg"])
+    assert cli._profile_client_id(parsed) == ""
+
+
+def test_an_unknown_profile_offers_no_client_id_either() -> None:
+    """A name this does not know is not an error here: the flow decides what to say."""
+    parsed = cli._parser().parse_args(["token", "init", "--provider", "nosuchvo"])
+    assert cli._profile_client_id(parsed) == ""

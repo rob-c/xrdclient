@@ -250,6 +250,15 @@ def _token_parser(parser: argparse.ArgumentParser) -> None:
         help="the client registered with the issuer ($WLCG_CLIENT_ID or $WLCG_TOKEN_CLIENT_ID)",
     )
     init.add_argument(
+        "--algorithm",
+        default="",
+        metavar="ALG",
+        help=(
+            "the signature to ask for (default RS256, which HTCondor can verify); "
+            "an issuer that does not support it answers with its own algorithm"
+        ),
+    )
+    init.add_argument(
         "--scope",
         default=None,
         help="the scope to ask for (storage.read:/ storage.modify:/ wlcg.groups)",
@@ -1082,9 +1091,13 @@ def _token_init(args: argparse.Namespace) -> int:
     except (token_client.TokenError, proxytool_unavailable()) as refused:
         return fail(program_name(), refused)
     said = token.claims
+    signature = token_client.algorithm_of(token.access_token)
+    usable = signature in token_client.HTCONDOR_ALGORITHMS
     output.record(
         "result",
         path=path,
+        algorithm=signature,
+        usable_by_htcondor=usable,
         issuer=said.get("iss"),
         audience=said.get("aud"),
         scope=said.get("scope"),
@@ -1098,6 +1111,15 @@ def _token_init(args: argparse.Namespace) -> int:
         _say(f"scope     : {said.get('scope')}\n")
         _say(f"groups    : {said.get('wlcg.groups')}\n")
         _say(f"valid for : {_clock(token.time_left())}\n")
+        _say(f"signature : {signature}\n")
+        if not usable:
+            _say(
+                f"\nNote: this token is signed with {signature}, and HTCondor's SciTokens\n"
+                "library can only verify "
+                + " or ".join(token_client.HTCONDOR_ALGORITHMS)
+                + " - so an HTCondor-CE cannot accept it. Ask the issuer for RS256, or\n"
+                "use an issuer that signs with it.\n"
+            )
     return OK
 
 
@@ -1227,6 +1249,33 @@ def _subject_token(args: argparse.Namespace) -> str:
     return token_client.read_token()[0]
 
 
+def _wanted_algorithm(args: argparse.Namespace) -> str:
+    """The signature to ask for: the flag, the environment, then RS256."""
+    from xrdsec import token_client
+
+    return args.algorithm or environ_algorithm() or token_client.PREFERRED_ALGORITHM
+
+
+def _device_client_id(args: argparse.Namespace, issuer: Any) -> str:
+    """Which client the device flow speaks as: flag, environment, store, profile."""
+    from xrdsec import clientstore, token_client
+
+    for found in (
+        args.client_id,
+        _client_id_from_environment(),
+        clientstore.remembered(issuer.url),
+        _profile_client_id(args),
+    ):
+        if found:
+            return str(found)
+    raise token_client.TokenError(
+        "the device flow needs a client id: run `" + program_name() + " token register`"
+        " for an issuer that allows it, or register a public client yourself and pass"
+        " --client-id (or set WLCG_CLIENT_ID)",
+        code="no_client",
+    )
+
+
 def _profile_client_id(args: argparse.Namespace) -> str:
     """The client id the named profile publishes, if it publishes one."""
     from xrdsec import providers
@@ -1242,23 +1291,12 @@ def _profile_client_id(args: argparse.Namespace) -> str:
 
 def _by_device_flow(args: argparse.Namespace, issuer: Any, scope: str, ca_path: str | None) -> Any:
     """RFC 8628: show a code, wait for a person to approve it, and take the token."""
-    from xrdsec import clientstore, token_client
+    from xrdsec import token_client
 
-    client_id = args.client_id or _client_id_from_environment()
-    if not client_id:
-        client_id = clientstore.remembered(issuer.url)
-    if not client_id:
-        # An issuer whose own tools ship a public client: use that, rather than
-        # asking a person to invent an identifier the issuer already knows.
-        client_id = _profile_client_id(args)
-    if not client_id:
-        raise token_client.TokenError(
-            "the device flow needs a client id: run `" + program_name() + " token register`"
-            " for an issuer that allows it, or register a public client yourself and pass"
-            " --client-id (or set WLCG_CLIENT_ID)",
-            code="no_client",
-        )
-    started = token_client.device_authorization(issuer, client_id, scope=scope, ca_path=ca_path)
+    client_id = _device_client_id(args, issuer)
+    started = token_client.device_authorization(
+        issuer, client_id, scope=scope, algorithm=_wanted_algorithm(args), ca_path=ca_path
+    )
     where = started.get("verification_uri_complete") or started.get("verification_uri")
     if not args.quiet:
         _say(f"To approve this request, open:\n\n    {where}\n\n")
@@ -1367,6 +1405,11 @@ def _token_destroy(args: argparse.Namespace) -> int:
     if not args.quiet:
         _say(f"{'Would remove' if args.dry else 'Removed'} {path}\n")
     return OK
+
+
+def environ_algorithm() -> str:
+    """``WLCG_TOKEN_ALGORITHM``, the same way every other setting is read."""
+    return (os.environ.get("WLCG_TOKEN_ALGORITHM") or "").strip()
 
 
 def _client_id_from_environment() -> str:
